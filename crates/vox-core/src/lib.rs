@@ -1,14 +1,12 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! vox-core: foundational voxel types — blocks, chunks, coordinates.
+//!
+//! This crate is headless: it must never depend on wgpu, winit, or anything
+//! graphical (see CLAUDE.md workspace rules).
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod block;
+pub mod chunk;
+pub mod coords;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use block::BlockId;
+pub use chunk::Chunk;
+pub use coords::{CHUNK_BITS, CHUNK_SIZE, CHUNK_VOLUME, ChunkPos, LocalPos, WorldPos};
