@@ -6,7 +6,9 @@
 pub mod block;
 pub mod chunk;
 pub mod coords;
+pub mod world;
 
 pub use block::BlockId;
 pub use chunk::Chunk;
 pub use coords::{CHUNK_BITS, CHUNK_SIZE, CHUNK_VOLUME, ChunkPos, LocalPos, WorldPos};
+pub use world::World;

@@ -4,12 +4,13 @@
 //! Must never depend on wgpu/winit — meshing is pure data transformation
 //! and is unit-tested without a GPU.
 //!
-//! Milestone 00: naive *culled* meshing — one quad per solid-block face
-//! that borders a non-solid block. Greedy meshing (merging coplanar quads)
-//! replaces this in Milestone 01; the [`MeshData`] output type is the
-//! stable contract between the two.
+//! Milestone 01 state: naive *culled* meshing with cross-chunk culling —
+//! a chunk is meshed together with views of its six face-neighbors, so no
+//! quads are emitted between solid blocks across a chunk border. Greedy
+//! meshing (merging coplanar quads) is task 3; [`MeshData`] is the stable
+//! contract between the two.
 
-use vox_core::{BlockId, CHUNK_SIZE, Chunk, LocalPos};
+use vox_core::{BlockId, CHUNK_SIZE, Chunk, ChunkPos, LocalPos, World};
 
 /// One mesh vertex. `repr(C)` + Pod so vox-render can cast the vertex
 /// buffer straight to bytes for GPU upload.
@@ -38,6 +39,50 @@ impl MeshData {
 
     pub fn quad_count(&self) -> usize {
         self.indices.len() / 6
+    }
+}
+
+/// Read-only views of a chunk's six face-neighbors, used for cross-chunk
+/// face culling. A `None` neighbor (unloaded / nonexistent chunk) is
+/// treated as air, so faces on the edge of the loaded world are emitted.
+///
+/// This type — rather than `&World` — is the mesher input so that meshing
+/// stays trivially parallelizable: a meshing job borrows exactly seven
+/// chunks and nothing else.
+#[derive(Default, Clone, Copy)]
+pub struct ChunkNeighbors<'a> {
+    pub neg_x: Option<&'a Chunk>,
+    pub pos_x: Option<&'a Chunk>,
+    pub neg_y: Option<&'a Chunk>,
+    pub pos_y: Option<&'a Chunk>,
+    pub neg_z: Option<&'a Chunk>,
+    pub pos_z: Option<&'a Chunk>,
+}
+
+impl<'a> ChunkNeighbors<'a> {
+    /// No neighbors: standalone-chunk behavior (all border faces emitted).
+    pub const NONE: ChunkNeighbors<'static> = ChunkNeighbors {
+        neg_x: None,
+        pos_x: None,
+        neg_y: None,
+        pos_y: None,
+        neg_z: None,
+        pos_z: None,
+    };
+
+    /// Gather the six neighbors of `pos` from a world.
+    pub fn of(world: &'a World, pos: ChunkPos) -> Self {
+        let n = |dx: i64, dy: i64, dz: i64| {
+            world.chunk(ChunkPos::new(pos.x + dx, pos.y + dy, pos.z + dz))
+        };
+        Self {
+            neg_x: n(-1, 0, 0),
+            pos_x: n(1, 0, 0),
+            neg_y: n(0, -1, 0),
+            pos_y: n(0, 1, 0),
+            neg_z: n(0, 0, -1),
+            pos_z: n(0, 0, 1),
+        }
     }
 }
 
@@ -126,18 +171,52 @@ const FACES: [Face; 6] = [
     },
 ];
 
-/// Mesh a single chunk with culled meshing.
+/// Is the block at chunk-relative coords (x, y, z) air? Coordinates one
+/// step outside `0..32` resolve into the corresponding neighbor (only one
+/// axis can be out of range, since face offsets are unit steps). Missing
+/// neighbors count as air.
+fn is_air_at(chunk: &Chunk, neighbors: &ChunkNeighbors, x: i32, y: i32, z: i32) -> bool {
+    let size = CHUNK_SIZE as i32;
+    let last = (size - 1) as u8;
+
+    let (target, local) = if x < 0 {
+        (neighbors.neg_x, LocalPos::new(last, y as u8, z as u8))
+    } else if x >= size {
+        (neighbors.pos_x, LocalPos::new(0, y as u8, z as u8))
+    } else if y < 0 {
+        (neighbors.neg_y, LocalPos::new(x as u8, last, z as u8))
+    } else if y >= size {
+        (neighbors.pos_y, LocalPos::new(x as u8, 0, z as u8))
+    } else if z < 0 {
+        (neighbors.neg_z, LocalPos::new(x as u8, y as u8, last))
+    } else if z >= size {
+        (neighbors.pos_z, LocalPos::new(x as u8, y as u8, 0))
+    } else {
+        return chunk.get(LocalPos::new(x as u8, y as u8, z as u8)).is_air();
+    };
+
+    match target {
+        None => true,
+        Some(neighbor) => neighbor.get(local).is_air(),
+    }
+}
+
+/// Mesh a single chunk with culled meshing, consulting `neighbors` for
+/// faces on chunk borders.
 ///
 /// `color_of` maps a (non-air) block to its base RGB color; block→color
 /// policy deliberately lives with the caller, not in this crate.
-///
-/// MILESTONE 00 LIMITATION: neighbors outside this chunk are treated as
-/// air, so faces on chunk borders are always emitted. Correct cross-chunk
-/// culling needs neighbor data and arrives with the multi-chunk world
-/// (Milestone 01+).
-pub fn mesh_chunk(chunk: &Chunk, mut color_of: impl FnMut(BlockId) -> [f32; 3]) -> MeshData {
+pub fn mesh_chunk(
+    chunk: &Chunk,
+    neighbors: &ChunkNeighbors,
+    mut color_of: impl FnMut(BlockId) -> [f32; 3],
+) -> MeshData {
     let mut mesh = MeshData::default();
-    let size = CHUNK_SIZE as i32;
+
+    // Uniform-air fast path: most chunks in a cubic-chunk world.
+    if chunk.is_all_air() {
+        return mesh;
+    }
 
     for pos in LocalPos::iter() {
         let block = chunk.get(pos);
@@ -148,18 +227,14 @@ pub fn mesh_chunk(chunk: &Chunk, mut color_of: impl FnMut(BlockId) -> [f32; 3]) 
         let (x, y, z) = (pos.x() as i32, pos.y() as i32, pos.z() as i32);
 
         for face in &FACES {
-            let (nx, ny, nz) = (x + face.offset[0], y + face.offset[1], z + face.offset[2]);
-
-            let neighbor_is_air =
-                if (0..size).contains(&nx) && (0..size).contains(&ny) && (0..size).contains(&nz) {
-                    chunk
-                        .get(LocalPos::new(nx as u8, ny as u8, nz as u8))
-                        .is_air()
-                } else {
-                    true // outside the chunk: treat as air (see doc comment)
-                };
-
-            if neighbor_is_air {
+            let neighbor_air = is_air_at(
+                chunk,
+                neighbors,
+                x + face.offset[0],
+                y + face.offset[1],
+                z + face.offset[2],
+            );
+            if neighbor_air {
                 emit_quad(&mut mesh, [x as f32, y as f32, z as f32], face, base_color);
             }
         }
@@ -204,56 +279,50 @@ mod tests {
 
     const WHITE: fn(BlockId) -> [f32; 3] = |_| [1.0, 1.0, 1.0];
     const STONE: BlockId = BlockId(1);
+    const N: usize = CHUNK_SIZE;
+
+    // --- Milestone 00 behavior, preserved with NONE neighbors. ---
 
     #[test]
     fn empty_chunk_produces_empty_mesh() {
-        let mesh = mesh_chunk(&Chunk::new_air(), WHITE);
+        let mesh = mesh_chunk(&Chunk::new_air(), &ChunkNeighbors::NONE, WHITE);
         assert!(mesh.is_empty());
         assert!(mesh.vertices.is_empty());
     }
 
-    /// Acceptance criterion: one isolated block → exactly 6 quads.
     #[test]
     fn isolated_block_has_six_quads() {
         let mut chunk = Chunk::new_air();
         chunk.set(LocalPos::new(5, 5, 5), STONE);
-        let mesh = mesh_chunk(&chunk, WHITE);
+        let mesh = mesh_chunk(&chunk, &ChunkNeighbors::NONE, WHITE);
         assert_eq!(mesh.quad_count(), 6);
         assert_eq!(mesh.vertices.len(), 24);
         assert_eq!(mesh.indices.len(), 36);
     }
 
-    /// Acceptance criterion: two adjacent blocks → 10 quads (the two
-    /// touching faces are culled).
     #[test]
     fn adjacent_pair_has_ten_quads() {
         let mut chunk = Chunk::new_air();
         chunk.set(LocalPos::new(5, 5, 5), STONE);
         chunk.set(LocalPos::new(6, 5, 5), STONE);
-        let mesh = mesh_chunk(&chunk, WHITE);
+        let mesh = mesh_chunk(&chunk, &ChunkNeighbors::NONE, WHITE);
         assert_eq!(mesh.quad_count(), 10);
     }
 
-    /// A block on the chunk corner: out-of-chunk neighbors count as air,
-    /// so all 6 faces are emitted.
     #[test]
-    fn corner_block_has_six_quads() {
+    fn corner_block_without_neighbors_has_six_quads() {
         let mut chunk = Chunk::new_air();
         chunk.set(LocalPos::new(0, 0, 0), STONE);
-        let mesh = mesh_chunk(&chunk, WHITE);
+        let mesh = mesh_chunk(&chunk, &ChunkNeighbors::NONE, WHITE);
         assert_eq!(mesh.quad_count(), 6);
     }
 
-    /// A completely solid chunk meshes to exactly its outer shell:
-    /// 6 sides × 32×32 faces. Interior faces must all be culled.
     #[test]
     fn solid_chunk_meshes_to_shell_only() {
-        let mesh = mesh_chunk(&Chunk::filled(STONE), WHITE);
-        assert_eq!(mesh.quad_count(), 6 * 32 * 32);
+        let mesh = mesh_chunk(&Chunk::filled(STONE), &ChunkNeighbors::NONE, WHITE);
+        assert_eq!(mesh.quad_count(), 6 * N * N);
     }
 
-    /// Every index must reference a real vertex, and indices come in
-    /// whole triangles.
     #[test]
     fn indices_are_valid() {
         let mut chunk = Chunk::new_air();
@@ -262,23 +331,18 @@ mod tests {
                 chunk.set(LocalPos::new(x, 3, z), STONE);
             }
         }
-        let mesh = mesh_chunk(&chunk, WHITE);
+        let mesh = mesh_chunk(&chunk, &ChunkNeighbors::NONE, WHITE);
         assert_eq!(mesh.indices.len() % 3, 0);
         let max = mesh.vertices.len() as u32;
         assert!(mesh.indices.iter().all(|&i| i < max));
     }
 
-    /// Winding check: for every triangle, the cross product of its edges
-    /// must have positive length (no degenerate triangles), and for the
-    /// known top face of a single block it must point up (+Y).
     #[test]
     fn top_face_winding_points_up() {
         let mut chunk = Chunk::new_air();
         chunk.set(LocalPos::new(0, 0, 0), STONE);
-        let mesh = mesh_chunk(&chunk, WHITE);
+        let mesh = mesh_chunk(&chunk, &ChunkNeighbors::NONE, WHITE);
 
-        // Find a triangle whose three vertices all sit at y == 1.0 — that's
-        // the top face. Its winding normal must be +Y.
         let mut found_top = false;
         for tri in mesh.indices.chunks_exact(3) {
             let [a, b, c] = [
@@ -295,5 +359,92 @@ mod tests {
             }
         }
         assert!(found_top, "no top face found");
+    }
+
+    // --- Milestone 01: cross-chunk culling. ---
+
+    /// A solid chunk with one solid neighbor: the shared border emits no
+    /// faces. 6 sides of 32×32, minus the one shared side.
+    #[test]
+    fn solid_neighbor_culls_shared_border() {
+        let chunk = Chunk::filled(STONE);
+        let neighbor = Chunk::filled(STONE);
+        let neighbors = ChunkNeighbors {
+            pos_x: Some(&neighbor),
+            ..ChunkNeighbors::NONE
+        };
+        let mesh = mesh_chunk(&chunk, &neighbors, WHITE);
+        assert_eq!(mesh.quad_count(), 5 * N * N);
+    }
+
+    /// Fully enclosed by solid neighbors: nothing to draw at all.
+    #[test]
+    fn fully_enclosed_chunk_meshes_to_nothing() {
+        let chunk = Chunk::filled(STONE);
+        let solid = Chunk::filled(STONE);
+        let neighbors = ChunkNeighbors {
+            neg_x: Some(&solid),
+            pos_x: Some(&solid),
+            neg_y: Some(&solid),
+            pos_y: Some(&solid),
+            neg_z: Some(&solid),
+            pos_z: Some(&solid),
+        };
+        let mesh = mesh_chunk(&chunk, &neighbors, WHITE);
+        assert!(mesh.is_empty());
+    }
+
+    /// An all-air neighbor that exists must behave exactly like a missing
+    /// neighbor: the border faces are emitted.
+    #[test]
+    fn air_neighbor_equals_missing_neighbor() {
+        let chunk = Chunk::filled(STONE);
+        let air = Chunk::new_air();
+        let neighbors = ChunkNeighbors {
+            pos_x: Some(&air),
+            ..ChunkNeighbors::NONE
+        };
+        let with_air = mesh_chunk(&chunk, &neighbors, WHITE);
+        let with_none = mesh_chunk(&chunk, &ChunkNeighbors::NONE, WHITE);
+        assert_eq!(with_air.quad_count(), with_none.quad_count());
+    }
+
+    /// Two single blocks touching across a chunk border: each loses
+    /// exactly the touching face.
+    #[test]
+    fn single_blocks_touching_across_border() {
+        let mut chunk = Chunk::new_air();
+        chunk.set(LocalPos::new(31, 5, 5), STONE);
+        let mut neighbor = Chunk::new_air();
+        neighbor.set(LocalPos::new(0, 5, 5), STONE);
+
+        let neighbors = ChunkNeighbors {
+            pos_x: Some(&neighbor),
+            ..ChunkNeighbors::NONE
+        };
+        let mesh = mesh_chunk(&chunk, &neighbors, WHITE);
+        assert_eq!(mesh.quad_count(), 5);
+    }
+
+    /// ChunkNeighbors::of gathers the right chunks from a World,
+    /// including across negative coordinates.
+    #[test]
+    fn neighbors_of_world() {
+        use vox_core::WorldPos;
+        let mut world = vox_core::World::new();
+        // Fill chunk (0,0,0) and its +X neighbor (1,0,0) solid.
+        world.insert_chunk(ChunkPos::new(0, 0, 0), Chunk::filled(STONE));
+        world.insert_chunk(ChunkPos::new(1, 0, 0), Chunk::filled(STONE));
+        // Sanity: the world agrees blocks exist on both sides of the border.
+        assert!(!world.get_block(WorldPos::new(31, 0, 0)).is_air());
+        assert!(!world.get_block(WorldPos::new(32, 0, 0)).is_air());
+
+        let center = world.chunk(ChunkPos::new(0, 0, 0)).unwrap();
+        let neighbors = ChunkNeighbors::of(&world, ChunkPos::new(0, 0, 0));
+        assert!(neighbors.pos_x.is_some());
+        assert!(neighbors.neg_x.is_none());
+
+        let mesh = mesh_chunk(center, &neighbors, WHITE);
+        assert_eq!(mesh.quad_count(), 5 * N * N);
     }
 }

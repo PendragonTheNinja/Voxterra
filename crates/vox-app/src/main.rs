@@ -194,7 +194,7 @@ impl ApplicationHandler for App {
         // Build the Milestone 00 test scene: fill, mesh, upload. Once.
         let mut chunk = Chunk::new_air();
         test_fill(&mut chunk);
-        let mesh = mesh_chunk(&chunk, block_color);
+        let mesh = mesh_chunk(&chunk, &vox_mesh::ChunkNeighbors::NONE, block_color);
         log::info!(
             "test chunk meshed: {} quads, {} vertices",
             mesh.quad_count(),
