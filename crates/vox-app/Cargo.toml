@@ -4,3 +4,6 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
+vox-render = { path = "../vox-render" }
+winit.workspace = true
+env_logger.workspace = true
