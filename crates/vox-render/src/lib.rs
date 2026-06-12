@@ -1,25 +1,36 @@
 //! vox-render: the wgpu renderer.
 //!
-//! Milestone 00, task 3: owns the GPU connection (instance → surface →
-//! adapter → device/queue), the surface configuration, and a render pass
-//! that clears to sky blue. The chunk render pipeline arrives in task 6.
+//! Milestone 00, tasks 3+4+6: GPU connection, depth-tested render pipeline
+//! for chunk meshes, camera uniform, mesh upload, and the per-frame draw.
 
 use std::sync::Arc;
+
+use vox_mesh::MeshData;
+use wgpu::util::DeviceExt;
 use winit::window::Window;
+
+const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+/// A mesh that has been uploaded to GPU buffers.
+struct GpuMesh {
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    index_count: u32,
+}
 
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    depth_view: wgpu::TextureView,
+    pipeline: wgpu::RenderPipeline,
+    camera_buffer: wgpu::Buffer,
+    camera_bind_group: wgpu::BindGroup,
+    mesh: Option<GpuMesh>,
 }
 
 impl Renderer {
-    /// Connect to the GPU and configure the window surface.
-    ///
-    /// Blocking is fine here: this runs once at startup. The `Arc<Window>`
-    /// keeps the window alive as long as the surface, which is what lets
-    /// the surface be `'static`.
     pub fn new(window: Arc<Window>) -> Self {
         let size = window.inner_size();
 
@@ -29,8 +40,6 @@ impl Renderer {
             .create_surface(window.clone())
             .expect("failed to create surface");
 
-        // The adapter is a handle to a physical GPU. HighPerformance asks
-        // for the discrete GPU on dual-GPU systems (e.g. laptop iGPU+dGPU).
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
@@ -44,8 +53,6 @@ impl Renderer {
             &wgpu::DeviceDescriptor {
                 label: Some("main device"),
                 required_features: wgpu::Features::empty(),
-                // Default limits = broadly compatible. We'll revisit when a
-                // feature actually needs more (and gate it properly).
                 required_limits: wgpu::Limits::default(),
                 memory_hints: wgpu::MemoryHints::Performance,
             },
@@ -58,17 +65,136 @@ impl Renderer {
             .expect("surface not supported by adapter");
         surface.configure(&device, &config);
 
+        let depth_view = create_depth_view(&device, &config);
+
+        // --- Camera uniform: one mat4, rewritten every frame. ---
+        let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("camera uniform"),
+            size: std::mem::size_of::<[[f32; 4]; 4]>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let camera_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("camera bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("camera bind group"),
+            layout: &camera_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buffer.as_entire_binding(),
+            }],
+        });
+
+        // --- Pipeline. Vertex layout must match vox_mesh::Vertex exactly:
+        // [f32;3] position, [f32;3] color, 24-byte stride. ---
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("chunk shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("chunk pipeline layout"),
+            bind_group_layouts: &[&camera_bgl],
+            push_constant_ranges: &[],
+        });
+
+        let vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<vox_mesh::Vertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+        };
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("chunk pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[vertex_layout],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
+
         Self {
             surface,
             device,
             queue,
             config,
+            depth_view,
+            pipeline,
+            camera_buffer,
+            camera_bind_group,
+            mesh: None,
         }
     }
 
-    /// Reconfigure the surface for a new window size. Width/height of zero
-    /// (minimized window) is skipped — configuring a zero-sized surface
-    /// panics on some backends.
+    /// Upload a CPU mesh to the GPU, replacing any previous one.
+    /// Build once, draw many — this must NOT be called per frame.
+    pub fn upload_mesh(&mut self, mesh: &MeshData) {
+        if mesh.is_empty() {
+            self.mesh = None;
+            return;
+        }
+        let vertex_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("chunk vertices"),
+                contents: bytemuck::cast_slice(&mesh.vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        let index_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("chunk indices"),
+                contents: bytemuck::cast_slice(&mesh.indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+        self.mesh = Some(GpuMesh {
+            vertex_buffer,
+            index_buffer,
+            index_count: mesh.indices.len() as u32,
+        });
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
@@ -76,14 +202,20 @@ impl Renderer {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
+        // Depth buffer dimensions must always match the surface.
+        self.depth_view = create_depth_view(&self.device, &self.config);
     }
 
-    /// Render one frame: currently just clears to sky blue.
-    pub fn render(&mut self) {
+    /// Width/height ratio, for the projection matrix.
+    pub fn aspect(&self) -> f32 {
+        self.config.width as f32 / self.config.height.max(1) as f32
+    }
+
+    /// Render one frame with the given view-projection matrix
+    /// (column-major, as produced by `glam::Mat4::to_cols_array_2d`).
+    pub fn render(&mut self, view_proj: [[f32; 4]; 4]) {
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
-            // Surface lost/outdated happens on resize races and display
-            // changes; reconfigure and try again next frame.
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                 self.surface.configure(&self.device, &self.config);
                 return;
@@ -93,6 +225,9 @@ impl Renderer {
                 return;
             }
         };
+
+        self.queue
+            .write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&view_proj));
 
         let view = frame
             .texture
@@ -104,10 +239,9 @@ impl Renderer {
                 label: Some("frame encoder"),
             });
 
-        // Scope so the pass is dropped (ended) before we finish the encoder.
         {
-            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("clear pass"),
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("main pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -121,13 +255,46 @@ impl Renderer {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+
+            if let Some(mesh) = &self.mesh {
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            }
         }
 
         self.queue.submit(Some(encoder.finish()));
         frame.present();
     }
+}
+
+fn create_depth_view(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("depth texture"),
+        size: wgpu::Extent3d {
+            width: config.width,
+            height: config.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
 }

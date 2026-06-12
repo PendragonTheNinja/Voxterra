@@ -549,6 +549,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "glam"
+version = "0.29.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8babf46d4c1c9d92deac9f7be466f76dfc4482b6452fc5024b5e8daf6ffeb3ee"
+
+[[package]]
 name = "glow"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1883,6 +1889,10 @@ name = "vox-app"
 version = "0.1.0"
 dependencies = [
  "env_logger",
+ "glam",
+ "log",
+ "vox-core",
+ "vox-mesh",
  "vox-render",
  "winit",
 ]
@@ -1903,8 +1913,10 @@ dependencies = [
 name = "vox-render"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "log",
  "pollster",
+ "vox-mesh",
  "wgpu",
  "winit",
 ]

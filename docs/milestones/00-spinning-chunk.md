@@ -78,3 +78,14 @@ possible scale.
   a one-paragraph retrospective at the bottom of this file (what was harder
   than expected, what the next spec should account for), then write
   `01-real-chunk-system.md` before writing any Milestone 01 code.
+
+## Retrospective (2026-06-12)
+
+Completed in [N] sessions. The wgpu 24 / winit 0.30 API assumptions held with
+zero compile errors. Setup friction was entirely environmental (WSL vs native
+Windows confusion, Defender scanning fresh exes, exFAT drive ruled out) —
+none of it Rust. Workflow note: downloaded files arrive with prefixed names
+and must be renamed to lib.rs/main.rs; caused one broken build. Headless
+crates (core, mesh) were verified by Claude's sandbox before delivery;
+graphics crates compile-tested only on the dev machine — this split worked
+well and should continue.

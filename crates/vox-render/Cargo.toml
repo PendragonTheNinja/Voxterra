@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+vox-mesh = { path = "../vox-mesh" }
 wgpu.workspace = true
 winit.workspace = true
 pollster.workspace = true
 log.workspace = true
+bytemuck.workspace = true
