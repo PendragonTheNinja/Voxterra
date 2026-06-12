@@ -1,26 +1,45 @@
-//! Chunk block storage.
+//! Chunk block storage — palette-compressed (Milestone 01).
 //!
-//! MILESTONE 00 SCAFFOLDING NOTE: storage is currently a dense flat array
-//! (64 KiB per chunk). Milestone 01 replaces the *internals* with palette
-//! compression; the public API of [`Chunk`] is the contract and must not
-//! leak storage details. Nothing outside this module may assume dense
-//! storage or a fixed bits-per-voxel.
+//! Each chunk stores a *palette* (the distinct [`BlockId`]s present) and a
+//! packed index array mapping every voxel to a palette entry. Memory cost
+//! scales with block-type *diversity*, not block-type count — this is what
+//! makes hundreds of rock/mineral types affordable (see CLAUDE.md).
+//!
+//! Two invariants worth knowing:
+//!
+//! - **Uniform fast path:** a chunk whose palette has one entry (all air,
+//!   all stone, ...) stores NO index array. In a cubic-chunk world most
+//!   chunks are uniform (sky or deep underground), so this is the single
+//!   biggest memory win in the engine.
+//! - **Bit widths are 1, 2, 4, 8, or 16** — always a divisor of 64, so a
+//!   packed value never straddles a `u64` word boundary. Slightly more
+//!   memory than minimal bit packing, much simpler and faster access.
+//!
+//! Index order is Y-major [`LocalPos::index`] order — the same ordering
+//! contract the serialized chunk format (Milestone 02) will use.
+//!
+//! The public API is unchanged from the Milestone 00 dense version; the
+//! palette is an internal representation, and nothing outside this module
+//! may assume dense storage or a fixed bits-per-voxel.
 
 use crate::block::BlockId;
 use crate::coords::{CHUNK_VOLUME, LocalPos};
 
 /// Block storage for one 32³ chunk.
 pub struct Chunk {
-    /// Indexed by [`LocalPos::index`] (Y-major layout).
-    blocks: Box<[BlockId; CHUNK_VOLUME]>,
+    /// Distinct block types present (or once-present, until [`Chunk::compact`]).
+    /// Invariant: never empty. In the uniform case, exactly one entry.
+    palette: Vec<BlockId>,
+    /// Packed per-voxel palette indices; `None` iff the chunk is uniform.
+    indices: Option<Packed>,
 }
 
 impl Chunk {
-    /// A chunk uniformly filled with one block type.
+    /// A chunk uniformly filled with one block type. O(1) memory.
     pub fn filled(block: BlockId) -> Self {
-        let boxed: Box<[BlockId]> = vec![block; CHUNK_VOLUME].into_boxed_slice();
         Self {
-            blocks: boxed.try_into().expect("length is CHUNK_VOLUME"),
+            palette: vec![block],
+            indices: None,
         }
     }
 
@@ -31,18 +50,114 @@ impl Chunk {
 
     #[inline]
     pub fn get(&self, pos: LocalPos) -> BlockId {
-        self.blocks[pos.index()]
+        match &self.indices {
+            None => self.palette[0],
+            Some(packed) => self.palette[packed.get(pos.index()) as usize],
+        }
     }
 
-    #[inline]
     pub fn set(&mut self, pos: LocalPos, block: BlockId) {
-        self.blocks[pos.index()] = block;
+        // Uniform fast path: writing the same block is a no-op.
+        if self.indices.is_none() && block == self.palette[0] {
+            return;
+        }
+
+        let palette_index = self.palette_index_or_insert(block);
+
+        match &mut self.indices {
+            Some(packed) => packed.set(pos.index(), palette_index as u64),
+            None => {
+                // Leave the uniform representation: materialize an index
+                // array (all zeros = old uniform block), then write.
+                let mut packed = Packed::new(bits_for(self.palette.len()));
+                packed.set(pos.index(), palette_index as u64);
+                self.indices = Some(packed);
+            }
+        }
     }
 
-    /// True if every block in the chunk is air. (Meshing and rendering
-    /// skip such chunks entirely.)
+    /// True if every block in the chunk is air.
     pub fn is_all_air(&self) -> bool {
-        self.blocks.iter().all(|b| b.is_air())
+        match &self.indices {
+            None => self.palette[0].is_air(),
+            Some(packed) => {
+                // If no palette entry is air, no cell can be.
+                if !self.palette.iter().any(|b| b.is_air()) {
+                    return false;
+                }
+                (0..CHUNK_VOLUME).all(|i| self.palette[packed.get(i) as usize].is_air())
+            }
+        }
+    }
+
+    /// True if the chunk stores a single block type with no index array.
+    /// (Mesh/serialization fast paths key off this.)
+    pub fn is_uniform(&self) -> bool {
+        self.indices.is_none()
+    }
+
+    /// Number of palette entries. After many overwrites this can include
+    /// entries no longer used by any voxel — see [`Chunk::compact`].
+    pub fn palette_len(&self) -> usize {
+        self.palette.len()
+    }
+
+    /// Drop unused palette entries and re-pack at the smallest bit width;
+    /// collapses back to the uniform representation when possible.
+    ///
+    /// Never called automatically — callers decide when the O(volume) cost
+    /// is worth paying (e.g. before serialization).
+    pub fn compact(&mut self) {
+        let Some(packed) = &self.indices else {
+            return; // already uniform: nothing to do
+        };
+
+        let mut used = vec![false; self.palette.len()];
+        for i in 0..CHUNK_VOLUME {
+            used[packed.get(i) as usize] = true;
+        }
+
+        let mut remap = vec![0u64; self.palette.len()];
+        let mut new_palette = Vec::new();
+        for (old_index, &is_used) in used.iter().enumerate() {
+            if is_used {
+                remap[old_index] = new_palette.len() as u64;
+                new_palette.push(self.palette[old_index]);
+            }
+        }
+
+        if new_palette.len() == 1 {
+            self.palette = new_palette;
+            self.indices = None;
+            return;
+        }
+
+        let mut new_packed = Packed::new(bits_for(new_palette.len()));
+        for i in 0..CHUNK_VOLUME {
+            new_packed.set(i, remap[packed.get(i) as usize]);
+        }
+        self.palette = new_palette;
+        self.indices = Some(new_packed);
+    }
+
+    /// Palette index for `block`, inserting it if new. Widens the packed
+    /// array when the palette grows past the current bit width's capacity.
+    fn palette_index_or_insert(&mut self, block: BlockId) -> usize {
+        // Linear search: palettes are small (a handful of entries in
+        // practice). Revisit only if profiling ever says otherwise.
+        if let Some(i) = self.palette.iter().position(|&b| b == block) {
+            return i;
+        }
+
+        self.palette.push(block);
+        let needed_bits = bits_for(self.palette.len());
+        if let Some(packed) = &self.indices
+            && needed_bits > packed.bits
+        {
+            let widened = packed.repacked(needed_bits);
+            self.indices = Some(widened);
+        }
+        self.palette.len() - 1
     }
 }
 
@@ -52,10 +167,77 @@ impl Default for Chunk {
     }
 }
 
+/// Smallest supported bit width that can index a palette of `len` entries.
+/// Always one of {1, 2, 4, 8, 16} so values never straddle a u64 word.
+fn bits_for(len: usize) -> u32 {
+    debug_assert!((1..=u16::MAX as usize + 1).contains(&len));
+    if len <= 2 {
+        return 1;
+    }
+    // ceil(log2(len)), rounded up to a power of two.
+    let needed = usize::BITS - (len - 1).leading_zeros();
+    needed.next_power_of_two()
+}
+
+/// Fixed-width packed integer array, CHUNK_VOLUME entries.
+struct Packed {
+    /// Bits per value: 1, 2, 4, 8, or 16.
+    bits: u32,
+    /// Values per u64 word (64 / bits).
+    per_word: u32,
+    /// Mask of `bits` low ones.
+    mask: u64,
+    data: Vec<u64>,
+}
+
+impl Packed {
+    fn new(bits: u32) -> Self {
+        debug_assert!(matches!(bits, 1 | 2 | 4 | 8 | 16));
+        let per_word = 64 / bits;
+        let words = CHUNK_VOLUME.div_ceil(per_word as usize);
+        Self {
+            bits,
+            per_word,
+            mask: (1u64 << bits) - 1,
+            data: vec![0; words],
+        }
+    }
+
+    #[inline]
+    fn get(&self, i: usize) -> u64 {
+        debug_assert!(i < CHUNK_VOLUME);
+        let word = i / self.per_word as usize;
+        let shift = (i as u32 % self.per_word) * self.bits;
+        (self.data[word] >> shift) & self.mask
+    }
+
+    #[inline]
+    fn set(&mut self, i: usize, value: u64) {
+        debug_assert!(i < CHUNK_VOLUME);
+        debug_assert!(value <= self.mask);
+        let word = i / self.per_word as usize;
+        let shift = (i as u32 % self.per_word) * self.bits;
+        let slot = &mut self.data[word];
+        *slot = (*slot & !(self.mask << shift)) | (value << shift);
+    }
+
+    /// Copy of self at a wider bit width.
+    fn repacked(&self, new_bits: u32) -> Packed {
+        debug_assert!(new_bits > self.bits);
+        let mut out = Packed::new(new_bits);
+        for i in 0..CHUNK_VOLUME {
+            out.set(i, self.get(i));
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::coords::LocalPos;
+
+    // --- Milestone 00 tests, unchanged: the API contract. ---
 
     #[test]
     fn new_air_is_all_air() {
@@ -75,7 +257,6 @@ mod tests {
 
         assert_eq!(chunk.get(pos), stone);
         assert!(!chunk.is_all_air());
-        // Neighbors untouched.
         assert_eq!(chunk.get(LocalPos::new(4, 17, 30)), BlockId::AIR);
         assert_eq!(chunk.get(LocalPos::new(5, 16, 30)), BlockId::AIR);
     }
@@ -91,8 +272,6 @@ mod tests {
 
     #[test]
     fn set_does_not_bleed_between_cells() {
-        // Write a unique value everywhere, then verify every cell
-        // independently — catches any indexing aliasing bug.
         let mut chunk = Chunk::new_air();
         for pos in LocalPos::iter() {
             chunk.set(pos, BlockId((pos.index() % u16::MAX as usize) as u16));
@@ -102,6 +281,144 @@ mod tests {
                 chunk.get(pos),
                 BlockId((pos.index() % u16::MAX as usize) as u16)
             );
+        }
+    }
+
+    // --- Milestone 01: palette-specific tests. ---
+
+    #[test]
+    fn uniform_chunks_store_no_indices() {
+        assert!(Chunk::new_air().is_uniform());
+        assert!(Chunk::filled(BlockId(7)).is_uniform());
+        assert_eq!(Chunk::filled(BlockId(7)).palette_len(), 1);
+    }
+
+    #[test]
+    fn writing_uniform_value_stays_uniform() {
+        let mut chunk = Chunk::filled(BlockId(7));
+        chunk.set(LocalPos::new(3, 3, 3), BlockId(7));
+        assert!(chunk.is_uniform());
+    }
+
+    #[test]
+    fn first_differing_write_leaves_uniform() {
+        let mut chunk = Chunk::filled(BlockId(7));
+        chunk.set(LocalPos::new(3, 3, 3), BlockId(8));
+        assert!(!chunk.is_uniform());
+        assert_eq!(chunk.get(LocalPos::new(3, 3, 3)), BlockId(8));
+        assert_eq!(chunk.get(LocalPos::new(3, 3, 4)), BlockId(7));
+        assert_eq!(chunk.palette_len(), 2);
+    }
+
+    #[test]
+    fn bits_for_widths_are_word_aligned() {
+        assert_eq!(bits_for(1), 1);
+        assert_eq!(bits_for(2), 1);
+        assert_eq!(bits_for(3), 2);
+        assert_eq!(bits_for(4), 2);
+        assert_eq!(bits_for(5), 4);
+        assert_eq!(bits_for(16), 4);
+        assert_eq!(bits_for(17), 8);
+        assert_eq!(bits_for(256), 8);
+        assert_eq!(bits_for(257), 16);
+        assert_eq!(bits_for(65536), 16);
+    }
+
+    /// Insert progressively more block types so the packed array is forced
+    /// through every bit-width boundary; previously written data must
+    /// survive every widening.
+    #[test]
+    fn growth_across_bit_width_boundaries_preserves_data() {
+        let mut chunk = Chunk::new_air();
+        // 300 distinct types pushes the palette through 1→2→4→8→16 bits.
+        for i in 0..300u16 {
+            let pos = LocalPos::from_index(i as usize);
+            chunk.set(pos, BlockId(i + 1));
+            // After every single insertion, verify everything so far.
+            for j in 0..=i {
+                let p = LocalPos::from_index(j as usize);
+                assert_eq!(chunk.get(p), BlockId(j + 1), "lost data at width growth");
+            }
+        }
+    }
+
+    /// Differential test against a dense reference array under a
+    /// deterministic random workload — the strongest correctness evidence.
+    #[test]
+    fn random_workload_matches_dense_reference() {
+        let mut chunk = Chunk::new_air();
+        let mut reference = vec![BlockId::AIR; CHUNK_VOLUME];
+        let mut rng = SplitMix64::new(0xB10C_5EED);
+
+        for _ in 0..50_000 {
+            let index = (rng.next() as usize) % CHUNK_VOLUME;
+            // Small block-type range so overwrites and reuse are common.
+            let block = BlockId((rng.next() % 12) as u16);
+            chunk.set(LocalPos::from_index(index), block);
+            reference[index] = block;
+        }
+
+        for (i, &expected) in reference.iter().enumerate() {
+            assert_eq!(chunk.get(LocalPos::from_index(i)), expected);
+        }
+        assert_eq!(chunk.is_all_air(), reference.iter().all(|b| b.is_air()));
+    }
+
+    #[test]
+    fn compact_drops_unused_entries_and_recovers_uniform() {
+        let mut chunk = Chunk::new_air();
+        let pos = LocalPos::new(1, 2, 3);
+
+        // Touch several types, then overwrite everything back to air.
+        chunk.set(pos, BlockId(1));
+        chunk.set(pos, BlockId(2));
+        chunk.set(pos, BlockId(3));
+        chunk.set(pos, BlockId::AIR);
+        assert!(chunk.palette_len() > 1);
+
+        chunk.compact();
+
+        assert!(
+            chunk.is_uniform(),
+            "all-air chunk should compact to uniform"
+        );
+        assert_eq!(chunk.palette_len(), 1);
+        assert!(chunk.is_all_air());
+    }
+
+    #[test]
+    fn compact_preserves_contents() {
+        let mut chunk = Chunk::new_air();
+        let mut rng = SplitMix64::new(42);
+        let mut reference = vec![BlockId::AIR; CHUNK_VOLUME];
+
+        for _ in 0..10_000 {
+            let index = (rng.next() as usize) % CHUNK_VOLUME;
+            let block = BlockId((rng.next() % 30) as u16);
+            chunk.set(LocalPos::from_index(index), block);
+            reference[index] = block;
+        }
+
+        chunk.compact();
+
+        for (i, &expected) in reference.iter().enumerate() {
+            assert_eq!(chunk.get(LocalPos::from_index(i)), expected);
+        }
+    }
+
+    /// Minimal deterministic RNG for tests — no external crates in vox-core.
+    struct SplitMix64(u64);
+
+    impl SplitMix64 {
+        fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^ (z >> 31)
         }
     }
 }

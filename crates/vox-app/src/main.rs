@@ -38,8 +38,7 @@ fn test_fill(chunk: &mut Chunk) {
         for z in 0..CHUNK_SIZE as u8 {
             let fx = x as f32;
             let fz = z as f32;
-            let height =
-                (14.0 + 5.0 * (fx * 0.30).sin() + 4.0 * (fz * 0.23).cos()).round() as i32;
+            let height = (14.0 + 5.0 * (fx * 0.30).sin() + 4.0 * (fz * 0.23).cos()).round() as i32;
             for y in 0..CHUNK_SIZE as i32 {
                 let block = if y < height - 3 {
                     STONE
