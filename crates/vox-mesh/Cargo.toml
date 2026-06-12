@@ -4,3 +4,5 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+vox-core = { path = "../vox-core" }
+bytemuck = { version = "1", features = ["derive"] }
