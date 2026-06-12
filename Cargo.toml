@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vox-core",
+    "crates/vox-mesh",
+    "crates/vox-worldgen",
+    "crates/vox-render",
+    "crates/vox-app",
+]
+
+[workspace.package]
+edition = "2021"
+
+[profile.dev]
+opt-level = 1          # debug builds fast enough to actually run
+
+[profile.dev.package."*"]
+opt-level = 3          # dependencies always optimized
