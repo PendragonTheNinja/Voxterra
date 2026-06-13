@@ -1894,6 +1894,7 @@ dependencies = [
  "vox-core",
  "vox-mesh",
  "vox-render",
+ "vox-worldgen",
  "winit",
 ]
 
@@ -1916,6 +1917,7 @@ dependencies = [
  "bytemuck",
  "log",
  "pollster",
+ "vox-core",
  "vox-mesh",
  "wgpu",
  "winit",

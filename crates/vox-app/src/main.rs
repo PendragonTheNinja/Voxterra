@@ -6,9 +6,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use glam::{Mat4, Vec3};
-use vox_core::{BlockId, Chunk, LocalPos, CHUNK_SIZE};
-use vox_mesh::mesh_chunk;
+use vox_core::{BlockId, ChunkPos, World};
+use vox_mesh::{mesh_chunk, ChunkNeighbors, MeshData};
 use vox_render::Renderer;
+use vox_worldgen::Generator;
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -16,7 +17,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
 // ---------------------------------------------------------------------------
-// Test scene (Milestone 00 scaffolding — lives here, not in the engine)
+// Block appearance (vox-app owns block→color policy; IDs mirror vox-worldgen)
 // ---------------------------------------------------------------------------
 
 const STONE: BlockId = BlockId(1);
@@ -32,26 +33,22 @@ fn block_color(block: BlockId) -> [f32; 3] {
     }
 }
 
-/// Rolling sine-wave terrain: grass on top, dirt beneath, stone below.
-fn test_fill(chunk: &mut Chunk) {
-    for x in 0..CHUNK_SIZE as u8 {
-        for z in 0..CHUNK_SIZE as u8 {
-            let fx = x as f32;
-            let fz = z as f32;
-            let height = (14.0 + 5.0 * (fx * 0.30).sin() + 4.0 * (fz * 0.23).cos()).round() as i32;
-            for y in 0..CHUNK_SIZE as i32 {
-                let block = if y < height - 3 {
-                    STONE
-                } else if y < height {
-                    DIRT
-                } else if y == height {
-                    GRASS
-                } else {
-                    continue; // air
-                };
-                chunk.set(LocalPos::new(x, y as u8, z), block);
-            }
-        }
+/// Side length (in chunks) of the cube of world generated for this
+/// milestone's acceptance scene. 16 → 4,096 chunks → a 512³-block world.
+const WORLD_CHUNKS: i64 = 16;
+
+/// Translate every vertex of a locally-meshed chunk into world space by
+/// adding the chunk's origin. The mesher emits positions in 0..32 local
+/// space; this is where the chunk's world offset is baked in (see the
+/// Milestone 01 spec's note on f32 precision far from origin — fine at
+/// this scale, revisited via a future ADR before continent-scale worlds).
+fn offset_mesh(mesh: &mut MeshData, chunk_pos: ChunkPos) {
+    let origin = chunk_pos.origin();
+    let (ox, oy, oz) = (origin.x as f32, origin.y as f32, origin.z as f32);
+    for v in &mut mesh.vertices {
+        v.position[0] += ox;
+        v.position[1] += oy;
+        v.position[2] += oz;
     }
 }
 
@@ -68,7 +65,8 @@ struct FlyCamera {
 }
 
 impl FlyCamera {
-    const SPEED: f32 = 12.0; // m/s
+    const SPEED: f32 = 30.0; // m/s
+    const SPRINT_MULTIPLIER: f32 = 4.0; // hold Ctrl
     const SENSITIVITY: f32 = 0.0022; // radians per mouse count
     const PITCH_LIMIT: f32 = 1.55; // just under PI/2
 
@@ -113,7 +111,12 @@ impl FlyCamera {
         }
 
         if dir != Vec3::ZERO {
-            self.position += dir.normalize() * Self::SPEED * dt;
+            let speed = if keys.contains(&KeyCode::ControlLeft) {
+                Self::SPEED * Self::SPRINT_MULTIPLIER
+            } else {
+                Self::SPEED
+            };
+            self.position += dir.normalize() * speed * dt;
         }
     }
 
@@ -131,6 +134,7 @@ impl FlyCamera {
 struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
+    world: World,
     camera: FlyCamera,
     keys: HashSet<KeyCode>,
     cursor_captured: bool,
@@ -142,11 +146,12 @@ impl Default for App {
         Self {
             window: None,
             renderer: None,
-            // Outside the chunk's corner, looking in at the terrain.
+            world: World::new(),
+            // Up high and back, looking down into the generated terrain.
             camera: FlyCamera {
-                position: Vec3::new(-12.0, 26.0, -12.0),
-                yaw: std::f32::consts::FRAC_PI_4, // 45°: toward chunk center
-                pitch: -0.30,
+                position: Vec3::new(-20.0, 60.0, -20.0),
+                yaw: std::f32::consts::FRAC_PI_4, // 45°: toward world center
+                pitch: -0.45,
             },
             keys: HashSet::new(),
             cursor_captured: false,
@@ -191,17 +196,47 @@ impl ApplicationHandler for App {
 
         let mut renderer = Renderer::new(window.clone());
 
-        // Build the Milestone 00 test scene: fill, mesh, upload. Once.
-        let mut chunk = Chunk::new_air();
-        test_fill(&mut chunk);
-        let mesh = mesh_chunk(&chunk, &vox_mesh::ChunkNeighbors::NONE, block_color);
-        log::info!(
-            "test chunk meshed: {} quads, {} vertices",
-            mesh.quad_count(),
-            mesh.vertices.len()
-        );
-        renderer.upload_mesh(&mesh);
+        // --- Build the Milestone 01 acceptance scene: a WORLD_CHUNKS³ cube
+        // of generated terrain, meshed per chunk with cross-chunk culling,
+        // uploaded once. Single-threaded (rayon is task 6). ---
+        let gen_start = Instant::now();
+        let generator = Generator::new(0x0007_E22A_C0DE);
+        let mut world = World::new();
+        for cy in 0..WORLD_CHUNKS {
+            for cz in 0..WORLD_CHUNKS {
+                for cx in 0..WORLD_CHUNKS {
+                    let pos = ChunkPos::new(cx, cy, cz);
+                    world.insert_chunk(pos, generator.generate_chunk(pos));
+                }
+            }
+        }
+        let gen_ms = gen_start.elapsed().as_secs_f32() * 1000.0;
 
+        let mesh_start = Instant::now();
+        let mut total_quads = 0usize;
+        let mut nonempty = 0usize;
+        for (pos, chunk) in world.chunks() {
+            let neighbors = ChunkNeighbors::of(&world, pos);
+            let mut mesh = mesh_chunk(chunk, &neighbors, block_color);
+            if !mesh.is_empty() {
+                offset_mesh(&mut mesh, pos);
+                total_quads += mesh.quad_count();
+                nonempty += 1;
+                renderer.set_chunk_mesh(pos, &mesh);
+            }
+        }
+        let mesh_ms = mesh_start.elapsed().as_secs_f32() * 1000.0;
+
+        log::info!(
+            "world: {} chunks ({} non-empty meshes), {} quads | gen {:.0}ms, mesh {:.0}ms",
+            world.chunk_count(),
+            nonempty,
+            total_quads,
+            gen_ms,
+            mesh_ms,
+        );
+
+        self.world = world;
         self.renderer = Some(renderer);
         self.window = Some(window);
         self.last_frame = Instant::now();

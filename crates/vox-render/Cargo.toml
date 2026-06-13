@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+vox-core = { path = "../vox-core" }
 vox-mesh = { path = "../vox-mesh" }
 wgpu.workspace = true
 winit.workspace = true

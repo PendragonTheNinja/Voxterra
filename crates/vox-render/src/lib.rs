@@ -3,8 +3,10 @@
 //! Milestone 00, tasks 3+4+6: GPU connection, depth-tested render pipeline
 //! for chunk meshes, camera uniform, mesh upload, and the per-frame draw.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use vox_core::ChunkPos;
 use vox_mesh::MeshData;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
@@ -27,7 +29,9 @@ pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
-    mesh: Option<GpuMesh>,
+    /// One GPU mesh per chunk, keyed by chunk position. Empty/air chunks
+    /// have no entry and cost nothing to "draw".
+    meshes: HashMap<ChunkPos, GpuMesh>,
 }
 
 impl Renderer {
@@ -163,15 +167,16 @@ impl Renderer {
             pipeline,
             camera_buffer,
             camera_bind_group,
-            mesh: None,
+            meshes: HashMap::new(),
         }
     }
 
-    /// Upload a CPU mesh to the GPU, replacing any previous one.
-    /// Build once, draw many — this must NOT be called per frame.
-    pub fn upload_mesh(&mut self, mesh: &MeshData) {
+    /// Upload (or replace) the mesh for one chunk. An empty mesh removes
+    /// the chunk's entry entirely. Build once, draw many — call this when a
+    /// chunk's geometry changes, NOT every frame.
+    pub fn set_chunk_mesh(&mut self, pos: ChunkPos, mesh: &MeshData) {
         if mesh.is_empty() {
-            self.mesh = None;
+            self.meshes.remove(&pos);
             return;
         }
         let vertex_buffer = self
@@ -188,11 +193,19 @@ impl Renderer {
                 contents: bytemuck::cast_slice(&mesh.indices),
                 usage: wgpu::BufferUsages::INDEX,
             });
-        self.mesh = Some(GpuMesh {
-            vertex_buffer,
-            index_buffer,
-            index_count: mesh.indices.len() as u32,
-        });
+        self.meshes.insert(
+            pos,
+            GpuMesh {
+                vertex_buffer,
+                index_buffer,
+                index_count: mesh.indices.len() as u32,
+            },
+        );
+    }
+
+    /// Number of chunk meshes currently uploaded (for debug/telemetry).
+    pub fn mesh_count(&self) -> usize {
+        self.meshes.len()
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -267,12 +280,17 @@ impl Renderer {
                 occlusion_query_set: None,
             });
 
-            if let Some(mesh) = &self.mesh {
+            if !self.meshes.is_empty() {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                // Chunk world offset is baked into vertex positions at mesh
+                // time, so all chunks share one pipeline and bind group and
+                // differ only by their vertex/index buffers.
+                for mesh in self.meshes.values() {
+                    pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                }
             }
         }
 

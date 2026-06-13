@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
+vox-worldgen = { path = "../vox-worldgen" }
 vox-core = { path = "../vox-core" }
 vox-mesh = { path = "../vox-mesh" }
 vox-render = { path = "../vox-render" }
