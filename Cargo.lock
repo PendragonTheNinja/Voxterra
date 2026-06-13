@@ -1961,6 +1961,7 @@ name = "vox-render"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "glam",
  "log",
  "pollster",
  "vox-core",

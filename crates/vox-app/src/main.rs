@@ -162,6 +162,9 @@ struct App {
     keys: HashSet<KeyCode>,
     cursor_captured: bool,
     last_frame: Instant,
+    /// Telemetry: accumulate frames over ~1s to log FPS + drawn/total.
+    telemetry_accum: f32,
+    telemetry_frames: u32,
 }
 
 impl Default for App {
@@ -179,6 +182,8 @@ impl Default for App {
             keys: HashSet::new(),
             cursor_captured: false,
             last_frame: Instant::now(),
+            telemetry_accum: 0.0,
+            telemetry_frames: 0,
         }
     }
 }
@@ -395,6 +400,22 @@ impl ApplicationHandler for App {
                 if let Some(renderer) = self.renderer.as_mut() {
                     let view_proj = self.camera.view_proj(renderer.aspect());
                     renderer.render(view_proj.to_cols_array_2d());
+
+                    // Telemetry once per second: FPS and how many chunk
+                    // meshes survived frustum culling out of the total.
+                    self.telemetry_accum += dt;
+                    self.telemetry_frames += 1;
+                    if self.telemetry_accum >= 1.0 {
+                        let fps = self.telemetry_frames as f32 / self.telemetry_accum;
+                        log::info!(
+                            "{:.0} fps | drawn {}/{} chunk meshes",
+                            fps,
+                            renderer.drawn_last_frame(),
+                            renderer.mesh_count(),
+                        );
+                        self.telemetry_accum = 0.0;
+                        self.telemetry_frames = 0;
+                    }
                 }
                 if let Some(window) = &self.window {
                     window.request_redraw();

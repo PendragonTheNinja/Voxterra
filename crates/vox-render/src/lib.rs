@@ -6,18 +6,69 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use vox_core::ChunkPos;
+use glam::{Mat4, Vec3, Vec4};
+use vox_core::{CHUNK_SIZE, ChunkPos};
 use vox_mesh::MeshData;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-/// A mesh that has been uploaded to GPU buffers.
+/// A view frustum as six inward-facing planes, extracted from a
+/// view-projection matrix (Gribb–Hartmann). Used to skip drawing chunks
+/// the camera can't see.
+struct Frustum {
+    planes: [Vec4; 6],
+}
+
+impl Frustum {
+    fn from_view_proj(vp: Mat4) -> Self {
+        let r0 = vp.row(0);
+        let r1 = vp.row(1);
+        let r2 = vp.row(2);
+        let r3 = vp.row(3);
+        let raw = [
+            r3 + r0, // left
+            r3 - r0, // right
+            r3 + r1, // bottom
+            r3 - r1, // top
+            r3 + r2, // near
+            r3 - r2, // far
+        ];
+        let mut planes = [Vec4::ZERO; 6];
+        for (i, p) in raw.iter().enumerate() {
+            let len = Vec3::new(p.x, p.y, p.z).length();
+            planes[i] = if len > 0.0 { *p / len } else { *p };
+        }
+        Self { planes }
+    }
+
+    /// Conservative AABB test: returns false only when the box is wholly
+    /// outside the frustum (so no visible chunk is ever wrongly culled).
+    fn intersects_aabb(&self, min: Vec3, max: Vec3) -> bool {
+        for plane in &self.planes {
+            let n = Vec3::new(plane.x, plane.y, plane.z);
+            let positive_vertex = Vec3::new(
+                if n.x >= 0.0 { max.x } else { min.x },
+                if n.y >= 0.0 { max.y } else { min.y },
+                if n.z >= 0.0 { max.z } else { min.z },
+            );
+            if n.dot(positive_vertex) + plane.w < 0.0 {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// A mesh that has been uploaded to GPU buffers, with its world-space
+/// bounding box for frustum culling.
 struct GpuMesh {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     index_count: u32,
+    aabb_min: Vec3,
+    aabb_max: Vec3,
 }
 
 pub struct Renderer {
@@ -32,6 +83,8 @@ pub struct Renderer {
     /// One GPU mesh per chunk, keyed by chunk position. Empty/air chunks
     /// have no entry and cost nothing to "draw".
     meshes: HashMap<ChunkPos, GpuMesh>,
+    /// Chunks drawn in the most recent frame (after frustum culling).
+    drawn_last_frame: usize,
 }
 
 impl Renderer {
@@ -168,6 +221,7 @@ impl Renderer {
             camera_buffer,
             camera_bind_group,
             meshes: HashMap::new(),
+            drawn_last_frame: 0,
         }
     }
 
@@ -193,14 +247,27 @@ impl Renderer {
                 contents: bytemuck::cast_slice(&mesh.indices),
                 usage: wgpu::BufferUsages::INDEX,
             });
+        // A chunk occupies exactly its 32³ world-space cube. Computing the
+        // AABB from the position is exact and avoids scanning vertices.
+        let origin = pos.origin();
+        let aabb_min = Vec3::new(origin.x as f32, origin.y as f32, origin.z as f32);
+        let aabb_max = aabb_min + Vec3::splat(CHUNK_SIZE as f32);
+
         self.meshes.insert(
             pos,
             GpuMesh {
                 vertex_buffer,
                 index_buffer,
                 index_count: mesh.indices.len() as u32,
+                aabb_min,
+                aabb_max,
             },
         );
+    }
+
+    /// Chunks drawn in the most recent frame, after frustum culling.
+    pub fn drawn_last_frame(&self) -> usize {
+        self.drawn_last_frame
     }
 
     /// Number of chunk meshes currently uploaded (for debug/telemetry).
@@ -241,6 +308,10 @@ impl Renderer {
 
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&view_proj));
+
+        // Build the view frustum once per frame for culling.
+        let frustum = Frustum::from_view_proj(Mat4::from_cols_array_2d(&view_proj));
+        let mut drawn = 0usize;
 
         let view = frame
             .texture
@@ -287,12 +358,19 @@ impl Renderer {
                 // time, so all chunks share one pipeline and bind group and
                 // differ only by their vertex/index buffers.
                 for mesh in self.meshes.values() {
+                    // Frustum culling: skip chunks the camera can't see.
+                    if !frustum.intersects_aabb(mesh.aabb_min, mesh.aabb_max) {
+                        continue;
+                    }
                     pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                     pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                    drawn += 1;
                 }
             }
         }
+
+        self.drawn_last_frame = drawn;
 
         self.queue.submit(Some(encoder.finish()));
         frame.present();

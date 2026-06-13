@@ -11,3 +11,4 @@ winit.workspace = true
 pollster.workspace = true
 log.workspace = true
 bytemuck.workspace = true
+glam.workspace = true
