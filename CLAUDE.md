@@ -132,6 +132,6 @@ beyond what the invariants above already require.
 
 ## Current status
 
-- **Active milestone:** 00 — Spinning Chunk (`docs/milestones/00-spinning-chunk.md`)
-- **Last completed milestone:** none
+- **Active milestone:** 02 — Infinite World (spec not yet written)
+- **Last completed milestone:** 01 — Real Chunk System (2026-06-13)
 - Update this section at the end of every working session.

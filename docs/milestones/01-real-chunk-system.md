@@ -1,6 +1,6 @@
 # Milestone 01 — Real Chunk System
 
-- **Status:** Spec accepted, not started
+- **Status:** COMPLETE (2026-06-13)
 - **Spec written:** 2026-06-12
 - **Depends on:** Milestone 00, ADR-0001
 
@@ -116,3 +116,75 @@ architecture instead of declaring it.
 - When this milestone is accepted: update CLAUDE.md status, write the
   retrospective with the measured baseline numbers, then write
   `02-infinite-world.md` before any Milestone 02 code.
+
+
+
+## Retrospective (2026-06-13)
+
+**Status: COMPLETE.** All seven tasks landed; all acceptance criteria met.
+
+### Measured baseline (record for future comparison)
+
+Dev machine: Windows, NVIDIA GPU, 20 logical cores. Release-profile
+dependencies (`opt-level=3`), `dev` profile for workspace crates.
+
+Acceptance scene — 16×16×16 = **4,096 chunks** (512³-block world):
+
+- **Generation:** 204 ms (single-threaded). Not parallelized; fine at this
+  scale. Parallelizing gen is a Milestone 02+ option if streaming needs it.
+- **Meshing:** 64 ms (rayon, parallel) — vs. ~1,050 ms single-threaded in a
+  one-core sandbox, i.e. ~16× from threading. This is the headline win of
+  task 6.
+- **Non-empty chunk meshes:** 416 of 4,096 (~90% of chunks are uniform
+  air/stone and produce no mesh — the uniform fast path carrying the scene
+  exactly as predicted).
+- **Total quads:** 183,890 (greedy). Determinism confirmed: identical quad
+  count on the dev machine and in the sandbox.
+- **Frame rate:** 142–150 fps, vsync-capped (monitor refresh, not an engine
+  ceiling). Steady whether drawing 1 or 415 chunks → not GPU-bound at this
+  scale; substantial render-distance headroom remains.
+- **Frustum culling range:** drawn count swings from 1–2 (facing empty
+  space) to 407–415 (facing into the world), confirming correct culling.
+
+### What went well
+
+- The headless-core / sandbox-verified discipline held: vox-core, vox-mesh,
+  and vox-worldgen logic were all proven before reaching the dev machine.
+  Graphics (vox-render/vox-app) compile-tested only on the dev machine, as
+  expected.
+- The differential test (greedy vs. naive coverage maps) caught nothing
+  because greedy was right the first time — but it is the reason we can
+  trust that, and can refactor greedy later without fear.
+- `ChunkNeighbors`-by-borrow (decided in task 2) made task 6's rayon
+  parallelization fall out almost for free: each meshing job borrows seven
+  chunks immutably, no shared mutable state.
+- Uniform-chunk fast path is doing exactly the load-bearing work the spec
+  predicted (90% of chunks free).
+
+### Friction / notes for next time
+
+- The Fable→Opus 4.8 model handoff happened mid-task-3. The CLAUDE.md +
+  milestone-spec + committed-history scaffolding made it a near-non-event:
+  re-clone, read the spec, regenerate the in-flight task cleanly. This
+  validated the whole "make the project model-proof" approach.
+- Recurring class of small breakage: the build sandbox runs an older rustc
+  (1.75, edition 2021) than the dev machine (1.96, edition 2024). Three
+  edition/lint gaps slipped through to the dev machine: `gen` is a reserved
+  keyword in 2024 (not 2021); let-chains (`if let ... && ...`); and several
+  clippy lints (`collapsible_if`, `needless_range_loop`,
+  `unusual_byte_groupings`, unused imports left after refactors). Mitigation
+  going forward: avoid 2024 reserved words in identifiers, pre-empt the
+  common clippy lints, and double-check imports after deleting code.
+- f32 world-space vertex positions (chunk offset baked in at mesh time) are
+  fine at 512³ but degrade far from origin. Camera-relative rendering is the
+  known fix; needs its own ADR before continent-scale worlds (Milestone 02
+  criterion 8 already flags this).
+
+### Carried into Milestone 02
+
+- The Y-major `LocalPos::index` order is now load-bearing in palette storage
+  AND meshing; it must also be the serialized chunk format's order.
+- `set_chunk_mesh(pos, empty)` already removes stale geometry — the
+  load/unload path has a head start.
+- The dirty-set + neighbor-expansion pattern from the debug hole-punch is
+  the model for all future block edits and for streaming re-meshes.
