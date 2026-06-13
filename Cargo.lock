@@ -1924,6 +1924,9 @@ dependencies = [
 [[package]]
 name = "vox-worldgen"
 version = "0.1.0"
+dependencies = [
+ "vox-core",
+]
 
 [[package]]
 name = "walkdir"
