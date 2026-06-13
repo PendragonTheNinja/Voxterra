@@ -43,32 +43,23 @@ const WORLD_CHUNKS: i64 = 16;
 /// space; this is where the chunk's world offset is baked in (see the
 /// Milestone 01 spec's note on f32 precision far from origin — fine at
 /// this scale, revisited via a future ADR before continent-scale worlds).
-fn offset_mesh(mesh: &mut MeshData, chunk_pos: ChunkPos) {
-    let origin = chunk_pos.origin();
-    let (ox, oy, oz) = (origin.x as f32, origin.y as f32, origin.z as f32);
-    for v in &mut mesh.vertices {
-        v.position[0] += ox;
-        v.position[1] += oy;
-        v.position[2] += oz;
-    }
-}
-
 /// Mesh the given chunk positions in parallel (rayon), returning one
-/// world-space `(pos, mesh)` per non-empty result. Each task borrows its
-/// chunk and its six neighbors immutably from `world` — no shared mutable
-/// state — which is exactly why [`ChunkNeighbors`] takes borrowed chunks
-/// rather than `&World` by value. GPU upload stays on the caller's thread.
+/// `(pos, mesh)` per non-empty result. Meshes are in LOCAL chunk space
+/// (0..32); world placement is done by the renderer's per-chunk offset
+/// (floating origin, ADR-0002), so no world offset is baked here. Each task
+/// borrows its chunk and its six neighbors immutably from `world` — no
+/// shared mutable state — which is why [`ChunkNeighbors`] takes borrowed
+/// chunks rather than `&World` by value.
 fn mesh_chunks_parallel(world: &World, positions: &[ChunkPos]) -> Vec<(ChunkPos, MeshData)> {
     positions
         .par_iter()
         .filter_map(|&pos| {
             let chunk = world.chunk(pos)?;
             let neighbors = ChunkNeighbors::of(world, pos);
-            let mut mesh = mesh_chunk(chunk, &neighbors, block_color);
+            let mesh = mesh_chunk(chunk, &neighbors, block_color);
             if mesh.is_empty() {
                 None
             } else {
-                offset_mesh(&mut mesh, pos);
                 Some((pos, mesh))
             }
         })
@@ -143,9 +134,14 @@ impl FlyCamera {
         }
     }
 
-    fn view_proj(&self, aspect: f32) -> Mat4 {
+    /// View-projection matrix built with the camera positioned **relative to
+    /// the render origin** (ADR-0002). `render_origin_blocks` is the world
+    /// position of the render origin; subtracting it keeps the numbers fed
+    /// to the matrix small regardless of absolute distance.
+    fn view_proj(&self, aspect: f32, render_origin_blocks: Vec3) -> Mat4 {
         let proj = Mat4::perspective_rh(70f32.to_radians(), aspect, 0.1, 1000.0);
-        let view = Mat4::look_to_rh(self.position, self.forward(), Vec3::Y);
+        let rel_pos = self.position - render_origin_blocks;
+        let view = Mat4::look_to_rh(rel_pos, self.forward(), Vec3::Y);
         proj * view
     }
 }
@@ -398,7 +394,29 @@ impl ApplicationHandler for App {
                 self.camera.update(&self.keys, dt);
 
                 if let Some(renderer) = self.renderer.as_mut() {
-                    let view_proj = self.camera.view_proj(renderer.aspect());
+                    // Floating origin (ADR-0002): keep the render origin at
+                    // the camera's current chunk so vertex math stays precise
+                    // arbitrarily far from world zero. set_render_origin is a
+                    // no-op when unchanged, so this is free while standing
+                    // still and cheap (one uniform rewrite per chunk) when
+                    // crossing a boundary.
+                    let cam = WorldPos::new(
+                        self.camera.position.x.floor() as i64,
+                        self.camera.position.y.floor() as i64,
+                        self.camera.position.z.floor() as i64,
+                    );
+                    let origin_chunk = cam.chunk();
+                    renderer.set_render_origin(origin_chunk);
+
+                    let origin_blocks = origin_chunk.origin();
+                    let render_origin_blocks = Vec3::new(
+                        origin_blocks.x as f32,
+                        origin_blocks.y as f32,
+                        origin_blocks.z as f32,
+                    );
+                    let view_proj = self
+                        .camera
+                        .view_proj(renderer.aspect(), render_origin_blocks);
                     renderer.render(view_proj.to_cols_array_2d());
 
                     // Telemetry once per second: FPS and how many chunk

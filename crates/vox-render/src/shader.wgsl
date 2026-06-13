@@ -1,6 +1,10 @@
-// Voxterra chunk shader, Milestone 00.
-// Vertices arrive pre-colored (block color × face brightness, baked at mesh
-// time), so this is the simplest possible pair: transform and pass through.
+// Voxterra chunk shader, Milestone 02 (floating origin, ADR-0002).
+//
+// Vertices arrive in LOCAL chunk space (0..32) and pre-colored. Each chunk
+// supplies an `offset` = (chunk_world_origin - render_origin), computed on
+// the CPU in i64 and narrowed to f32 while small, so positions stay precise
+// arbitrarily far from world origin. The camera's view_proj is built with
+// the camera at the render origin, so this offset and the view agree.
 
 struct Camera {
     view_proj: mat4x4<f32>,
@@ -8,6 +12,15 @@ struct Camera {
 
 @group(0) @binding(0)
 var<uniform> camera: Camera;
+
+// Per-chunk data, bound per draw (group 1). `offset.w` is unused padding so
+// the struct is 16-byte aligned.
+struct ChunkData {
+    offset: vec4<f32>,
+};
+
+@group(1) @binding(0)
+var<uniform> chunk: ChunkData;
 
 struct VsIn {
     @location(0) position: vec3<f32>,
@@ -22,7 +35,8 @@ struct VsOut {
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
     var out: VsOut;
-    out.clip_position = camera.view_proj * vec4<f32>(in.position, 1.0);
+    let world_rel = in.position + chunk.offset.xyz;
+    out.clip_position = camera.view_proj * vec4<f32>(world_rel, 1.0);
     out.color = in.color;
     return out;
 }

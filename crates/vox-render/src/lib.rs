@@ -62,13 +62,18 @@ impl Frustum {
 }
 
 /// A mesh that has been uploaded to GPU buffers, with its world-space
-/// bounding box for frustum culling.
+/// bounding box for frustum culling and its per-chunk offset uniform for
+/// floating-origin rendering (ADR-0002).
 struct GpuMesh {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     index_count: u32,
     aabb_min: Vec3,
     aabb_max: Vec3,
+    /// Uniform holding `offset.xyz = (chunk_world_origin - render_origin)`,
+    /// rewritten when the render origin moves.
+    offset_buffer: wgpu::Buffer,
+    offset_bind_group: wgpu::BindGroup,
 }
 
 pub struct Renderer {
@@ -80,9 +85,14 @@ pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
+    /// Layout for each chunk's per-draw offset uniform (group 1).
+    chunk_bgl: wgpu::BindGroupLayout,
     /// One GPU mesh per chunk, keyed by chunk position. Empty/air chunks
     /// have no entry and cost nothing to "draw".
     meshes: HashMap<ChunkPos, GpuMesh>,
+    /// The chunk position all rendering is currently relative to
+    /// (ADR-0002). Updated when the camera crosses into a new chunk.
+    render_origin: ChunkPos,
     /// Chunks drawn in the most recent frame (after frustum culling).
     drawn_last_frame: usize,
 }
@@ -155,6 +165,22 @@ impl Renderer {
             }],
         });
 
+        // --- Per-chunk offset uniform layout (group 1), for floating
+        // origin. One small uniform per chunk, rebound per draw. ---
+        let chunk_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("chunk offset bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
         // --- Pipeline. Vertex layout must match vox_mesh::Vertex exactly:
         // [f32;3] position, [f32;3] color, 24-byte stride. ---
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -164,7 +190,7 @@ impl Renderer {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("chunk pipeline layout"),
-            bind_group_layouts: &[&camera_bgl],
+            bind_group_layouts: &[&camera_bgl, &chunk_bgl],
             push_constant_ranges: &[],
         });
 
@@ -220,14 +246,18 @@ impl Renderer {
             pipeline,
             camera_buffer,
             camera_bind_group,
+            chunk_bgl,
             meshes: HashMap::new(),
+            render_origin: ChunkPos::new(0, 0, 0),
             drawn_last_frame: 0,
         }
     }
 
     /// Upload (or replace) the mesh for one chunk. An empty mesh removes
     /// the chunk's entry entirely. Build once, draw many — call this when a
-    /// chunk's geometry changes, NOT every frame.
+    /// chunk's geometry changes, NOT every frame. Meshes are in LOCAL chunk
+    /// space (0..32); world placement happens via the per-chunk offset
+    /// (floating origin, ADR-0002).
     pub fn set_chunk_mesh(&mut self, pos: ChunkPos, mesh: &MeshData) {
         if mesh.is_empty() {
             self.meshes.remove(&pos);
@@ -247,11 +277,29 @@ impl Renderer {
                 contents: bytemuck::cast_slice(&mesh.indices),
                 usage: wgpu::BufferUsages::INDEX,
             });
-        // A chunk occupies exactly its 32³ world-space cube. Computing the
-        // AABB from the position is exact and avoids scanning vertices.
-        let origin = pos.origin();
-        let aabb_min = Vec3::new(origin.x as f32, origin.y as f32, origin.z as f32);
-        let aabb_max = aabb_min + Vec3::splat(CHUNK_SIZE as f32);
+
+        // Render-relative offset of this chunk's min corner, plus its AABB
+        // in the same (render-relative) space the frustum uses.
+        let offset = chunk_offset(pos, self.render_origin);
+        let aabb_min = offset;
+        let aabb_max = offset + Vec3::splat(CHUNK_SIZE as f32);
+
+        let offset_data = [offset.x, offset.y, offset.z, 0.0];
+        let offset_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("chunk offset uniform"),
+                contents: bytemuck::cast_slice(&offset_data),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+        let offset_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("chunk offset bind group"),
+            layout: &self.chunk_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: offset_buffer.as_entire_binding(),
+            }],
+        });
 
         self.meshes.insert(
             pos,
@@ -261,6 +309,8 @@ impl Renderer {
                 index_count: mesh.indices.len() as u32,
                 aabb_min,
                 aabb_max,
+                offset_buffer,
+                offset_bind_group,
             },
         );
     }
@@ -268,6 +318,30 @@ impl Renderer {
     /// Chunks drawn in the most recent frame, after frustum culling.
     pub fn drawn_last_frame(&self) -> usize {
         self.drawn_last_frame
+    }
+
+    /// Move the render origin (ADR-0002) and recompute every chunk's offset
+    /// uniform and render-relative AABB. Call when the camera crosses into a
+    /// new chunk; cheap relative to how often that happens. No-op if the
+    /// origin is unchanged.
+    pub fn set_render_origin(&mut self, origin: ChunkPos) {
+        if origin == self.render_origin {
+            return;
+        }
+        self.render_origin = origin;
+        for (&pos, mesh) in self.meshes.iter_mut() {
+            let offset = chunk_offset(pos, origin);
+            mesh.aabb_min = offset;
+            mesh.aabb_max = offset + Vec3::splat(CHUNK_SIZE as f32);
+            let data = [offset.x, offset.y, offset.z, 0.0];
+            self.queue
+                .write_buffer(&mesh.offset_buffer, 0, bytemuck::cast_slice(&data));
+        }
+    }
+
+    /// The current render origin.
+    pub fn render_origin(&self) -> ChunkPos {
+        self.render_origin
     }
 
     /// Number of chunk meshes currently uploaded (for debug/telemetry).
@@ -362,6 +436,7 @@ impl Renderer {
                     if !frustum.intersects_aabb(mesh.aabb_min, mesh.aabb_max) {
                         continue;
                     }
+                    pass.set_bind_group(1, &mesh.offset_bind_group, &[]);
                     pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                     pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..mesh.index_count, 0, 0..1);
@@ -375,6 +450,18 @@ impl Renderer {
         self.queue.submit(Some(encoder.finish()));
         frame.present();
     }
+}
+
+/// Render-relative offset (in blocks) of a chunk's min corner from the
+/// render origin. Computed in i64 and narrowed to f32 while small, so it
+/// stays exact regardless of absolute distance (ADR-0002).
+fn chunk_offset(pos: ChunkPos, render_origin: ChunkPos) -> Vec3 {
+    let d = CHUNK_SIZE as i64;
+    Vec3::new(
+        ((pos.x - render_origin.x) * d) as f32,
+        ((pos.y - render_origin.y) * d) as f32,
+        ((pos.z - render_origin.z) * d) as f32,
+    )
 }
 
 fn create_depth_view(
