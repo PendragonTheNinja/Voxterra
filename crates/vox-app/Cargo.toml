@@ -12,3 +12,4 @@ winit.workspace = true
 env_logger.workspace = true
 glam.workspace = true
 log.workspace = true
+rayon.workspace = true

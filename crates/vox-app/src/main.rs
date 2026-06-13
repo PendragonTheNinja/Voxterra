@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use glam::{Mat4, Vec3};
-use vox_core::{BlockId, ChunkPos, World};
+use rayon::prelude::*;
+use vox_core::{BlockId, ChunkPos, World, WorldPos};
 use vox_mesh::{mesh_chunk, ChunkNeighbors, MeshData};
 use vox_render::Renderer;
 use vox_worldgen::Generator;
@@ -50,6 +51,28 @@ fn offset_mesh(mesh: &mut MeshData, chunk_pos: ChunkPos) {
         v.position[1] += oy;
         v.position[2] += oz;
     }
+}
+
+/// Mesh the given chunk positions in parallel (rayon), returning one
+/// world-space `(pos, mesh)` per non-empty result. Each task borrows its
+/// chunk and its six neighbors immutably from `world` — no shared mutable
+/// state — which is exactly why [`ChunkNeighbors`] takes borrowed chunks
+/// rather than `&World` by value. GPU upload stays on the caller's thread.
+fn mesh_chunks_parallel(world: &World, positions: &[ChunkPos]) -> Vec<(ChunkPos, MeshData)> {
+    positions
+        .par_iter()
+        .filter_map(|&pos| {
+            let chunk = world.chunk(pos)?;
+            let neighbors = ChunkNeighbors::of(world, pos);
+            let mut mesh = mesh_chunk(chunk, &neighbors, block_color);
+            if mesh.is_empty() {
+                None
+            } else {
+                offset_mesh(&mut mesh, pos);
+                Some((pos, mesh))
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +184,80 @@ impl Default for App {
 }
 
 impl App {
+    /// DEBUG (Milestone 01 task 6): clear a sphere of blocks centered on the
+    /// camera, then re-mesh only the affected chunks — proving the targeted
+    /// invalidation path rather than a full-world rebuild. Block-editing UI
+    /// proper is Milestone 03; this exists only to exercise re-meshing.
+    fn debug_punch_hole(&mut self) {
+        const RADIUS: i64 = 6;
+        let center = WorldPos::new(
+            self.camera.position.x.floor() as i64,
+            self.camera.position.y.floor() as i64,
+            self.camera.position.z.floor() as i64,
+        );
+
+        // Clear blocks within the sphere, recording which chunks we touch.
+        let mut dirty: HashSet<ChunkPos> = HashSet::new();
+        for dy in -RADIUS..=RADIUS {
+            for dz in -RADIUS..=RADIUS {
+                for dx in -RADIUS..=RADIUS {
+                    if dx * dx + dy * dy + dz * dz > RADIUS * RADIUS {
+                        continue;
+                    }
+                    let pos = WorldPos::new(center.x + dx, center.y + dy, center.z + dz);
+                    if !self.world.get_block(pos).is_air() {
+                        self.world.set_block(pos, BlockId::AIR);
+                        dirty.insert(pos.chunk());
+                    }
+                }
+            }
+        }
+        if dirty.is_empty() {
+            return; // nothing solid here
+        }
+
+        // A chunk's mesh depends on its six neighbors' border blocks, so any
+        // neighbor of an edited chunk may now expose new faces. Expand the
+        // dirty set to include them before re-meshing.
+        let mut to_remesh: HashSet<ChunkPos> = HashSet::new();
+        for &c in &dirty {
+            to_remesh.insert(c);
+            for (dx, dy, dz) in [
+                (1, 0, 0),
+                (-1, 0, 0),
+                (0, 1, 0),
+                (0, -1, 0),
+                (0, 0, 1),
+                (0, 0, -1),
+            ] {
+                to_remesh.insert(ChunkPos::new(c.x + dx, c.y + dy, c.z + dz));
+            }
+        }
+
+        let positions: Vec<ChunkPos> = to_remesh.into_iter().collect();
+        let meshes = mesh_chunks_parallel(&self.world, &positions);
+
+        if let Some(renderer) = self.renderer.as_mut() {
+            // Re-upload remeshed chunks. A chunk that became empty produces
+            // no entry in `meshes`, so clear it explicitly to drop stale
+            // geometry.
+            let produced: HashSet<ChunkPos> = meshes.iter().map(|(p, _)| *p).collect();
+            for pos in &positions {
+                if !produced.contains(pos) {
+                    renderer.set_chunk_mesh(*pos, &MeshData::default());
+                }
+            }
+            for (pos, mesh) in &meshes {
+                renderer.set_chunk_mesh(*pos, mesh);
+            }
+        }
+        log::info!(
+            "punched hole at {:?}, remeshed {} chunks",
+            (center.x, center.y, center.z),
+            positions.len()
+        );
+    }
+
     fn set_cursor_captured(&mut self, captured: bool) {
         let Some(window) = &self.window else { return };
         if captured {
@@ -213,19 +310,17 @@ impl ApplicationHandler for App {
         let gen_ms = gen_start.elapsed().as_secs_f32() * 1000.0;
 
         let mesh_start = Instant::now();
-        let mut total_quads = 0usize;
-        let mut nonempty = 0usize;
-        for (pos, chunk) in world.chunks() {
-            let neighbors = ChunkNeighbors::of(&world, pos);
-            let mut mesh = mesh_chunk(chunk, &neighbors, block_color);
-            if !mesh.is_empty() {
-                offset_mesh(&mut mesh, pos);
-                total_quads += mesh.quad_count();
-                nonempty += 1;
-                renderer.set_chunk_mesh(pos, &mesh);
-            }
-        }
+        let positions: Vec<ChunkPos> = world.chunk_positions().collect();
+        let meshes = mesh_chunks_parallel(&world, &positions);
         let mesh_ms = mesh_start.elapsed().as_secs_f32() * 1000.0;
+
+        // Upload on this (main) thread — wgpu buffer creation stays single
+        // threaded. Cheap relative to meshing.
+        let total_quads: usize = meshes.iter().map(|(_, m)| m.quad_count()).sum();
+        let nonempty = meshes.len();
+        for (pos, mesh) in &meshes {
+            renderer.set_chunk_mesh(*pos, mesh);
+        }
 
         log::info!(
             "world: {} chunks ({} non-empty meshes), {} quads | gen {:.0}ms, mesh {:.0}ms",
@@ -259,6 +354,9 @@ impl ApplicationHandler for App {
                         ElementState::Pressed => {
                             if code == KeyCode::Escape {
                                 self.set_cursor_captured(false);
+                            } else if code == KeyCode::KeyG {
+                                // Debug: punch a hole to exercise re-meshing.
+                                self.debug_punch_hole();
                             } else {
                                 self.keys.insert(code);
                             }
