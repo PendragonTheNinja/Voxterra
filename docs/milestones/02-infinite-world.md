@@ -1,6 +1,6 @@
 # Milestone 02 — Infinite World
 
-- **Status:** Spec accepted, not started
+- **Status:**  COMPLETE (2026-06-14)
 - **Spec written:** 2026-06-13
 - **Depends on:** Milestone 01, ADR-0001, ADR-0002
 
@@ -144,3 +144,96 @@ the world renders without jitter, z-fighting, or cracks.
   retrospective with new baseline numbers, then write `03-…md` (block
   interaction + lighting + textures, per the M01 roadmap) before any
   Milestone 03 code.
+
+Retrospective (2026-06-14)
+
+Status: COMPLETE. All six tasks landed; all acceptance criteria met.
+Voxterra is now a genuinely unbounded, persistent, streamed world.
+
+Measured baseline (record for future comparison)
+
+Dev machine: Windows, NVIDIA GPU, 20 logical cores. LOAD_RADIUS = 8,
+UNLOAD_RADIUS = 10 chunks. GEN_SPAWN_BUDGET = 64, MESH_BUDGET = 48.
+
+Steady state, standing still:
+
+
+fps: 144 (vsync-capped; not an engine ceiling).
+loaded chunks: ~2,671 (bounded; sits between the load and unload
+spheres, as hysteresis intends).
+non-empty meshes (total): ~520–550 of those 2,671 (the rest are
+uniform air/stone → no mesh, the fast path doing its job).
+drawn after frustum cull: ~110–180 of ~520 (frustum culling working).
+
+
+Fast flight (Ctrl-sprint, sustained):
+
+
+fps: holds 142–145, no hitching or drops observed.
+gen queue: blips to ~60 when crossing into new regions, else 0 —
+async generation keeps ahead of travel.
+dirty queue: spikes to a few hundred when chunks stream in, drains
+back to 0 within 1–2 frames. Bounded, never accumulates (see leak note).
+
+
+Far travel: world stays crisp at large coordinates (floating origin,
+ADR-0002); fps unaffected. Persistence verified: edits survive
+unload→reload and full app restart.
+
+Telemetry caught a real bug (the headline lesson)
+
+Task 6's telemetry immediately exposed a dirty-set leak: the per-frame
+mesh batch filtered out non-resident "ghost" dirty entries but never removed
+them, so the set grew unbounded (observed climbing past 16,000 during a ~2
+min flight while the loaded set stayed ~2,671). It was invisible to
+rendering — fps and visuals were perfect — which is exactly why a metric was
+needed to see it. Fixed by pruning non-resident entries each frame
+(dirty.retain(|p| world.chunk(p).is_some())); a non-resident chunk has no
+mesh to build and gets re-marked dirty if it later generates. Verified in a
+sandbox sim (200 chunk-steps: 13,001 leaked → 2,061 bounded) and on the dev
+machine (dirty now spikes-and-drains to 0). This validated building
+telemetry as its own task: the first real measurement found something.
+
+What went well
+
+
+The exact/relative coordinate split (ADR-0002) held cleanly: i64
+everywhere in simulation, camera-relative only at draw. No precision
+issues at distance, no leakage of the render origin into game logic.
+ChunkNeighbors-by-borrow (M01) again paid off — async generation +
+bounded-parallel meshing fell out without sharing the World across
+threads or cloning chunk data.
+The "only modified chunks persist" design keeps saves tiny: an explored
+but unedited world writes almost nothing to disk.
+Headless verification covered the high-risk logic (streaming policy,
+serialization round-trip, the full generate→edit→save→reload loop, and
+the leak fix) before any of it touched the dev machine.
+
+
+Decisions worth remembering
+
+
+Meshing is bounded-parallel-per-frame, not fire-and-forget. It borrows
+the World immutably via mesh_chunks_parallel (all cores), capped at
+MESH_BUDGET/frame. This honors "runs on the rayon pool, bounded, no
+stall" without cloning 7 chunks per mesh job or locking the World. If a
+future workload makes per-frame meshing too bursty, revisit toward true
+async with snapshotting — but only with a measurement showing the need.
+Storage lives in vox-core's storage module, not a vox-io crate
+(yet). Thin wrapper over Chunk::serialize; graduate to its own crate if
+region files / compression / threading make it grow.
+
+
+Carried into Milestone 03
+
+
+The dirty-set + neighbor-expansion pattern is now the universal re-mesh
+path (streaming, edits, and — next — lighting updates will all feed it).
+MESH_BUDGET / GEN_SPAWN_BUDGET are the per-frame throttles; any new
+per-frame work (lighting propagation, etc.) should be budgeted the same
+way and surfaced in telemetry.
+The chunk serialization format has a version byte: adding lighting data or
+block-state to chunks means bumping CHUNK_FORMAT_VERSION and handling v1.
+Block IDs are still the placeholder STONE/DIRT/GRASS trio mirrored between
+vox-worldgen and vox-app. A real block registry is overdue and should come
+with (or before) textures in M03.
