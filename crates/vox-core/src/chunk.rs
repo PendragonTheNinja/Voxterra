@@ -159,7 +159,149 @@ impl Chunk {
         }
         self.palette.len() - 1
     }
+
+    // ---- Serialization (Milestone 02 task 4) ----
+    //
+    // The on-disk format stores the *semantic* content (palette + per-voxel
+    // palette indices in Y-major `LocalPos::index` order), NOT the in-memory
+    // `Packed` layout. This keeps saved worlds valid even if the in-memory
+    // representation changes later. A version byte is written first, always.
+    //
+    // Format v1 (little-endian):
+    //   [0..4]  magic "VXTC"
+    //   [4]     version = 1
+    //   [5..7]  palette length N (u16)
+    //   [7....] palette: N × BlockId (u16 each)
+    //   then, ONLY if N > 1:
+    //           CHUNK_VOLUME palette indices, in LocalPos::index order,
+    //           1 byte each if N <= 256, else 2 bytes each (LE).
+    //   (N == 1 is a uniform chunk: the single palette entry fills the whole
+    //   chunk, so no index body is written.)
+
+    /// Serialize this chunk to the versioned on-disk format.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&CHUNK_MAGIC);
+        out.push(CHUNK_FORMAT_VERSION);
+
+        let n = self.palette.len();
+        out.extend_from_slice(&(n as u16).to_le_bytes());
+        for b in &self.palette {
+            out.extend_from_slice(&b.0.to_le_bytes());
+        }
+
+        if n > 1 {
+            let two_bytes = n > 256;
+            for i in 0..CHUNK_VOLUME {
+                let idx = match &self.indices {
+                    Some(packed) => packed.get(i) as u16,
+                    // n > 1 with no index array is impossible by construction,
+                    // but fall back safely to palette entry 0.
+                    None => 0,
+                };
+                if two_bytes {
+                    out.extend_from_slice(&idx.to_le_bytes());
+                } else {
+                    out.push(idx as u8);
+                }
+            }
+        }
+        out
+    }
+
+    /// Reconstruct a chunk from bytes produced by [`Chunk::serialize`].
+    pub fn deserialize(bytes: &[u8]) -> Result<Chunk, ChunkDecodeError> {
+        let mut cur = 0usize;
+        let take = |cur: &mut usize, n: usize| -> Result<&[u8], ChunkDecodeError> {
+            let end = cur.checked_add(n).ok_or(ChunkDecodeError::Truncated)?;
+            let slice = bytes.get(*cur..end).ok_or(ChunkDecodeError::Truncated)?;
+            *cur = end;
+            Ok(slice)
+        };
+
+        let magic = take(&mut cur, 4)?;
+        if magic != CHUNK_MAGIC {
+            return Err(ChunkDecodeError::BadMagic);
+        }
+        let version = take(&mut cur, 1)?[0];
+        if version != CHUNK_FORMAT_VERSION {
+            return Err(ChunkDecodeError::UnsupportedVersion(version));
+        }
+
+        let n = u16::from_le_bytes(take(&mut cur, 2)?.try_into().unwrap()) as usize;
+        if n == 0 {
+            return Err(ChunkDecodeError::EmptyPalette);
+        }
+        let mut palette = Vec::with_capacity(n);
+        for _ in 0..n {
+            let id = u16::from_le_bytes(take(&mut cur, 2)?.try_into().unwrap());
+            palette.push(BlockId(id));
+        }
+
+        if n == 1 {
+            // Uniform chunk.
+            return Ok(Chunk {
+                palette,
+                indices: None,
+            });
+        }
+
+        // Rebuild the packed index array from the body.
+        let mut packed = Packed::new(bits_for(n));
+        let two_bytes = n > 256;
+        for i in 0..CHUNK_VOLUME {
+            let idx = if two_bytes {
+                u16::from_le_bytes(take(&mut cur, 2)?.try_into().unwrap()) as usize
+            } else {
+                take(&mut cur, 1)?[0] as usize
+            };
+            if idx >= n {
+                return Err(ChunkDecodeError::IndexOutOfRange);
+            }
+            packed.set(i, idx as u64);
+        }
+
+        Ok(Chunk {
+            palette,
+            indices: Some(packed),
+        })
+    }
 }
+
+/// Magic bytes identifying a serialized Voxterra chunk.
+const CHUNK_MAGIC: [u8; 4] = *b"VXTC";
+/// On-disk chunk format version. Bump when the format changes; old versions
+/// must continue to deserialize (or be migrated) — never silently reinterpret.
+pub const CHUNK_FORMAT_VERSION: u8 = 1;
+
+/// Why a chunk failed to deserialize.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChunkDecodeError {
+    /// Input ended before the format expected.
+    Truncated,
+    /// Magic bytes didn't match — not a Voxterra chunk.
+    BadMagic,
+    /// Format version not understood by this build.
+    UnsupportedVersion(u8),
+    /// Palette claimed zero entries (always invalid; min is 1).
+    EmptyPalette,
+    /// A stored index pointed outside the palette.
+    IndexOutOfRange,
+}
+
+impl core::fmt::Display for ChunkDecodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Truncated => write!(f, "chunk data truncated"),
+            Self::BadMagic => write!(f, "bad chunk magic (not a Voxterra chunk)"),
+            Self::UnsupportedVersion(v) => write!(f, "unsupported chunk format version {v}"),
+            Self::EmptyPalette => write!(f, "chunk palette is empty"),
+            Self::IndexOutOfRange => write!(f, "chunk index out of palette range"),
+        }
+    }
+}
+
+impl std::error::Error for ChunkDecodeError {}
 
 impl Default for Chunk {
     fn default() -> Self {
@@ -420,5 +562,124 @@ mod tests {
             z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
             z ^ (z >> 31)
         }
+    }
+
+    // ---- Serialization (Milestone 02 task 4) ----
+
+    fn assert_roundtrip(chunk: &Chunk) {
+        let bytes = chunk.serialize();
+        let back = Chunk::deserialize(&bytes).expect("deserialize");
+        for pos in LocalPos::iter() {
+            assert_eq!(chunk.get(pos), back.get(pos), "mismatch at {pos:?}");
+        }
+        // Re-serializing the decoded chunk must yield identical bytes.
+        assert_eq!(bytes, back.serialize(), "serialize not deterministic");
+    }
+
+    #[test]
+    fn roundtrip_uniform_air() {
+        assert_roundtrip(&Chunk::new_air());
+    }
+
+    #[test]
+    fn roundtrip_uniform_stone() {
+        assert_roundtrip(&Chunk::filled(BlockId(1)));
+    }
+
+    #[test]
+    fn uniform_chunk_serializes_compactly() {
+        // magic(4) + version(1) + palette_len(2) + 1 BlockId(2) = 9 bytes,
+        // and crucially NO per-voxel body.
+        let bytes = Chunk::filled(BlockId(7)).serialize();
+        assert_eq!(bytes.len(), 9, "uniform chunk should have no index body");
+    }
+
+    #[test]
+    fn roundtrip_two_blocks() {
+        let mut chunk = Chunk::new_air();
+        chunk.set(LocalPos::new(1, 2, 3), BlockId(1));
+        chunk.set(LocalPos::new(30, 30, 30), BlockId(1));
+        assert_roundtrip(&chunk);
+        // 2 palette entries => 1 byte per voxel.
+        let bytes = chunk.serialize();
+        assert_eq!(bytes.len(), 4 + 1 + 2 + 2 * 2 + CHUNK_VOLUME);
+    }
+
+    #[test]
+    fn roundtrip_many_blocks_two_byte_indices() {
+        // >256 palette entries forces 2-byte indices.
+        let mut chunk = Chunk::new_air();
+        for i in 0..300u16 {
+            chunk.set(LocalPos::from_index(i as usize), BlockId(i + 1));
+        }
+        assert!(chunk.palette_len() > 256);
+        assert_roundtrip(&chunk);
+        let bytes = chunk.serialize();
+        let n = chunk.palette_len();
+        assert_eq!(bytes.len(), 4 + 1 + 2 + n * 2 + CHUNK_VOLUME * 2);
+    }
+
+    #[test]
+    fn roundtrip_random_workload() {
+        let mut rng = SplitMix64::new(0xBEEF);
+        let mut chunk = Chunk::new_air();
+        for _ in 0..40_000 {
+            let i = (rng.next() as usize) % CHUNK_VOLUME;
+            let b = BlockId((rng.next() % 50) as u16);
+            chunk.set(LocalPos::from_index(i), b);
+        }
+        assert_roundtrip(&chunk);
+    }
+
+    #[test]
+    fn deserialize_rejects_bad_input() {
+        assert!(matches!(
+            Chunk::deserialize(&[]),
+            Err(ChunkDecodeError::Truncated)
+        ));
+        assert!(matches!(
+            Chunk::deserialize(b"XXXX\x01"),
+            Err(ChunkDecodeError::BadMagic)
+        ));
+        // Good magic, unknown version.
+        let mut bad = b"VXTC".to_vec();
+        bad.push(99);
+        assert!(matches!(
+            Chunk::deserialize(&bad),
+            Err(ChunkDecodeError::UnsupportedVersion(99))
+        ));
+        // Good header, palette length 0.
+        let mut empty_pal = b"VXTC".to_vec();
+        empty_pal.push(CHUNK_FORMAT_VERSION);
+        empty_pal.extend_from_slice(&0u16.to_le_bytes());
+        assert!(matches!(
+            Chunk::deserialize(&empty_pal),
+            Err(ChunkDecodeError::EmptyPalette)
+        ));
+        // Truncated body: claims 2 palette entries but supplies no index data.
+        let mut trunc = b"VXTC".to_vec();
+        trunc.push(CHUNK_FORMAT_VERSION);
+        trunc.extend_from_slice(&2u16.to_le_bytes());
+        trunc.extend_from_slice(&0u16.to_le_bytes());
+        trunc.extend_from_slice(&1u16.to_le_bytes());
+        assert!(matches!(
+            Chunk::deserialize(&trunc),
+            Err(ChunkDecodeError::Truncated)
+        ));
+    }
+
+    /// Compacting before serialize must not change the decoded contents.
+    #[test]
+    fn roundtrip_after_compact() {
+        let mut chunk = Chunk::new_air();
+        for i in 0..100u16 {
+            chunk.set(LocalPos::from_index(i as usize), BlockId(i + 1));
+        }
+        // Overwrite half back to air, then compact.
+        for i in 0..50u16 {
+            chunk.set(LocalPos::from_index(i as usize), BlockId::AIR);
+        }
+        chunk.compact();
+        assert_roundtrip(&chunk);
     }
 }
