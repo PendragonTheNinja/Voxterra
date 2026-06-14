@@ -2,12 +2,13 @@
 //! Milestone 00 test scene: one sine-wave chunk.
 
 use std::collections::HashSet;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::Instant;
 
 use glam::{Mat4, Vec3};
 use rayon::prelude::*;
-use vox_core::{BlockId, ChunkPos, World, WorldPos};
+use vox_core::{BlockId, Chunk, ChunkPos, Streamer, World, WorldPos};
 use vox_mesh::{mesh_chunk, ChunkNeighbors, MeshData};
 use vox_render::Renderer;
 use vox_worldgen::Generator;
@@ -36,7 +37,32 @@ fn block_color(block: BlockId) -> [f32; 3] {
 
 /// Side length (in chunks) of the cube of world generated for this
 /// milestone's acceptance scene. 16 → 4,096 chunks → a 512³-block world.
-const WORLD_CHUNKS: i64 = 16;
+/// The six face-neighbor offsets, shared by streaming and edit re-meshing.
+const NEIGHBOR_OFFSETS: [(i64, i64, i64); 6] = [
+    (1, 0, 0),
+    (-1, 0, 0),
+    (0, 1, 0),
+    (0, -1, 0),
+    (0, 0, 1),
+    (0, 0, -1),
+];
+
+/// Streaming radii, in chunks (ADR-0002 / M02). Chunks within `LOAD_RADIUS`
+/// of the camera's chunk are generated/loaded; chunks beyond `UNLOAD_RADIUS`
+/// are dropped. The gap between them is hysteresis to prevent boundary
+/// thrash. With 32-block chunks, radius 8 ≈ 256 blocks of full-res world in
+/// every direction (~2,000 chunks resident).
+const LOAD_RADIUS: i64 = 8;
+const UNLOAD_RADIUS: i64 = 10;
+
+/// Per-frame work budgets, to keep frame time stable while streaming.
+/// Generation is async (rayon), but we bound how many jobs we *spawn* per
+/// frame so a big initial load fills in progressively rather than spiking.
+const GEN_SPAWN_BUDGET: usize = 64;
+/// Meshing runs bounded-parallel on the main thread each frame (borrows the
+/// World immutably; see the streaming-tick comment). This caps how many
+/// dirty chunks are meshed+uploaded per frame.
+const MESH_BUDGET: usize = 48;
 
 /// Translate every vertex of a locally-meshed chunk into world space by
 /// adding the chunk's origin. The mesher emits positions in 0..32 local
@@ -158,6 +184,20 @@ struct App {
     keys: HashSet<KeyCode>,
     cursor_captured: bool,
     last_frame: Instant,
+
+    // --- Streaming (M02 task 3) ---
+    generator: Generator,
+    streamer: Streamer,
+    /// Chunks whose generation has been spawned but whose result hasn't been
+    /// received yet — prevents re-spawning the same chunk every frame.
+    gen_in_flight: HashSet<ChunkPos>,
+    /// Chunks needing a (re)mesh: newly generated chunks and any loaded
+    /// neighbor whose border faces may have changed.
+    dirty: HashSet<ChunkPos>,
+    /// Async generation results arrive here from the rayon pool.
+    gen_tx: Sender<(ChunkPos, Chunk)>,
+    gen_rx: Receiver<(ChunkPos, Chunk)>,
+
     /// Telemetry: accumulate frames over ~1s to log FPS + drawn/total.
     telemetry_accum: f32,
     telemetry_frames: u32,
@@ -165,19 +205,28 @@ struct App {
 
 impl Default for App {
     fn default() -> Self {
+        let (gen_tx, gen_rx) = std::sync::mpsc::channel();
         Self {
             window: None,
             renderer: None,
             world: World::new(),
-            // Up high and back, looking down into the generated terrain.
+            // Up high, looking down into the terrain that streams in below.
             camera: FlyCamera {
-                position: Vec3::new(-20.0, 60.0, -20.0),
-                yaw: std::f32::consts::FRAC_PI_4, // 45°: toward world center
+                position: Vec3::new(0.0, 60.0, 0.0),
+                yaw: std::f32::consts::FRAC_PI_4,
                 pitch: -0.45,
             },
             keys: HashSet::new(),
             cursor_captured: false,
             last_frame: Instant::now(),
+
+            generator: Generator::new(0x0007_E22A_C0DE),
+            streamer: Streamer::new(LOAD_RADIUS, UNLOAD_RADIUS),
+            gen_in_flight: HashSet::new(),
+            dirty: HashSet::new(),
+            gen_tx,
+            gen_rx,
+
             telemetry_accum: 0.0,
             telemetry_frames: 0,
         }
@@ -185,10 +234,117 @@ impl Default for App {
 }
 
 impl App {
-    /// DEBUG (Milestone 01 task 6): clear a sphere of blocks centered on the
-    /// camera, then re-mesh only the affected chunks — proving the targeted
-    /// invalidation path rather than a full-world rebuild. Block-editing UI
-    /// proper is Milestone 03; this exists only to exercise re-meshing.
+    /// Mark a chunk and its six face-neighbors dirty (needing a re-mesh).
+    /// A chunk's border faces depend on its neighbors, so any edit or
+    /// load/unload of a chunk can change its neighbors' meshes.
+    fn mark_dirty_with_neighbors(&mut self, c: ChunkPos) {
+        self.dirty.insert(c);
+        for (dx, dy, dz) in NEIGHBOR_OFFSETS {
+            self.dirty
+                .insert(ChunkPos::new(c.x + dx, c.y + dy, c.z + dz));
+        }
+    }
+
+    /// One streaming step, run every frame. Keeps the resident chunk set
+    /// centered on the camera and the GPU meshes in sync, within per-frame
+    /// budgets so the frame never stalls.
+    ///
+    /// Generation is async (rayon `spawn` → channel). Meshing is
+    /// bounded-parallel on the main thread: it borrows the World immutably
+    /// via `mesh_chunks_parallel` (all cores), capped at `MESH_BUDGET`
+    /// chunks/frame so the cost stays well under a millisecond. This honors
+    /// "runs on the rayon pool, bounded, no stall" without needing to clone
+    /// chunk data into mesh jobs or share the World across threads.
+    fn stream_tick(&mut self, camera_chunk: ChunkPos) {
+        // 1. Ask the streamer what should change.
+        let update = self.streamer.update(camera_chunk);
+
+        // 2. Unloads: drop chunk data + GPU mesh; neighbors may now expose
+        //    a border face, so mark them dirty.
+        for pos in &update.to_unload {
+            self.world.remove_chunk(*pos);
+            self.streamer.mark_unloaded(*pos);
+            self.dirty.remove(pos);
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.set_chunk_mesh(*pos, &MeshData::default());
+            }
+        }
+        // Separate pass so neighbor marking isn't undone by the removal loop.
+        for pos in &update.to_unload {
+            for (dx, dy, dz) in NEIGHBOR_OFFSETS {
+                let n = ChunkPos::new(pos.x + dx, pos.y + dy, pos.z + dz);
+                if self.streamer.is_loaded(n) {
+                    self.dirty.insert(n);
+                }
+            }
+        }
+
+        // 3. Spawn async generation for newly-in-range chunks, bounded.
+        let mut spawned = 0;
+        for pos in update.to_load {
+            if spawned >= GEN_SPAWN_BUDGET {
+                break;
+            }
+            if self.gen_in_flight.contains(&pos) || self.streamer.is_loaded(pos) {
+                continue;
+            }
+            self.gen_in_flight.insert(pos);
+            let generator = self.generator;
+            let tx = self.gen_tx.clone();
+            rayon::spawn(move || {
+                let chunk = generator.generate_chunk(pos);
+                let _ = tx.send((pos, chunk));
+            });
+            spawned += 1;
+        }
+
+        // 4. Drain finished generation: insert into the World, mark loaded,
+        //    and dirty the chunk + its neighbors so borders resolve.
+        let mut newly_generated = Vec::new();
+        while let Ok((pos, chunk)) = self.gen_rx.try_recv() {
+            self.gen_in_flight.remove(&pos);
+            self.world.insert_chunk(pos, chunk);
+            self.streamer.mark_loaded(pos);
+            newly_generated.push(pos);
+        }
+        for pos in newly_generated {
+            self.mark_dirty_with_neighbors(pos);
+        }
+
+        // 5. Mesh a bounded batch of dirty chunks and upload. Only mesh
+        //    chunks that are actually resident; skip (defer) others.
+        if !self.dirty.is_empty() {
+            let batch: Vec<ChunkPos> = self
+                .dirty
+                .iter()
+                .copied()
+                .filter(|p| self.world.chunk(*p).is_some())
+                .take(MESH_BUDGET)
+                .collect();
+            for p in &batch {
+                self.dirty.remove(p);
+            }
+
+            let meshes = mesh_chunks_parallel(&self.world, &batch);
+            if let Some(renderer) = self.renderer.as_mut() {
+                let produced: HashSet<ChunkPos> = meshes.iter().map(|(p, _)| *p).collect();
+                // A batch chunk that produced no mesh (all air, or fully
+                // occluded) must have any stale GPU mesh cleared.
+                for p in &batch {
+                    if !produced.contains(p) {
+                        renderer.set_chunk_mesh(*p, &MeshData::default());
+                    }
+                }
+                for (pos, mesh) in &meshes {
+                    renderer.set_chunk_mesh(*pos, mesh);
+                }
+            }
+        }
+    }
+
+    /// DEBUG: clear a sphere of blocks at the camera, marking touched chunks
+    /// (and their neighbors) dirty so the streaming tick re-meshes them.
+    /// Block-editing UI proper is Milestone 03; this exercises re-meshing.
     fn debug_punch_hole(&mut self) {
         const RADIUS: i64 = 6;
         let center = WorldPos::new(
@@ -197,8 +353,7 @@ impl App {
             self.camera.position.z.floor() as i64,
         );
 
-        // Clear blocks within the sphere, recording which chunks we touch.
-        let mut dirty: HashSet<ChunkPos> = HashSet::new();
+        let mut touched: HashSet<ChunkPos> = HashSet::new();
         for dy in -RADIUS..=RADIUS {
             for dz in -RADIUS..=RADIUS {
                 for dx in -RADIUS..=RADIUS {
@@ -208,55 +363,14 @@ impl App {
                     let pos = WorldPos::new(center.x + dx, center.y + dy, center.z + dz);
                     if !self.world.get_block(pos).is_air() {
                         self.world.set_block(pos, BlockId::AIR);
-                        dirty.insert(pos.chunk());
+                        touched.insert(pos.chunk());
                     }
                 }
             }
         }
-        if dirty.is_empty() {
-            return; // nothing solid here
+        for c in touched {
+            self.mark_dirty_with_neighbors(c);
         }
-
-        // A chunk's mesh depends on its six neighbors' border blocks, so any
-        // neighbor of an edited chunk may now expose new faces. Expand the
-        // dirty set to include them before re-meshing.
-        let mut to_remesh: HashSet<ChunkPos> = HashSet::new();
-        for &c in &dirty {
-            to_remesh.insert(c);
-            for (dx, dy, dz) in [
-                (1, 0, 0),
-                (-1, 0, 0),
-                (0, 1, 0),
-                (0, -1, 0),
-                (0, 0, 1),
-                (0, 0, -1),
-            ] {
-                to_remesh.insert(ChunkPos::new(c.x + dx, c.y + dy, c.z + dz));
-            }
-        }
-
-        let positions: Vec<ChunkPos> = to_remesh.into_iter().collect();
-        let meshes = mesh_chunks_parallel(&self.world, &positions);
-
-        if let Some(renderer) = self.renderer.as_mut() {
-            // Re-upload remeshed chunks. A chunk that became empty produces
-            // no entry in `meshes`, so clear it explicitly to drop stale
-            // geometry.
-            let produced: HashSet<ChunkPos> = meshes.iter().map(|(p, _)| *p).collect();
-            for pos in &positions {
-                if !produced.contains(pos) {
-                    renderer.set_chunk_mesh(*pos, &MeshData::default());
-                }
-            }
-            for (pos, mesh) in &meshes {
-                renderer.set_chunk_mesh(*pos, mesh);
-            }
-        }
-        log::info!(
-            "punched hole at {:?}, remeshed {} chunks",
-            (center.x, center.y, center.z),
-            positions.len()
-        );
     }
 
     fn set_cursor_captured(&mut self, captured: bool) {
@@ -292,47 +406,18 @@ impl ApplicationHandler for App {
                 .expect("failed to create window"),
         );
 
-        let mut renderer = Renderer::new(window.clone());
+        let renderer = Renderer::new(window.clone());
 
-        // --- Build the Milestone 01 acceptance scene: a WORLD_CHUNKS³ cube
-        // of generated terrain, meshed per chunk with cross-chunk culling,
-        // uploaded once. Single-threaded (rayon is task 6). ---
-        let gen_start = Instant::now();
-        let generator = Generator::new(0x0007_E22A_C0DE);
-        let mut world = World::new();
-        for cy in 0..WORLD_CHUNKS {
-            for cz in 0..WORLD_CHUNKS {
-                for cx in 0..WORLD_CHUNKS {
-                    let pos = ChunkPos::new(cx, cy, cz);
-                    world.insert_chunk(pos, generator.generate_chunk(pos));
-                }
-            }
-        }
-        let gen_ms = gen_start.elapsed().as_secs_f32() * 1000.0;
-
-        let mesh_start = Instant::now();
-        let positions: Vec<ChunkPos> = world.chunk_positions().collect();
-        let meshes = mesh_chunks_parallel(&world, &positions);
-        let mesh_ms = mesh_start.elapsed().as_secs_f32() * 1000.0;
-
-        // Upload on this (main) thread — wgpu buffer creation stays single
-        // threaded. Cheap relative to meshing.
-        let total_quads: usize = meshes.iter().map(|(_, m)| m.quad_count()).sum();
-        let nonempty = meshes.len();
-        for (pos, mesh) in &meshes {
-            renderer.set_chunk_mesh(*pos, mesh);
-        }
-
+        // The world is no longer pre-built: chunks stream in around the
+        // camera each frame via stream_tick (M02). resumed() just stands up
+        // the window/renderer; the first frames fill the initial sphere
+        // progressively, bounded by GEN_SPAWN_BUDGET / MESH_BUDGET.
         log::info!(
-            "world: {} chunks ({} non-empty meshes), {} quads | gen {:.0}ms, mesh {:.0}ms",
-            world.chunk_count(),
-            nonempty,
-            total_quads,
-            gen_ms,
-            mesh_ms,
+            "streaming: load radius {} / unload {} chunks",
+            LOAD_RADIUS,
+            UNLOAD_RADIUS
         );
 
-        self.world = world;
         self.renderer = Some(renderer);
         self.window = Some(window);
         self.last_frame = Instant::now();
@@ -393,6 +478,23 @@ impl ApplicationHandler for App {
 
                 self.camera.update(&self.keys, dt);
 
+                // Camera's current chunk drives both streaming and the
+                // floating-origin render origin.
+                let cam = WorldPos::new(
+                    self.camera.position.x.floor() as i64,
+                    self.camera.position.y.floor() as i64,
+                    self.camera.position.z.floor() as i64,
+                );
+                let origin_chunk = cam.chunk();
+
+                // Stream chunks in/out around the camera (borrows all of
+                // self), before the render borrow below.
+                self.stream_tick(origin_chunk);
+
+                let loaded = self.streamer.loaded_count();
+                let in_flight = self.gen_in_flight.len();
+                let dirty = self.dirty.len();
+
                 if let Some(renderer) = self.renderer.as_mut() {
                     // Floating origin (ADR-0002): keep the render origin at
                     // the camera's current chunk so vertex math stays precise
@@ -400,12 +502,6 @@ impl ApplicationHandler for App {
                     // no-op when unchanged, so this is free while standing
                     // still and cheap (one uniform rewrite per chunk) when
                     // crossing a boundary.
-                    let cam = WorldPos::new(
-                        self.camera.position.x.floor() as i64,
-                        self.camera.position.y.floor() as i64,
-                        self.camera.position.z.floor() as i64,
-                    );
-                    let origin_chunk = cam.chunk();
                     renderer.set_render_origin(origin_chunk);
 
                     let origin_blocks = origin_chunk.origin();
@@ -419,17 +515,20 @@ impl ApplicationHandler for App {
                         .view_proj(renderer.aspect(), render_origin_blocks);
                     renderer.render(view_proj.to_cols_array_2d());
 
-                    // Telemetry once per second: FPS and how many chunk
-                    // meshes survived frustum culling out of the total.
+                    // Telemetry once per second: FPS, frustum-culling ratio,
+                    // and streaming state (resident chunks, gen queue, dirty).
                     self.telemetry_accum += dt;
                     self.telemetry_frames += 1;
                     if self.telemetry_accum >= 1.0 {
                         let fps = self.telemetry_frames as f32 / self.telemetry_accum;
                         log::info!(
-                            "{:.0} fps | drawn {}/{} chunk meshes",
+                            "{:.0} fps | drawn {}/{} | loaded {} | gen {} | dirty {}",
                             fps,
                             renderer.drawn_last_frame(),
                             renderer.mesh_count(),
+                            loaded,
+                            in_flight,
+                            dirty,
                         );
                         self.telemetry_accum = 0.0;
                         self.telemetry_frames = 0;
