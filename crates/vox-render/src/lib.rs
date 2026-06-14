@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use glam::{Mat4, Vec3, Vec4};
-use vox_core::{CHUNK_SIZE, ChunkPos};
+use vox_core::{CHUNK_SIZE, ChunkPos, WorldPos};
 use vox_mesh::MeshData;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
@@ -98,6 +98,18 @@ pub struct Renderer {
     render_origin: ChunkPos,
     /// Chunks drawn in the most recent frame (after frustum culling).
     drawn_last_frame: usize,
+
+    // --- Targeted-block highlight (M03 task 3) ---
+    /// Line-list pipeline for the wireframe cube outline.
+    highlight_pipeline: wgpu::RenderPipeline,
+    /// 24 line vertices (12 cube edges) in local 0..1 space, uploaded once.
+    highlight_vertices: wgpu::Buffer,
+    /// Per-draw offset uniform (reuses `chunk_bgl`) placing the outline on
+    /// the targeted voxel under floating origin.
+    highlight_offset_buffer: wgpu::Buffer,
+    highlight_bind_group: wgpu::BindGroup,
+    /// The currently targeted block in world coords, or `None`.
+    highlight_target: Option<WorldPos>,
 }
 
 impl Renderer {
@@ -274,6 +286,78 @@ impl Renderer {
             cache: None,
         });
 
+        // --- Targeted-block highlight pipeline (M03 task 3): a line-list
+        // wireframe cube. Reuses camera (group 0) + an offset uniform
+        // (chunk_bgl, group 1). No culling; drawn after chunks. ---
+        let highlight_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("highlight shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("highlight.wgsl").into()),
+        });
+        let highlight_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("highlight pipeline layout"),
+            bind_group_layouts: &[&camera_bgl, &chunk_bgl],
+            push_constant_ranges: &[],
+        });
+        let highlight_vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: (3 * std::mem::size_of::<f32>()) as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+        };
+        let highlight_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("highlight pipeline"),
+            layout: Some(&highlight_layout),
+            vertex: wgpu::VertexState {
+                module: &highlight_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[highlight_vertex_layout],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            fragment: Some(wgpu::FragmentState {
+                module: &highlight_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        let highlight_vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("highlight vertices"),
+            contents: bytemuck::cast_slice(&cube_edge_vertices()),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let highlight_offset_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("highlight offset"),
+                contents: bytemuck::cast_slice(&[0.0f32, 0.0, 0.0, 0.0]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+        let highlight_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("highlight offset bind group"),
+            layout: &chunk_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: highlight_offset_buffer.as_entire_binding(),
+            }],
+        });
+
         Self {
             surface,
             device,
@@ -288,6 +372,11 @@ impl Renderer {
             meshes: HashMap::new(),
             render_origin: ChunkPos::new(0, 0, 0),
             drawn_last_frame: 0,
+            highlight_pipeline,
+            highlight_vertices,
+            highlight_offset_buffer,
+            highlight_bind_group,
+            highlight_target: None,
         }
     }
 
@@ -380,6 +469,26 @@ impl Renderer {
     /// The current render origin.
     pub fn render_origin(&self) -> ChunkPos {
         self.render_origin
+    }
+
+    /// Set (or clear) the targeted-block highlight. Updates the outline's
+    /// floating-origin offset so it sits exactly on the targeted voxel.
+    pub fn set_highlight(&mut self, target: Option<WorldPos>) {
+        self.highlight_target = target;
+        if let Some(pos) = target {
+            let origin = self.render_origin.origin();
+            let offset = [
+                (pos.x - origin.x) as f32,
+                (pos.y - origin.y) as f32,
+                (pos.z - origin.z) as f32,
+                0.0,
+            ];
+            self.queue.write_buffer(
+                &self.highlight_offset_buffer,
+                0,
+                bytemuck::cast_slice(&offset),
+            );
+        }
     }
 
     /// Number of chunk meshes currently uploaded (for debug/telemetry).
@@ -482,6 +591,16 @@ impl Renderer {
                     pass.draw_indexed(0..mesh.index_count, 0, 0..1);
                     drawn += 1;
                 }
+
+                // Targeted-block highlight (M03 task 3): wireframe cube on
+                // the looked-at block, after chunks, sharing the depth pass.
+                if self.highlight_target.is_some() {
+                    pass.set_pipeline(&self.highlight_pipeline);
+                    pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                    pass.set_bind_group(1, &self.highlight_bind_group, &[]);
+                    pass.set_vertex_buffer(0, self.highlight_vertices.slice(..));
+                    pass.draw(0..24, 0..1);
+                }
             }
         }
 
@@ -502,6 +621,49 @@ fn chunk_offset(pos: ChunkPos, render_origin: ChunkPos) -> Vec3 {
         ((pos.y - render_origin.y) * d) as f32,
         ((pos.z - render_origin.z) * d) as f32,
     )
+}
+
+/// The 24 vertices (12 edges, 2 verts each) of a unit cube outline, slightly
+/// inflated so the wireframe hugs the block faces without z-fighting. Local
+/// space; the highlight offset uniform places it on the targeted voxel.
+fn cube_edge_vertices() -> [[f32; 3]; 24] {
+    const E: f32 = 0.002; // small inflation
+    let lo = -E;
+    let hi = 1.0 + E;
+    // 8 corners.
+    let c = [
+        [lo, lo, lo],
+        [hi, lo, lo],
+        [hi, hi, lo],
+        [lo, hi, lo],
+        [lo, lo, hi],
+        [hi, lo, hi],
+        [hi, hi, hi],
+        [lo, hi, hi],
+    ];
+    // 12 edges as corner-index pairs.
+    let edges = [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 0), // bottom face
+        (4, 5),
+        (5, 6),
+        (6, 7),
+        (7, 4), // top face
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7), // verticals
+    ];
+    let mut out = [[0.0f32; 3]; 24];
+    let mut i = 0;
+    for (a, b) in edges {
+        out[i] = c[a];
+        out[i + 1] = c[b];
+        i += 2;
+    }
+    out
 }
 
 /// Build the block texture array (ADR-0003): one 16×16 RGBA layer per tile,

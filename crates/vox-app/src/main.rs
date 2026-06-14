@@ -8,7 +8,9 @@ use std::time::Instant;
 
 use glam::{Mat4, Vec3};
 use rayon::prelude::*;
-use vox_core::{BlockId, BlockRegistry, Chunk, ChunkPos, Streamer, World, WorldPos, WorldStore};
+use vox_core::{
+    BlockId, BlockRegistry, Chunk, ChunkPos, RayHit, Streamer, World, WorldPos, WorldStore,
+};
 use vox_mesh::{mesh_chunk, ChunkNeighbors, MeshData};
 use vox_render::Renderer;
 use vox_worldgen::Generator;
@@ -49,6 +51,10 @@ const GEN_SPAWN_BUDGET: usize = 64;
 /// World immutably; see the streaming-tick comment). This caps how many
 /// dirty chunks are meshed+uploaded per frame.
 const MESH_BUDGET: usize = 48;
+
+/// How far (world units / blocks) the targeting raycast reaches from the
+/// camera for break/place interaction (M03).
+const REACH: f64 = 6.0;
 
 /// Translate every vertex of a locally-meshed chunk into world space by
 /// adding the chunk's origin. The mesher emits positions in 0..32 local
@@ -193,6 +199,9 @@ struct App {
     /// Chunks needing a (re)mesh: newly generated chunks and any loaded
     /// neighbor whose border faces may have changed.
     dirty: HashSet<ChunkPos>,
+    /// Block currently under the crosshair (raycast result), or none.
+    targeted: Option<RayHit>,
+
     /// Async generation results arrive here from the rayon pool.
     gen_tx: Sender<(ChunkPos, Chunk)>,
     gen_rx: Receiver<(ChunkPos, Chunk)>,
@@ -235,6 +244,7 @@ impl Default for App {
             store,
             gen_in_flight: HashSet::new(),
             dirty: HashSet::new(),
+            targeted: None,
             gen_tx,
             gen_rx,
 
@@ -550,6 +560,26 @@ impl ApplicationHandler for App {
                 // self), before the render borrow below.
                 self.stream_tick(origin_chunk);
 
+                // Raycast from the camera to find the targeted block (M03
+                // task 3). Uses loaded world data; unloaded cells read as air
+                // (get_block returns AIR for missing chunks), so you can only
+                // target visible blocks. Computed before the renderer borrow.
+                let hit = {
+                    let world = &self.world;
+                    let registry = &self.registry;
+                    let eye = [
+                        self.camera.position.x as f64,
+                        self.camera.position.y as f64,
+                        self.camera.position.z as f64,
+                    ];
+                    let fwd = self.camera.forward();
+                    let dir = [fwd.x as f64, fwd.y as f64, fwd.z as f64];
+                    vox_core::raycast_voxels(eye, dir, REACH, |p| {
+                        registry.is_solid(world.get_block(p))
+                    })
+                };
+                self.targeted = hit;
+
                 let loaded = self.streamer.loaded_count();
                 let in_flight = self.gen_in_flight.len();
                 let dirty = self.dirty.len();
@@ -562,6 +592,10 @@ impl ApplicationHandler for App {
                     // still and cheap (one uniform rewrite per chunk) when
                     // crossing a boundary.
                     renderer.set_render_origin(origin_chunk);
+
+                    // Highlight the targeted block (offset uses the current
+                    // render origin, set just above).
+                    renderer.set_highlight(self.targeted.map(|h| h.block_pos));
 
                     let origin_blocks = origin_chunk.origin();
                     let render_origin_blocks = Vec3::new(
