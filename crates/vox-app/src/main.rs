@@ -366,16 +366,20 @@ impl App {
             self.mark_dirty_with_neighbors(pos);
         }
 
-        // 5. Mesh a bounded batch of dirty chunks and upload. Only mesh
-        //    chunks that are actually resident; skip (defer) others.
+        // 5. Mesh a bounded batch of dirty chunks and upload.
+        //
+        // First prune "ghost" dirty entries — positions that are no longer
+        // resident (unloaded, or marked dirty as a neighbor before they were
+        // ever generated). A non-resident chunk has no mesh to build; if it
+        // later loads, the generation drain (step 4) re-marks it dirty.
+        // Without this prune the dirty set leaks unbounded as you travel
+        // (it accumulates every unloaded chunk's former neighbors).
+        {
+            let world = &self.world;
+            self.dirty.retain(|p| world.chunk(*p).is_some());
+        }
         if !self.dirty.is_empty() {
-            let batch: Vec<ChunkPos> = self
-                .dirty
-                .iter()
-                .copied()
-                .filter(|p| self.world.chunk(*p).is_some())
-                .take(MESH_BUDGET)
-                .collect();
+            let batch: Vec<ChunkPos> = self.dirty.iter().copied().take(MESH_BUDGET).collect();
             for p in &batch {
                 self.dirty.remove(p);
             }
