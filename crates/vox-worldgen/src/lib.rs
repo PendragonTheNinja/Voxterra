@@ -20,15 +20,11 @@
 
 use vox_core::{BlockId, CHUNK_SIZE, Chunk, ChunkPos, LocalPos};
 
-/// Placeholder block vocabulary. These IDs are the contract the rest of the
-/// engine reads (vox-app's color table mirrors them). The real pipeline
-/// will replace this with a proper block registry.
+/// Block ids used by the placeholder generator. These now come from the
+/// canonical block registry in vox-core (Milestone 03); re-exported here so
+/// existing call sites (`blocks::STONE`, etc.) keep working unchanged.
 pub mod blocks {
-    use vox_core::BlockId;
-    pub const AIR: BlockId = BlockId::AIR;
-    pub const STONE: BlockId = BlockId(1);
-    pub const DIRT: BlockId = BlockId(2);
-    pub const GRASS: BlockId = BlockId(3);
+    pub use vox_core::registry::{AIR, DIRT, GRASS, STONE};
 }
 
 /// Number of dirt blocks below the surface grass layer.

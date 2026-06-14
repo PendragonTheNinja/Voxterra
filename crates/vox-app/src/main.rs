@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use glam::{Mat4, Vec3};
 use rayon::prelude::*;
-use vox_core::{BlockId, Chunk, ChunkPos, Streamer, World, WorldPos, WorldStore};
+use vox_core::{BlockId, BlockRegistry, Chunk, ChunkPos, Streamer, World, WorldPos, WorldStore};
 use vox_mesh::{mesh_chunk, ChunkNeighbors, MeshData};
 use vox_render::Renderer;
 use vox_worldgen::Generator;
@@ -19,25 +19,11 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
 // ---------------------------------------------------------------------------
-// Block appearance (vox-app owns block→color policy; IDs mirror vox-worldgen)
+// Block appearance — sourced from the vox-core block registry (M03 task 1).
+// Flat per-block color is interim; task 2 replaces it with textures.
 // ---------------------------------------------------------------------------
 
-const STONE: BlockId = BlockId(1);
-const DIRT: BlockId = BlockId(2);
-const GRASS: BlockId = BlockId(3);
-
-fn block_color(block: BlockId) -> [f32; 3] {
-    match block {
-        STONE => [0.55, 0.55, 0.58],
-        DIRT => [0.55, 0.40, 0.27],
-        GRASS => [0.33, 0.62, 0.28],
-        _ => [1.0, 0.0, 1.0], // magenta = "you forgot a block type"
-    }
-}
-
-/// Side length (in chunks) of the cube of world generated for this
-/// milestone's acceptance scene. 16 → 4,096 chunks → a 512³-block world.
-/// The six face-neighbor offsets, shared by streaming and edit re-meshing.
+// The six face-neighbor offsets, shared by streaming and edit re-meshing.
 const NEIGHBOR_OFFSETS: [(i64, i64, i64); 6] = [
     (1, 0, 0),
     (-1, 0, 0),
@@ -76,13 +62,20 @@ const MESH_BUDGET: usize = 48;
 /// borrows its chunk and its six neighbors immutably from `world` — no
 /// shared mutable state — which is why [`ChunkNeighbors`] takes borrowed
 /// chunks rather than `&World` by value.
-fn mesh_chunks_parallel(world: &World, positions: &[ChunkPos]) -> Vec<(ChunkPos, MeshData)> {
+fn mesh_chunks_parallel(
+    world: &World,
+    registry: &BlockRegistry,
+    positions: &[ChunkPos],
+) -> Vec<(ChunkPos, MeshData)> {
     positions
         .par_iter()
         .filter_map(|&pos| {
             let chunk = world.chunk(pos)?;
             let neighbors = ChunkNeighbors::of(world, pos);
-            let mesh = mesh_chunk(chunk, &neighbors, block_color);
+            // Interim: resolve flat color via the registry (textures in
+            // task 2). The closure borrows the registry, which is Sync, so
+            // it's shared across the rayon workers.
+            let mesh = mesh_chunk(chunk, &neighbors, |b| registry.color(b));
             if mesh.is_empty() {
                 None
             } else {
@@ -188,6 +181,9 @@ struct App {
     // --- Streaming (M02 task 3) ---
     generator: Generator,
     streamer: Streamer,
+    /// Block definitions: appearance + flags, the single source of truth
+    /// (M03 task 1). Shared into meshing (Sync).
+    registry: BlockRegistry,
     /// On-disk world: generate-or-load on chunk-in, save modified on
     /// chunk-out (M02 task 5).
     store: WorldStore,
@@ -235,6 +231,7 @@ impl Default for App {
 
             generator: Generator::new(seed),
             streamer: Streamer::new(LOAD_RADIUS, UNLOAD_RADIUS),
+            registry: BlockRegistry::default_set(),
             store,
             gen_in_flight: HashSet::new(),
             dirty: HashSet::new(),
@@ -384,7 +381,7 @@ impl App {
                 self.dirty.remove(p);
             }
 
-            let meshes = mesh_chunks_parallel(&self.world, &batch);
+            let meshes = mesh_chunks_parallel(&self.world, &self.registry, &batch);
             if let Some(renderer) = self.renderer.as_mut() {
                 let produced: HashSet<ChunkPos> = meshes.iter().map(|(p, _)| *p).collect();
                 // A batch chunk that produced no mesh (all air, or fully
