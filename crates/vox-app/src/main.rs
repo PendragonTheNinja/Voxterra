@@ -72,10 +72,10 @@ fn mesh_chunks_parallel(
         .filter_map(|&pos| {
             let chunk = world.chunk(pos)?;
             let neighbors = ChunkNeighbors::of(world, pos);
-            // Interim: resolve flat color via the registry (textures in
-            // task 2). The closure borrows the registry, which is Sync, so
-            // it's shared across the rayon workers.
-            let mesh = mesh_chunk(chunk, &neighbors, |b| registry.color(b));
+            // Texture array (ADR-0003): resolve each face's layer via the
+            // registry. The closure borrows the registry (Sync), shared
+            // across the rayon workers.
+            let mesh = mesh_chunk(chunk, &neighbors, |b, face| registry.face_layer(b, face));
             if mesh.is_empty() {
                 None
             } else {

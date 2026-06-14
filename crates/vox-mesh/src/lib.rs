@@ -23,14 +23,19 @@ use vox_core::{BlockId, CHUNK_SIZE, Chunk, ChunkPos, LocalPos, World};
 /// One mesh vertex. `repr(C)` + Pod so vox-render can cast the vertex
 /// buffer straight to bytes for GPU upload.
 ///
-/// Milestone 00 format: position + final color (block color × face
-/// brightness, baked CPU-side). This will be redesigned when textures
-/// arrive — expected, fine.
+/// Milestone 03 format (texture array, ADR-0003): position, plus texture
+/// coordinates `uv` that run `0..W` / `0..H` across a greedy-merged quad
+/// (so the layer tiles W×H times under a Repeat sampler), the texture-array
+/// `layer` index for this face, and a directional `brightness` scalar that
+/// the shader multiplies into the sampled color so geometry reads as 3D
+/// before real lighting (Milestone 04).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vertex {
     pub position: [f32; 3],
-    pub color: [f32; 3],
+    pub uv: [f32; 2],
+    pub layer: u32,
+    pub brightness: f32,
 }
 
 /// CPU-side mesh: vertex + index buffers ready for GPU upload.
@@ -173,21 +178,20 @@ fn emit_rect(
     v_dir: [f32; 3],
     w: f32,
     h: f32,
-    base_color: [f32; 3],
+    layer: u32,
     brightness: f32,
 ) {
-    let color = [
-        base_color[0] * brightness,
-        base_color[1] * brightness,
-        base_color[2] * brightness,
-    ];
+    // UVs run 0..w / 0..h so the texture-array layer tiles w×h times across
+    // a greedy-merged quad under a Repeat sampler (ADR-0003).
     let corner = |du: f32, dv: f32| Vertex {
         position: [
             base[0] + u_dir[0] * du + v_dir[0] * dv,
             base[1] + u_dir[1] * du + v_dir[1] * dv,
             base[2] + u_dir[2] * du + v_dir[2] * dv,
         ],
-        color,
+        uv: [du, dv],
+        layer,
+        brightness,
     };
 
     let base_index = mesh.vertices.len() as u32;
@@ -211,10 +215,14 @@ fn emit_rect(
 
 /// Culled meshing: one quad per solid-block face bordering a non-solid
 /// block. Kept forever as the correctness oracle for [`mesh_chunk`].
+///
+/// `layer_of(block, face_index)` returns the texture-array layer for that
+/// block's given face. `face_index` matches `FACE_DIRS` order
+/// (0:+X 1:-X 2:+Y 3:-Y 4:+Z 5:-Z), which is also the registry's face order.
 pub fn mesh_chunk_naive(
     chunk: &Chunk,
     neighbors: &ChunkNeighbors,
-    mut color_of: impl FnMut(BlockId) -> [f32; 3],
+    mut layer_of: impl FnMut(BlockId, usize) -> u32,
 ) -> MeshData {
     let mut mesh = MeshData::default();
     if chunk.is_all_air() {
@@ -226,10 +234,9 @@ pub fn mesh_chunk_naive(
         if block.is_air() {
             continue;
         }
-        let base_color = color_of(block);
         let coords = [pos.x() as i32, pos.y() as i32, pos.z() as i32];
 
-        for &(axis, positive, u_axis, v_axis) in &FACE_DIRS {
+        for (face_index, &(axis, positive, u_axis, v_axis)) in FACE_DIRS.iter().enumerate() {
             let mut neighbor = coords;
             neighbor[axis] += if positive { 1 } else { -1 };
             if !is_air_at(chunk, neighbors, neighbor[0], neighbor[1], neighbor[2]) {
@@ -248,7 +255,7 @@ pub fn mesh_chunk_naive(
                 axis_unit(v_axis),
                 1.0,
                 1.0,
-                base_color,
+                layer_of(block, face_index),
                 face_brightness(axis, positive),
             );
         }
@@ -271,7 +278,7 @@ pub fn mesh_chunk_naive(
 pub fn mesh_chunk(
     chunk: &Chunk,
     neighbors: &ChunkNeighbors,
-    mut color_of: impl FnMut(BlockId) -> [f32; 3],
+    mut layer_of: impl FnMut(BlockId, usize) -> u32,
 ) -> MeshData {
     let mut mesh = MeshData::default();
     if chunk.is_all_air() {
@@ -283,7 +290,7 @@ pub fn mesh_chunk(
     let mut mask: Vec<Option<BlockId>> = vec![None; size * size];
     let at = |u: usize, v: usize| u + v * size;
 
-    for &(axis, positive, u_axis, v_axis) in &FACE_DIRS {
+    for (face_index, &(axis, positive, u_axis, v_axis)) in FACE_DIRS.iter().enumerate() {
         let brightness = face_brightness(axis, positive);
         let u_dir = axis_unit(u_axis);
         let v_dir = axis_unit(v_axis);
@@ -369,7 +376,7 @@ pub fn mesh_chunk(
                         v_dir,
                         w as f32,
                         h as f32,
-                        color_of(block),
+                        layer_of(block, face_index),
                         brightness,
                     );
                 }
@@ -385,7 +392,13 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    const WHITE: fn(BlockId) -> [f32; 3] = |_| [1.0, 1.0, 1.0];
+    // A layer closure for tests: distinct layer per (block, face) so the
+    // differential test also exercises per-face layer correctness. For the
+    // simple count tests, the exact layer doesn't matter.
+    fn layers(b: BlockId, face: usize) -> u32 {
+        (b.0 as u32) * 6 + face as u32
+    }
+    const WHITE: fn(BlockId, usize) -> u32 = layers;
     const STONE: BlockId = BlockId(1);
     const N: usize = CHUNK_SIZE;
 
@@ -534,8 +547,8 @@ mod tests {
     // over randomized chunks with randomized neighbors.
     // -----------------------------------------------------------------
 
-    /// A unit face cell: (axis, outward sign, plane, a, b, color bits).
-    type CellKey = (usize, bool, i32, i32, i32, [u32; 3]);
+    /// A unit face cell: (axis, outward sign, plane, a, b, layer).
+    type CellKey = (usize, bool, i32, i32, i32, u32);
 
     /// Decompose a mesh into the unit face cells its quads cover.
     fn coverage(mesh: &MeshData) -> HashMap<CellKey, u32> {
@@ -557,8 +570,12 @@ mod tests {
                 mesh.vertices[bi + 2].position,
                 mesh.vertices[bi + 3].position,
             ];
-            let color = mesh.vertices[bi].color;
-            let color_bits = [color[0].to_bits(), color[1].to_bits(), color[2].to_bits()];
+            let layer = mesh.vertices[bi].layer;
+            // All four corners of a quad must share the layer.
+            assert!(
+                (0..4).all(|k| mesh.vertices[bi + k].layer == layer),
+                "quad has inconsistent layer"
+            );
 
             // Plane axis: the coordinate identical across all four corners.
             let axis = (0..3)
@@ -579,8 +596,7 @@ mod tests {
 
             for p in min1..max1 {
                 for q in min2..max2 {
-                    *map.entry((axis, positive, plane, p, q, color_bits))
-                        .or_insert(0) += 1;
+                    *map.entry((axis, positive, plane, p, q, layer)).or_insert(0) += 1;
                 }
             }
         }
@@ -627,13 +643,45 @@ mod tests {
         chunk
     }
 
+    /// A greedy-merged W×H quad must carry UVs spanning 0..W / 0..H so the
+    /// texture-array layer tiles W×H times (not stretched). For a solid
+    /// chunk, each of the 6 faces is one 32×32 quad whose UVs span 0..32.
+    #[test]
+    fn greedy_quad_uvs_tile_across_merge() {
+        let mesh = mesh_chunk(&Chunk::filled(STONE), &ChunkNeighbors::NONE, WHITE);
+        assert_eq!(mesh.quad_count(), 6);
+        for quad in mesh.indices.chunks_exact(6) {
+            let bi = quad[0] as usize;
+            let uvs: Vec<[f32; 2]> = (0..4).map(|k| mesh.vertices[bi + k].uv).collect();
+            let max_u = uvs.iter().map(|c| c[0]).fold(0.0_f32, f32::max);
+            let max_v = uvs.iter().map(|c| c[1]).fold(0.0_f32, f32::max);
+            assert_eq!(max_u, 32.0, "merged face U should span the full 32");
+            assert_eq!(max_v, 32.0, "merged face V should span the full 32");
+            assert_eq!(uvs[0], [0.0, 0.0]);
+        }
+    }
+
+    /// A single isolated block's faces are 1×1, UVs span 0..1 (one tile).
+    #[test]
+    fn unit_quad_uvs_are_unit() {
+        let mut chunk = Chunk::new_air();
+        chunk.set(LocalPos::new(5, 5, 5), STONE);
+        let mesh = mesh_chunk(&chunk, &ChunkNeighbors::NONE, WHITE);
+        for quad in mesh.indices.chunks_exact(6) {
+            let bi = quad[0] as usize;
+            let uvs: Vec<[f32; 2]> = (0..4).map(|k| mesh.vertices[bi + k].uv).collect();
+            let max_u = uvs.iter().map(|c| c[0]).fold(0.0_f32, f32::max);
+            let max_v = uvs.iter().map(|c| c[1]).fold(0.0_f32, f32::max);
+            assert_eq!(max_u, 1.0);
+            assert_eq!(max_v, 1.0);
+        }
+    }
+
     #[test]
     fn differential_greedy_equals_naive_coverage() {
-        // Distinct colors per block so color equality is also under test.
-        let colorful = |b: BlockId| {
-            let v = b.0 as f32;
-            [(v * 0.1) % 1.0, (v * 0.31) % 1.0, (v * 0.73) % 1.0]
-        };
+        // Distinct layer per (block, face) so per-face layer equality is
+        // also under test (a uniform layer would hide face-mixups).
+        let layered = |b: BlockId, face: usize| (b.0 as u32) * 6 + face as u32;
 
         for seed in 0..8u64 {
             let mut rng = SplitMix64::new(0xC0FFEE + seed);
@@ -649,8 +697,8 @@ mod tests {
                 ..ChunkNeighbors::NONE
             };
 
-            let naive = mesh_chunk_naive(&chunk, &neighbors, colorful);
-            let greedy = mesh_chunk(&chunk, &neighbors, colorful);
+            let naive = mesh_chunk_naive(&chunk, &neighbors, layered);
+            let greedy = mesh_chunk(&chunk, &neighbors, layered);
 
             let naive_cov = coverage(&naive);
             let greedy_cov = coverage(&greedy);

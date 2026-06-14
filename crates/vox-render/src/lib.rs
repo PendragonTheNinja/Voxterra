@@ -87,6 +87,9 @@ pub struct Renderer {
     camera_bind_group: wgpu::BindGroup,
     /// Layout for each chunk's per-draw offset uniform (group 1).
     chunk_bgl: wgpu::BindGroupLayout,
+    /// Block texture array + sampler bind group (group 2), bound once per
+    /// frame (shared by all chunks).
+    texture_bind_group: wgpu::BindGroup,
     /// One GPU mesh per chunk, keyed by chunk position. Empty/air chunks
     /// have no entry and cost nothing to "draw".
     meshes: HashMap<ChunkPos, GpuMesh>,
@@ -181,8 +184,35 @@ impl Renderer {
             }],
         });
 
+        // --- Block texture array (group 2), ADR-0003. One layer per tile;
+        // Repeat sampler tiles a layer across greedy-merged faces, nearest
+        // filtering keeps voxel pixels crisp. ---
+        let texture_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("block texture bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        let texture_bind_group = create_block_texture(&device, &queue, &texture_bgl);
+
         // --- Pipeline. Vertex layout must match vox_mesh::Vertex exactly:
-        // [f32;3] position, [f32;3] color, 24-byte stride. ---
+        // position [f32;3], uv [f32;2], layer u32, brightness f32. ---
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("chunk shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
@@ -190,14 +220,21 @@ impl Renderer {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("chunk pipeline layout"),
-            bind_group_layouts: &[&camera_bgl, &chunk_bgl],
+            bind_group_layouts: &[&camera_bgl, &chunk_bgl, &texture_bgl],
             push_constant_ranges: &[],
         });
 
         let vertex_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<vox_mesh::Vertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+            // Matches vox_mesh::Vertex (texture array, ADR-0003):
+            // position [f32;3], uv [f32;2], layer u32, brightness f32.
+            attributes: &wgpu::vertex_attr_array![
+                0 => Float32x3,
+                1 => Float32x2,
+                2 => Uint32,
+                3 => Float32
+            ],
         };
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -247,6 +284,7 @@ impl Renderer {
             camera_buffer,
             camera_bind_group,
             chunk_bgl,
+            texture_bind_group,
             meshes: HashMap::new(),
             render_origin: ChunkPos::new(0, 0, 0),
             drawn_last_frame: 0,
@@ -428,6 +466,8 @@ impl Renderer {
             if !self.meshes.is_empty() {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                // Group 2 (block textures) is shared by all chunks — bind once.
+                pass.set_bind_group(2, &self.texture_bind_group, &[]);
                 // Chunk world offset is baked into vertex positions at mesh
                 // time, so all chunks share one pipeline and bind group and
                 // differ only by their vertex/index buffers.
@@ -462,6 +502,125 @@ fn chunk_offset(pos: ChunkPos, render_origin: ChunkPos) -> Vec3 {
         ((pos.y - render_origin.y) * d) as f32,
         ((pos.z - render_origin.z) * d) as f32,
     )
+}
+
+/// Build the block texture array (ADR-0003): one 16×16 RGBA layer per tile,
+/// generated procedurally so the engine ships no image assets yet. Layer
+/// indices match the block registry's assignment (L_STONE=0 .. L_PLANKS=6).
+/// Real PNG tiles can replace `tile_pixels` later with no format change.
+///
+/// Returns the bind group (texture view + Repeat/nearest sampler) for group 2.
+fn create_block_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+) -> wgpu::BindGroup {
+    const TILE: u32 = 16;
+    const LAYERS: u32 = 7; // = registry DEFAULT_LAYER_COUNT
+
+    // Generate all layers back-to-back (the upload expects layers contiguous).
+    let mut data = Vec::with_capacity((TILE * TILE * 4 * LAYERS) as usize);
+    for layer in 0..LAYERS {
+        data.extend_from_slice(&tile_pixels(layer, TILE));
+    }
+
+    let size = wgpu::Extent3d {
+        width: TILE,
+        height: TILE,
+        depth_or_array_layers: LAYERS,
+    };
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("block texture array"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &data,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * TILE),
+            rows_per_image: Some(TILE),
+        },
+        size,
+    );
+
+    let view = texture.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    });
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("block sampler"),
+        // Repeat so a layer tiles across greedy-merged faces (ADR-0003).
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        address_mode_w: wgpu::AddressMode::Repeat,
+        // Nearest for crisp voxel pixels.
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::FilterMode::Nearest,
+        ..Default::default()
+    });
+
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("block texture bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    })
+}
+
+/// Procedural RGBA pixels for one tile layer. A simple per-layer base color
+/// plus a cheap deterministic per-texel variation so surfaces read as
+/// textured rather than flat. Placeholder until real art drops in.
+fn tile_pixels(layer: u32, tile: u32) -> Vec<u8> {
+    // Base colors keyed to the registry's layer assignment.
+    let base: [u8; 3] = match layer {
+        0 => [128, 128, 134], // stone
+        1 => [134, 96, 64],   // dirt
+        2 => [80, 150, 64],   // grass top
+        3 => [96, 132, 70],   // grass side (dirt-with-green-ish)
+        4 => [206, 192, 138], // sand
+        5 => [120, 120, 126], // cobblestone
+        6 => [156, 116, 70],  // planks
+        _ => [255, 0, 255],   // magenta = missing
+    };
+    let mut px = Vec::with_capacity((tile * tile * 4) as usize);
+    for y in 0..tile {
+        for x in 0..tile {
+            // Cheap hash-based dither, deterministic per texel.
+            let h = (x
+                .wrapping_mul(73)
+                .wrapping_add(y.wrapping_mul(151))
+                .wrapping_add(layer.wrapping_mul(977)))
+                & 0x1F;
+            let jitter = h as i32 - 16; // -16..15
+            let shade = |c: u8| -> u8 { (c as i32 + jitter).clamp(0, 255) as u8 };
+            px.push(shade(base[0]));
+            px.push(shade(base[1]));
+            px.push(shade(base[2]));
+            px.push(255);
+        }
+    }
+    px
 }
 
 fn create_depth_view(
