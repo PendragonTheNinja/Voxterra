@@ -32,6 +32,12 @@ pub struct Chunk {
     palette: Vec<BlockId>,
     /// Packed per-voxel palette indices; `None` iff the chunk is uniform.
     indices: Option<Packed>,
+    /// Whether this chunk differs from what worldgen would produce for its
+    /// position — i.e. it has been edited (or was loaded from disk, which
+    /// means it was edited at some earlier point). Only modified chunks need
+    /// saving; unmodified chunks regenerate from the seed for free. Runtime
+    /// state, NOT serialized (see [`Chunk::serialize`]).
+    modified: bool,
 }
 
 impl Chunk {
@@ -40,6 +46,7 @@ impl Chunk {
         Self {
             palette: vec![block],
             indices: None,
+            modified: false,
         }
     }
 
@@ -61,6 +68,10 @@ impl Chunk {
         if self.indices.is_none() && block == self.palette[0] {
             return;
         }
+
+        // Any write that reaches here changes (or may change) the chunk's
+        // contents relative to generation — treat it as an edit.
+        self.modified = true;
 
         let palette_index = self.palette_index_or_insert(block);
 
@@ -94,6 +105,25 @@ impl Chunk {
     /// (Mesh/serialization fast paths key off this.)
     pub fn is_uniform(&self) -> bool {
         self.indices.is_none()
+    }
+
+    /// Whether this chunk has been edited since generation (or loaded from
+    /// disk). Drives save-on-unload: only modified chunks need persisting.
+    pub fn is_modified(&self) -> bool {
+        self.modified
+    }
+
+    /// Mark this chunk as modified (must be persisted). Used by the storage
+    /// layer for chunks read from disk, since their existence on disk means
+    /// they were edited at some point.
+    pub fn mark_modified(&mut self) {
+        self.modified = true;
+    }
+
+    /// Mark this chunk as matching generation (need not be persisted). Used
+    /// after generating a chunk, and after saving one.
+    pub fn mark_unmodified(&mut self) {
+        self.modified = false;
     }
 
     /// Number of palette entries. After many overwrites this can include
@@ -243,6 +273,7 @@ impl Chunk {
             return Ok(Chunk {
                 palette,
                 indices: None,
+                modified: false,
             });
         }
 
@@ -264,6 +295,7 @@ impl Chunk {
         Ok(Chunk {
             palette,
             indices: Some(packed),
+            modified: false,
         })
     }
 }

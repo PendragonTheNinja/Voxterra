@@ -106,6 +106,10 @@ impl Generator {
                 }
             }
         }
+        // The chunk was built with set(), which marks it modified; but this
+        // IS the canonical generated state, so clear the flag. Only later
+        // edits should mark it modified (and thus needing a save).
+        chunk.mark_unmodified();
         chunk
     }
 
@@ -280,5 +284,18 @@ mod tests {
                 assert!((-1.0..=1.0).contains(&n), "noise out of range: {n}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod modflag_tests {
+    use super::*;
+    #[test]
+    fn generated_chunks_are_unmodified() {
+        let g = Generator::new(0x0007_E22A_C0DE);
+        // Mixed (surface) chunk and uniform chunks alike must be unmodified.
+        assert!(!g.generate_chunk(ChunkPos::new(0, 0, 0)).is_modified());
+        assert!(!g.generate_chunk(ChunkPos::new(0, 100, 0)).is_modified()); // air
+        assert!(!g.generate_chunk(ChunkPos::new(0, -100, 0)).is_modified()); // stone
     }
 }

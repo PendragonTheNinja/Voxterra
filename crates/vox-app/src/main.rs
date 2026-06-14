@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use glam::{Mat4, Vec3};
 use rayon::prelude::*;
-use vox_core::{BlockId, Chunk, ChunkPos, Streamer, World, WorldPos};
+use vox_core::{BlockId, Chunk, ChunkPos, Streamer, World, WorldPos, WorldStore};
 use vox_mesh::{mesh_chunk, ChunkNeighbors, MeshData};
 use vox_render::Renderer;
 use vox_worldgen::Generator;
@@ -188,6 +188,9 @@ struct App {
     // --- Streaming (M02 task 3) ---
     generator: Generator,
     streamer: Streamer,
+    /// On-disk world: generate-or-load on chunk-in, save modified on
+    /// chunk-out (M02 task 5).
+    store: WorldStore,
     /// Chunks whose generation has been spawned but whose result hasn't been
     /// received yet — prevents re-spawning the same chunk every frame.
     gen_in_flight: HashSet<ChunkPos>,
@@ -206,6 +209,16 @@ struct App {
 impl Default for App {
     fn default() -> Self {
         let (gen_tx, gen_rx) = std::sync::mpsc::channel();
+
+        // Open (or create) the world directory. The store's seed is
+        // authoritative: a new world uses this default seed, an existing one
+        // reuses its saved seed so terrain regenerates identically.
+        const DEFAULT_SEED: u64 = 0x0007_E22A_C0DE;
+        let store =
+            WorldStore::open("world", DEFAULT_SEED).expect("failed to open world directory");
+        let seed = store.seed();
+        log::info!("world at {:?}, seed {:#x}", store.root(), seed);
+
         Self {
             window: None,
             renderer: None,
@@ -220,8 +233,9 @@ impl Default for App {
             cursor_captured: false,
             last_frame: Instant::now(),
 
-            generator: Generator::new(0x0007_E22A_C0DE),
+            generator: Generator::new(seed),
             streamer: Streamer::new(LOAD_RADIUS, UNLOAD_RADIUS),
+            store,
             gen_in_flight: HashSet::new(),
             dirty: HashSet::new(),
             gen_tx,
@@ -245,6 +259,24 @@ impl App {
         }
     }
 
+    /// Save every loaded chunk that's been modified — called on exit so
+    /// edits to chunks still resident (not yet unloaded) aren't lost.
+    fn save_all_modified(&self) {
+        let mut saved = 0;
+        for (pos, chunk) in self.world.chunks() {
+            if chunk.is_modified() {
+                if let Err(e) = self.store.save_chunk(pos, chunk) {
+                    log::error!("exit save failed for {:?}: {e}", (pos.x, pos.y, pos.z));
+                } else {
+                    saved += 1;
+                }
+            }
+        }
+        if saved > 0 {
+            log::info!("saved {saved} modified chunks on exit");
+        }
+    }
+
     /// One streaming step, run every frame. Keeps the resident chunk set
     /// centered on the camera and the GPU meshes in sync, within per-frame
     /// budgets so the frame never stalls.
@@ -259,9 +291,17 @@ impl App {
         // 1. Ask the streamer what should change.
         let update = self.streamer.update(camera_chunk);
 
-        // 2. Unloads: drop chunk data + GPU mesh; neighbors may now expose
-        //    a border face, so mark them dirty.
+        // 2. Unloads: save the chunk if it was modified, then drop its data
+        //    + GPU mesh; neighbors may now expose a border face, so they're
+        //    marked dirty below.
         for pos in &update.to_unload {
+            if let Some(chunk) = self.world.chunk(*pos) {
+                if chunk.is_modified() {
+                    if let Err(e) = self.store.save_chunk(*pos, chunk) {
+                        log::error!("failed to save chunk {:?}: {e}", (pos.x, pos.y, pos.z));
+                    }
+                }
+            }
             self.world.remove_chunk(*pos);
             self.streamer.mark_unloaded(*pos);
             self.dirty.remove(pos);
@@ -290,9 +330,24 @@ impl App {
             }
             self.gen_in_flight.insert(pos);
             let generator = self.generator;
+            let store = self.store.clone();
             let tx = self.gen_tx.clone();
             rayon::spawn(move || {
-                let chunk = generator.generate_chunk(pos);
+                // Generate-or-load: a saved (edited) chunk takes precedence
+                // over regeneration; otherwise generate from the seed. A
+                // load error falls back to generation so a corrupt file can't
+                // wedge streaming.
+                let chunk = match store.load_chunk(pos) {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => generator.generate_chunk(pos),
+                    Err(e) => {
+                        log::error!(
+                            "load chunk {:?} failed: {e}; regenerating",
+                            (pos.x, pos.y, pos.z)
+                        );
+                        generator.generate_chunk(pos)
+                    }
+                };
                 let _ = tx.send((pos, chunk));
             });
             spawned += 1;
@@ -426,7 +481,10 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                self.save_all_modified();
+                event_loop.exit();
+            }
 
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
