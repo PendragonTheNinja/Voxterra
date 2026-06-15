@@ -405,39 +405,82 @@ impl LightVolume for PaddedChunk<'_> {
 ///
 /// Light is derived, not persisted: call this on load/generation and after
 /// any block edit that affects light. Does not mark the chunk modified.
-pub fn relight_chunk(chunk: &mut Chunk, registry: &BlockRegistry, borders: &NeighborLight) -> bool {
-    // Snapshot outgoing borders before.
-    let before: Vec<Vec<u8>> = (0..6).map(|f| chunk_light_plane(chunk, f)).collect();
+/// Compute a chunk's block light **without mutating it** — read-only, so it
+/// can run in parallel across chunks (ADR-0004). Returns the new light as an
+/// owned 32³ buffer (indexed by [`LocalPos::index`]) plus whether the
+/// chunk's *outgoing* border light changed versus its current light (so the
+/// caller can re-dirty neighbors for cross-chunk convergence).
+///
+/// Apply the buffer with [`apply_chunk_light`]. Splitting compute from apply
+/// is what lets relighting be parallelized like meshing: the parallel phase
+/// only reads, the cheap sequential phase writes.
+pub fn compute_chunk_light(
+    chunk: &Chunk,
+    registry: &BlockRegistry,
+    borders: &NeighborLight,
+) -> (Vec<u8>, bool) {
+    let mut vol = PaddedChunk::build(chunk, registry, borders);
+    propagate_block_light(&mut vol);
 
-    // Propagate in the padded volume (borrows chunk immutably), then copy the
-    // center light out into an owned buffer so the borrow can be released
-    // before we mutate the chunk's light.
-    let center: Vec<u8> = {
-        let mut vol = PaddedChunk::build(chunk, registry, borders);
-        propagate_block_light(&mut vol);
-        let mut out = vec![0u8; CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE];
-        for pos in LocalPos::iter() {
-            let i = PaddedChunk::idx(
-                pos.x() as usize + 1,
-                pos.y() as usize + 1,
-                pos.z() as usize + 1,
-            );
-            out[pos.index()] = vol.light[i];
-        }
-        out
-    };
+    let mut out = vec![0u8; CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE];
+    for pos in LocalPos::iter() {
+        let i = PaddedChunk::idx(
+            pos.x() as usize + 1,
+            pos.y() as usize + 1,
+            pos.z() as usize + 1,
+        );
+        out[pos.index()] = vol.light[i];
+    }
 
-    // Write center light back into the chunk (fresh recompute).
+    let changed = border_changed(chunk, &out);
+    (out, changed)
+}
+
+/// Apply a light buffer (from [`compute_chunk_light`]) to a chunk's storage.
+pub fn apply_chunk_light(chunk: &mut Chunk, light: &[u8]) {
     chunk.clear_light();
     for pos in LocalPos::iter() {
-        let level = center[pos.index()];
+        let level = light[pos.index()];
         if level > 0 {
             chunk.set_block_light(pos, level);
         }
     }
+}
 
-    // Did any outgoing border change?
-    (0..6).any(|f| chunk_light_plane(chunk, f) != before[f])
+/// Whether the outgoing border planes of `new_light` (a 32³ buffer) differ
+/// from the chunk's currently-stored light on any of the six faces.
+fn border_changed(chunk: &Chunk, new_light: &[u8]) -> bool {
+    let n = CHUNK_SIZE;
+    let last = (n - 1) as u8;
+    let idx = |x: u8, y: u8, z: u8| LocalPos::new(x, y, z).index();
+    for v in 0..n {
+        for u in 0..n {
+            let (lu, lv) = (u as u8, v as u8);
+            let faces = [
+                idx(last, lu, lv),
+                idx(0, lu, lv),
+                idx(lu, last, lv),
+                idx(lu, 0, lv),
+                idx(lu, lv, last),
+                idx(lu, lv, 0),
+            ];
+            for &i in &faces {
+                if chunk.block_light(LocalPos::from_index(i)) != new_light[i] {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Recompute a chunk's block light in place (compute + apply). Convenience
+/// for single-chunk use and tests; the streaming path uses the split
+/// [`compute_chunk_light`] / [`apply_chunk_light`] to parallelize.
+pub fn relight_chunk(chunk: &mut Chunk, registry: &BlockRegistry, borders: &NeighborLight) -> bool {
+    let (light, changed) = compute_chunk_light(chunk, registry, borders);
+    apply_chunk_light(chunk, &light);
+    changed
 }
 
 #[cfg(test)]

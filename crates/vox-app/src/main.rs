@@ -82,6 +82,36 @@ fn digit_slot(code: KeyCode) -> Option<usize> {
     }
 }
 
+/// Compute block light for many chunks in parallel (rayon), read-only — each
+/// task reads its chunk plus neighbor border light and returns an owned light
+/// buffer + whether its outgoing border changed (ADR-0004). The caller then
+/// applies the buffers and re-dirties neighbors sequentially (cheap). This
+/// keeps relighting off the single-threaded path, like meshing.
+#[allow(clippy::type_complexity)]
+fn relight_chunks_parallel(
+    world: &World,
+    registry: &BlockRegistry,
+    positions: &[ChunkPos],
+) -> Vec<(ChunkPos, Vec<u8>, bool)> {
+    // Neighbor face → the neighbor's opposite face plane that touches us.
+    const OPPOSITE: [usize; 6] = [1, 0, 3, 2, 5, 4];
+    positions
+        .par_iter()
+        .filter_map(|&pos| {
+            let chunk = world.chunk(pos)?;
+            let mut borders: vox_core::NeighborLight = [None, None, None, None, None, None];
+            for (face, (dx, dy, dz)) in NEIGHBOR_OFFSETS.iter().enumerate() {
+                let npos = ChunkPos::new(pos.x + dx, pos.y + dy, pos.z + dz);
+                if let Some(n) = world.chunk(npos) {
+                    borders[face] = Some(vox_core::chunk_light_plane(n, OPPOSITE[face]));
+                }
+            }
+            let (light, changed) = vox_core::compute_chunk_light(chunk, registry, &borders);
+            Some((pos, light, changed))
+        })
+        .collect()
+}
+
 fn mesh_chunks_parallel(
     world: &World,
     registry: &BlockRegistry,
@@ -409,14 +439,18 @@ impl App {
                 self.dirty.remove(p);
             }
 
-            // Relight each chunk before meshing (the mesh bakes light into
-            // brightness). Light is recomputed from blocks (ADR-0004); when a
-            // chunk's outgoing border changes, its neighbors must relight too
-            // so light converges across chunk boundaries — re-dirty them.
-            for &p in &batch {
-                if self.relight_one(p) {
+            // Relight before meshing (the mesh bakes light into brightness).
+            // Compute light in parallel (read-only), then apply sequentially
+            // and re-dirty neighbors whose border light this chunk changed,
+            // so light converges across chunk boundaries (ADR-0004).
+            let lit = relight_chunks_parallel(&self.world, &self.registry, &batch);
+            for (pos, light, changed) in lit {
+                if let Some(chunk) = self.world.chunk_mut(pos) {
+                    vox_core::apply_chunk_light(chunk, &light);
+                }
+                if changed {
                     for (dx, dy, dz) in NEIGHBOR_OFFSETS {
-                        let n = ChunkPos::new(p.x + dx, p.y + dy, p.z + dz);
+                        let n = ChunkPos::new(pos.x + dx, pos.y + dy, pos.z + dz);
                         if self.world.chunk(n).is_some() {
                             self.dirty.insert(n);
                         }
@@ -438,29 +472,6 @@ impl App {
                     renderer.set_chunk_mesh(*pos, mesh);
                 }
             }
-        }
-    }
-
-    /// Recompute one chunk's block light (ADR-0004), pulling border light
-    /// from its loaded neighbors. Returns whether the chunk's outgoing border
-    /// changed (so the caller can re-dirty neighbors for cross-chunk spread).
-    /// Extracts neighbor borders first (immutable reads), then takes `&mut`
-    /// the chunk — never both at once.
-    fn relight_one(&mut self, pos: ChunkPos) -> bool {
-        // Build the neighbor border-light planes. borders[face] is the plane
-        // of the neighbor in that direction that touches this chunk — i.e.
-        // the neighbor's OPPOSITE face. Face order: 0:+X 1:-X 2:+Y 3:-Y 4:+Z 5:-Z.
-        let opposite = [1usize, 0, 3, 2, 5, 4];
-        let mut borders: vox_core::NeighborLight = [None, None, None, None, None, None];
-        for (face, (dx, dy, dz)) in NEIGHBOR_OFFSETS.iter().enumerate() {
-            let npos = ChunkPos::new(pos.x + dx, pos.y + dy, pos.z + dz);
-            if let Some(neighbor) = self.world.chunk(npos) {
-                borders[face] = Some(vox_core::chunk_light_plane(neighbor, opposite[face]));
-            }
-        }
-        match self.world.chunk_mut(pos) {
-            Some(chunk) => vox_core::relight_chunk(chunk, &self.registry, &borders),
-            None => false,
         }
     }
 
