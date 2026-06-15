@@ -153,6 +153,25 @@ fn sign(x: f64) -> i64 {
     }
 }
 
+/// Whether the unit voxel cell at integer `cell` (spanning `[cell, cell+1]`
+/// on each axis) intersects the axis-aligned box `[aabb_min, aabb_max]`.
+///
+/// Used to reject block placement that would overlap the player (so you
+/// can't entomb the camera). Standard separating-axis AABB overlap; touching
+/// faces (shared boundary, zero overlap volume) do NOT count as overlap, so
+/// you can place a block flush against the player without being blocked.
+pub fn cell_overlaps_aabb(cell: WorldPos, aabb_min: [f64; 3], aabb_max: [f64; 3]) -> bool {
+    let cell_min = [cell.x as f64, cell.y as f64, cell.z as f64];
+    let cell_max = [cell_min[0] + 1.0, cell_min[1] + 1.0, cell_min[2] + 1.0];
+    for a in 0..3 {
+        // Strict inequalities: flush contact is not overlap.
+        if cell_max[a] <= aabb_min[a] || cell_min[a] >= aabb_max[a] {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,5 +277,34 @@ mod tests {
             hit.place_pos.unwrap(),
             WorldPos::new(b.x + n.0, b.y + n.1, b.z + n.2)
         );
+    }
+
+    #[test]
+    fn overlap_cell_containing_point() {
+        // A small player box around (5.5, 10.5, 5.5) overlaps cell (5,10,5).
+        let min = [5.2, 10.2, 5.2];
+        let max = [5.8, 11.8, 5.8];
+        assert!(cell_overlaps_aabb(WorldPos::new(5, 10, 5), min, max));
+        assert!(cell_overlaps_aabb(WorldPos::new(5, 11, 5), min, max)); // head cell
+    }
+
+    #[test]
+    fn no_overlap_adjacent_cell() {
+        // Player box well inside cell (5,10,5); neighbor cell (6,10,5) is clear.
+        let min = [5.3, 10.2, 5.3];
+        let max = [5.7, 11.6, 5.7];
+        assert!(!cell_overlaps_aabb(WorldPos::new(6, 10, 5), min, max));
+        assert!(!cell_overlaps_aabb(WorldPos::new(4, 10, 5), min, max));
+        assert!(!cell_overlaps_aabb(WorldPos::new(5, 9, 5), min, max)); // below feet
+    }
+
+    #[test]
+    fn flush_contact_is_not_overlap() {
+        // Box exactly spanning [5,6] touches cell (6,..) at the shared face
+        // but does not overlap it — placement flush against the player is OK.
+        let min = [5.0, 10.0, 5.0];
+        let max = [6.0, 11.0, 6.0];
+        assert!(!cell_overlaps_aabb(WorldPos::new(6, 10, 5), min, max));
+        assert!(cell_overlaps_aabb(WorldPos::new(5, 10, 5), min, max));
     }
 }

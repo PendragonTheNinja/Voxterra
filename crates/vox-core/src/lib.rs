@@ -15,7 +15,7 @@ pub mod world;
 pub use block::BlockId;
 pub use chunk::{CHUNK_FORMAT_VERSION, Chunk, ChunkDecodeError};
 pub use coords::{CHUNK_BITS, CHUNK_SIZE, CHUNK_VOLUME, ChunkPos, LocalPos, WorldPos};
-pub use raycast::{RayHit, raycast_blocks, raycast_voxels};
+pub use raycast::{RayHit, cell_overlaps_aabb, raycast_blocks, raycast_voxels};
 pub use registry::{BlockRegistry, BlockType};
 pub use storage::{StoreError, WORLD_META_VERSION, WorldStore};
 pub use streaming::{StreamUpdate, Streamer};

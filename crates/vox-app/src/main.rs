@@ -9,7 +9,8 @@ use std::time::Instant;
 use glam::{Mat4, Vec3};
 use rayon::prelude::*;
 use vox_core::{
-    BlockId, BlockRegistry, Chunk, ChunkPos, RayHit, Streamer, World, WorldPos, WorldStore,
+    cell_overlaps_aabb, BlockId, BlockRegistry, Chunk, ChunkPos, RayHit, Streamer, World, WorldPos,
+    WorldStore,
 };
 use vox_mesh::{mesh_chunk, ChunkNeighbors, MeshData};
 use vox_render::Renderer;
@@ -68,6 +69,19 @@ const REACH: f64 = 6.0;
 /// borrows its chunk and its six neighbors immutably from `world` — no
 /// shared mutable state — which is why [`ChunkNeighbors`] takes borrowed
 /// chunks rather than `&World` by value.
+/// Map a number-row key to a 1-based block-selection slot (1..=6).
+fn digit_slot(code: KeyCode) -> Option<usize> {
+    match code {
+        KeyCode::Digit1 => Some(1),
+        KeyCode::Digit2 => Some(2),
+        KeyCode::Digit3 => Some(3),
+        KeyCode::Digit4 => Some(4),
+        KeyCode::Digit5 => Some(5),
+        KeyCode::Digit6 => Some(6),
+        _ => None,
+    }
+}
+
 fn mesh_chunks_parallel(
     world: &World,
     registry: &BlockRegistry,
@@ -201,6 +215,9 @@ struct App {
     dirty: HashSet<ChunkPos>,
     /// Block currently under the crosshair (raycast result), or none.
     targeted: Option<RayHit>,
+    /// Block type placed on right-click (M03 task 4). Cycled with number
+    /// keys / scroll among the registry's placeable blocks.
+    selected_block: BlockId,
 
     /// Async generation results arrive here from the rayon pool.
     gen_tx: Sender<(ChunkPos, Chunk)>,
@@ -245,6 +262,7 @@ impl Default for App {
             gen_in_flight: HashSet::new(),
             dirty: HashSet::new(),
             targeted: None,
+            selected_block: vox_core::registry::STONE,
             gen_tx,
             gen_rx,
 
@@ -408,6 +426,85 @@ impl App {
         }
     }
 
+    /// Break the currently targeted block (left-click). Sets it to air and
+    /// re-meshes via the dirty-set path (which marks the chunk modified, so
+    /// the edit persists). No-op when nothing is targeted.
+    fn break_block(&mut self) {
+        let Some(hit) = self.targeted else { return };
+        let pos = hit.block_pos;
+        if self.world.get_block(pos).is_air() {
+            return;
+        }
+        self.world.set_block(pos, BlockId::AIR);
+        self.mark_dirty_with_neighbors(pos.chunk());
+        log::info!("broke block at {:?}", (pos.x, pos.y, pos.z));
+    }
+
+    /// Place the selected block against the targeted face (right-click).
+    /// Rejects placement into a non-empty cell or one overlapping the
+    /// player (so you can't entomb the camera). Re-meshes + persists.
+    fn place_block(&mut self) {
+        let Some(hit) = self.targeted else { return };
+        let Some(pos) = hit.place_pos else { return };
+        if !self.world.get_block(pos).is_air() {
+            return; // target cell occupied
+        }
+        // Reject if the cell would overlap the player's box.
+        let (min, max) = self.player_aabb();
+        if cell_overlaps_aabb(pos, min, max) {
+            return;
+        }
+        self.world.set_block(pos, self.selected_block);
+        self.mark_dirty_with_neighbors(pos.chunk());
+        log::info!("placed block at {:?}", (pos.x, pos.y, pos.z));
+    }
+
+    /// A small AABB approximating the player, centered on the camera. For
+    /// now the camera is a free-flying point, so this is just a modest box
+    /// around it — enough to stop placing a block that engulfs the view. A
+    /// real player body (with physics) will replace this later.
+    fn player_aabb(&self) -> ([f64; 3], [f64; 3]) {
+        const HALF: f64 = 0.3;
+        let p = self.camera.position;
+        (
+            [p.x as f64 - HALF, p.y as f64 - HALF, p.z as f64 - HALF],
+            [p.x as f64 + HALF, p.y as f64 + HALF, p.z as f64 + HALF],
+        )
+    }
+
+    /// Set the selected block to the Nth placeable block (1-based), from
+    /// number keys. Out-of-range indices are ignored.
+    fn select_block_slot(&mut self, slot: usize) {
+        let placeable: Vec<BlockId> = self.registry.placeable().collect();
+        if slot >= 1 && slot <= placeable.len() {
+            self.selected_block = placeable[slot - 1];
+            self.log_selection();
+        }
+    }
+
+    /// Cycle the selected block forward (+1) or backward (-1), from scroll.
+    fn cycle_selection(&mut self, dir: i32) {
+        let placeable: Vec<BlockId> = self.registry.placeable().collect();
+        if placeable.is_empty() {
+            return;
+        }
+        let cur = placeable
+            .iter()
+            .position(|&b| b == self.selected_block)
+            .unwrap_or(0) as i32;
+        let n = placeable.len() as i32;
+        let next = (cur + dir).rem_euclid(n) as usize;
+        self.selected_block = placeable[next];
+        self.log_selection();
+    }
+
+    fn log_selection(&self) {
+        log::info!(
+            "selected block: {}",
+            self.registry.get(self.selected_block).name
+        );
+    }
+
     /// DEBUG: clear a sphere of blocks at the camera, marking touched chunks
     /// (and their neighbors) dirty so the streaming tick re-meshes them.
     /// Block-editing UI proper is Milestone 03; this exercises re-meshing.
@@ -512,6 +609,8 @@ impl ApplicationHandler for App {
                             } else if code == KeyCode::KeyG {
                                 // Debug: punch a hole to exercise re-meshing.
                                 self.debug_punch_hole();
+                            } else if let Some(slot) = digit_slot(code) {
+                                self.select_block_slot(slot);
                             } else {
                                 self.keys.insert(code);
                             }
@@ -523,14 +622,36 @@ impl ApplicationHandler for App {
                 }
             }
 
-            // Click to recapture the mouse after Esc.
+            // Mouse buttons: left = break (or recapture cursor after Esc),
+            // right = place. Only act on edits while the cursor is captured.
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
-                button: MouseButton::Left,
+                button,
                 ..
-            } => {
-                if !self.cursor_captured {
-                    self.set_cursor_captured(true);
+            } => match button {
+                MouseButton::Left => {
+                    if self.cursor_captured {
+                        self.break_block();
+                    } else {
+                        self.set_cursor_captured(true);
+                    }
+                }
+                MouseButton::Right if self.cursor_captured => {
+                    self.place_block();
+                }
+                _ => {}
+            },
+
+            // Scroll wheel cycles the selected block.
+            WindowEvent::MouseWheel { delta, .. } => {
+                if self.cursor_captured {
+                    let dir = match delta {
+                        winit::event::MouseScrollDelta::LineDelta(_, y) => -y.signum() as i32,
+                        winit::event::MouseScrollDelta::PixelDelta(p) => -(p.y.signum() as i32),
+                    };
+                    if dir != 0 {
+                        self.cycle_selection(dir);
+                    }
                 }
             }
 
