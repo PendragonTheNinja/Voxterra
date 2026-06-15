@@ -132,6 +132,8 @@ beyond what the invariants above already require.
 
 ## Current status
 
-- **Active milestone:** 02 — Infinite World (spec not yet written)
-- **Last completed milestone:** 01 — Real Chunk System (2026-06-13)
+- **Active milestone:** 04 — Lighting (spec not yet written)
+- **Last completed milestone:** 03 — Blocks, Interaction, Textures (2026-06-15)
+- Milestones 02 (Infinite World, 2026-06-14) and 03 are complete; see their
+  retrospectives in `docs/milestones/`.
 - Update this section at the end of every working session.
