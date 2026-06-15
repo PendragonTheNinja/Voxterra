@@ -108,6 +108,120 @@ pub fn propagate_block_light(vol: &mut impl LightVolume) -> usize {
     lit
 }
 
+/// Remove block light, two-phase (ADR-0004), after a light-affecting change
+/// at `(sx, sy, sz)` — e.g. a light source was broken, or a solid block was
+/// placed where light used to be. Call this with the volume's `emission`/
+/// `is_solid` already reflecting the change; it repairs the light field
+/// without a full recompute.
+///
+/// Phase 1 (un-light): from the changed cell, clear cells whose light could
+/// only have come from here (their level is strictly less than the cell
+/// we're clearing), collecting as re-light seeds any neighbor that is *as
+/// bright or brighter* than expected — those are sustained by other sources.
+/// Phase 2 (re-light): BFS-propagate outward from those seeds (and from the
+/// changed cell's own emission, if it still emits) so surviving light flows
+/// back in correctly.
+///
+/// This is bounded to the affected region, not the whole volume.
+pub fn remove_block_light(vol: &mut impl LightVolume, sx: usize, sy: usize, sz: usize) {
+    let [dx, dy, dz] = vol.dims();
+
+    // The light level we're removing from the origin cell.
+    let start_level = vol.get_light(sx, sy, sz);
+    // The cell may still emit (e.g. a solid block placed atop an emitter, or
+    // the change didn't actually remove emission); its own emission survives.
+    let start_emit = vol.emission(sx, sy, sz);
+
+    if start_level == 0 {
+        // Nothing was lit here; only a (re)propagation from emission matters.
+        if start_emit > 0 {
+            vol.set_light(sx, sy, sz, start_emit);
+            let mut q = vec![(sx, sy, sz)];
+            bfs_spread(vol, &mut q);
+        }
+        return;
+    }
+
+    // Phase 1: BFS clearing cells fed only by the removed light.
+    // Queue carries (cell, level_it_had_before_clearing).
+    let mut unlight: Vec<(usize, usize, usize, u8)> = vec![(sx, sy, sz, start_level)];
+    // Seed cells that remain lit by other sources → re-propagate from them.
+    let mut relight: Vec<(usize, usize, usize)> = Vec::new();
+
+    // Clear the origin first (unless it still emits — handled in phase 2).
+    vol.set_light(sx, sy, sz, 0);
+
+    let mut head = 0;
+    while head < unlight.len() {
+        let (x, y, z, level) = unlight[head];
+        head += 1;
+
+        for (nx, ny, nz) in neighbors(x, y, z, dx, dy, dz) {
+            let nl = vol.get_light(nx, ny, nz);
+            if nl == 0 {
+                continue;
+            }
+            if nl < level {
+                // This neighbor's light came (only) from us: clear it and
+                // continue un-lighting from it. Its emission, if any, will be
+                // restored in phase 2.
+                vol.set_light(nx, ny, nz, 0);
+                unlight.push((nx, ny, nz, nl));
+            } else {
+                // nl >= level: sustained by another source. Re-light seed.
+                relight.push((nx, ny, nz));
+            }
+        }
+    }
+
+    // Phase 2: re-propagate from surviving borders and any cell that still
+    // emits (origin, or emitters we cleared in phase 1).
+    let mut q: Vec<(usize, usize, usize)> = Vec::new();
+    for (x, y, z) in relight {
+        // Only seed cells that currently still hold light.
+        if vol.get_light(x, y, z) > 0 {
+            q.push((x, y, z));
+        }
+    }
+    // Restore emission for any cleared emitter (including the origin) so it
+    // re-seeds the flood.
+    let cleared: Vec<(usize, usize, usize)> =
+        unlight.iter().map(|&(x, y, z, _)| (x, y, z)).collect();
+    for &(x, y, z) in &cleared {
+        let e = vol.emission(x, y, z);
+        if e > vol.get_light(x, y, z) {
+            vol.set_light(x, y, z, e);
+            q.push((x, y, z));
+        }
+    }
+    bfs_spread(vol, &mut q);
+}
+
+/// Shared BFS spread step used by add/remove: from each seed, push light-1
+/// into dimmer non-solid neighbors. Seeds must already hold their light.
+fn bfs_spread(vol: &mut impl LightVolume, queue: &mut Vec<(usize, usize, usize)>) {
+    let [dx, dy, dz] = vol.dims();
+    let mut head = 0;
+    while head < queue.len() {
+        let (x, y, z) = queue[head];
+        head += 1;
+        let level = vol.get_light(x, y, z);
+        if level <= 1 {
+            continue;
+        }
+        let spread = level - 1;
+        for (nx, ny, nz) in neighbors(x, y, z, dx, dy, dz) {
+            if vol.is_solid(nx, ny, nz) {
+                continue;
+            }
+            if vol.get_light(nx, ny, nz) < spread {
+                vol.set_light(nx, ny, nz, spread);
+                queue.push((nx, ny, nz));
+            }
+        }
+    }
+}
+
 /// The in-bounds 6-neighbors of a cell.
 fn neighbors(
     x: usize,
@@ -325,5 +439,143 @@ mod tests {
         assert!(behind > 0, "light should reach behind via the gap");
         // The blocked cell on the wall is dark.
         assert_eq!(g.get_light(3, 3, 1), 0);
+    }
+
+    // ---- Removal (two-phase) ----
+
+    /// Helper: full add, then remove at a cell whose emission was zeroed.
+    fn add_then_remove_at(g: &mut Grid, rx: usize, ry: usize, rz: usize) {
+        propagate_block_light(g);
+        // Simulate breaking the source: clear its emission, then remove.
+        g.set_emission(rx, ry, rz, 0);
+        remove_block_light(g, rx, ry, rz);
+    }
+
+    #[test]
+    fn removing_only_source_restores_darkness() {
+        let mut g = Grid::new(11, 11, 11);
+        g.set_emission(5, 5, 5, 15);
+        add_then_remove_at(&mut g, 5, 5, 5);
+
+        // Everything must be dark again — no stale glow anywhere.
+        for z in 0..11 {
+            for y in 0..11 {
+                for x in 0..11 {
+                    assert_eq!(g.get_light(x, y, z), 0, "stale light at {x},{y},{z}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn removing_one_of_two_sources_keeps_survivor_light() {
+        // THE case naive removal gets wrong: two overlapping sources, remove
+        // one, the region must remain correctly lit by the other.
+        let mut g = Grid::new(11, 3, 3);
+        g.set_emission(0, 1, 1, 15);
+        g.set_emission(10, 1, 1, 15);
+        add_then_remove_at(&mut g, 0, 1, 1); // remove the left source
+
+        // Compare against a from-scratch recompute with only the right source.
+        let mut reference = Grid::new(11, 3, 3);
+        reference.set_emission(10, 1, 1, 15);
+        propagate_block_light(&mut reference);
+
+        for x in 0..11 {
+            assert_eq!(
+                g.get_light(x, 1, 1),
+                reference.get_light(x, 1, 1),
+                "mismatch at x={x} after removing one source"
+            );
+        }
+        // Sanity: the surviving source is still full bright, far end dark-ish.
+        assert_eq!(g.get_light(10, 1, 1), 15);
+        assert_eq!(g.get_light(0, 1, 1), 5); // 10 away from survivor
+    }
+
+    #[test]
+    fn removal_matches_full_recompute_random() {
+        // Fuzz: random emitters + walls, remove one, compare to a clean
+        // recompute without it. Removal must converge to the same field.
+        let mut rng = 0x1234_5678u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for _ in 0..40 {
+            let mut g = Grid::new(9, 9, 9);
+            // Sprinkle walls.
+            for _ in 0..60 {
+                let x = (next() % 9) as usize;
+                let y = (next() % 9) as usize;
+                let z = (next() % 9) as usize;
+                g.set_solid(x, y, z);
+            }
+            // A few emitters on non-solid cells.
+            let mut emitters = Vec::new();
+            for _ in 0..4 {
+                let x = (next() % 9) as usize;
+                let y = (next() % 9) as usize;
+                let z = (next() % 9) as usize;
+                if !g.is_solid(x, y, z) {
+                    let e = 8 + (next() % 8) as u8;
+                    g.set_emission(x, y, z, e);
+                    emitters.push((x, y, z));
+                }
+            }
+            if emitters.is_empty() {
+                continue;
+            }
+            propagate_block_light(&mut g);
+
+            // Remove the first emitter.
+            let (rx, ry, rz) = emitters[0];
+            g.set_emission(rx, ry, rz, 0);
+            remove_block_light(&mut g, rx, ry, rz);
+
+            // Reference: recompute from scratch with that emitter gone.
+            let mut reference = Grid::new(9, 9, 9);
+            reference.solid = g.solid.clone();
+            reference.emission = g.emission.clone();
+            propagate_block_light(&mut reference);
+
+            for i in 0..(9 * 9 * 9) {
+                assert_eq!(
+                    g.light[i], reference.light[i],
+                    "incremental removal diverged from full recompute"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn placing_solid_over_light_removes_it() {
+        // Light a corridor, then drop a solid wall mid-way and remove from
+        // there: the far side past the new wall goes dark.
+        let mut g = Grid::new(12, 3, 3);
+        for z in 0..3 {
+            for y in 0..3 {
+                for x in 0..12 {
+                    if !(y == 1 && z == 1) {
+                        g.set_solid(x, y, z);
+                    }
+                }
+            }
+        }
+        g.set_emission(0, 1, 1, 15);
+        propagate_block_light(&mut g);
+        assert!(g.get_light(8, 1, 1) > 0);
+
+        // Place a solid block at x=5 and remove light there.
+        g.set_solid(5, 1, 1);
+        remove_block_light(&mut g, 5, 1, 1);
+
+        // Near side still lit, far side past the wall dark.
+        assert!(g.get_light(4, 1, 1) > 0, "near side stays lit");
+        assert_eq!(g.get_light(5, 1, 1), 0, "the new solid is dark");
+        let reference_far = g.get_light(8, 1, 1);
+        assert_eq!(reference_far, 0, "far side past new wall went dark");
     }
 }
