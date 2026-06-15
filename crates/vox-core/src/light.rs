@@ -24,6 +24,10 @@
 /// Maximum light level (4-bit, ADR-0004).
 pub const MAX_LIGHT: u8 = 15;
 
+use crate::chunk::Chunk;
+use crate::coords::{CHUNK_SIZE, LocalPos};
+use crate::registry::BlockRegistry;
+
 /// A rectangular volume the propagator can read solidity/emission from and
 /// read/write light into. Coordinates are volume-local `(x, y, z)`, each in
 /// `0..dim(axis)`. Implementors decide how out-of-this-chunk borders are
@@ -251,6 +255,189 @@ fn neighbors(
         out.push((x, y, z - 1));
     }
     out.into_iter()
+}
+
+// ===========================================================================
+// Chunk adapter (Milestone 04 task 4)
+// ===========================================================================
+
+/// Light planes from a chunk's six face-neighbors, used as boundary input
+/// when relighting a chunk. `planes[face]` is the 32×32 light of the
+/// neighbor cells touching this chunk on that face (the neighbor's opposite
+/// face plane), or `None` if that neighbor isn't loaded (treated as dark).
+///
+/// Face order matches the registry/mesher: 0:+X 1:-X 2:+Y 3:-Y 4:+Z 5:-Z.
+/// In-plane index is `u + v * CHUNK_SIZE`, where (u, v) are the two axes
+/// perpendicular to the face, in ascending axis order (X faces: (y, z);
+/// Y faces: (x, z); Z faces: (x, y)).
+pub type NeighborLight = [Option<Vec<u8>>; 6];
+
+/// Read a chunk's outer-layer block-light on the given face as a 32×32 plane
+/// (same indexing as [`NeighborLight`]). Used to feed a neighbor's border in
+/// and to detect outgoing-border changes.
+pub fn chunk_light_plane(chunk: &Chunk, face: usize) -> Vec<u8> {
+    let n = CHUNK_SIZE;
+    let last = (n - 1) as u8;
+    let mut plane = vec![0u8; n * n];
+    for v in 0..n {
+        for u in 0..n {
+            let (lu, lv) = (u as u8, v as u8);
+            let pos = match face {
+                0 => LocalPos::new(last, lu, lv), // +X: x=last, (y,z)
+                1 => LocalPos::new(0, lu, lv),    // -X: x=0
+                2 => LocalPos::new(lu, last, lv), // +Y: y=last, (x,z)
+                3 => LocalPos::new(lu, 0, lv),    // -Y: y=0
+                4 => LocalPos::new(lu, lv, last), // +Z: z=last, (x,y)
+                _ => LocalPos::new(lu, lv, 0),    // -Z: z=0
+            };
+            plane[u + v * n] = chunk.block_light(pos);
+        }
+    }
+    plane
+}
+
+/// Padded volume: the chunk's 32³ voxels surrounded by a one-cell border
+/// (so dims are 34³). Center cells read solidity/emission from the chunk via
+/// the registry and hold writable light; border cells carry neighbor light
+/// (injected as "emission" so it floods inward) and are never written back.
+struct PaddedChunk<'a> {
+    chunk: &'a Chunk,
+    registry: &'a BlockRegistry,
+    emission: Vec<u8>, // 34³, border = neighbor light, center = block emission
+    light: Vec<u8>,    // 34³ scratch
+}
+
+const PAD: usize = CHUNK_SIZE + 2;
+
+impl<'a> PaddedChunk<'a> {
+    fn idx(x: usize, y: usize, z: usize) -> usize {
+        x + y * PAD + z * PAD * PAD
+    }
+
+    fn build(chunk: &'a Chunk, registry: &'a BlockRegistry, borders: &NeighborLight) -> Self {
+        let n = CHUNK_SIZE;
+        let mut emission = vec![0u8; PAD * PAD * PAD];
+
+        // Center: block emission (scratch coord = local + 1).
+        for pos in LocalPos::iter() {
+            let e = registry.emission(chunk.get(pos));
+            if e > 0 {
+                let i = Self::idx(
+                    pos.x() as usize + 1,
+                    pos.y() as usize + 1,
+                    pos.z() as usize + 1,
+                );
+                emission[i] = e;
+            }
+        }
+
+        // Borders: inject neighbor light as emission on the matching face.
+        for (face, plane) in borders.iter().enumerate() {
+            let Some(plane) = plane else { continue };
+            for v in 0..n {
+                for u in 0..n {
+                    let val = plane[u + v * n];
+                    if val == 0 {
+                        continue;
+                    }
+                    let (sx, sy, sz) = match face {
+                        0 => (n + 1, u + 1, v + 1), // +X border at scratch x=n+1
+                        1 => (0, u + 1, v + 1),     // -X border at x=0
+                        2 => (u + 1, n + 1, v + 1), // +Y
+                        3 => (u + 1, 0, v + 1),     // -Y
+                        4 => (u + 1, v + 1, n + 1), // +Z
+                        _ => (u + 1, v + 1, 0),     // -Z
+                    };
+                    emission[Self::idx(sx, sy, sz)] = val;
+                }
+            }
+        }
+
+        Self {
+            chunk,
+            registry,
+            emission,
+            light: vec![0u8; PAD * PAD * PAD],
+        }
+    }
+
+    /// Map a scratch coord to the chunk LocalPos if it's a center cell.
+    fn center_local(x: usize, y: usize, z: usize) -> Option<LocalPos> {
+        if (1..=CHUNK_SIZE).contains(&x)
+            && (1..=CHUNK_SIZE).contains(&y)
+            && (1..=CHUNK_SIZE).contains(&z)
+        {
+            Some(LocalPos::new((x - 1) as u8, (y - 1) as u8, (z - 1) as u8))
+        } else {
+            None
+        }
+    }
+}
+
+impl LightVolume for PaddedChunk<'_> {
+    fn dims(&self) -> [usize; 3] {
+        [PAD, PAD, PAD]
+    }
+    fn is_solid(&self, x: usize, y: usize, z: usize) -> bool {
+        // Border cells are non-solid (they only feed light in). Center cells
+        // use the registry's solidity for the block.
+        match Self::center_local(x, y, z) {
+            Some(pos) => self.registry.is_solid(self.chunk.get(pos)),
+            None => false,
+        }
+    }
+    fn emission(&self, x: usize, y: usize, z: usize) -> u8 {
+        self.emission[Self::idx(x, y, z)]
+    }
+    fn get_light(&self, x: usize, y: usize, z: usize) -> u8 {
+        self.light[Self::idx(x, y, z)]
+    }
+    fn set_light(&mut self, x: usize, y: usize, z: usize, level: u8) {
+        self.light[Self::idx(x, y, z)] = level;
+    }
+}
+
+/// Recompute a chunk's block light from scratch, given its neighbors' border
+/// light (ADR-0004). Writes the result into the chunk's light storage and
+/// returns `true` if the chunk's *outgoing* border light changed (so the
+/// caller can mark neighbors for relight — this is how light converges across
+/// chunk boundaries).
+///
+/// Light is derived, not persisted: call this on load/generation and after
+/// any block edit that affects light. Does not mark the chunk modified.
+pub fn relight_chunk(chunk: &mut Chunk, registry: &BlockRegistry, borders: &NeighborLight) -> bool {
+    // Snapshot outgoing borders before.
+    let before: Vec<Vec<u8>> = (0..6).map(|f| chunk_light_plane(chunk, f)).collect();
+
+    // Propagate in the padded volume (borrows chunk immutably), then copy the
+    // center light out into an owned buffer so the borrow can be released
+    // before we mutate the chunk's light.
+    let center: Vec<u8> = {
+        let mut vol = PaddedChunk::build(chunk, registry, borders);
+        propagate_block_light(&mut vol);
+        let mut out = vec![0u8; CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE];
+        for pos in LocalPos::iter() {
+            let i = PaddedChunk::idx(
+                pos.x() as usize + 1,
+                pos.y() as usize + 1,
+                pos.z() as usize + 1,
+            );
+            out[pos.index()] = vol.light[i];
+        }
+        out
+    };
+
+    // Write center light back into the chunk (fresh recompute).
+    chunk.clear_light();
+    for pos in LocalPos::iter() {
+        let level = center[pos.index()];
+        if level > 0 {
+            chunk.set_block_light(pos, level);
+        }
+    }
+
+    // Did any outgoing border change?
+    (0..6).any(|f| chunk_light_plane(chunk, f) != before[f])
 }
 
 #[cfg(test)]
@@ -577,5 +764,96 @@ mod tests {
         assert_eq!(g.get_light(5, 1, 1), 0, "the new solid is dark");
         let reference_far = g.get_light(8, 1, 1);
         assert_eq!(reference_far, 0, "far side past new wall went dark");
+    }
+
+    // ---- Chunk relight adapter ----
+
+    use crate::block::BlockId;
+    use crate::registry::{BlockRegistry, LAMP};
+
+    fn no_borders() -> NeighborLight {
+        [None, None, None, None, None, None]
+    }
+
+    #[test]
+    fn relight_empty_chunk_is_dark() {
+        let reg = BlockRegistry::default_set();
+        let mut chunk = Chunk::new_air();
+        let changed = relight_chunk(&mut chunk, &reg, &no_borders());
+        assert!(!chunk.has_light(), "no emitters → fully dark");
+        assert!(!changed, "no outgoing border change");
+    }
+
+    #[test]
+    fn relight_lamp_lights_neighborhood() {
+        let reg = BlockRegistry::default_set();
+        let mut chunk = Chunk::new_air();
+        // Lamp in the interior so falloff is visible without borders.
+        let lp = LocalPos::new(16, 16, 16);
+        chunk.set(lp, LAMP);
+        relight_chunk(&mut chunk, &reg, &no_borders());
+
+        assert_eq!(chunk.block_light(lp), 14, "lamp holds its emission");
+        assert_eq!(chunk.block_light(LocalPos::new(17, 16, 16)), 13);
+        assert_eq!(chunk.block_light(LocalPos::new(18, 16, 16)), 12);
+        // Far corner well beyond reach stays dark.
+        assert_eq!(chunk.block_light(LocalPos::new(0, 0, 0)), 0);
+    }
+
+    #[test]
+    fn relight_changes_border_when_light_reaches_edge() {
+        let reg = BlockRegistry::default_set();
+        let mut chunk = Chunk::new_air();
+        // Lamp near the -X edge so light reaches x=0.
+        chunk.set(LocalPos::new(2, 16, 16), LAMP);
+        let changed = relight_chunk(&mut chunk, &reg, &no_borders());
+        assert!(
+            changed,
+            "light reaching the edge changes the outgoing border"
+        );
+        // The -X plane (x=0) at the lamp's row should be lit.
+        let plane = chunk_light_plane(&chunk, 1); // NEG_X
+        assert!(
+            plane[16 + 16 * CHUNK_SIZE] > 0,
+            "edge plane lit at lamp row"
+        );
+    }
+
+    #[test]
+    fn border_light_flows_in_from_neighbor() {
+        // Simulate a bright neighbor on -X: inject a full-bright border plane
+        // and confirm light floods into this (otherwise dark) chunk.
+        let reg = BlockRegistry::default_set();
+        let mut chunk = Chunk::new_air();
+
+        let n = CHUNK_SIZE;
+        let mut neg_x_plane = vec![0u8; n * n];
+        // Neighbor's touching plane is bright (15) at one row.
+        neg_x_plane[16 + 16 * n] = 15;
+        let borders: NeighborLight = [None, Some(neg_x_plane), None, None, None, None];
+
+        relight_chunk(&mut chunk, &reg, &borders);
+
+        // The -X edge cell (x=0) at that row receives 15-1=14 (one step in).
+        assert_eq!(chunk.block_light(LocalPos::new(0, 16, 16)), 14);
+        assert_eq!(chunk.block_light(LocalPos::new(1, 16, 16)), 13);
+    }
+
+    #[test]
+    fn relight_clears_stale_light_when_lamp_removed() {
+        let reg = BlockRegistry::default_set();
+        let mut chunk = Chunk::new_air();
+        let lp = LocalPos::new(16, 16, 16);
+        chunk.set(lp, LAMP);
+        relight_chunk(&mut chunk, &reg, &no_borders());
+        assert!(chunk.has_light());
+
+        // Remove the lamp and relight from scratch.
+        chunk.set(lp, BlockId::AIR);
+        relight_chunk(&mut chunk, &reg, &no_borders());
+        assert!(
+            !chunk.has_light(),
+            "removing the only lamp clears all light"
+        );
     }
 }

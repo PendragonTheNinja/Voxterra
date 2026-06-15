@@ -16,6 +16,10 @@ pub mod world;
 pub use block::BlockId;
 pub use chunk::{CHUNK_FORMAT_VERSION, Chunk, ChunkDecodeError};
 pub use coords::{CHUNK_BITS, CHUNK_SIZE, CHUNK_VOLUME, ChunkPos, LocalPos, WorldPos};
+pub use light::{
+    LightVolume, MAX_LIGHT, NeighborLight, chunk_light_plane, propagate_block_light, relight_chunk,
+    remove_block_light,
+};
 pub use raycast::{RayHit, cell_overlaps_aabb, raycast_blocks, raycast_voxels};
 pub use registry::{BlockRegistry, BlockType};
 pub use storage::{StoreError, WORLD_META_VERSION, WorldStore};

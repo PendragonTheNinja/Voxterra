@@ -145,6 +145,48 @@ fn is_air_at(chunk: &Chunk, neighbors: &ChunkNeighbors, x: i32, y: i32, z: i32) 
     }
 }
 
+/// Block-light level at chunk-relative coords, reaching into the appropriate
+/// neighbor when one step outside `0..32` (mirrors [`is_air_at`]). Missing
+/// neighbors read as dark (0). A face samples the light of the (air) cell it
+/// looks into, so surfaces are lit by the light in front of them.
+fn light_at(chunk: &Chunk, neighbors: &ChunkNeighbors, x: i32, y: i32, z: i32) -> u8 {
+    let size = CHUNK_SIZE as i32;
+    let last = (size - 1) as u8;
+
+    let (target, local) = if x < 0 {
+        (neighbors.neg_x, LocalPos::new(last, y as u8, z as u8))
+    } else if x >= size {
+        (neighbors.pos_x, LocalPos::new(0, y as u8, z as u8))
+    } else if y < 0 {
+        (neighbors.neg_y, LocalPos::new(x as u8, last, z as u8))
+    } else if y >= size {
+        (neighbors.pos_y, LocalPos::new(x as u8, 0, z as u8))
+    } else if z < 0 {
+        (neighbors.neg_z, LocalPos::new(x as u8, y as u8, last))
+    } else if z >= size {
+        (neighbors.pos_z, LocalPos::new(x as u8, y as u8, 0))
+    } else {
+        return chunk.block_light(LocalPos::new(x as u8, y as u8, z as u8));
+    };
+
+    match target {
+        None => 0,
+        Some(neighbor) => neighbor.block_light(local),
+    }
+}
+
+/// Map a 0..=15 light level to a brightness multiplier. Non-linear so the
+/// falloff looks natural, with a small ambient floor so unlit areas are dim
+/// but not pure black (caves stay barely navigable). Combined multiplicatively
+/// with the directional face shading.
+fn light_curve(level: u8) -> f32 {
+    const AMBIENT: f32 = 0.06;
+    let t = (level as f32) / 15.0;
+    // Slight gamma so mid-levels read brighter; eases the linear band.
+    let curved = t.powf(0.85);
+    AMBIENT + (1.0 - AMBIENT) * curved
+}
+
 /// Unit vector along `axis`.
 fn axis_unit(axis: usize) -> [f32; 3] {
     let mut v = [0.0; 3];
@@ -248,6 +290,9 @@ pub fn mesh_chunk_naive(
             if positive {
                 base[axis] += 1.0;
             }
+            // Light the face by the cell it looks into (the air neighbor).
+            let light = light_at(chunk, neighbors, neighbor[0], neighbor[1], neighbor[2]);
+            let brightness = face_brightness(axis, positive) * light_curve(light);
             emit_rect(
                 &mut mesh,
                 base,
@@ -256,7 +301,7 @@ pub fn mesh_chunk_naive(
                 1.0,
                 1.0,
                 layer_of(block, face_index),
-                face_brightness(axis, positive),
+                brightness,
             );
         }
     }
@@ -286,12 +331,14 @@ pub fn mesh_chunk(
     }
 
     let size = CHUNK_SIZE;
-    // Per-slice visibility mask, reused across slices.
-    let mut mask: Vec<Option<BlockId>> = vec![None; size * size];
+    // Per-slice mask: each visible face cell carries its block AND the light
+    // level of the air cell it faces. Faces only merge when BOTH match, so a
+    // light gradient correctly subdivides the merged rectangles.
+    let mut mask: Vec<Option<(BlockId, u8)>> = vec![None; size * size];
     let at = |u: usize, v: usize| u + v * size;
 
     for (face_index, &(axis, positive, u_axis, v_axis)) in FACE_DIRS.iter().enumerate() {
-        let brightness = face_brightness(axis, positive);
+        let dir_shade = face_brightness(axis, positive);
         let u_dir = axis_unit(u_axis);
         let v_dir = axis_unit(v_axis);
 
@@ -320,7 +367,8 @@ pub fn mesh_chunk(
                     let mut n = coords;
                     n[axis] += if positive { 1 } else { -1 };
                     if is_air_at(chunk, neighbors, n[0], n[1], n[2]) {
-                        *cell = Some(block);
+                        let light = light_at(chunk, neighbors, n[0], n[1], n[2]);
+                        *cell = Some((block, light));
                         any = true;
                     } else {
                         *cell = None;
@@ -334,13 +382,14 @@ pub fn mesh_chunk(
             // --- Merge mask cells into maximal rectangles. ---
             for v0 in 0..size {
                 for u0 in 0..size {
-                    let Some(block) = mask[at(u0, v0)] else {
+                    let Some(key) = mask[at(u0, v0)] else {
                         continue;
                     };
+                    let (block, light) = key;
 
                     // Grow width along u.
                     let mut w = 1;
-                    while u0 + w < size && mask[at(u0 + w, v0)] == Some(block) {
+                    while u0 + w < size && mask[at(u0 + w, v0)] == Some(key) {
                         w += 1;
                     }
 
@@ -348,7 +397,7 @@ pub fn mesh_chunk(
                     let mut h = 1;
                     'grow: while v0 + h < size {
                         for du in 0..w {
-                            if mask[at(u0 + du, v0 + h)] != Some(block) {
+                            if mask[at(u0 + du, v0 + h)] != Some(key) {
                                 break 'grow;
                             }
                         }
@@ -377,7 +426,7 @@ pub fn mesh_chunk(
                         w as f32,
                         h as f32,
                         layer_of(block, face_index),
-                        brightness,
+                        dir_shade * light_curve(light),
                     );
                 }
             }
@@ -548,7 +597,7 @@ mod tests {
     // -----------------------------------------------------------------
 
     /// A unit face cell: (axis, outward sign, plane, a, b, layer).
-    type CellKey = (usize, bool, i32, i32, i32, u32);
+    type CellKey = (usize, bool, i32, i32, i32, u32, u32);
 
     /// Decompose a mesh into the unit face cells its quads cover.
     fn coverage(mesh: &MeshData) -> HashMap<CellKey, u32> {
@@ -571,6 +620,7 @@ mod tests {
                 mesh.vertices[bi + 3].position,
             ];
             let layer = mesh.vertices[bi].layer;
+            let bright = mesh.vertices[bi].brightness.to_bits();
             // All four corners of a quad must share the layer.
             assert!(
                 (0..4).all(|k| mesh.vertices[bi + k].layer == layer),
@@ -596,7 +646,8 @@ mod tests {
 
             for p in min1..max1 {
                 for q in min2..max2 {
-                    *map.entry((axis, positive, plane, p, q, layer)).or_insert(0) += 1;
+                    *map.entry((axis, positive, plane, p, q, layer, bright))
+                        .or_insert(0) += 1;
                 }
             }
         }
