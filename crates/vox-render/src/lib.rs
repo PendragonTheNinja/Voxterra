@@ -678,7 +678,7 @@ fn create_block_texture(
     layout: &wgpu::BindGroupLayout,
 ) -> wgpu::BindGroup {
     const TILE: u32 = 16;
-    const LAYERS: u32 = 7; // = registry DEFAULT_LAYER_COUNT
+    const LAYERS: u32 = 8; // = registry DEFAULT_LAYER_COUNT
 
     // Generate all layers back-to-back (the upload expects layers contiguous).
     let mut data = Vec::with_capacity((TILE * TILE * 4 * LAYERS) as usize);
@@ -763,6 +763,7 @@ fn tile_pixels(layer: u32, tile: u32) -> Vec<u8> {
         4 => [206, 192, 138], // sand
         5 => [120, 120, 126], // cobblestone
         6 => [156, 116, 70],  // planks
+        7 => [255, 236, 170], // lamp (warm, bright)
         _ => [255, 0, 255],   // magenta = missing
     };
     let mut px = Vec::with_capacity((tile * tile * 4) as usize);

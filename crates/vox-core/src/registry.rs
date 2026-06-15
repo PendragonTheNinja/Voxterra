@@ -50,6 +50,9 @@ pub struct BlockType {
     /// (task 2) replaces flat colors with atlas/array sampling. Remove when
     /// the mesher emits texture coords instead of colors.
     pub color: [f32; 3],
+    /// Block-light this block emits (0..=15), 0 for non-emitters. Seeds the
+    /// lighting flood-fill (Milestone 04, ADR-0004).
+    pub light_emission: u8,
 }
 
 impl BlockType {
@@ -60,6 +63,7 @@ impl BlockType {
             solid: true,
             faces: [layer; 6],
             color,
+            light_emission: 0,
         }
     }
 
@@ -71,6 +75,18 @@ impl BlockType {
             solid: true,
             faces: [side, side, top, bottom, side, side],
             color,
+            light_emission: 0,
+        }
+    }
+
+    /// A uniform-textured block that emits block light (e.g. a lamp).
+    const fn emitter(name: &'static str, layer: u32, color: [f32; 3], emission: u8) -> Self {
+        Self {
+            name,
+            solid: true,
+            faces: [layer; 6],
+            color,
+            light_emission: emission,
         }
     }
 
@@ -80,6 +96,7 @@ impl BlockType {
             solid: false,
             faces: [0; 6],
             color: [0.0, 0.0, 0.0],
+            light_emission: 0,
         }
     }
 }
@@ -92,6 +109,8 @@ pub const GRASS: BlockId = BlockId(3);
 pub const SAND: BlockId = BlockId(4);
 pub const COBBLESTONE: BlockId = BlockId(5);
 pub const PLANKS: BlockId = BlockId(6);
+/// A light-emitting block (Milestone 04). Solid, glows at near-max level.
+pub const LAMP: BlockId = BlockId(7);
 
 // --- Texture-array layer assignment (one layer per distinct tile). Used by
 // the texture pipeline in task 2; declared here so the registry is the
@@ -103,9 +122,13 @@ const L_GRASS_SIDE: u32 = 3;
 const L_SAND: u32 = 4;
 const L_COBBLE: u32 = 5;
 const L_PLANKS: u32 = 6;
-/// Number of texture-array layers the default registry references. The atlas
-/// / texture array built in task 2 must have at least this many layers.
-pub const DEFAULT_LAYER_COUNT: u32 = 7;
+const L_LAMP: u32 = 7;
+/// Number of texture-array layers the default registry references. The
+/// texture array built in M03 task 2 must have at least this many layers.
+pub const DEFAULT_LAYER_COUNT: u32 = 8;
+
+/// Block-light level emitted by the lamp block.
+pub const LAMP_EMISSION: u8 = 14;
 
 /// The registry of all known block types, indexed by `BlockId`.
 pub struct BlockRegistry {
@@ -131,6 +154,7 @@ impl BlockRegistry {
             BlockType::uniform("sand", L_SAND, [0.82, 0.76, 0.55]),   // 4
             BlockType::uniform("cobblestone", L_COBBLE, [0.50, 0.50, 0.52]), // 5
             BlockType::uniform("planks", L_PLANKS, [0.62, 0.46, 0.28]), // 6
+            BlockType::emitter("lamp", L_LAMP, [1.0, 0.93, 0.70], LAMP_EMISSION), // 7
         ];
         Self { types }
     }
@@ -146,6 +170,12 @@ impl BlockRegistry {
     #[inline]
     pub fn is_solid(&self, id: BlockId) -> bool {
         self.get(id).solid
+    }
+
+    /// Block-light this block emits (0..=15), 0 for non-emitters.
+    #[inline]
+    pub fn emission(&self, id: BlockId) -> u8 {
+        self.get(id).light_emission
     }
 
     /// Texture-array layer for a given face (see module docs for face index).
@@ -265,7 +295,25 @@ mod tests {
         let placeable: Vec<BlockId> = reg.placeable().collect();
         assert!(!placeable.contains(&AIR));
         assert!(placeable.contains(&STONE));
-        assert_eq!(placeable.len(), 6); // stone..planks
+        assert_eq!(placeable.len(), 7); // stone..lamp
+    }
+
+    #[test]
+    fn lamp_emits_others_dark() {
+        let reg = BlockRegistry::default_set();
+        assert_eq!(reg.emission(LAMP), LAMP_EMISSION);
+        assert!(reg.emission(LAMP) > 0);
+        assert_eq!(reg.emission(STONE), 0);
+        assert_eq!(reg.emission(GRASS), 0);
+        assert_eq!(reg.emission(AIR), 0);
+    }
+
+    #[test]
+    fn lamp_is_placeable_and_solid() {
+        let reg = BlockRegistry::default_set();
+        assert!(reg.is_solid(LAMP));
+        let placeable: Vec<BlockId> = reg.placeable().collect();
+        assert!(placeable.contains(&LAMP));
     }
 }
 

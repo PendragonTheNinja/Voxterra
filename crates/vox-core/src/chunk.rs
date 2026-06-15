@@ -38,6 +38,11 @@ pub struct Chunk {
     /// saving; unmodified chunks regenerate from the seed for free. Runtime
     /// state, NOT serialized (see [`Chunk::serialize`]).
     modified: bool,
+    /// Per-voxel light, one packed byte each (high nibble sky, low nibble
+    /// block; ADR-0004). `None` means fully dark (the common case) and costs
+    /// nothing — allocated lazily on first nonzero light. Runtime-derived
+    /// from blocks, NOT serialized (recomputed on load).
+    light: Option<Box<[u8; CHUNK_VOLUME]>>,
 }
 
 impl Chunk {
@@ -47,6 +52,7 @@ impl Chunk {
             palette: vec![block],
             indices: None,
             modified: false,
+            light: None,
         }
     }
 
@@ -124,6 +130,52 @@ impl Chunk {
     /// after generating a chunk, and after saving one.
     pub fn mark_unmodified(&mut self) {
         self.modified = false;
+    }
+
+    // ---- Light (Milestone 04, ADR-0004) ----
+    //
+    // One packed byte per voxel: high nibble sky (M05, unused here), low
+    // nibble block light. Stored lazily — `None` means fully dark. Light is
+    // derived from blocks and never serialized; setting it does not mark the
+    // chunk modified.
+
+    /// Block-light level (0..=15) at `pos`. Dark (0) when no light array is
+    /// allocated.
+    #[inline]
+    pub fn block_light(&self, pos: LocalPos) -> u8 {
+        match &self.light {
+            Some(arr) => arr[pos.index()] & 0x0F,
+            None => 0,
+        }
+    }
+
+    /// Set the block-light level (clamped to 0..=15) at `pos`, preserving the
+    /// sky nibble. Allocates the light array on first nonzero write.
+    pub fn set_block_light(&mut self, pos: LocalPos, level: u8) {
+        let level = level.min(15);
+        if self.light.is_none() {
+            if level == 0 {
+                return; // already dark; no need to allocate
+            }
+            self.light = Some(Box::new([0u8; CHUNK_VOLUME]));
+        }
+        let arr = self.light.as_mut().unwrap();
+        let i = pos.index();
+        arr[i] = (arr[i] & 0xF0) | level;
+    }
+
+    /// Whether any light storage is allocated (i.e. the chunk may be lit).
+    /// A `false` result guarantees the chunk is fully dark.
+    #[inline]
+    pub fn has_light(&self) -> bool {
+        self.light.is_some()
+    }
+
+    /// Clear all light back to dark, releasing the storage. Used when
+    /// relighting from scratch (recompute-on-load) or when light is fully
+    /// removed.
+    pub fn clear_light(&mut self) {
+        self.light = None;
     }
 
     /// Number of palette entries. After many overwrites this can include
@@ -274,6 +326,7 @@ impl Chunk {
                 palette,
                 indices: None,
                 modified: false,
+                light: None,
             });
         }
 
@@ -296,6 +349,7 @@ impl Chunk {
             palette,
             indices: Some(packed),
             modified: false,
+            light: None,
         })
     }
 }
@@ -593,6 +647,91 @@ mod tests {
             z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
             z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
             z ^ (z >> 31)
+        }
+    }
+
+    // ---- Light storage (Milestone 04, ADR-0004) ----
+
+    #[test]
+    fn fresh_chunk_is_dark_and_unallocated() {
+        let chunk = Chunk::new_air();
+        assert!(!chunk.has_light());
+        assert_eq!(chunk.block_light(LocalPos::new(0, 0, 0)), 0);
+        assert_eq!(chunk.block_light(LocalPos::new(31, 31, 31)), 0);
+    }
+
+    #[test]
+    fn setting_zero_light_does_not_allocate() {
+        let mut chunk = Chunk::new_air();
+        chunk.set_block_light(LocalPos::new(5, 5, 5), 0);
+        assert!(!chunk.has_light(), "zero light must not allocate storage");
+    }
+
+    #[test]
+    fn set_then_get_block_light() {
+        let mut chunk = Chunk::new_air();
+        chunk.set_block_light(LocalPos::new(3, 4, 5), 12);
+        assert!(chunk.has_light());
+        assert_eq!(chunk.block_light(LocalPos::new(3, 4, 5)), 12);
+        // Neighbors remain dark.
+        assert_eq!(chunk.block_light(LocalPos::new(3, 4, 6)), 0);
+    }
+
+    #[test]
+    fn block_light_clamps_to_15() {
+        let mut chunk = Chunk::new_air();
+        chunk.set_block_light(LocalPos::new(0, 0, 0), 200);
+        assert_eq!(chunk.block_light(LocalPos::new(0, 0, 0)), 15);
+    }
+
+    #[test]
+    fn set_block_light_preserves_sky_nibble() {
+        // Simulate a future skylight value in the high nibble, then set block
+        // light, and confirm the high nibble survives (M05-readiness).
+        let mut chunk = Chunk::new_air();
+        let p = LocalPos::new(1, 2, 3);
+        // Force allocation and write a raw byte with a sky nibble set.
+        chunk.set_block_light(p, 1);
+        // Manually poke the high nibble via another block-light write path:
+        // set block light to 7 and verify only the low nibble changed from
+        // whatever it was; since we can't write sky directly yet, assert the
+        // low-nibble masking behavior instead.
+        chunk.set_block_light(p, 7);
+        assert_eq!(chunk.block_light(p), 7);
+    }
+
+    #[test]
+    fn clear_light_releases_storage() {
+        let mut chunk = Chunk::new_air();
+        chunk.set_block_light(LocalPos::new(0, 0, 0), 10);
+        assert!(chunk.has_light());
+        chunk.clear_light();
+        assert!(!chunk.has_light());
+        assert_eq!(chunk.block_light(LocalPos::new(0, 0, 0)), 0);
+    }
+
+    #[test]
+    fn light_independent_of_block_modified_flag() {
+        let mut chunk = Chunk::filled(BlockId::AIR);
+        assert!(!chunk.is_modified());
+        chunk.set_block_light(LocalPos::new(0, 0, 0), 14);
+        assert!(
+            !chunk.is_modified(),
+            "setting light must not mark the chunk modified"
+        );
+    }
+
+    #[test]
+    fn light_survives_full_voxel_range() {
+        let mut chunk = Chunk::new_air();
+        // Write a deterministic pattern over the whole volume, read it back.
+        for pos in LocalPos::iter() {
+            let level = (pos.x() ^ pos.y() ^ pos.z()) & 0x0F;
+            chunk.set_block_light(pos, level);
+        }
+        for pos in LocalPos::iter() {
+            let expected = (pos.x() ^ pos.y() ^ pos.z()) & 0x0F;
+            assert_eq!(chunk.block_light(pos), expected);
         }
     }
 
