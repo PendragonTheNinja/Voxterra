@@ -1,6 +1,6 @@
 # Milestone 04 — Block Light
 
-- **Status:** Spec accepted, not started
+- **Status:** COMPLETE (2026-06-15)
 - **Spec written:** 2026-06-15
 - **Depends on:** Milestone 03
 
@@ -153,3 +153,113 @@ add/remove sources, with no full-world rebuild and stable framerate.
   baseline numbers, then write `05-skylight.md` (with its ADR for cubic-chunk
   skylight propagation — the heightmap-vs-boundary-propagation question)
   before any M05 code.
+
+
+## Retrospective (2026-06-15)
+
+**Status: COMPLETE.** All five tasks landed; all acceptance criteria met.
+Block light works end to end: place a lamp and it casts a smooth radial glow
+that fades with distance, stops at walls, blends with other lamps (brightest
+wins), and retracts cleanly when broken — across chunk boundaries, and
+surviving unload/reload (recomputed from blocks on load).
+
+### Measured baseline (record for future comparison)
+
+Dev machine: Windows, NVIDIA GPU, 20 logical cores. Settings unchanged
+(`LOAD_RADIUS = 8`, `UNLOAD_RADIUS = 10`, `MESH_BUDGET = 48`,
+`GEN_SPAWN_BUDGET = 64`).
+
+- **fps:** 142–146 sustained, **including during streaming bursts** (`gen`
+  spiking to 63/64, `dirty` to ~180–380) — matches the pre-lighting M03
+  baseline. Lighting added no steady-state or streaming framerate cost once
+  parallelized (see lesson below).
+- **Startup:** a one-time ~48 fps first second as the initial sphere lights
+  from cold, then immediately 144. Not a sustained cost.
+- **loaded:** ~2,670–2,980 (motion-dependent, bounded as before).
+- **meshes (`total`):** ~540–690; **drawn** ~150–290 after frustum cull.
+- **Editing:** placing/breaking lamps logs instantly; `dirty` spikes and
+  drains to 0 within a frame. No hitch.
+
+### Telemetry caught a real regression — again (the headline lesson)
+
+The task-5 baseline measurement immediately exposed a streaming fps
+regression: standing still and editing held 144 fps, but flying (chunks
+streaming in) dropped to **46–59 fps**. Cause: task 4 first wired relighting
+as a **sequential, main-thread loop** running before the parallel mesh —
+each freshly-loaded chunk ran a 34³ flood-fill BFS one after another, up to
+`MESH_BUDGET` per frame, serializing work that should be parallel. Invisible
+when idle (nothing dirty), brutal during streaming.
+
+Fix: split relighting into a **read-only parallel compute**
+(`compute_chunk_light` → owned light buffer, run across all cores via rayon
+exactly like `mesh_chunks_parallel`) and a **cheap sequential apply**
+(`apply_chunk_light`). The expensive BFS is now off the critical path; fps
+holds 144 through streaming. This is the same compute-parallel / apply-
+sequential shape meshing already uses, and the same "measure before you trust
+it" lesson as M02's dirty-set leak. Two milestones running, the baseline-
+measurement task has paid for itself by catching a real perf bug.
+
+### What went well
+
+- **Pure, deterministic worldgen kept paying off:** light is derived state,
+  recomputed from blocks on load rather than serialized, so the chunk format
+  never changed and light can't go stale vs. blocks.
+- **The borrowed-accessor pattern (LightVolume trait)** let the flood-fill
+  and two-phase removal be exhaustively unit-tested on tiny hand-built grids,
+  independent of Chunk/registry/renderer — including a fuzz test proving
+  incremental removal is byte-identical to a full recompute across 40 random
+  configurations.
+- **The dirty-set + neighbor-expansion path absorbed lighting** with no new
+  mechanism: relight feeds the same re-mesh/persist path, and border-change
+  detection re-dirties neighbors so light converges across chunks.
+- **The packed-u8 light byte (sky nibble reserved)** means M05 skylight is a
+  storage no-op.
+
+### Decisions worth remembering
+
+- **Relighting is parallel-compute + sequential-apply.** Any future
+  per-chunk work that's more than trivial must go on the parallel path, not a
+  main-thread loop. The idle-vs-streaming asymmetry hides such bugs from
+  casual testing — always measure under streaming load.
+- **Ambient floor = 0.06 is an interim value.** It's the brightness of a
+  fully-unlit surface, which becomes the nighttime/cave baseline once
+  skylight (M05) exists. Likely too bright for true night; re-tune during M05
+  when there's a bright daytime reference to contrast against. One-line change
+  (`light_curve` in vox-mesh).
+- **Light-aware greedy meshing:** faces now merge only when block AND light
+  match, so light gradients subdivide quads. Verified the greedy==naive
+  differential still holds on per-face brightness.
+
+### Carried into Milestone 05 (skylight)
+
+- Skylight uses the reserved high nibble + a second propagation pass over the
+  same `LightVolume` machinery. The mesher combines sky+block light (max of
+  the two channels) into `brightness`.
+- The hard part is **cubic-chunk skylight with no world ceiling**: there's no
+  fixed top to flood down from. Needs its own ADR (heightmap-per-column vs.
+  propagate-from-loaded-region-boundary, and how it re-propagates as chunks
+  stream in above). Write that ADR before any M05 code.
+- Re-tune the ambient floor once daytime exists.
+
+### Future roadmap note: seed-driven LOD / far view distance
+
+Captured here so the reasoning isn't lost (its own milestone later, not
+soon). Goal: see *much* farther than Minecraft via a level-of-detail system,
+with a toggleable near view distance and progressively coarser LOD shells
+beyond it dissolving into distance fog.
+
+The key design distinction from Distant Horizons: DH builds LODs from chunks
+the player has *already visited* (a cache). Voxterra's worldgen is **pure and
+deterministic** (seed + position → terrain, no history), so we can generate
+*coarse* LODs for never-visited chunks on demand, purely from the seed — far
+terrain appears in directions you've never flown. Strictly more capable than
+a visit-cache approach, and only possible because worldgen has no hidden
+state.
+
+Sketch: concentric shells of decreasing resolution (sample every 1 m, then
+4 m, 16 m, 64 m…); a cheaper worldgen path that computes only surface height
+(not full voxelization) for far LODs; LOD-aware meshing with crack-free
+stitching between adjacent LOD levels (the genuinely hard part — an ADR
+topic); concentric LOD streaming rings instead of one radius; distance fog at
+the far edge. Touches worldgen, meshing, streaming, and rendering — a large,
+high-value differentiator. Spec + stitching ADR when scheduled.

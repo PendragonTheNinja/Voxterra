@@ -132,8 +132,11 @@ beyond what the invariants above already require.
 
 ## Current status
 
-- **Active milestone:** 04 — Lighting (spec not yet written)
-- **Last completed milestone:** 03 — Blocks, Interaction, Textures (2026-06-15)
+- **Active milestone:** 05 — Skylight (spec not yet written)
+- **Last completed milestone:** 04 — Block Light (2026-06-15)
+- Completed milestones have retrospectives in `docs/milestones/`. A future
+  seed-driven LOD / far-view-distance system is noted at the end of the M04
+  retro (its own milestone when scheduled).
 - Milestones 02 (Infinite World, 2026-06-14) and 03 are complete; see their
   retrospectives in `docs/milestones/`.
 - Update this section at the end of every working session.
