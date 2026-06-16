@@ -560,40 +560,214 @@ pub fn compute_chunk_light(
     registry: &BlockRegistry,
     borders: &NeighborLight,
 ) -> (Vec<u8>, bool) {
-    let mut vol = PaddedChunk::build(chunk, registry, borders);
-    propagate_block_light(&mut vol);
+    compute_chunk_light_2ch(chunk, registry, borders, &NEIGHBOR_SKY_NONE, true)
+}
 
+/// Six neighbor sky-light planes (same shape/indexing as [`NeighborLight`]),
+/// used to feed skylight across chunk boundaries. `planes[face]` is the
+/// neighbor-in-that-direction's touching-face sky-light plane, or `None` if
+/// not loaded.
+pub type NeighborSky = [Option<Vec<u8>>; 6];
+
+const NEIGHBOR_SKY_NONE: NeighborSky = [None, None, None, None, None, None];
+
+/// Read a chunk's outer-layer **sky** light on the given face as a 32×32
+/// plane (same indexing as [`chunk_light_plane`], which reads block light).
+pub fn chunk_sky_plane(chunk: &Chunk, face: usize) -> Vec<u8> {
+    let n = CHUNK_SIZE;
+    let last = (n - 1) as u8;
+    let mut plane = vec![0u8; n * n];
+    for v in 0..n {
+        for u in 0..n {
+            let (lu, lv) = (u as u8, v as u8);
+            let pos = match face {
+                0 => LocalPos::new(last, lu, lv),
+                1 => LocalPos::new(0, lu, lv),
+                2 => LocalPos::new(lu, last, lv),
+                3 => LocalPos::new(lu, 0, lv),
+                4 => LocalPos::new(lu, lv, last),
+                _ => LocalPos::new(lu, lv, 0),
+            };
+            plane[u + v * n] = chunk.sky_light(pos);
+        }
+    }
+    plane
+}
+
+/// Compute both light channels for a chunk **without mutating it**, returning
+/// an owned 32³ buffer of packed bytes (high nibble sky, low nibble block;
+/// ADR-0004/0005) plus whether either outgoing border changed.
+///
+/// Block light floods from emitters + the block-light neighbor borders.
+/// Skylight floods from the sky neighbor borders, with the +Y face defaulting
+/// to open daylight (15) where no chunk is loaded above — so a chunk with
+/// nothing overhead is sky-lit, and a loaded chunk above instead feeds its
+/// own (possibly shadowed) sky downward (ADR-0005). When `do_sky` is false
+/// only block light is computed (sky stays 0) — used where skylight isn't
+/// wanted.
+pub fn compute_chunk_light_2ch(
+    chunk: &Chunk,
+    registry: &BlockRegistry,
+    block_borders: &NeighborLight,
+    sky_borders: &NeighborSky,
+    do_sky: bool,
+) -> (Vec<u8>, bool) {
+    // --- Block light (low nibble) ---
+    let block = {
+        let mut vol = PaddedChunk::build(chunk, registry, block_borders);
+        propagate_block_light(&mut vol);
+        let mut out = vec![0u8; CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE];
+        for pos in LocalPos::iter() {
+            out[pos.index()] = vol.light[PaddedChunk::idx(
+                pos.x() as usize + 1,
+                pos.y() as usize + 1,
+                pos.z() as usize + 1,
+            )];
+        }
+        out
+    };
+
+    // --- Sky light (high nibble) ---
+    let sky = if do_sky {
+        compute_padded_sky(chunk, registry, sky_borders)
+    } else {
+        vec![0u8; CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE]
+    };
+
+    // Pack: high nibble sky, low nibble block.
     let mut out = vec![0u8; CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE];
-    for pos in LocalPos::iter() {
-        let i = PaddedChunk::idx(
-            pos.x() as usize + 1,
-            pos.y() as usize + 1,
-            pos.z() as usize + 1,
-        );
-        out[pos.index()] = vol.light[i];
+    for i in 0..out.len() {
+        out[i] = (sky[i] << 4) | (block[i] & 0x0F);
     }
 
-    let changed = border_changed(chunk, &out);
+    let changed = packed_border_changed(chunk, &out);
     (out, changed)
 }
 
-/// Apply a light buffer (from [`compute_chunk_light`]) to a chunk's storage.
+/// Sky-light flood over a chunk's padded volume. Seeds the border ring from
+/// neighbor sky planes; the +Y border defaults to 15 (open sky) wherever no
+/// neighbor-above plane is supplied. Returns the center 32³ sky buffer.
+fn compute_padded_sky(chunk: &Chunk, registry: &BlockRegistry, sky: &NeighborSky) -> Vec<u8> {
+    let n = CHUNK_SIZE;
+    let mut light = vec![0u8; PAD * PAD * PAD];
+
+    // Solidity lookup for a padded coord (center from blocks; border non-solid).
+    let solid = |x: usize, y: usize, z: usize| -> bool {
+        match PaddedChunk::center_local(x, y, z) {
+            Some(pos) => registry.is_solid(chunk.get(pos)),
+            None => false,
+        }
+    };
+
+    // Seed border ring from neighbor sky planes. Face order 0:+X 1:-X 2:+Y
+    // 3:-Y 4:+Z 5:-Z. The +Y face (index 2) defaults to 15 (open sky) where
+    // no plane is given.
+    let mut queue: Vec<(usize, usize, usize)> = Vec::new();
+    let seed = |light: &mut [u8], queue: &mut Vec<(usize, usize, usize)>, x, y, z, val: u8| {
+        if val > 0 {
+            light[PaddedChunk::idx(x, y, z)] = val;
+            queue.push((x, y, z));
+        }
+    };
+
+    for v in 0..n {
+        for u in 0..n {
+            // +X (x = n+1), plane (y,z) = (u,v)
+            if let Some(p) = &sky[0] {
+                seed(&mut light, &mut queue, n + 1, u + 1, v + 1, p[u + v * n]);
+            }
+            // -X (x = 0)
+            if let Some(p) = &sky[1] {
+                seed(&mut light, &mut queue, 0, u + 1, v + 1, p[u + v * n]);
+            }
+            // +Y (y = n+1), plane (x,z) = (u,v) — open-sky default 15
+            let top_val = match &sky[2] {
+                Some(p) => p[u + v * n],
+                None => MAX_LIGHT,
+            };
+            seed(&mut light, &mut queue, u + 1, n + 1, v + 1, top_val);
+            // -Y (y = 0)
+            if let Some(p) = &sky[3] {
+                seed(&mut light, &mut queue, u + 1, 0, v + 1, p[u + v * n]);
+            }
+            // +Z (z = n+1), plane (x,y) = (u,v)
+            if let Some(p) = &sky[4] {
+                seed(&mut light, &mut queue, u + 1, v + 1, n + 1, p[u + v * n]);
+            }
+            // -Z (z = 0)
+            if let Some(p) = &sky[5] {
+                seed(&mut light, &mut queue, u + 1, v + 1, 0, p[u + v * n]);
+            }
+        }
+    }
+
+    // BFS with the sky rule (no attenuation straight down at full strength).
+    let mut head = 0;
+    while head < queue.len() {
+        let (x, y, z) = queue[head];
+        head += 1;
+        let level = light[PaddedChunk::idx(x, y, z)];
+        if level <= 1 {
+            continue;
+        }
+        for (nx, ny, nz) in neighbors(x, y, z, PAD, PAD, PAD) {
+            if solid(nx, ny, nz) {
+                continue;
+            }
+            let going_down = nx == x && nz == z && ny + 1 == y;
+            let spread = if going_down && level == MAX_LIGHT {
+                MAX_LIGHT
+            } else {
+                level - 1
+            };
+            let ni = PaddedChunk::idx(nx, ny, nz);
+            if light[ni] < spread {
+                light[ni] = spread;
+                queue.push((nx, ny, nz));
+            }
+        }
+    }
+
+    // Extract center 32³.
+    let mut out = vec![0u8; n * n * n];
+    for pos in LocalPos::iter() {
+        out[pos.index()] = light[PaddedChunk::idx(
+            pos.x() as usize + 1,
+            pos.y() as usize + 1,
+            pos.z() as usize + 1,
+        )];
+    }
+    out
+}
+
+/// Apply a packed light buffer (from [`compute_chunk_light_2ch`]) to a
+/// chunk's storage: high nibble → sky light, low nibble → block light.
 pub fn apply_chunk_light(chunk: &mut Chunk, light: &[u8]) {
     chunk.clear_light();
     for pos in LocalPos::iter() {
-        let level = light[pos.index()];
-        if level > 0 {
-            chunk.set_block_light(pos, level);
+        let packed = light[pos.index()];
+        let block = packed & 0x0F;
+        let sky = (packed >> 4) & 0x0F;
+        if block > 0 {
+            chunk.set_block_light(pos, block);
+        }
+        if sky > 0 {
+            chunk.set_sky_light(pos, sky);
         }
     }
 }
 
-/// Whether the outgoing border planes of `new_light` (a 32³ buffer) differ
-/// from the chunk's currently-stored light on any of the six faces.
-fn border_changed(chunk: &Chunk, new_light: &[u8]) -> bool {
+/// Whether the outgoing border planes of a packed `new_light` (32³) buffer
+/// differ from the chunk's currently-stored packed light on any of the six
+/// faces — checking both channels at once.
+fn packed_border_changed(chunk: &Chunk, new_light: &[u8]) -> bool {
     let n = CHUNK_SIZE;
     let last = (n - 1) as u8;
     let idx = |x: u8, y: u8, z: u8| LocalPos::new(x, y, z).index();
+    let current = |i: usize| {
+        let p = LocalPos::from_index(i);
+        (chunk.sky_light(p) << 4) | (chunk.block_light(p) & 0x0F)
+    };
     for v in 0..n {
         for u in 0..n {
             let (lu, lv) = (u as u8, v as u8);
@@ -606,7 +780,7 @@ fn border_changed(chunk: &Chunk, new_light: &[u8]) -> bool {
                 idx(lu, lv, 0),
             ];
             for &i in &faces {
-                if chunk.block_light(LocalPos::from_index(i)) != new_light[i] {
+                if current(i) != new_light[i] {
                     return true;
                 }
             }
@@ -615,11 +789,27 @@ fn border_changed(chunk: &Chunk, new_light: &[u8]) -> bool {
     false
 }
 
-/// Recompute a chunk's block light in place (compute + apply). Convenience
-/// for single-chunk use and tests; the streaming path uses the split
-/// [`compute_chunk_light`] / [`apply_chunk_light`] to parallelize.
+/// Recompute a chunk's **block light only**, in place (compute + apply).
+/// Convenience for single-chunk use and tests; preserves M04 semantics
+/// (no skylight). The streaming path uses [`compute_chunk_light_2ch`] /
+/// [`apply_chunk_light`] to compute both channels in parallel.
 pub fn relight_chunk(chunk: &mut Chunk, registry: &BlockRegistry, borders: &NeighborLight) -> bool {
-    let (light, changed) = compute_chunk_light(chunk, registry, borders);
+    let (light, changed) =
+        compute_chunk_light_2ch(chunk, registry, borders, &NEIGHBOR_SKY_NONE, false);
+    apply_chunk_light(chunk, &light);
+    changed
+}
+
+/// Recompute **both** light channels for a chunk in place (compute + apply).
+/// Convenience wrapper over [`compute_chunk_light_2ch`] for tests.
+pub fn relight_chunk_2ch(
+    chunk: &mut Chunk,
+    registry: &BlockRegistry,
+    block_borders: &NeighborLight,
+    sky_borders: &NeighborSky,
+) -> bool {
+    let (light, changed) =
+        compute_chunk_light_2ch(chunk, registry, block_borders, sky_borders, true);
     apply_chunk_light(chunk, &light);
     changed
 }
@@ -1176,6 +1366,102 @@ mod tests {
         assert!(
             !chunk.has_light(),
             "removing the only lamp clears all light"
+        );
+    }
+
+    // ---- Two-channel relight (Milestone 05 task 3) ----
+
+    fn no_sky() -> NeighborSky {
+        [None, None, None, None, None, None]
+    }
+
+    #[test]
+    fn two_channel_open_air_chunk_is_fully_skylit() {
+        // An all-air chunk with no neighbors → open top → sky 15 everywhere,
+        // block light 0 everywhere.
+        let reg = BlockRegistry::default_set();
+        let mut chunk = Chunk::new_air();
+        relight_chunk_2ch(&mut chunk, &reg, &no_borders(), &no_sky());
+        for pos in [
+            LocalPos::new(0, 0, 0),
+            LocalPos::new(31, 31, 31),
+            LocalPos::new(16, 0, 16),
+        ] {
+            assert_eq!(chunk.sky_light(pos), 15, "open air sky at {pos:?}");
+            assert_eq!(chunk.block_light(pos), 0, "no block light");
+        }
+    }
+
+    #[test]
+    fn two_channel_lamp_and_sky_coexist() {
+        // A lamp in open air: block light from the lamp AND full skylight, in
+        // separate nibbles, both present.
+        let reg = BlockRegistry::default_set();
+        let mut chunk = Chunk::new_air();
+        let lp = LocalPos::new(16, 16, 16);
+        chunk.set(lp, LAMP);
+        relight_chunk_2ch(&mut chunk, &reg, &no_borders(), &no_sky());
+
+        // Lamp cell: block light = emission; sky is 0 there (lamp is solid).
+        assert_eq!(chunk.block_light(lp), 14);
+        assert_eq!(chunk.sky_light(lp), 0, "solid lamp blocks sky in its cell");
+        // A nearby air cell: both channels lit.
+        let near = LocalPos::new(17, 16, 16);
+        assert_eq!(chunk.block_light(near), 13);
+        assert_eq!(chunk.sky_light(near), 15);
+    }
+
+    #[test]
+    fn two_channel_roof_casts_sky_shadow_not_block_shadow() {
+        // A solid roof slab high in the chunk; cells below are sky-shadowed.
+        let reg = BlockRegistry::default_set();
+        let mut chunk = Chunk::new_air();
+        // Roof at y=20 across the whole chunk.
+        for z in 0..32u8 {
+            for x in 0..32u8 {
+                chunk.set(LocalPos::new(x, 20, z), STONE);
+            }
+        }
+        relight_chunk_2ch(&mut chunk, &reg, &no_borders(), &no_sky());
+
+        // Above the roof: full sky.
+        assert_eq!(chunk.sky_light(LocalPos::new(16, 25, 16)), 15);
+        // Directly below the roof (sealed): no sky.
+        assert_eq!(chunk.sky_light(LocalPos::new(16, 10, 16)), 0);
+        assert_eq!(chunk.sky_light(LocalPos::new(16, 0, 16)), 0);
+    }
+
+    #[test]
+    fn two_channel_sky_flows_down_from_neighbor_above() {
+        // No solid blocks; supply a +Y neighbor whose bottom plane is full
+        // daylight (an open shaft coming from above) → sky floods down to 15.
+        let reg = BlockRegistry::default_set();
+        let mut chunk = Chunk::new_air();
+        let n = CHUNK_SIZE;
+        let plane = vec![15u8; n * n]; // neighbor-above bottom row all lit
+        let sky: NeighborSky = [None, None, Some(plane), None, None, None];
+        relight_chunk_2ch(&mut chunk, &reg, &no_borders(), &sky);
+
+        // Top cell receives 15 (down rule across boundary), and stays 15 down.
+        assert_eq!(chunk.sky_light(LocalPos::new(16, 31, 16)), 15);
+        assert_eq!(chunk.sky_light(LocalPos::new(16, 0, 16)), 15);
+    }
+
+    #[test]
+    fn two_channel_dark_neighbor_above_blocks_sky() {
+        // A +Y neighbor whose bottom plane is dark (it has a roof) → no sky
+        // enters from above; with no other source, the chunk is sky-dark.
+        let reg = BlockRegistry::default_set();
+        let mut chunk = Chunk::new_air();
+        let n = CHUNK_SIZE;
+        let plane = vec![0u8; n * n];
+        let sky: NeighborSky = [None, None, Some(plane), None, None, None];
+        relight_chunk_2ch(&mut chunk, &reg, &no_borders(), &sky);
+
+        assert_eq!(
+            chunk.sky_light(LocalPos::new(16, 31, 16)),
+            0,
+            "dark neighbor above => shadow (no open-sky default when plane given)"
         );
     }
 
