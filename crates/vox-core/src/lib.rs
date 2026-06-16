@@ -17,8 +17,9 @@ pub use block::BlockId;
 pub use chunk::{CHUNK_FORMAT_VERSION, Chunk, ChunkDecodeError};
 pub use coords::{CHUNK_BITS, CHUNK_SIZE, CHUNK_VOLUME, ChunkPos, LocalPos, WorldPos};
 pub use light::{
-    LightVolume, MAX_LIGHT, NeighborLight, apply_chunk_light, chunk_light_plane,
-    compute_chunk_light, propagate_block_light, relight_chunk, remove_block_light,
+    ColumnMap, LightVolume, MAX_LIGHT, NeighborLight, apply_chunk_light, chunk_column_heights,
+    chunk_column_occludes, chunk_light_plane, column_index, compute_chunk_light,
+    propagate_block_light, relight_chunk, remove_block_light,
 };
 pub use raycast::{RayHit, cell_overlaps_aabb, raycast_blocks, raycast_voxels};
 pub use registry::{BlockRegistry, BlockType};

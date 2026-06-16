@@ -164,8 +164,35 @@ impl Chunk {
         arr[i] = (arr[i] & 0xF0) | level;
     }
 
+    /// Sky-light level (0..=15) at `pos`, from the high nibble (ADR-0005).
+    /// Dark (0) when no light array is allocated. NOTE: an unallocated chunk
+    /// reads 0 here, but "open to sky" cells are assigned 15 by the relight
+    /// pass — storage default 0 is correct; daylight comes from propagation.
+    #[inline]
+    pub fn sky_light(&self, pos: LocalPos) -> u8 {
+        match &self.light {
+            Some(arr) => (arr[pos.index()] >> 4) & 0x0F,
+            None => 0,
+        }
+    }
+
+    /// Set the sky-light level (clamped to 0..=15) at `pos`, preserving the
+    /// block-light nibble. Allocates the light array on first nonzero write.
+    pub fn set_sky_light(&mut self, pos: LocalPos, level: u8) {
+        let level = level.min(15);
+        if self.light.is_none() {
+            if level == 0 {
+                return; // already dark; no need to allocate
+            }
+            self.light = Some(Box::new([0u8; CHUNK_VOLUME]));
+        }
+        let arr = self.light.as_mut().unwrap();
+        let i = pos.index();
+        arr[i] = (arr[i] & 0x0F) | (level << 4);
+    }
+
     /// Whether any light storage is allocated (i.e. the chunk may be lit).
-    /// A `false` result guarantees the chunk is fully dark.
+    /// A `false` result guarantees the chunk is fully dark (both channels).
     #[inline]
     pub fn has_light(&self) -> bool {
         self.light.is_some()
@@ -732,6 +759,84 @@ mod tests {
         for pos in LocalPos::iter() {
             let expected = (pos.x() ^ pos.y() ^ pos.z()) & 0x0F;
             assert_eq!(chunk.block_light(pos), expected);
+        }
+    }
+
+    // ---- Sky light (Milestone 05, ADR-0005) ----
+
+    #[test]
+    fn fresh_chunk_has_no_sky_light() {
+        let chunk = Chunk::new_air();
+        assert_eq!(chunk.sky_light(LocalPos::new(0, 0, 0)), 0);
+        assert_eq!(chunk.sky_light(LocalPos::new(31, 31, 31)), 0);
+    }
+
+    #[test]
+    fn set_then_get_sky_light() {
+        let mut chunk = Chunk::new_air();
+        chunk.set_sky_light(LocalPos::new(3, 4, 5), 15);
+        assert_eq!(chunk.sky_light(LocalPos::new(3, 4, 5)), 15);
+        assert_eq!(chunk.sky_light(LocalPos::new(3, 4, 6)), 0);
+    }
+
+    #[test]
+    fn sky_light_clamps_to_15() {
+        let mut chunk = Chunk::new_air();
+        chunk.set_sky_light(LocalPos::new(0, 0, 0), 200);
+        assert_eq!(chunk.sky_light(LocalPos::new(0, 0, 0)), 15);
+    }
+
+    #[test]
+    fn sky_and_block_light_are_independent() {
+        // THE key property: both channels share one byte without clobbering.
+        let mut chunk = Chunk::new_air();
+        let p = LocalPos::new(7, 8, 9);
+        chunk.set_block_light(p, 11);
+        chunk.set_sky_light(p, 13);
+        assert_eq!(chunk.block_light(p), 11, "block survived sky write");
+        assert_eq!(chunk.sky_light(p), 13, "sky survived block write");
+
+        // Overwrite one; the other is untouched.
+        chunk.set_block_light(p, 2);
+        assert_eq!(chunk.sky_light(p), 13);
+        assert_eq!(chunk.block_light(p), 2);
+        chunk.set_sky_light(p, 5);
+        assert_eq!(chunk.block_light(p), 2);
+        assert_eq!(chunk.sky_light(p), 5);
+    }
+
+    #[test]
+    fn setting_zero_sky_light_does_not_allocate() {
+        let mut chunk = Chunk::new_air();
+        chunk.set_sky_light(LocalPos::new(1, 1, 1), 0);
+        assert!(!chunk.has_light(), "zero sky light must not allocate");
+    }
+
+    #[test]
+    fn clear_light_clears_both_channels() {
+        let mut chunk = Chunk::new_air();
+        let p = LocalPos::new(2, 2, 2);
+        chunk.set_block_light(p, 9);
+        chunk.set_sky_light(p, 14);
+        chunk.clear_light();
+        assert_eq!(chunk.block_light(p), 0);
+        assert_eq!(chunk.sky_light(p), 0);
+    }
+
+    #[test]
+    fn both_channels_survive_full_voxel_range() {
+        let mut chunk = Chunk::new_air();
+        for pos in LocalPos::iter() {
+            let b = (pos.x() ^ pos.y()) & 0x0F;
+            let s = (pos.y() ^ pos.z()) & 0x0F;
+            chunk.set_block_light(pos, b);
+            chunk.set_sky_light(pos, s);
+        }
+        for pos in LocalPos::iter() {
+            let b = (pos.x() ^ pos.y()) & 0x0F;
+            let s = (pos.y() ^ pos.z()) & 0x0F;
+            assert_eq!(chunk.block_light(pos), b);
+            assert_eq!(chunk.sky_light(pos), s);
         }
     }
 

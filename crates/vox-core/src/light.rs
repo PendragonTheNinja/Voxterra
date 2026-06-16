@@ -272,6 +272,64 @@ fn neighbors(
 /// Y faces: (x, z); Z faces: (x, y)).
 pub type NeighborLight = [Option<Vec<u8>>; 6];
 
+// ---------------------------------------------------------------------------
+// Heightmap / sky occlusion (Milestone 05, ADR-0005)
+// ---------------------------------------------------------------------------
+//
+// Skylight needs to know, per (x, z) column, whether the sky is occluded
+// above a given cell. In a streaming cubic world the full column is never all
+// loaded, so we derive the top-boundary per chunk during relight: a chunk's
+// skylight comes in from the cells directly above it (its +Y neighbor), and
+// where there is no occluder above, that boundary is full daylight (15).
+//
+// These headless helpers compute a chunk's own per-column occlusion, used to
+// (a) feed the +Y neighbor's contribution downward and (b) decide a chunk's
+// open-top boundary when no +Y neighbor is loaded.
+
+/// `CHUNK_SIZE × CHUNK_SIZE` per-column data for one chunk, indexed
+/// `x + z * CHUNK_SIZE`.
+pub type ColumnMap = Vec<u8>;
+
+/// Index helper for a column map: `(x, z) -> x + z * CHUNK_SIZE`.
+#[inline]
+pub fn column_index(x: usize, z: usize) -> usize {
+    x + z * CHUNK_SIZE
+}
+
+/// For each `(x, z)` column in the chunk, the local Y (0..=31) of the highest
+/// sky-occluding (solid) block, or `None` if the column is entirely
+/// non-solid within this chunk. Used both for the heightmap and to know
+/// where skylight stops descending inside the chunk.
+pub fn chunk_column_heights(chunk: &Chunk, registry: &BlockRegistry) -> Vec<Option<u8>> {
+    let n = CHUNK_SIZE;
+    let mut heights = vec![None; n * n];
+    for z in 0..n {
+        for x in 0..n {
+            let mut top: Option<u8> = None;
+            // Scan from the top down; first solid is the column's height.
+            for y in (0..n).rev() {
+                let pos = LocalPos::new(x as u8, y as u8, z as u8);
+                if registry.is_solid(chunk.get(pos)) {
+                    top = Some(y as u8);
+                    break;
+                }
+            }
+            heights[column_index(x, z)] = top;
+        }
+    }
+    heights
+}
+
+/// Whether each `(x, z)` column of this chunk has *any* solid block — i.e.
+/// whether it would occlude sky for chunks below it. `true` at a column means
+/// a chunk below should NOT treat that column's top as open sky.
+pub fn chunk_column_occludes(chunk: &Chunk, registry: &BlockRegistry) -> Vec<bool> {
+    chunk_column_heights(chunk, registry)
+        .into_iter()
+        .map(|h| h.is_some())
+        .collect()
+}
+
 /// Read a chunk's outer-layer block-light on the given face as a 32×32 plane
 /// (same indexing as [`NeighborLight`]). Used to feed a neighbor's border in
 /// and to detect outgoing-border changes.
@@ -898,5 +956,59 @@ mod tests {
             !chunk.has_light(),
             "removing the only lamp clears all light"
         );
+    }
+
+    // ---- Heightmap / sky occlusion (Milestone 05) ----
+
+    use crate::registry::STONE;
+
+    #[test]
+    fn empty_chunk_has_no_column_heights() {
+        let reg = BlockRegistry::default_set();
+        let chunk = Chunk::new_air();
+        let h = chunk_column_heights(&chunk, &reg);
+        assert!(h.iter().all(|c| c.is_none()), "air columns are open");
+        let occ = chunk_column_occludes(&chunk, &reg);
+        assert!(occ.iter().all(|&o| !o));
+    }
+
+    #[test]
+    fn column_height_is_topmost_solid() {
+        let reg = BlockRegistry::default_set();
+        let mut chunk = Chunk::new_air();
+        // Stack of stone at (4, z=5) from y=0..=10; plus a floating block at 20.
+        for y in 0..=10u8 {
+            chunk.set(LocalPos::new(4, y, 5), STONE);
+        }
+        chunk.set(LocalPos::new(4, 20, 5), STONE);
+        let h = chunk_column_heights(&chunk, &reg);
+        assert_eq!(h[column_index(4, 5)], Some(20), "topmost solid wins");
+        // A neighbor column with only the low stack.
+        assert_eq!(h[column_index(0, 0)], None);
+    }
+
+    #[test]
+    fn full_floor_occludes_every_column() {
+        let reg = BlockRegistry::default_set();
+        let mut chunk = Chunk::new_air();
+        // Solid slab at y=0 across the whole chunk.
+        for z in 0..32u8 {
+            for x in 0..32u8 {
+                chunk.set(LocalPos::new(x, 0, z), STONE);
+            }
+        }
+        let occ = chunk_column_occludes(&chunk, &reg);
+        assert!(occ.iter().all(|&o| o), "every column occludes");
+        let h = chunk_column_heights(&chunk, &reg);
+        assert!(h.iter().all(|&c| c == Some(0)));
+    }
+
+    #[test]
+    fn air_block_does_not_occlude() {
+        let reg = BlockRegistry::default_set();
+        let mut chunk = Chunk::new_air();
+        chunk.set(LocalPos::new(1, 1, 1), BlockId::AIR); // no-op
+        let occ = chunk_column_occludes(&chunk, &reg);
+        assert!(!occ[column_index(1, 1)]);
     }
 }
