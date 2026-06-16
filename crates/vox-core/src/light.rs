@@ -257,6 +257,89 @@ fn neighbors(
     out.into_iter()
 }
 
+/// Propagate **sky light** through `vol` from scratch (Milestone 05,
+/// ADR-0005). Skylight enters from the top boundary (the open sky, or a
+/// neighbor above) and floods down and sideways. Two rules distinguish it
+/// from block light:
+///
+/// 1. **No attenuation straight down at full strength.** A downward step into
+///    a non-solid cell keeps the level unchanged *iff* the level is
+///    [`MAX_LIGHT`] (direct sunlight). A vertical shaft open to the sky stays
+///    15 all the way to the floor. (Restricting no-attenuation to level 15 is
+///    the classic behavior; it avoids non-physical pillars of dimmed diffuse
+///    light falling forever.)
+/// 2. **Open-top boundary = daylight.** `top_sky[x + z*dx]` is the skylight
+///    arriving from directly above each column — 15 for open sky, or a
+///    neighbor-above's value. Where it is 15 the top non-solid cell is 15
+///    (down rule across the boundary); otherwise it enters one dimmer.
+///
+/// All other steps (horizontal, upward) dim by one, like block light. Solid
+/// cells block skylight. This operates on whichever channel the
+/// [`LightVolume`] exposes via get/set_light (the chunk adapter points it at
+/// the sky nibble); it clears that channel first (from-scratch recompute).
+pub fn propagate_sky_light(vol: &mut impl LightVolume, top_sky: &[u8]) {
+    let [dx, dy, dz] = vol.dims();
+    debug_assert_eq!(top_sky.len(), dx * dz, "top_sky must be per-column (dx*dz)");
+
+    // Clear this channel first.
+    for z in 0..dz {
+        for y in 0..dy {
+            for x in 0..dx {
+                vol.set_light(x, y, z, 0);
+            }
+        }
+    }
+
+    // Seed the top layer from the incoming sky per column.
+    let mut queue: Vec<(usize, usize, usize)> = Vec::new();
+    let top_y = dy - 1;
+    for z in 0..dz {
+        for x in 0..dx {
+            if vol.is_solid(x, top_y, z) {
+                continue; // a roof at the very top blocks this column's sky
+            }
+            let incoming = top_sky[x + z * dx];
+            // Entering downward across the top boundary obeys the down rule.
+            let level = if incoming == MAX_LIGHT {
+                MAX_LIGHT
+            } else {
+                incoming.saturating_sub(1)
+            };
+            if level > 0 {
+                vol.set_light(x, top_y, z, level);
+                queue.push((x, top_y, z));
+            }
+        }
+    }
+
+    // BFS flood with the directional rules.
+    let mut head = 0;
+    while head < queue.len() {
+        let (x, y, z) = queue[head];
+        head += 1;
+        let level = vol.get_light(x, y, z);
+        if level <= 1 {
+            continue;
+        }
+        for (nx, ny, nz) in neighbors(x, y, z, dx, dy, dz) {
+            if vol.is_solid(nx, ny, nz) {
+                continue;
+            }
+            // Straight down means the neighbor is directly below (ny = y-1).
+            let going_down = nz == z && nx == x && ny + 1 == y;
+            let spread = if going_down && level == MAX_LIGHT {
+                MAX_LIGHT
+            } else {
+                level - 1
+            };
+            if vol.get_light(nx, ny, nz) < spread {
+                vol.set_light(nx, ny, nz, spread);
+                queue.push((nx, ny, nz));
+            }
+        }
+    }
+}
+
 // ===========================================================================
 // Chunk adapter (Milestone 04 task 4)
 // ===========================================================================
@@ -569,6 +652,11 @@ mod tests {
             let i = self.idx(x, y, z);
             self.solid[i] = true;
         }
+        #[allow(dead_code)]
+        fn clear_solid(&mut self, x: usize, y: usize, z: usize) {
+            let i = self.idx(x, y, z);
+            self.solid[i] = false;
+        }
         fn set_emission(&mut self, x: usize, y: usize, z: usize, e: u8) {
             let i = self.idx(x, y, z);
             self.emission[i] = e;
@@ -727,6 +815,139 @@ mod tests {
         assert!(behind > 0, "light should reach behind via the gap");
         // The blocked cell on the wall is dark.
         assert_eq!(g.get_light(3, 3, 1), 0);
+    }
+
+    // ---- Sky light propagation (Milestone 05) ----
+
+    /// Open sky over every column (all 15 incoming).
+    fn open_top(dx: usize, dz: usize) -> Vec<u8> {
+        vec![15u8; dx * dz]
+    }
+
+    #[test]
+    fn sky_open_flat_is_all_15() {
+        // Empty volume, open sky everywhere → every cell full daylight.
+        let mut g = Grid::new(5, 5, 5);
+        propagate_sky_light(&mut g, &open_top(5, 5));
+        for z in 0..5 {
+            for y in 0..5 {
+                for x in 0..5 {
+                    assert_eq!(g.get_light(x, y, z), 15, "open air cell {x},{y},{z}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sky_vertical_shaft_stays_15_to_floor() {
+        // Solid everywhere except a 1-wide vertical shaft of air at (2,*,2).
+        let mut g = Grid::new(5, 10, 5);
+        for z in 0..5 {
+            for y in 0..10 {
+                for x in 0..5 {
+                    if !(x == 2 && z == 2) {
+                        g.set_solid(x, y, z);
+                    }
+                }
+            }
+        }
+        propagate_sky_light(&mut g, &open_top(5, 5));
+        // No attenuation straight down: full 15 from top to floor.
+        for y in 0..10 {
+            assert_eq!(g.get_light(2, y, 2), 15, "shaft at y={y}");
+        }
+    }
+
+    #[test]
+    fn sky_horizontal_tunnel_darkens() {
+        // A vertical shaft, then a horizontal tunnel branching off its bottom.
+        let mut g = Grid::new(12, 8, 3);
+        // Fill solid, carve shaft at x=0 (all y, z=1) and a tunnel at y=0.
+        for z in 0..3 {
+            for y in 0..8 {
+                for x in 0..12 {
+                    g.set_solid(x, y, z);
+                }
+            }
+        }
+        // Shaft: x=0, z=1, all y open.
+        for y in 0..8 {
+            g.clear_solid(0, y, 1);
+        }
+        // Tunnel along x at y=0, z=1.
+        for x in 0..12 {
+            g.clear_solid(x, 0, 1);
+        }
+        propagate_sky_light(&mut g, &open_top(12, 3));
+
+        // Shaft bottom is 15 (came straight down).
+        assert_eq!(g.get_light(0, 0, 1), 15);
+        // Tunnel darkens by one per horizontal step away from the shaft.
+        assert_eq!(g.get_light(1, 0, 1), 14);
+        assert_eq!(g.get_light(2, 0, 1), 13);
+        assert_eq!(g.get_light(5, 0, 1), 10);
+    }
+
+    #[test]
+    fn sky_under_roof_is_shadowed() {
+        // A solid roof over an air cavity, with solid walls except open sky
+        // above the roof. The cavity beneath gets no direct sky.
+        let mut g = Grid::new(5, 5, 5);
+        // Roof slab at y=3 across the whole xz.
+        for z in 0..5 {
+            for x in 0..5 {
+                g.set_solid(x, 3, z);
+            }
+        }
+        propagate_sky_light(&mut g, &open_top(5, 5));
+        // Above the roof: lit.
+        assert_eq!(g.get_light(2, 4, 2), 15);
+        // Below the roof, sealed from the sides: dark.
+        assert_eq!(g.get_light(2, 2, 2), 0);
+        assert_eq!(g.get_light(2, 0, 2), 0);
+    }
+
+    #[test]
+    fn sky_roof_with_side_opening_lets_diffuse_in() {
+        // Roof at y=3, but the volume's sides are open (no walls), so daylight
+        // from the open columns beside the roof spills under it horizontally.
+        let mut g = Grid::new(7, 5, 3);
+        // Roof slab only covers x=2..=4 at y=3; rest open to sky.
+        for z in 0..3 {
+            for x in 2..=4 {
+                g.set_solid(x, 3, z);
+            }
+        }
+        propagate_sky_light(&mut g, &open_top(7, 3));
+        // Open column beside the roof is full daylight top-to-bottom.
+        assert_eq!(g.get_light(0, 0, 1), 15);
+        // Under the roof edge: lit by diffuse spill from the open side, dimmer.
+        let under_edge = g.get_light(2, 2, 1);
+        assert!(
+            under_edge > 0 && under_edge < 15,
+            "diffuse under roof edge: {under_edge}"
+        );
+        // Deeper under the roof center: dimmer still (or dark).
+        assert!(g.get_light(4, 2, 1) <= under_edge);
+    }
+
+    #[test]
+    fn sky_partial_top_boundary_occludes_some_columns() {
+        // Simulate a neighbor above occluding half the columns: top_sky = 0
+        // for x<3 (covered), 15 for x>=3 (open).
+        let mut g = Grid::new(6, 4, 2);
+        let mut top = vec![0u8; 6 * 2];
+        for z in 0..2 {
+            for x in 3..6 {
+                top[x + z * 6] = 15;
+            }
+        }
+        propagate_sky_light(&mut g, &top);
+        // Open side: full daylight.
+        assert_eq!(g.get_light(5, 3, 0), 15);
+        // Covered side top cell: no direct sky (0 incoming), only diffuse from
+        // the open side — so dimmer than 15.
+        assert!(g.get_light(0, 3, 0) < 15);
     }
 
     // ---- Removal (two-phase) ----
