@@ -1,7 +1,7 @@
 //! vox-app: the game binary. Window, event loop, fly camera, and the
 //! Milestone 00 test scene: one sine-wave chunk.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::Instant;
@@ -9,8 +9,8 @@ use std::time::Instant;
 use glam::{Mat4, Vec3};
 use rayon::prelude::*;
 use vox_core::{
-    cell_overlaps_aabb, BlockId, BlockRegistry, Chunk, ChunkPos, RayHit, Streamer, World, WorldPos,
-    WorldStore,
+    cell_overlaps_aabb, BlockId, BlockRegistry, Chunk, ChunkPos, LocalPos, RayHit, Streamer, World,
+    WorldPos, WorldStore,
 };
 use vox_mesh::{mesh_chunk, ChunkNeighbors, MeshData};
 use vox_render::Renderer;
@@ -49,9 +49,17 @@ const UNLOAD_RADIUS: i64 = 10;
 /// frame so a big initial load fills in progressively rather than spiking.
 const GEN_SPAWN_BUDGET: usize = 64;
 /// Meshing runs bounded-parallel on the main thread each frame (borrows the
-/// World immutably; see the streaming-tick comment). This caps how many
-/// dirty chunks are meshed+uploaded per frame.
-const MESH_BUDGET: usize = 48;
+/// World immutably; see the streaming-tick comment). Meshing and relighting
+/// are time-budgeted per frame (not capped to a fixed chunk count), so a burst
+/// of generation can't blow the frame: each pass runs parallel sub-batches
+/// until its time cap, then yields. Heavy chunks → fewer per frame, light
+/// chunks → more; frame time stays bounded.
+const MESH_SUBBATCH: usize = 24;
+const RELIGHT_SUBBATCH: usize = 64;
+const MESH_TIME_MS: f32 = 4.0;
+const RELIGHT_TIME_MS: f32 = 3.0;
+/// Chunk side length as i64, for heightmap/world-coordinate math.
+const CHUNK_SIZE_I: i64 = vox_core::CHUNK_SIZE as i64;
 
 /// How far (world units / blocks) the targeting raycast reaches from the
 /// camera for break/place interaction (M03).
@@ -82,32 +90,87 @@ fn digit_slot(code: KeyCode) -> Option<usize> {
     }
 }
 
-/// Compute block light for many chunks in parallel (rayon), read-only — each
-/// task reads its chunk plus neighbor border light and returns an owned light
-/// buffer + whether its outgoing border changed (ADR-0004). The caller then
-/// applies the buffers and re-dirties neighbors sequentially (cheap). This
-/// keeps relighting off the single-threaded path, like meshing.
+/// Build a chunk's heightmap-derived `top_sky` (CHUNK_SIZE², daylight
+/// entering each column from directly above: 15 open, 0 occluded). Free fn so
+/// it can run inside the parallel relight workers rather than serially on the
+/// main thread (the serial version was ~12 ms/frame at full budget).
+fn top_sky_from_heightmap(heights: &HashMap<(i64, i64), i64>, pos: ChunkPos) -> Vec<u8> {
+    let origin = pos.origin();
+    let mut top = vec![0u8; (CHUNK_SIZE_I * CHUNK_SIZE_I) as usize];
+    for lz in 0..CHUNK_SIZE_I {
+        for lx in 0..CHUNK_SIZE_I {
+            let h = heights
+                .get(&(origin.x + lx, origin.z + lz))
+                .copied()
+                .unwrap_or(i64::MIN);
+            // Inject full daylight at the chunk's TOP FACE only when the column
+            // is open through this ENTIRE chunk — i.e. the highest solid is
+            // below the chunk's floor. Then 15 legitimately fills the column
+            // top-to-bottom (it's all air to the surface, which lies below).
+            //
+            // When the surface lies INSIDE this chunk (origin.y <= h), we must
+            // NOT blanket the ceiling with 15 — that would flood daylight down
+            // past the surface into sealed air below it (the cave-lit bug).
+            // Instead leave the top face at 0 here; the real daylight enters
+            // from the chunk ABOVE via its -Y sky plane (the +Y neighbor border)
+            // and BFS-floods down only through actual air, stopping at the
+            // surface solid. Sealed shafts below the surface stay dark.
+            top[(lx + lz * CHUNK_SIZE_I) as usize] =
+                if h < origin.y { vox_core::MAX_LIGHT } else { 0 };
+        }
+    }
+    top
+}
+
+/// Compute both light channels for many chunks in parallel (rayon),
+/// read-only. Each worker builds its own heightmap-derived `top_sky` (so that
+/// work is parallel, not serial), reads neighbor borders, and returns the
+/// packed buffer plus `interior_changed` (→ needs re-mesh) and
+/// `border_changed` (→ neighbors need a relight check). Skylight's vertical
+/// fill comes from `top_sky`, so there's no dependence on the +Y neighbor
+/// being relit first — no vertical cascade (ADR-0005).
 #[allow(clippy::type_complexity)]
 fn relight_chunks_parallel(
     world: &World,
     registry: &BlockRegistry,
+    heights: &HashMap<(i64, i64), i64>,
     positions: &[ChunkPos],
-) -> Vec<(ChunkPos, Vec<u8>, bool)> {
-    // Neighbor face → the neighbor's opposite face plane that touches us.
+) -> Vec<(ChunkPos, Vec<u8>, bool, bool)> {
     const OPPOSITE: [usize; 6] = [1, 0, 3, 2, 5, 4];
     positions
         .par_iter()
         .filter_map(|&pos| {
             let chunk = world.chunk(pos)?;
-            let mut borders: vox_core::NeighborLight = [None, None, None, None, None, None];
+            let top_sky = top_sky_from_heightmap(heights, pos);
+            let mut block_borders: vox_core::NeighborLight = [None, None, None, None, None, None];
+            let mut sky_borders: vox_core::NeighborSky = [None, None, None, None, None, None];
             for (face, (dx, dy, dz)) in NEIGHBOR_OFFSETS.iter().enumerate() {
                 let npos = ChunkPos::new(pos.x + dx, pos.y + dy, pos.z + dz);
                 if let Some(n) = world.chunk(npos) {
-                    borders[face] = Some(vox_core::chunk_light_plane(n, OPPOSITE[face]));
+                    block_borders[face] = Some(vox_core::chunk_light_plane(n, OPPOSITE[face]));
+                    // Pass all sky borders EXCEPT -Y (face 3): sky never flows
+                    // up. The +Y face (2) carries real daylight DOWN from the
+                    // chunk above (shafts/caves below the natural surface); the
+                    // heightmap top_sky handles the open-air region above it.
+                    if face != 3 {
+                        sky_borders[face] = Some(vox_core::chunk_sky_plane(n, OPPOSITE[face]));
+                    }
                 }
             }
-            let (light, changed) = vox_core::compute_chunk_light(chunk, registry, &borders);
-            Some((pos, light, changed))
+            let (light, border_changed) = vox_core::compute_chunk_light_2ch(
+                chunk,
+                registry,
+                &block_borders,
+                &sky_borders,
+                &top_sky,
+                true,
+            );
+            let interior_changed = (0..light.len()).any(|i| {
+                let p = LocalPos::from_index(i);
+                let cur = (chunk.sky_light(p) << 4) | (chunk.block_light(p) & 0x0F);
+                cur != light[i]
+            });
+            Some((pos, light, interior_changed, border_changed))
         })
         .collect()
 }
@@ -139,19 +202,51 @@ fn mesh_chunks_parallel(
 // Fly camera
 // ---------------------------------------------------------------------------
 
+/// How the player moves through the world.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MoveMode {
+    /// Free-fly noclip (the original behavior): WASD relative to yaw,
+    /// Space/Shift for vertical, Ctrl to sprint. Passes through blocks.
+    Spectator,
+    /// Grounded survival movement: gravity, jumping, AABB collision against
+    /// solid blocks, Minecraft-style auto-step over single-block ledges.
+    Survival,
+}
+
 struct FlyCamera {
+    /// Eye position in world blocks. In survival the player AABB hangs below
+    /// this by `EYE_HEIGHT`.
     position: Vec3,
     /// Radians. 0 looks along +X; positive turns toward +Z.
     yaw: f32,
     /// Radians, clamped to ±~89° so the view never flips.
     pitch: f32,
+    /// World-space velocity (m/s). Used by survival physics; spectator ignores
+    /// it (moves position directly).
+    velocity: Vec3,
+    /// Whether the player is standing on solid ground (survival).
+    on_ground: bool,
+    mode: MoveMode,
 }
 
 impl FlyCamera {
-    const SPEED: f32 = 30.0; // m/s
-    const SPRINT_MULTIPLIER: f32 = 4.0; // hold Ctrl
+    const SPEED: f32 = 30.0; // m/s (spectator)
+    const SPRINT_MULTIPLIER: f32 = 4.0; // hold Ctrl (spectator)
     const SENSITIVITY: f32 = 0.0022; // radians per mouse count
     const PITCH_LIMIT: f32 = 1.55; // just under PI/2
+
+    // --- Survival tuning (Minecraft-like) ---
+    /// Player collision box: 0.6 × 1.8 × 0.6 blocks.
+    const HALF_WIDTH: f32 = 0.3;
+    const HEIGHT: f32 = 1.8;
+    /// Eye sits near the top of the box (MC eye height ~1.62).
+    const EYE_HEIGHT: f32 = 1.62;
+    const WALK_SPEED: f32 = 4.317; // m/s, MC walking
+    const SPRINT_SPEED: f32 = 5.612; // m/s, MC sprinting
+    const GRAVITY: f32 = 28.0; // m/s² (tuned for snappy MC-ish fall)
+    const JUMP_SPEED: f32 = 9.0; // m/s initial (clears ~1.25 blocks)
+    const STEP_HEIGHT: f32 = 0.6; // auto-step over single blocks
+    const TERMINAL_FALL: f32 = 78.0; // m/s clamp
 
     fn forward(&self) -> Vec3 {
         Vec3::new(
@@ -167,7 +262,8 @@ impl FlyCamera {
             .clamp(-Self::PITCH_LIMIT, Self::PITCH_LIMIT);
     }
 
-    fn update(&mut self, keys: &HashSet<KeyCode>, dt: f32) {
+    /// Spectator free-fly: move the eye directly, no collision.
+    fn update_spectator(&mut self, keys: &HashSet<KeyCode>, dt: f32) {
         // Horizontal movement follows yaw only (classic fly-cam feel);
         // Space/Shift move straight up/down in world space.
         let flat_forward = Vec3::new(self.yaw.cos(), 0.0, self.yaw.sin());
@@ -201,6 +297,22 @@ impl FlyCamera {
             };
             self.position += dir.normalize() * speed * dt;
         }
+    }
+
+    /// The player AABB (min, max) in world blocks, derived from the eye.
+    fn aabb(&self) -> ([f64; 3], [f64; 3]) {
+        let feet_y = self.position.y - Self::EYE_HEIGHT;
+        let min = [
+            (self.position.x - Self::HALF_WIDTH) as f64,
+            feet_y as f64,
+            (self.position.z - Self::HALF_WIDTH) as f64,
+        ];
+        let max = [
+            (self.position.x + Self::HALF_WIDTH) as f64,
+            (feet_y + Self::HEIGHT) as f64,
+            (self.position.z + Self::HALF_WIDTH) as f64,
+        ];
+        (min, max)
     }
 
     /// View-projection matrix built with the camera positioned **relative to
@@ -243,6 +355,16 @@ struct App {
     /// Chunks needing a (re)mesh: newly generated chunks and any loaded
     /// neighbor whose border faces may have changed.
     dirty: HashSet<ChunkPos>,
+    /// Chunks needing a light recompute, kept separate from `dirty` so that
+    /// cross-chunk light convergence does cheap parallel relighting without
+    /// forcing an expensive re-mesh of every rippled chunk (ADR-0005).
+    relight: HashSet<ChunkPos>,
+    /// Per-column heightmap: world `(x, z)` → highest solid block world-Y
+    /// among loaded chunks. Drives the skylight top boundary directly, so each
+    /// chunk computes its daylight in one pass without waiting on its vertical
+    /// neighbors to be relit (avoids the skylight cascade; ADR-0005). Absent
+    /// key = no solid known in that column = fully open to sky.
+    column_heights: HashMap<(i64, i64), i64>,
     /// Block currently under the crosshair (raycast result), or none.
     targeted: Option<RayHit>,
     /// Block type placed on right-click (M03 task 4). Cycled with number
@@ -280,6 +402,9 @@ impl Default for App {
                 position: Vec3::new(0.0, 60.0, 0.0),
                 yaw: std::f32::consts::FRAC_PI_4,
                 pitch: -0.45,
+                velocity: Vec3::ZERO,
+                on_ground: false,
+                mode: MoveMode::Spectator,
             },
             keys: HashSet::new(),
             cursor_captured: false,
@@ -291,6 +416,8 @@ impl Default for App {
             store,
             gen_in_flight: HashSet::new(),
             dirty: HashSet::new(),
+            relight: HashSet::new(),
+            column_heights: HashMap::new(),
             targeted: None,
             selected_block: vox_core::registry::STONE,
             gen_tx,
@@ -303,14 +430,275 @@ impl Default for App {
 }
 
 impl App {
-    /// Mark a chunk and its six face-neighbors dirty (needing a re-mesh).
-    /// A chunk's border faces depend on its neighbors, so any edit or
-    /// load/unload of a chunk can change its neighbors' meshes.
+    /// True if the given world-space AABB overlaps any solid block. Scans the
+    /// integer block cells the box spans (loaded chunks only; unloaded reads as
+    /// air, so you won't fall through the world unless it's genuinely ungen).
+    fn aabb_hits_solid(&self, min: [f64; 3], max: [f64; 3]) -> bool {
+        let lo = [
+            min[0].floor() as i64,
+            min[1].floor() as i64,
+            min[2].floor() as i64,
+        ];
+        let hi = [
+            (max[0] - 1e-6).floor() as i64,
+            (max[1] - 1e-6).floor() as i64,
+            (max[2] - 1e-6).floor() as i64,
+        ];
+        for bx in lo[0]..=hi[0] {
+            for by in lo[1]..=hi[1] {
+                for bz in lo[2]..=hi[2] {
+                    let wp = WorldPos::new(bx, by, bz);
+                    if self.registry.is_solid(self.world.get_block(wp))
+                        && cell_overlaps_aabb(wp, min, max)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Move the player's eye by `delta` along one axis with AABB collision: if
+    /// the moved box hits a solid, cancel the motion on that axis. Returns
+    /// whether a collision blocked it.
+    fn move_axis(&self, cam: &mut FlyCamera, axis: usize, delta: f32) -> bool {
+        if delta == 0.0 {
+            return false;
+        }
+        let saved = cam.position;
+        cam.position[axis] += delta;
+        let (min, max) = cam.aabb();
+        if self.aabb_hits_solid(min, max) {
+            cam.position = saved;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Survival physics step: gravity, jump, WASD (yaw-relative), per-axis AABB
+    /// collision, and Minecraft-style auto-step over single-block ledges.
+    fn physics_update(&mut self, dt: f32) {
+        let mut cam = FlyCamera {
+            position: self.camera.position,
+            yaw: self.camera.yaw,
+            pitch: self.camera.pitch,
+            velocity: self.camera.velocity,
+            on_ground: self.camera.on_ground,
+            mode: self.camera.mode,
+        };
+
+        // Horizontal velocity from input (yaw-relative).
+        let flat_forward = Vec3::new(cam.yaw.cos(), 0.0, cam.yaw.sin());
+        let right = Vec3::new(-cam.yaw.sin(), 0.0, cam.yaw.cos());
+        let mut wish = Vec3::ZERO;
+        if self.keys.contains(&KeyCode::KeyW) {
+            wish += flat_forward;
+        }
+        if self.keys.contains(&KeyCode::KeyS) {
+            wish -= flat_forward;
+        }
+        if self.keys.contains(&KeyCode::KeyD) {
+            wish += right;
+        }
+        if self.keys.contains(&KeyCode::KeyA) {
+            wish -= right;
+        }
+        let speed = if self.keys.contains(&KeyCode::ControlLeft) {
+            FlyCamera::SPRINT_SPEED
+        } else {
+            FlyCamera::WALK_SPEED
+        };
+        let horiz = if wish != Vec3::ZERO {
+            wish.normalize() * speed
+        } else {
+            Vec3::ZERO
+        };
+        cam.velocity.x = horiz.x;
+        cam.velocity.z = horiz.z;
+
+        // Jump only when grounded.
+        if cam.on_ground && self.keys.contains(&KeyCode::Space) {
+            cam.velocity.y = FlyCamera::JUMP_SPEED;
+            cam.on_ground = false;
+        }
+
+        // Gravity (clamped to terminal velocity).
+        cam.velocity.y -= FlyCamera::GRAVITY * dt;
+        if cam.velocity.y < -FlyCamera::TERMINAL_FALL {
+            cam.velocity.y = -FlyCamera::TERMINAL_FALL;
+        }
+
+        // Vertical first, with collision → sets grounded state.
+        let dy = cam.velocity.y * dt;
+        let hit_y = self.move_axis(&mut cam, 1, dy);
+        if hit_y {
+            cam.on_ground = dy < 0.0;
+            cam.velocity.y = 0.0;
+        } else {
+            cam.on_ground = false;
+        }
+
+        // Then horizontal, with auto-step over single-block ledges.
+        let dx = cam.velocity.x * dt;
+        let dz = cam.velocity.z * dt;
+        self.move_horizontal_with_step(&mut cam, dx, dz);
+
+        self.camera.position = cam.position;
+        self.camera.velocity = cam.velocity;
+        self.camera.on_ground = cam.on_ground;
+    }
+
+    /// Horizontal motion on X and Z; if an axis is blocked while grounded,
+    /// retry after stepping up (auto-step over 1-block ledges), then drop back
+    /// down onto the ledge.
+    fn move_horizontal_with_step(&self, cam: &mut FlyCamera, dx: f32, dz: f32) {
+        for (axis, d) in [(0usize, dx), (2usize, dz)] {
+            if d == 0.0 {
+                continue;
+            }
+            let before_axis = cam.position[axis];
+            let blocked = self.move_axis(cam, axis, d);
+            if blocked && cam.on_ground {
+                let lifted = self.move_axis(cam, 1, FlyCamera::STEP_HEIGHT);
+                if !lifted {
+                    let still_blocked = self.move_axis(cam, axis, d);
+                    let _ = self.move_axis(cam, 1, -FlyCamera::STEP_HEIGHT);
+                    if still_blocked {
+                        cam.position[axis] = before_axis;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Mark a chunk and its six face-neighbors dirty (re-mesh) and queued for
+    /// relight. Border faces and border light both depend on neighbors.
     fn mark_dirty_with_neighbors(&mut self, c: ChunkPos) {
         self.dirty.insert(c);
+        self.relight.insert(c);
         for (dx, dy, dz) in NEIGHBOR_OFFSETS {
-            self.dirty
-                .insert(ChunkPos::new(c.x + dx, c.y + dy, c.z + dz));
+            let n = ChunkPos::new(c.x + dx, c.y + dy, c.z + dz);
+            self.dirty.insert(n);
+            self.relight.insert(n);
+        }
+    }
+
+    /// Fold a freshly-loaded/edited chunk's columns into the heightmap. For
+    /// each column, raise the stored world-Y to the chunk's highest solid
+    /// block in that column. If a column's height rises, the chunk(s) below in
+    /// that column become newly shadowed and must relight — so we queue the
+    /// chunk directly below for relight (the shadow then propagates further
+    /// down through normal border convergence, but only where it actually
+    /// changes). Returns nothing; updates `column_heights` and `relight`.
+    fn update_heightmap_for(&mut self, pos: ChunkPos) {
+        let Some(chunk) = self.world.chunk(pos) else {
+            return;
+        };
+        let heights = vox_core::chunk_column_heights(chunk, &self.registry);
+        let origin = pos.origin();
+        let mut any_raised = false;
+        for lz in 0..(CHUNK_SIZE_I) {
+            for lx in 0..(CHUNK_SIZE_I) {
+                let local_top = heights[(lx + lz * CHUNK_SIZE_I) as usize];
+                let Some(ly) = local_top else { continue };
+                let world_y = origin.y + ly as i64;
+                let key = (origin.x + lx, origin.z + lz);
+                let e = self.column_heights.entry(key).or_insert(i64::MIN);
+                if world_y > *e {
+                    *e = world_y;
+                    any_raised = true;
+                }
+            }
+        }
+        if any_raised {
+            // The chunk directly below may now be shadowed; relight it.
+            let below = ChunkPos::new(pos.x, pos.y - 1, pos.z);
+            if self.world.chunk(below).is_some() {
+                self.relight.insert(below);
+            }
+        }
+    }
+
+    /// Recompute one world column's height by scanning the loaded chunks in
+    /// that column from the top down (used after an edit, which can raise OR
+    /// lower a column). Updates the heightmap and queues the column's loaded
+    /// chunks for relight so shadows appear/clear correctly.
+    /// Recompute one world column's height by scanning the loaded chunks in
+    /// that column from the top down (used after an edit, which can raise OR
+    /// lower a column). Updates the heightmap, then re-relights the affected
+    /// region so player builds cast correct shadows.
+    ///
+    /// This is only ever called from an edit (place/break), which always
+    /// changes block topology, so we relight unconditionally — NOT only when
+    /// the column's max height moved. A build can change interior light
+    /// (hollowing a room, roofing an area) without changing the column max, and
+    /// those cells still need recomputing. We relight:
+    ///   - every loaded chunk in the edited column (the vertical shadow), and
+    ///   - their ±X/±Z horizontal neighbors, because skylight under an overhang
+    ///     is fed by diffuse light bleeding in from open sides; if those
+    ///     neighbors aren't relit, level-15 sky keeps leaking under the build.
+    ///
+    /// Border-change convergence in `stream_tick` then carries any further
+    /// ripple, but only where light actually changes.
+    /// Re-relight the region affected by an edit at world column (wx, wz), and
+    /// RAISE the heightmap if the edit added solid above the recorded surface.
+    ///
+    /// Crucially this never LOWERS the heightmap. The heightmap models the
+    /// natural sky surface (highest solid that has open sky above it); digging
+    /// down must NOT mark the column "open" below the dig, or daylight would
+    /// flood the shaft floor and bleed into side tunnels (the old bug). Below
+    /// the surface, skylight is computed honestly by downward propagation from
+    /// the chunk above (the +Y sky plane), so a dug shaft stays correctly lit
+    /// while sealed/side regions go dark — no heightmap lowering required.
+    fn recompute_height_column(&mut self, wx: i64, wz: i64) {
+        let key = (wx, wz);
+        let lx = wx.rem_euclid(CHUNK_SIZE_I) as u8;
+        let lz = wz.rem_euclid(CHUNK_SIZE_I) as u8;
+        let cx = wx.div_euclid(CHUNK_SIZE_I);
+        let cz = wz.div_euclid(CHUNK_SIZE_I);
+
+        let mut highest: Option<i64> = None;
+        let mut column_chunks: Vec<ChunkPos> = Vec::new();
+        for (cpos, chunk) in self.world.chunks() {
+            if cpos.x != cx || cpos.z != cz {
+                continue;
+            }
+            column_chunks.push(cpos);
+            for ly in (0..CHUNK_SIZE_I as u8).rev() {
+                let p = LocalPos::new(lx, ly, lz);
+                if self.registry.is_solid(chunk.get(p)) {
+                    let wy = cpos.origin().y + ly as i64;
+                    highest = Some(highest.map_or(wy, |h| h.max(wy)));
+                    break;
+                }
+            }
+        }
+
+        // Raise-only: a placed block above the surface extends it; a break can
+        // only lower the physical top, which we deliberately ignore here.
+        if let Some(h) = highest {
+            let e = self.column_heights.entry(key).or_insert(i64::MIN);
+            if h > *e {
+                *e = h;
+            }
+        }
+
+        // Relight the edited column's chunks plus their horizontal neighbors so
+        // shafts/caves resolve via honest propagation. Border-change
+        // convergence in stream_tick carries any further vertical ripple.
+        for p in column_chunks {
+            self.relight.insert(p);
+            for (dx, dy, dz) in NEIGHBOR_OFFSETS {
+                if dy != 0 {
+                    continue; // horizontal neighbors only
+                }
+                let n = ChunkPos::new(p.x + dx, p.y + dy, p.z + dz);
+                if self.world.chunk(n).is_some() {
+                    self.relight.insert(n);
+                }
+            }
         }
     }
 
@@ -338,7 +726,7 @@ impl App {
     ///
     /// Generation is async (rayon `spawn` → channel). Meshing is
     /// bounded-parallel on the main thread: it borrows the World immutably
-    /// via `mesh_chunks_parallel` (all cores), capped at `MESH_BUDGET`
+    /// via `mesh_chunks_parallel` (all cores), time-budgeted per frame
     /// chunks/frame so the cost stays well under a millisecond. This honors
     /// "runs on the rayon pool, bounded, no stall" without needing to clone
     /// chunk data into mesh jobs or share the World across threads.
@@ -418,6 +806,9 @@ impl App {
             newly_generated.push(pos);
         }
         for pos in newly_generated {
+            // Fold the new chunk into the column heightmap BEFORE marking it
+            // dirty, so its first relight uses a correct sky top boundary.
+            self.update_heightmap_for(pos);
             self.mark_dirty_with_neighbors(pos);
         }
 
@@ -432,44 +823,85 @@ impl App {
         {
             let world = &self.world;
             self.dirty.retain(|p| world.chunk(*p).is_some());
+            self.relight.retain(|p| world.chunk(*p).is_some());
         }
-        if !self.dirty.is_empty() {
-            let batch: Vec<ChunkPos> = self.dirty.iter().copied().take(MESH_BUDGET).collect();
-            for p in &batch {
-                self.dirty.remove(p);
-            }
 
-            // Relight before meshing (the mesh bakes light into brightness).
-            // Compute light in parallel (read-only), then apply sequentially
-            // and re-dirty neighbors whose border light this chunk changed,
-            // so light converges across chunk boundaries (ADR-0004).
-            let lit = relight_chunks_parallel(&self.world, &self.registry, &batch);
-            for (pos, light, changed) in lit {
-                if let Some(chunk) = self.world.chunk_mut(pos) {
-                    vox_core::apply_chunk_light(chunk, &light);
+        // --- Relight pass (time-budgeted, parallel). ---
+        // Recompute light in parallel sub-batches until a per-frame time cap.
+        // top_sky is built per-chunk inside the workers (parallel), not here.
+        // Apply only where light actually changed (→ re-mesh via `dirty`); a
+        // changed border just queues a neighbor relight check (no re-mesh).
+        if !self.relight.is_empty() {
+            let start = Instant::now();
+            loop {
+                let sub: Vec<ChunkPos> = self
+                    .relight
+                    .iter()
+                    .copied()
+                    .take(RELIGHT_SUBBATCH)
+                    .collect();
+                if sub.is_empty() {
+                    break;
                 }
-                if changed {
-                    for (dx, dy, dz) in NEIGHBOR_OFFSETS {
-                        let n = ChunkPos::new(pos.x + dx, pos.y + dy, pos.z + dz);
-                        if self.world.chunk(n).is_some() {
-                            self.dirty.insert(n);
+                for p in &sub {
+                    self.relight.remove(p);
+                }
+                let lit = relight_chunks_parallel(
+                    &self.world,
+                    &self.registry,
+                    &self.column_heights,
+                    &sub,
+                );
+                for (pos, light, interior_changed, border_changed) in lit {
+                    if interior_changed {
+                        if let Some(chunk) = self.world.chunk_mut(pos) {
+                            vox_core::apply_chunk_light(chunk, &light);
+                        }
+                        self.dirty.insert(pos);
+                    }
+                    if border_changed {
+                        for (dx, dy, dz) in NEIGHBOR_OFFSETS {
+                            let n = ChunkPos::new(pos.x + dx, pos.y + dy, pos.z + dz);
+                            if self.world.chunk(n).is_some() {
+                                self.relight.insert(n);
+                            }
                         }
                     }
                 }
+                if start.elapsed().as_secs_f32() * 1000.0 >= RELIGHT_TIME_MS {
+                    break;
+                }
             }
+        }
 
-            let meshes = mesh_chunks_parallel(&self.world, &self.registry, &batch);
-            if let Some(renderer) = self.renderer.as_mut() {
-                let produced: HashSet<ChunkPos> = meshes.iter().map(|(p, _)| *p).collect();
-                // A batch chunk that produced no mesh (all air, or fully
-                // occluded) must have any stale GPU mesh cleared.
+        // --- Mesh pass (time-budgeted, parallel). ---
+        if !self.dirty.is_empty() {
+            let start = Instant::now();
+            loop {
+                let batch: Vec<ChunkPos> = self.dirty.iter().copied().take(MESH_SUBBATCH).collect();
+                if batch.is_empty() {
+                    break;
+                }
                 for p in &batch {
-                    if !produced.contains(p) {
-                        renderer.set_chunk_mesh(*p, &MeshData::default());
+                    self.dirty.remove(p);
+                }
+
+                let meshes = mesh_chunks_parallel(&self.world, &self.registry, &batch);
+                if let Some(renderer) = self.renderer.as_mut() {
+                    let produced: HashSet<ChunkPos> = meshes.iter().map(|(p, _)| *p).collect();
+                    // A batch chunk that produced no mesh (all air, or fully
+                    // occluded) must have any stale GPU mesh cleared.
+                    for p in &batch {
+                        if !produced.contains(p) {
+                            renderer.set_chunk_mesh(*p, &MeshData::default());
+                        }
+                    }
+                    for (pos, mesh) in &meshes {
+                        renderer.set_chunk_mesh(*pos, mesh);
                     }
                 }
-                for (pos, mesh) in &meshes {
-                    renderer.set_chunk_mesh(*pos, mesh);
+                if start.elapsed().as_secs_f32() * 1000.0 >= MESH_TIME_MS {
+                    break;
                 }
             }
         }
@@ -483,6 +915,7 @@ impl App {
             return;
         }
         self.world.set_block(pos, BlockId::AIR);
+        self.recompute_height_column(pos.x, pos.z);
         self.mark_dirty_with_neighbors(pos.chunk());
         log::info!("broke block at {:?}", (pos.x, pos.y, pos.z));
     }
@@ -502,6 +935,7 @@ impl App {
             return;
         }
         self.world.set_block(pos, self.selected_block);
+        self.recompute_height_column(pos.x, pos.z);
         self.mark_dirty_with_neighbors(pos.chunk());
         log::info!("placed block at {:?}", (pos.x, pos.y, pos.z));
     }
@@ -621,7 +1055,7 @@ impl ApplicationHandler for App {
         // The world is no longer pre-built: chunks stream in around the
         // camera each frame via stream_tick (M02). resumed() just stands up
         // the window/renderer; the first frames fill the initial sphere
-        // progressively, bounded by GEN_SPAWN_BUDGET / MESH_BUDGET.
+        // progressively, bounded by GEN_SPAWN_BUDGET and the per-frame mesh time budget.
         log::info!(
             "streaming: load radius {} / unload {} chunks",
             LOAD_RADIUS,
@@ -653,6 +1087,21 @@ impl ApplicationHandler for App {
                         ElementState::Pressed => {
                             if code == KeyCode::Escape {
                                 self.set_cursor_captured(false);
+                            } else if code == KeyCode::KeyF {
+                                // Toggle spectator (noclip free-fly) <-> survival.
+                                self.camera.mode = match self.camera.mode {
+                                    MoveMode::Spectator => MoveMode::Survival,
+                                    MoveMode::Survival => MoveMode::Spectator,
+                                };
+                                self.camera.velocity = Vec3::ZERO;
+                                self.camera.on_ground = false;
+                                log::info!(
+                                    "move mode: {}",
+                                    match self.camera.mode {
+                                        MoveMode::Spectator => "spectator (fly)",
+                                        MoveMode::Survival => "survival",
+                                    }
+                                );
                             } else if code == KeyCode::KeyG {
                                 // Debug: punch a hole to exercise re-meshing.
                                 self.debug_punch_hole();
@@ -713,7 +1162,10 @@ impl ApplicationHandler for App {
                 let dt = (now - self.last_frame).as_secs_f32().min(0.1);
                 self.last_frame = now;
 
-                self.camera.update(&self.keys, dt);
+                match self.camera.mode {
+                    MoveMode::Spectator => self.camera.update_spectator(&self.keys, dt),
+                    MoveMode::Survival => self.physics_update(dt),
+                }
 
                 // Camera's current chunk drives both streaming and the
                 // floating-origin render origin.
@@ -751,6 +1203,7 @@ impl ApplicationHandler for App {
                 let loaded = self.streamer.loaded_count();
                 let in_flight = self.gen_in_flight.len();
                 let dirty = self.dirty.len();
+                let relight = self.relight.len();
 
                 if let Some(renderer) = self.renderer.as_mut() {
                     // Floating origin (ADR-0002): keep the render origin at
@@ -783,13 +1236,14 @@ impl ApplicationHandler for App {
                     if self.telemetry_accum >= 1.0 {
                         let fps = self.telemetry_frames as f32 / self.telemetry_accum;
                         log::info!(
-                            "{:.0} fps | drawn {}/{} | loaded {} | gen {} | dirty {}",
+                            "{:.0} fps | drawn {}/{} | loaded {} | gen {} | dirty {} | relight {}",
                             fps,
                             renderer.drawn_last_frame(),
                             renderer.mesh_count(),
                             loaded,
                             in_flight,
                             dirty,
+                            relight,
                         );
                         self.telemetry_accum = 0.0;
                         self.telemetry_frames = 0;

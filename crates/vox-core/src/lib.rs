@@ -19,8 +19,8 @@ pub use coords::{CHUNK_BITS, CHUNK_SIZE, CHUNK_VOLUME, ChunkPos, LocalPos, World
 pub use light::{
     ColumnMap, LightVolume, MAX_LIGHT, NeighborLight, NeighborSky, apply_chunk_light,
     chunk_column_heights, chunk_column_occludes, chunk_light_plane, chunk_sky_plane, column_index,
-    compute_chunk_light, compute_chunk_light_2ch, propagate_block_light, propagate_sky_light,
-    relight_chunk, relight_chunk_2ch, remove_block_light,
+    compute_chunk_light, compute_chunk_light_2ch, open_sky_top, propagate_block_light,
+    propagate_sky_light, relight_chunk, relight_chunk_2ch, remove_block_light,
 };
 pub use raycast::{RayHit, cell_overlaps_aabb, raycast_blocks, raycast_voxels};
 pub use registry::{BlockRegistry, BlockType};

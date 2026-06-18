@@ -560,7 +560,22 @@ pub fn compute_chunk_light(
     registry: &BlockRegistry,
     borders: &NeighborLight,
 ) -> (Vec<u8>, bool) {
-    compute_chunk_light_2ch(chunk, registry, borders, &NEIGHBOR_SKY_NONE, true)
+    // Block-only convenience: sky disabled, so top_sky is irrelevant.
+    let dark_top = [0u8; CHUNK_SIZE * CHUNK_SIZE];
+    compute_chunk_light_2ch(
+        chunk,
+        registry,
+        borders,
+        &NEIGHBOR_SKY_NONE,
+        &dark_top,
+        false,
+    )
+}
+
+/// A fully-open-sky top boundary (every column receiving full daylight, 15).
+/// Convenience for tests and for chunks known to have nothing above them.
+pub fn open_sky_top() -> Vec<u8> {
+    vec![MAX_LIGHT; CHUNK_SIZE * CHUNK_SIZE]
 }
 
 /// Six neighbor sky-light planes (same shape/indexing as [`NeighborLight`]),
@@ -610,8 +625,62 @@ pub fn compute_chunk_light_2ch(
     registry: &BlockRegistry,
     block_borders: &NeighborLight,
     sky_borders: &NeighborSky,
+    top_sky: &[u8],
     do_sky: bool,
 ) -> (Vec<u8>, bool) {
+    // --- Fast path: uniform chunks (single block type). ---
+    // ~86% of streamed chunks are uniform (all-air above terrain, or all-solid
+    // underground). Their light is trivially determined, so skip both BFS
+    // passes. Guard on the uniform block being a non-emitter (a uniform block
+    // of lamps would need real propagation; worldgen never produces that, but
+    // be safe). Note we ignore horizontal sky border spill here: a uniform
+    // chunk has no faces to mesh (all-air) or admits no light (all-solid), so
+    // its only role is donating border light, and the dominant donation — the
+    // vertical sky column — is captured exactly. Any second-order diffuse
+    // spill is resolved by the neighbor that actually needs it.
+    if chunk.is_uniform() {
+        let b = chunk.get(LocalPos::new(0, 0, 0));
+        // Only safe to skip the block-light BFS when no block light can flood
+        // in from a neighbor (e.g. an adjacent lamp lighting this air). If any
+        // block border carries light, fall through to the full computation.
+        let no_block_inflow = block_borders
+            .iter()
+            .all(|p| p.as_ref().is_none_or(|plane| plane.iter().all(|&v| v == 0)));
+        // Only safe to skip the sky BFS when no neighbor sky plane brings in
+        // MORE light than the heightmap's top_sky already accounts for. Below
+        // the surface, real daylight flows down a shaft via the overhead (+Y)
+        // plane and sideways via the horizontal planes; if any such inflow
+        // exceeds top_sky, this air must propagate it — use the full path.
+        let no_extra_sky_inflow = !do_sky
+            || sky_borders.iter().enumerate().all(|(face, plane)| {
+                // -Y (face 3) never brings sky up; ignore it.
+                face == 3
+                    || plane.as_ref().is_none_or(|p| {
+                        p.iter().enumerate().all(|(i, &v)| {
+                            // Compare against this column's top_sky where the
+                            // plane indexes a column; for face planes that index
+                            // (u,v) not aligned to (x,z), be conservative and
+                            // require v == 0 (no inflow at all).
+                            v == 0 || (matches!(face, 2) && v <= top_sky[i])
+                        })
+                    })
+            });
+        if registry.emission(b) == 0 && no_block_inflow && no_extra_sky_inflow {
+            let mut out = vec![0u8; CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE];
+            if do_sky && !registry.is_solid(b) {
+                // All-air: each column carries its top_sky straight down (the
+                // no-attenuation-down rule keeps 15 at 15; 0 stays 0).
+                for pos in LocalPos::iter() {
+                    let col = pos.x() as usize + pos.z() as usize * CHUNK_SIZE;
+                    out[pos.index()] = top_sky[col] << 4;
+                }
+            }
+            // (All-solid stays fully 0: light can't enter solid cells.)
+            let changed = packed_border_changed(chunk, &out);
+            return (out, changed);
+        }
+    }
+
     // --- Block light (low nibble) ---
     let block = {
         let mut vol = PaddedChunk::build(chunk, registry, block_borders);
@@ -629,7 +698,7 @@ pub fn compute_chunk_light_2ch(
 
     // --- Sky light (high nibble) ---
     let sky = if do_sky {
-        compute_padded_sky(chunk, registry, sky_borders)
+        compute_padded_sky(chunk, registry, top_sky, sky_borders)
     } else {
         vec![0u8; CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE]
     };
@@ -647,7 +716,28 @@ pub fn compute_chunk_light_2ch(
 /// Sky-light flood over a chunk's padded volume. Seeds the border ring from
 /// neighbor sky planes; the +Y border defaults to 15 (open sky) wherever no
 /// neighbor-above plane is supplied. Returns the center 32³ sky buffer.
-fn compute_padded_sky(chunk: &Chunk, registry: &BlockRegistry, sky: &NeighborSky) -> Vec<u8> {
+/// Sky-light flood over a chunk's padded volume.
+///
+/// The **top boundary** comes from `top_sky` (per-column, `CHUNK_SIZE²`,
+/// indexed `x + z*CHUNK_SIZE`): the daylight entering each column from
+/// directly above, derived from the world heightmap (15 where nothing solid
+/// is above this chunk in the column, 0 where occluded). Using the heightmap
+/// rather than the +Y neighbor's current light is what avoids a vertical
+/// relight cascade — every chunk computes its correct direct daylight in one
+/// pass, independent of whether its vertical neighbors have been relit yet
+/// (ADR-0005).
+///
+/// The **horizontal** neighbor sky planes (`sky[0]`=+X, `sky[1]`=-X,
+/// `sky[4]`=+Z, `sky[5]`=-Z) seed diffuse skylight spilling across side
+/// chunk borders (e.g. under an overhang straddling a boundary). The ±Y
+/// planes are ignored — vertical sky is handled by `top_sky` (down) and not
+/// needed upward.
+fn compute_padded_sky(
+    chunk: &Chunk,
+    registry: &BlockRegistry,
+    top_sky: &[u8],
+    sky: &NeighborSky,
+) -> Vec<u8> {
     let n = CHUNK_SIZE;
     let mut light = vec![0u8; PAD * PAD * PAD];
 
@@ -659,9 +749,6 @@ fn compute_padded_sky(chunk: &Chunk, registry: &BlockRegistry, sky: &NeighborSky
         }
     };
 
-    // Seed border ring from neighbor sky planes. Face order 0:+X 1:-X 2:+Y
-    // 3:-Y 4:+Z 5:-Z. The +Y face (index 2) defaults to 15 (open sky) where
-    // no plane is given.
     let mut queue: Vec<(usize, usize, usize)> = Vec::new();
     let seed = |light: &mut [u8], queue: &mut Vec<(usize, usize, usize)>, x, y, z, val: u8| {
         if val > 0 {
@@ -680,16 +767,25 @@ fn compute_padded_sky(chunk: &Chunk, registry: &BlockRegistry, sky: &NeighborSky
             if let Some(p) = &sky[1] {
                 seed(&mut light, &mut queue, 0, u + 1, v + 1, p[u + v * n]);
             }
-            // +Y (y = n+1), plane (x,z) = (u,v) — open-sky default 15
-            let top_val = match &sky[2] {
-                Some(p) => p[u + v * n],
-                None => MAX_LIGHT,
-            };
-            seed(&mut light, &mut queue, u + 1, n + 1, v + 1, top_val);
-            // -Y (y = 0)
-            if let Some(p) = &sky[3] {
-                seed(&mut light, &mut queue, u + 1, 0, v + 1, p[u + v * n]);
-            }
+            // +Y top boundary (y = n+1). Two honest sources, combined by max:
+            //   - the heightmap's `top_sky` (15 for columns open to sky above
+            //     the natural surface — correct in one pass, no cascade), and
+            //   - the REAL sky light flowing down from the chunk directly above
+            //     (its -Y face plane, `sky[2]`), which carries daylight down
+            //     shafts/through cave openings at/below the surface.
+            // Above the surface the heightmap value dominates; below it (where
+            // the heightmap reads 0) the overhead plane carries real skylight,
+            // so shafts stay lit and sealed/side regions go dark via honest BFS.
+            let top_from_height = top_sky[u + v * n];
+            let top_from_above = sky[2].as_ref().map_or(0, |p| p[u + v * n]);
+            seed(
+                &mut light,
+                &mut queue,
+                u + 1,
+                n + 1,
+                v + 1,
+                top_from_height.max(top_from_above),
+            );
             // +Z (z = n+1), plane (x,y) = (u,v)
             if let Some(p) = &sky[4] {
                 seed(&mut light, &mut queue, u + 1, v + 1, n + 1, p[u + v * n]);
@@ -794,22 +890,31 @@ fn packed_border_changed(chunk: &Chunk, new_light: &[u8]) -> bool {
 /// (no skylight). The streaming path uses [`compute_chunk_light_2ch`] /
 /// [`apply_chunk_light`] to compute both channels in parallel.
 pub fn relight_chunk(chunk: &mut Chunk, registry: &BlockRegistry, borders: &NeighborLight) -> bool {
-    let (light, changed) =
-        compute_chunk_light_2ch(chunk, registry, borders, &NEIGHBOR_SKY_NONE, false);
+    let dark_top = [0u8; CHUNK_SIZE * CHUNK_SIZE];
+    let (light, changed) = compute_chunk_light_2ch(
+        chunk,
+        registry,
+        borders,
+        &NEIGHBOR_SKY_NONE,
+        &dark_top,
+        false,
+    );
     apply_chunk_light(chunk, &light);
     changed
 }
 
-/// Recompute **both** light channels for a chunk in place (compute + apply).
-/// Convenience wrapper over [`compute_chunk_light_2ch`] for tests.
+/// Recompute **both** light channels for a chunk in place (compute + apply),
+/// with a fully-open sky above (every column daylit). Convenience wrapper for
+/// tests; the streaming path supplies a real heightmap-derived `top_sky`.
 pub fn relight_chunk_2ch(
     chunk: &mut Chunk,
     registry: &BlockRegistry,
     block_borders: &NeighborLight,
     sky_borders: &NeighborSky,
 ) -> bool {
+    let top = open_sky_top();
     let (light, changed) =
-        compute_chunk_light_2ch(chunk, registry, block_borders, sky_borders, true);
+        compute_chunk_light_2ch(chunk, registry, block_borders, sky_borders, &top, true);
     apply_chunk_light(chunk, &light);
     changed
 }
@@ -1433,35 +1538,123 @@ mod tests {
 
     #[test]
     fn two_channel_sky_flows_down_from_neighbor_above() {
-        // No solid blocks; supply a +Y neighbor whose bottom plane is full
-        // daylight (an open shaft coming from above) → sky floods down to 15.
+        // Open top (top_sky = 15 per column) → daylight floods down a clear
+        // chunk and, with the no-down-attenuation rule, stays 15 to the floor.
         let reg = BlockRegistry::default_set();
-        let mut chunk = Chunk::new_air();
-        let n = CHUNK_SIZE;
-        let plane = vec![15u8; n * n]; // neighbor-above bottom row all lit
-        let sky: NeighborSky = [None, None, Some(plane), None, None, None];
-        relight_chunk_2ch(&mut chunk, &reg, &no_borders(), &sky);
-
-        // Top cell receives 15 (down rule across boundary), and stays 15 down.
-        assert_eq!(chunk.sky_light(LocalPos::new(16, 31, 16)), 15);
-        assert_eq!(chunk.sky_light(LocalPos::new(16, 0, 16)), 15);
+        let chunk = Chunk::new_air();
+        let top = open_sky_top();
+        let (light, _) =
+            compute_chunk_light_2ch(&chunk, &reg, &no_borders(), &no_sky(), &top, true);
+        let sky_at = |p: LocalPos| (light[p.index()] >> 4) & 0x0F;
+        assert_eq!(sky_at(LocalPos::new(16, 31, 16)), 15);
+        assert_eq!(sky_at(LocalPos::new(16, 0, 16)), 15);
     }
 
     #[test]
-    fn two_channel_dark_neighbor_above_blocks_sky() {
-        // A +Y neighbor whose bottom plane is dark (it has a roof) → no sky
-        // enters from above; with no other source, the chunk is sky-dark.
+    fn two_channel_occluded_top_blocks_sky() {
+        // top_sky = 0 for every column (the heightmap says something solid is
+        // above this chunk) → no daylight enters; with no other source the
+        // chunk is sky-dark.
+        let reg = BlockRegistry::default_set();
+        let chunk = Chunk::new_air();
+        let dark_top = vec![0u8; CHUNK_SIZE * CHUNK_SIZE];
+        let (light, _) =
+            compute_chunk_light_2ch(&chunk, &reg, &no_borders(), &no_sky(), &dark_top, true);
+        let sky_at = |p: LocalPos| (light[p.index()] >> 4) & 0x0F;
+        assert_eq!(
+            sky_at(LocalPos::new(16, 31, 16)),
+            0,
+            "occluded top (heightmap) => shadow"
+        );
+    }
+
+    #[test]
+    fn uniform_fast_path_matches_full_for_open_air() {
+        // An all-air chunk under open sky: the fast path fills each column
+        // with top_sky straight down. A partial top_sky (some columns lit,
+        // some occluded) must produce exactly that pattern, 15 or 0.
+        let reg = BlockRegistry::default_set();
+        let chunk = Chunk::new_air();
+        let n = CHUNK_SIZE;
+        let mut top = vec![0u8; n * n];
+        for z in 0..n {
+            for x in 0..n {
+                if x >= n / 2 {
+                    top[x + z * n] = 15;
+                }
+            }
+        }
+        let (light, _) =
+            compute_chunk_light_2ch(&chunk, &reg, &no_borders(), &no_sky(), &top, true);
+        for pos in LocalPos::iter() {
+            let sky = (light[pos.index()] >> 4) & 0x0F;
+            let want = if (pos.x() as usize) >= n / 2 { 15 } else { 0 };
+            assert_eq!(sky, want, "air column sky at {pos:?}");
+            assert_eq!(light[pos.index()] & 0x0F, 0, "no block light in open air");
+        }
+    }
+
+    #[test]
+    fn uniform_fast_path_solid_is_dark() {
+        // An all-stone chunk: light cannot enter; every cell stays 0 in both
+        // channels regardless of top_sky.
+        let reg = BlockRegistry::default_set();
+        let chunk = Chunk::filled(STONE);
+        let (light, _) = compute_chunk_light_2ch(
+            &chunk,
+            &reg,
+            &no_borders(),
+            &no_sky(),
+            &open_sky_top(),
+            true,
+        );
+        assert!(light.iter().all(|&v| v == 0), "solid chunk fully dark");
+    }
+
+    #[test]
+    fn uniform_with_block_inflow_uses_full_path() {
+        // An all-air chunk WITH a block-light border must still flood that
+        // block light in (fast path must defer to the full computation).
+        let reg = BlockRegistry::default_set();
+        let chunk = Chunk::new_air();
+        let n = CHUNK_SIZE;
+        let mut neg_x = vec![0u8; n * n];
+        neg_x[16 + 16 * n] = 15;
+        let block_borders: NeighborLight = [None, Some(neg_x), None, None, None, None];
+        let dark_top = vec![0u8; n * n];
+        let (light, _) =
+            compute_chunk_light_2ch(&chunk, &reg, &block_borders, &no_sky(), &dark_top, true);
+        // Block light floods in from the -X border.
+        assert_eq!(light[LocalPos::new(0, 16, 16).index()] & 0x0F, 14);
+    }
+
+    #[test]
+    fn platform_casts_shadow_underneath() {
+        use crate::*;
         let reg = BlockRegistry::default_set();
         let mut chunk = Chunk::new_air();
-        let n = CHUNK_SIZE;
-        let plane = vec![0u8; n * n];
-        let sky: NeighborSky = [None, None, Some(plane), None, None, None];
-        relight_chunk_2ch(&mut chunk, &reg, &no_borders(), &sky);
-
+        // Solid platform across the whole chunk at y=20 (so no open sides — fully enclosed below).
+        for z in 0..CHUNK_SIZE as u8 {
+            for x in 0..CHUNK_SIZE as u8 {
+                chunk.set(LocalPos::new(x, 20, z), STONE);
+            }
+        }
+        let top = open_sky_top(); // heightmap: column open (platform is top solid)
+        let (light, _) =
+            compute_chunk_light_2ch(&chunk, &reg, &no_borders(), &no_sky(), &top, true);
+        let sky = |x, y, z| (light[LocalPos::new(x, y, z).index()] >> 4) & 0x0F;
+        println!("above platform y=25: {}", sky(16, 25, 16));
+        println!("just below platform y=19: {}", sky(16, 19, 16));
+        println!("bottom y=0: {}", sky(16, 0, 16));
         assert_eq!(
-            chunk.sky_light(LocalPos::new(16, 31, 16)),
+            sky(16, 25, 16),
+            15,
+            "above platform should be full daylight"
+        );
+        assert_eq!(
+            sky(16, 19, 16),
             0,
-            "dark neighbor above => shadow (no open-sky default when plane given)"
+            "fully-covered cell below platform must be dark"
         );
     }
 
@@ -1517,5 +1710,274 @@ mod tests {
         chunk.set(LocalPos::new(1, 1, 1), BlockId::AIR); // no-op
         let occ = chunk_column_occludes(&chunk, &reg);
         assert!(!occ[column_index(1, 1)]);
+    }
+    #[test]
+    fn enclosed_box_interior_is_dark() {
+        let reg = BlockRegistry::default_set();
+        let mut chunk = Chunk::new_air();
+        for dz in -1i32..=1 {
+            for dy in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    let (x, y, z) = ((16 + dx) as u8, (16 + dy) as u8, (16 + dz) as u8);
+                    if dx.abs() == 1 || dy.abs() == 1 || dz.abs() == 1 {
+                        chunk.set(LocalPos::new(x, y, z), STONE);
+                    }
+                }
+            }
+        }
+        let top = open_sky_top();
+        let (light, _) =
+            compute_chunk_light_2ch(&chunk, &reg, &no_borders(), &no_sky(), &top, true);
+        let center = (light[LocalPos::new(16, 16, 16).index()] >> 4) & 0x0F;
+        println!("enclosed box interior sky: {center}");
+        assert_eq!(center, 0, "sealed box interior must be pitch dark");
+    }
+
+    #[test]
+    fn fast_path_air_chunk_under_platform_in_heightmap() {
+        // The bug repro: an all-air chunk sits BELOW a platform that lives in
+        // the chunk above. The heightmap (top_sky) for THIS air chunk's
+        // columns should say "occluded" (0) because the platform above blocks
+        // the sky. If the app passes top_sky=0, the fast path must produce a
+        // DARK chunk. If instead top_sky=15 is passed (heightmap stale/wrong),
+        // the fast path floods it with daylight -> the observed bug.
+        let reg = BlockRegistry::default_set();
+        let chunk = Chunk::new_air(); // uniform all-air -> hits fast path
+        // Correct heightmap: platform above => this column is occluded.
+        let occluded_top = vec![0u8; CHUNK_SIZE * CHUNK_SIZE];
+        let (light, _) =
+            compute_chunk_light_2ch(&chunk, &reg, &no_borders(), &no_sky(), &occluded_top, true);
+        let center = (light[LocalPos::new(16, 16, 16).index()] >> 4) & 0x0F;
+        println!("air-under-platform (top_sky=0) center sky: {center}");
+        assert_eq!(
+            center, 0,
+            "air chunk under a platform must be dark when top_sky=0"
+        );
+    }
+
+    #[test]
+    fn overhead_plane_lights_shaft_below_surface() {
+        // Below-surface chunk (top_sky all 0, i.e. heightmap says "covered"),
+        // but the chunk ABOVE passes real daylight down its -Y plane at one
+        // column (a shaft). That column must light up 15 top-to-bottom (no-down
+        // attenuation); other columns stay dark. This is honest skylight, not
+        // the heightmap.
+        let reg = BlockRegistry::default_set();
+        let chunk = Chunk::new_air();
+        let n = CHUNK_SIZE;
+        let mut above = vec![0u8; n * n]; // overhead chunk's -Y sky plane
+        let shaft = 16 + 16 * n;
+        above[shaft] = 15; // one open column directly overhead
+        let sky: NeighborSky = [None, None, Some(above), None, None, None];
+        let dark_top = vec![0u8; n * n]; // heightmap: covered
+        let (light, _) =
+            compute_chunk_light_2ch(&chunk, &reg, &no_borders(), &sky, &dark_top, true);
+        let sky_at = |x, y, z| (light[LocalPos::new(x, y, z).index()] >> 4) & 0x0F;
+        assert_eq!(sky_at(16, 31, 16), 15, "shaft top lit from overhead plane");
+        assert_eq!(sky_at(16, 0, 16), 15, "shaft stays 15 to the bottom");
+        // A column far from the shaft only gets attenuated horizontal spread.
+        assert!(sky_at(16 + 5, 31, 16) < 15, "off-shaft column dimmer");
+        assert!(sky_at(16 + 14, 16, 16) <= 1, "far from shaft ~dark");
+    }
+
+    #[test]
+    fn covered_air_chunk_below_surface_is_dark() {
+        // Below-surface air chunk, overhead plane all 0 (solid roof above) and
+        // top_sky all 0: must be fully dark. Confirms we do not invent skylight.
+        let reg = BlockRegistry::default_set();
+        let chunk = Chunk::new_air();
+        let n = CHUNK_SIZE;
+        let above = vec![0u8; n * n];
+        let sky: NeighborSky = [None, None, Some(above), None, None, None];
+        let dark_top = vec![0u8; n * n];
+        let (light, _) =
+            compute_chunk_light_2ch(&chunk, &reg, &no_borders(), &sky, &dark_top, true);
+        assert!(
+            light.iter().all(|&v| (v >> 4) == 0),
+            "covered air stays dark"
+        );
+    }
+
+    #[test]
+    fn upward_tunnel_stops_below_surface() {
+        // Surface at y=20 (stone 0..=20, air above). Carve a vertical air
+        // shaft from y=1 up to y=18 (top still has solid at y=19,20 above it).
+        // With top_sky=15 (heightmap: column open above the y=20 surface),
+        // daylight enters at the chunk top and floods DOWN, correctly stopping
+        // at y=20. The shaft (y<=18) is sealed beneath two solid blocks, so it
+        // must stay DARK. If it lights up, top_sky/propagation is leaking.
+        let reg = BlockRegistry::default_set();
+        let mut chunk = Chunk::new_air();
+        for z in 0..CHUNK_SIZE as u8 {
+            for x in 0..CHUNK_SIZE as u8 {
+                for y in 0..=20u8 {
+                    chunk.set(LocalPos::new(x, y, z), STONE);
+                }
+            }
+        }
+        // Carve the shaft at column (16,16): clear y=1..=18 (leave 19,20 solid).
+        for y in 1..=18u8 {
+            chunk.set(LocalPos::new(16, y, 16), BlockId::AIR);
+        }
+        let top = open_sky_top(); // top_sky = 15 everywhere (open above surface)
+        let (light, _) =
+            compute_chunk_light_2ch(&chunk, &reg, &no_borders(), &no_sky(), &top, true);
+        let sky = |y| (light[LocalPos::new(16, y, 16).index()] >> 4) & 0x0F;
+        println!("shaft sky: y18={} y10={} y1={}", sky(18), sky(10), sky(1));
+        assert_eq!(sky(18), 0, "sealed shaft top (2 solid above) must be dark");
+        assert_eq!(sky(1), 0, "sealed shaft bottom must be dark");
+    }
+
+    #[test]
+    fn upward_tunnel_across_chunk_seam_stays_dark() {
+        // Model the real case: a LOWER chunk full of stone with a vertical air
+        // shaft carved up to its TOP edge (local y=31). The chunk ABOVE has the
+        // surface (solid up to some height, air above). The lower chunk's
+        // top_sky from the heightmap: its columns are BELOW the surface, so
+        // top_sky=0. The only sky that could enter is via the +Y overhead plane
+        // (sky[2]) = the upper chunk's -Y face sky. If the upper chunk is solid
+        // at the seam above the shaft, that plane is 0 there → shaft stays dark.
+        let reg = BlockRegistry::default_set();
+        let mut lower = Chunk::filled(STONE);
+        // Carve shaft column (16,16) for the full height of the lower chunk.
+        for y in 0..CHUNK_SIZE as u8 {
+            lower.set(LocalPos::new(16, y, 16), BlockId::AIR);
+        }
+        // Overhead (+Y) sky plane: the upper chunk is SOLID at the seam above
+        // the shaft (surface is higher up), so its bottom sky is 0 there.
+        let n = CHUNK_SIZE;
+        let above = vec![0u8; n * n]; // all 0: solid seam above
+        let sky: NeighborSky = [None, None, Some(above), None, None, None];
+        let dark_top = vec![0u8; n * n]; // heightmap: below surface
+        let (light, _) =
+            compute_chunk_light_2ch(&lower, &reg, &no_borders(), &sky, &dark_top, true);
+        let sky_at = |y| (light[LocalPos::new(16, y, 16).index()] >> 4) & 0x0F;
+        println!(
+            "seam shaft: top31={} mid16={} bot0={}",
+            sky_at(31),
+            sky_at(16),
+            sky_at(0)
+        );
+        assert_eq!(
+            sky_at(31),
+            0,
+            "shaft top at seam must be dark (solid above)"
+        );
+        assert_eq!(sky_at(0), 0, "shaft bottom dark");
+    }
+
+    #[test]
+    fn capped_shaft_below_in_chunk_surface_stays_dark() {
+        // Exact repro of the VPROBE case: chunk spans local y=0..31. Solid
+        // surface at y=18 (open air y=19..31 above it -> top_sky=15 floods down
+        // and stops at 18). A sealed shaft column at (x,z)=(13,3) runs y=1..11,
+        // capped by solid y=12..18 (>=6 solid above it). Everything else solid.
+        // The shaft MUST be fully dark; top_sky=15 must not leak past the cap.
+        let reg = BlockRegistry::default_set();
+        let mut chunk = Chunk::filled(STONE);
+        let n = CHUNK_SIZE as u8;
+        // Open air above the surface everywhere: clear y=19..31.
+        for z in 0..n {
+            for x in 0..n {
+                for y in 19..n {
+                    chunk.set(LocalPos::new(x, y, z), BlockId::AIR);
+                }
+            }
+        }
+        // Carve the sealed shaft at (13,3), y=1..=11.
+        for y in 1..=11u8 {
+            chunk.set(LocalPos::new(13, y, 3), BlockId::AIR);
+        }
+        let top = open_sky_top(); // top_sky=15 (column open above this chunk)
+        let (light, _) =
+            compute_chunk_light_2ch(&chunk, &reg, &no_borders(), &no_sky(), &top, true);
+        let sky = |x, y, z| (light[LocalPos::new(x, y, z).index()] >> 4) & 0x0F;
+        println!(
+            "surface col: y31={} y19={} y18(solid)={}",
+            sky(13, 31, 3),
+            sky(13, 19, 3),
+            sky(13, 18, 3)
+        );
+        println!(
+            "shaft: y11={} y6={} y1={}",
+            sky(13, 11, 3),
+            sky(13, 6, 3),
+            sky(13, 1, 3)
+        );
+        assert_eq!(sky(13, 19, 3), 15, "open air above surface lit");
+        assert_eq!(sky(13, 11, 3), 0, "sealed shaft top dark");
+        assert_eq!(sky(13, 1, 3), 0, "sealed shaft bottom dark");
+    }
+
+    #[test]
+    fn seam_no_daylight_leak_into_subsurface_shaft() {
+        // Two stacked chunks model the real bug. LOWER chunk (origin.y=0):
+        // surface solid at local y=18 (h=18, INSIDE the chunk), open air
+        // y=19..31 above it, sealed shaft column (13,3) at y=1..11 capped by
+        // solid y=12..18. UPPER chunk (origin.y=32): all air.
+        //
+        // App rule: top_sky=15 only when h < origin.y. For the lower chunk
+        // h=18 >= 0, so its top_sky=0; daylight must arrive via the upper
+        // chunk's -Y sky plane (the +Y neighbor border) and BFS down to y=18.
+        let reg = BlockRegistry::default_set();
+
+        // Upper chunk: all air, top_sky=15 (h=18 < origin.y=32) -> fully lit.
+        let upper = Chunk::new_air();
+        let (upper_light, _) = compute_chunk_light_2ch(
+            &upper,
+            &reg,
+            &no_borders(),
+            &no_sky(),
+            &open_sky_top(),
+            true,
+        );
+        // Its -Y face plane (what it hands down to the lower chunk's +Y).
+        let n = CHUNK_SIZE;
+        let mut upper_bottom = vec![0u8; n * n];
+        for z in 0..n {
+            for x in 0..n {
+                let s = (upper_light[LocalPos::new(x as u8, 0, z as u8).index()] >> 4) & 0x0F;
+                upper_bottom[x + z * n] = s;
+            }
+        }
+
+        // Lower chunk geometry.
+        let mut lower = Chunk::filled(STONE);
+        for z in 0..n as u8 {
+            for x in 0..n as u8 {
+                for y in 19..n as u8 {
+                    lower.set(LocalPos::new(x, y, z), BlockId::AIR);
+                }
+            }
+        }
+        for y in 1..=11u8 {
+            lower.set(LocalPos::new(13, y, 3), BlockId::AIR);
+        }
+
+        // Lower chunk: top_sky=0 (surface inside), overhead plane = upper_bottom.
+        let lower_top = vec![0u8; n * n];
+        let sky: NeighborSky = [None, None, Some(upper_bottom), None, None, None];
+        let (light, _) =
+            compute_chunk_light_2ch(&lower, &reg, &no_borders(), &sky, &lower_top, true);
+        let sky_at = |x, y, z| (light[LocalPos::new(x, y, z).index()] >> 4) & 0x0F;
+        println!(
+            "open y19={} surface y18={} shaft y11={} y6={} y1={}",
+            sky_at(13, 19, 3),
+            sky_at(13, 18, 3),
+            sky_at(13, 11, 3),
+            sky_at(13, 6, 3),
+            sky_at(13, 1, 3)
+        );
+        assert_eq!(
+            sky_at(13, 19, 3),
+            15,
+            "open air above surface lit from overhead plane"
+        );
+        assert_eq!(
+            sky_at(13, 11, 3),
+            0,
+            "sealed shaft top dark (no daylight leak)"
+        );
+        assert_eq!(sky_at(13, 1, 3), 0, "sealed shaft bottom dark");
     }
 }

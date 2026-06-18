@@ -166,12 +166,13 @@ fn light_at(chunk: &Chunk, neighbors: &ChunkNeighbors, x: i32, y: i32, z: i32) -
     } else if z >= size {
         (neighbors.pos_z, LocalPos::new(x as u8, y as u8, 0))
     } else {
-        return chunk.block_light(LocalPos::new(x as u8, y as u8, z as u8));
+        let p = LocalPos::new(x as u8, y as u8, z as u8);
+        return chunk.block_light(p).max(chunk.sky_light(p));
     };
 
     match target {
         None => 0,
-        Some(neighbor) => neighbor.block_light(local),
+        Some(neighbor) => neighbor.block_light(local).max(neighbor.sky_light(local)),
     }
 }
 
