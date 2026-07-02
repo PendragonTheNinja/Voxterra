@@ -99,6 +99,130 @@ impl<'a> ChunkNeighbors<'a> {
     }
 }
 
+/// Padded 34³ snapshot of everything the meshers sample (ADR-0006): per cell
+/// the block id and the packed light scalar (`max(block_light, sky_light)`),
+/// center from the chunk, the 1-cell shell from neighbors (absent cells read
+/// as air / light 0 — the same standalone behavior as before). The hot
+/// meshing loops then run against flat arrays with no palette decodes and no
+/// chunk-boundary branching — the same "pay one bounded gather up front"
+/// design as the relight engine's `PaddedChunk` (M05).
+///
+/// Task 1 (M06) fills the shell from the six FACE neighbors only, because
+/// that is all today's per-face sampling reads; edge/corner cells stay air
+/// until per-vertex sampling lands (task 2), which will widen the fill to
+/// all 26 neighbors.
+pub struct MeshInput {
+    /// 34³ block ids; shell cells default to AIR.
+    block: Vec<BlockId>,
+    /// 34³ light scalars (`max(block, sky)`); shell defaults to 0.
+    light: Vec<u8>,
+    all_air: bool,
+}
+
+const PAD: usize = CHUNK_SIZE + 2;
+
+impl MeshInput {
+    #[inline]
+    fn idx(x: usize, y: usize, z: usize) -> usize {
+        x + y * PAD + z * PAD * PAD
+    }
+
+    /// Chunk-relative coords (each in `-1..=32`) to the padded index.
+    #[inline]
+    fn cidx(x: i32, y: i32, z: i32) -> usize {
+        Self::idx((x + 1) as usize, (y + 1) as usize, (z + 1) as usize)
+    }
+
+    /// Is the cell at chunk-relative coords air? (Absent neighbors are air.)
+    #[inline]
+    pub fn is_air(&self, x: i32, y: i32, z: i32) -> bool {
+        self.block[Self::cidx(x, y, z)].is_air()
+    }
+
+    /// Block id at chunk-relative coords.
+    #[inline]
+    pub fn block(&self, x: i32, y: i32, z: i32) -> BlockId {
+        self.block[Self::cidx(x, y, z)]
+    }
+
+    /// Light scalar at chunk-relative coords (0 in absent neighbors).
+    #[inline]
+    pub fn light(&self, x: i32, y: i32, z: i32) -> u8 {
+        self.light[Self::cidx(x, y, z)]
+    }
+
+    /// Build the snapshot from a chunk and its face neighbors.
+    pub fn build(chunk: &Chunk, neighbors: &ChunkNeighbors) -> Self {
+        let n = CHUNK_SIZE;
+        let mut block = vec![BlockId::AIR; PAD * PAD * PAD];
+        let mut light = vec![0u8; PAD * PAD * PAD];
+
+        // Center. Uniform chunks skip the per-cell palette decode entirely.
+        if chunk.is_uniform() {
+            let b = chunk.get(LocalPos::new(0, 0, 0));
+            if !b.is_air() {
+                for z in 1..=n {
+                    for y in 1..=n {
+                        let row = Self::idx(1, y, z);
+                        block[row..row + n].fill(b);
+                    }
+                }
+            }
+        } else {
+            for pos in LocalPos::iter() {
+                block[Self::cidx(pos.x() as i32, pos.y() as i32, pos.z() as i32)] = chunk.get(pos);
+            }
+        }
+        for pos in LocalPos::iter() {
+            let l = chunk.block_light(pos).max(chunk.sky_light(pos));
+            if l > 0 {
+                light[Self::cidx(pos.x() as i32, pos.y() as i32, pos.z() as i32)] = l;
+            }
+        }
+
+        // Shell: the touching layer of each present face neighbor. Absent
+        // neighbors stay AIR / light 0 (standalone-chunk behavior).
+        let last = (n - 1) as u8;
+        let mut fill_face =
+            |nb: Option<&Chunk>, map: &mut dyn FnMut(u8, u8) -> (i32, i32, i32, LocalPos)| {
+                let Some(nb) = nb else { return };
+                for v in 0..n as u8 {
+                    for u in 0..n as u8 {
+                        let (x, y, z, lp) = map(u, v);
+                        let i = Self::cidx(x, y, z);
+                        block[i] = nb.get(lp);
+                        light[i] = nb.block_light(lp).max(nb.sky_light(lp));
+                    }
+                }
+            };
+        let sz = n as i32;
+        fill_face(neighbors.neg_x, &mut |u, v| {
+            (-1, u as i32, v as i32, LocalPos::new(last, u, v))
+        });
+        fill_face(neighbors.pos_x, &mut |u, v| {
+            (sz, u as i32, v as i32, LocalPos::new(0, u, v))
+        });
+        fill_face(neighbors.neg_y, &mut |u, v| {
+            (u as i32, -1, v as i32, LocalPos::new(u, last, v))
+        });
+        fill_face(neighbors.pos_y, &mut |u, v| {
+            (u as i32, sz, v as i32, LocalPos::new(u, 0, v))
+        });
+        fill_face(neighbors.neg_z, &mut |u, v| {
+            (u as i32, v as i32, -1, LocalPos::new(u, v, last))
+        });
+        fill_face(neighbors.pos_z, &mut |u, v| {
+            (u as i32, v as i32, sz, LocalPos::new(u, v, 0))
+        });
+
+        Self {
+            block,
+            light,
+            all_air: chunk.is_all_air(),
+        }
+    }
+}
+
 /// Directional shading per (axis, positive sign): top brightest, bottom
 /// darkest, so geometry reads as 3D before real lighting exists. Shared by
 /// both meshers — the differential test compares vertex colors, so any
@@ -112,67 +236,6 @@ fn face_brightness(axis: usize, positive: bool) -> f32 {
         (2, true) => 0.8,   // +Z south
         (2, false) => 0.6,  // -Z north
         _ => unreachable!("axis is 0..3"),
-    }
-}
-
-/// Is the block at chunk-relative coords air? Coordinates one step outside
-/// `0..32` resolve into the corresponding neighbor (only one axis can be
-/// out of range, since face offsets are unit steps). Missing neighbors
-/// count as air.
-fn is_air_at(chunk: &Chunk, neighbors: &ChunkNeighbors, x: i32, y: i32, z: i32) -> bool {
-    let size = CHUNK_SIZE as i32;
-    let last = (size - 1) as u8;
-
-    let (target, local) = if x < 0 {
-        (neighbors.neg_x, LocalPos::new(last, y as u8, z as u8))
-    } else if x >= size {
-        (neighbors.pos_x, LocalPos::new(0, y as u8, z as u8))
-    } else if y < 0 {
-        (neighbors.neg_y, LocalPos::new(x as u8, last, z as u8))
-    } else if y >= size {
-        (neighbors.pos_y, LocalPos::new(x as u8, 0, z as u8))
-    } else if z < 0 {
-        (neighbors.neg_z, LocalPos::new(x as u8, y as u8, last))
-    } else if z >= size {
-        (neighbors.pos_z, LocalPos::new(x as u8, y as u8, 0))
-    } else {
-        return chunk.get(LocalPos::new(x as u8, y as u8, z as u8)).is_air();
-    };
-
-    match target {
-        None => true,
-        Some(neighbor) => neighbor.get(local).is_air(),
-    }
-}
-
-/// Block-light level at chunk-relative coords, reaching into the appropriate
-/// neighbor when one step outside `0..32` (mirrors [`is_air_at`]). Missing
-/// neighbors read as dark (0). A face samples the light of the (air) cell it
-/// looks into, so surfaces are lit by the light in front of them.
-fn light_at(chunk: &Chunk, neighbors: &ChunkNeighbors, x: i32, y: i32, z: i32) -> u8 {
-    let size = CHUNK_SIZE as i32;
-    let last = (size - 1) as u8;
-
-    let (target, local) = if x < 0 {
-        (neighbors.neg_x, LocalPos::new(last, y as u8, z as u8))
-    } else if x >= size {
-        (neighbors.pos_x, LocalPos::new(0, y as u8, z as u8))
-    } else if y < 0 {
-        (neighbors.neg_y, LocalPos::new(x as u8, last, z as u8))
-    } else if y >= size {
-        (neighbors.pos_y, LocalPos::new(x as u8, 0, z as u8))
-    } else if z < 0 {
-        (neighbors.neg_z, LocalPos::new(x as u8, y as u8, last))
-    } else if z >= size {
-        (neighbors.pos_z, LocalPos::new(x as u8, y as u8, 0))
-    } else {
-        let p = LocalPos::new(x as u8, y as u8, z as u8);
-        return chunk.block_light(p).max(chunk.sky_light(p));
-    };
-
-    match target {
-        None => 0,
-        Some(neighbor) => neighbor.block_light(local).max(neighbor.sky_light(local)),
     }
 }
 
@@ -268,21 +331,22 @@ pub fn mesh_chunk_naive(
     mut layer_of: impl FnMut(BlockId, usize) -> u32,
 ) -> MeshData {
     let mut mesh = MeshData::default();
-    if chunk.is_all_air() {
+    let input = MeshInput::build(chunk, neighbors);
+    if input.all_air {
         return mesh;
     }
 
     for pos in LocalPos::iter() {
-        let block = chunk.get(pos);
+        let coords = [pos.x() as i32, pos.y() as i32, pos.z() as i32];
+        let block = input.block(coords[0], coords[1], coords[2]);
         if block.is_air() {
             continue;
         }
-        let coords = [pos.x() as i32, pos.y() as i32, pos.z() as i32];
 
         for (face_index, &(axis, positive, u_axis, v_axis)) in FACE_DIRS.iter().enumerate() {
             let mut neighbor = coords;
             neighbor[axis] += if positive { 1 } else { -1 };
-            if !is_air_at(chunk, neighbors, neighbor[0], neighbor[1], neighbor[2]) {
+            if !input.is_air(neighbor[0], neighbor[1], neighbor[2]) {
                 continue;
             }
 
@@ -292,7 +356,7 @@ pub fn mesh_chunk_naive(
                 base[axis] += 1.0;
             }
             // Light the face by the cell it looks into (the air neighbor).
-            let light = light_at(chunk, neighbors, neighbor[0], neighbor[1], neighbor[2]);
+            let light = input.light(neighbor[0], neighbor[1], neighbor[2]);
             let brightness = face_brightness(axis, positive) * light_curve(light);
             emit_rect(
                 &mut mesh,
@@ -327,7 +391,8 @@ pub fn mesh_chunk(
     mut layer_of: impl FnMut(BlockId, usize) -> u32,
 ) -> MeshData {
     let mut mesh = MeshData::default();
-    if chunk.is_all_air() {
+    let input = MeshInput::build(chunk, neighbors);
+    if input.all_air {
         return mesh;
     }
 
@@ -353,11 +418,7 @@ pub fn mesh_chunk(
                     coords[u_axis] = u as i32;
                     coords[v_axis] = v as i32;
 
-                    let block = chunk.get(LocalPos::new(
-                        coords[0] as u8,
-                        coords[1] as u8,
-                        coords[2] as u8,
-                    ));
+                    let block = input.block(coords[0], coords[1], coords[2]);
 
                     let cell = &mut mask[at(u, v)];
                     if block.is_air() {
@@ -367,8 +428,8 @@ pub fn mesh_chunk(
 
                     let mut n = coords;
                     n[axis] += if positive { 1 } else { -1 };
-                    if is_air_at(chunk, neighbors, n[0], n[1], n[2]) {
-                        let light = light_at(chunk, neighbors, n[0], n[1], n[2]);
+                    if input.is_air(n[0], n[1], n[2]) {
+                        let light = input.light(n[0], n[1], n[2]);
                         *cell = Some((block, light));
                         any = true;
                     } else {
@@ -812,5 +873,88 @@ mod tests {
             z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
             z ^ (z >> 31)
         }
+    }
+    #[test]
+    fn snapshot_matches_chunk_and_neighbors() {
+        // The snapshot must agree with direct chunk reads: interior cells,
+        // a present face neighbor's touching layer, and absent neighbors as
+        // air / light 0.
+        let mut chunk = Chunk::new_air();
+        chunk.set(LocalPos::new(3, 4, 5), STONE);
+        chunk.set_sky_light(LocalPos::new(3, 5, 5), 12);
+        let mut west = Chunk::filled(STONE);
+        west.set(LocalPos::new(31, 7, 7), BlockId::AIR);
+        west.set_block_light(LocalPos::new(31, 7, 7), 9);
+        let neighbors = ChunkNeighbors {
+            neg_x: Some(&west),
+            ..ChunkNeighbors::NONE
+        };
+        let input = MeshInput::build(&chunk, &neighbors);
+        // Interior.
+        assert!(!input.is_air(3, 4, 5));
+        assert_eq!(input.block(3, 4, 5), STONE);
+        assert!(input.is_air(3, 5, 5));
+        assert_eq!(input.light(3, 5, 5), 12);
+        // Present neighbor's touching layer (x = -1 maps to west x = 31).
+        assert!(input.is_air(-1, 7, 7));
+        assert_eq!(input.light(-1, 7, 7), 9);
+        assert!(!input.is_air(-1, 8, 8));
+        // Absent neighbors: air, dark.
+        assert!(input.is_air(32, 0, 0));
+        assert_eq!(input.light(32, 0, 0), 0);
+        assert!(input.is_air(0, -1, 0));
+    }
+
+    /// Perf yardstick, not a correctness test. Run with:
+    /// `cargo test --release -p vox-mesh bench_mesh -- --ignored --nocapture`
+    /// History: 2736us (per-visit palette decodes) -> 1876us (MeshInput
+    /// snapshot, ADR-0006; build alone ~197us), July 2026. The remaining
+    /// cost is the mask/merge loops, restructured in M06 task 2.
+    #[test]
+    #[ignore]
+    fn bench_mesh_realistic_surface_chunk() {
+        use vox_core::{BlockRegistry, apply_chunk_light, compute_chunk_light_2ch, open_sky_top};
+        let reg = BlockRegistry::default_set();
+        let n = CHUNK_SIZE;
+        let mut chunk = Chunk::new_air();
+        for z in 0..n {
+            for x in 0..n {
+                for y in 0..=18usize {
+                    chunk.set(LocalPos::new(x as u8, y as u8, z as u8), STONE);
+                }
+            }
+        }
+        for z in 8..=14u8 {
+            for x in 8..=14u8 {
+                for y in 4..=9u8 {
+                    chunk.set(LocalPos::new(x, y, z), BlockId::AIR);
+                }
+            }
+        }
+        for y in 2..=31u8 {
+            chunk.set(LocalPos::new(20, y, 20), BlockId::AIR);
+        }
+        // Real light so greedy merge behavior is realistic.
+        let (light, _) = compute_chunk_light_2ch(
+            &chunk,
+            &reg,
+            &[None, None, None, None, None, None],
+            &[None, None, None, None, None, None],
+            &open_sky_top(),
+            true,
+        );
+        apply_chunk_light(&mut chunk, &light);
+        let iters = 300;
+        let start = std::time::Instant::now();
+        let mut quads = 0usize;
+        for _ in 0..iters {
+            let m = mesh_chunk(&chunk, &ChunkNeighbors::NONE, |_, _| 0);
+            quads = m.quad_count();
+        }
+        let total = start.elapsed();
+        println!(
+            "mesh x{iters}: per-chunk {:.0}us, {quads} quads",
+            total.as_secs_f64() * 1e6 / iters as f64
+        );
     }
 }
