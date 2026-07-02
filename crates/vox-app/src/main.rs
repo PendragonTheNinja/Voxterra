@@ -54,8 +54,14 @@ const GEN_SPAWN_BUDGET: usize = 64;
 /// of generation can't blow the frame: each pass runs parallel sub-batches
 /// until its time cap, then yields. Heavy chunks → fewer per frame, light
 /// chunks → more; frame time stays bounded.
-const MESH_SUBBATCH: usize = 24;
-const RELIGHT_SUBBATCH: usize = 64;
+// Sub-batch sizes are deliberately small: the time-cap check runs BETWEEN
+// batches, so one batch is the budget-overshoot unit. A mesh batch's GPU
+// uploads run serially on the main thread inside the loop — 24 chunks per
+// batch could triple the 4ms cap in a single iteration (the streaming-burst
+// fps dips). Smaller batches trade a little rayon efficiency for caps that
+// hold, which is exactly what "smooth while streaming" means.
+const MESH_SUBBATCH: usize = 8;
+const RELIGHT_SUBBATCH: usize = 32;
 const MESH_TIME_MS: f32 = 4.0;
 const RELIGHT_TIME_MS: f32 = 3.0;
 /// Chunk side length as i64, for heightmap/world-coordinate math.
@@ -99,14 +105,23 @@ fn top_sky_from_heightmap(heights: &HashMap<(i64, i64), i64>, pos: ChunkPos) -> 
     let mut top = vec![0u8; (CHUNK_SIZE_I * CHUNK_SIZE_I) as usize];
     for lz in 0..CHUNK_SIZE_I {
         for lx in 0..CHUNK_SIZE_I {
-            let h = heights
-                .get(&(origin.x + lx, origin.z + lz))
-                .copied()
-                .unwrap_or(i64::MIN);
+            // Distinguish a KNOWN column height from an UNKNOWN one. A column is
+            // unknown when its solid chunks have not streamed in yet (no entry
+            // in the heightmap). An unknown column must be treated as COVERED
+            // (top_sky = 0), never as open: assuming "open" here injects full
+            // daylight that the uniform-air fast path then commits straight down
+            // a column that may actually be sealed/underground, and because the
+            // heightmap is raise-only and relight is local, that bogus daylight
+            // gets frozen into already-lit chunks (the sealed-hole leak). It is
+            // always safe to start an unknown column dark and let it brighten
+            // honestly once the real terrain loads and relights it.
+            let known_h = heights.get(&(origin.x + lx, origin.z + lz)).copied();
+
             // Inject full daylight at the chunk's TOP FACE only when the column
-            // is open through this ENTIRE chunk — i.e. the highest solid is
-            // below the chunk's floor. Then 15 legitimately fills the column
-            // top-to-bottom (it's all air to the surface, which lies below).
+            // is KNOWN and open through this ENTIRE chunk — i.e. the highest
+            // solid is below the chunk's floor. Then 15 legitimately fills the
+            // column top-to-bottom (it's all air to the surface, which lies
+            // below).
             //
             // When the surface lies INSIDE this chunk (origin.y <= h), we must
             // NOT blanket the ceiling with 15 — that would flood daylight down
@@ -115,8 +130,10 @@ fn top_sky_from_heightmap(heights: &HashMap<(i64, i64), i64>, pos: ChunkPos) -> 
             // from the chunk ABOVE via its -Y sky plane (the +Y neighbor border)
             // and BFS-floods down only through actual air, stopping at the
             // surface solid. Sealed shafts below the surface stay dark.
-            top[(lx + lz * CHUNK_SIZE_I) as usize] =
-                if h < origin.y { vox_core::MAX_LIGHT } else { 0 };
+            top[(lx + lz * CHUNK_SIZE_I) as usize] = match known_h {
+                Some(h) if h < origin.y => vox_core::MAX_LIGHT,
+                _ => 0,
+            };
         }
     }
     top
@@ -135,7 +152,7 @@ fn relight_chunks_parallel(
     registry: &BlockRegistry,
     heights: &HashMap<(i64, i64), i64>,
     positions: &[ChunkPos],
-) -> Vec<(ChunkPos, Vec<u8>, bool, bool)> {
+) -> Vec<(ChunkPos, Vec<u8>, bool, u8)> {
     const OPPOSITE: [usize; 6] = [1, 0, 3, 2, 5, 4];
     positions
         .par_iter()
@@ -170,7 +187,15 @@ fn relight_chunks_parallel(
                 let cur = (chunk.sky_light(p) << 4) | (chunk.block_light(p) & 0x0F);
                 cur != light[i]
             });
-            Some((pos, light, interior_changed, border_changed))
+            // Which faces actually changed — so the consumer requeues only the
+            // neighbor across a changed face, not all six (up to 6x less
+            // relight/remesh cascade during streaming convergence).
+            let border_faces = if border_changed {
+                vox_core::packed_border_changed_faces(chunk, &light)
+            } else {
+                0
+            };
+            Some((pos, light, interior_changed, border_faces))
         })
         .collect()
 }
@@ -377,6 +402,10 @@ struct App {
 
     /// Telemetry: accumulate frames over ~1s to log FPS + drawn/total.
     telemetry_accum: f32,
+    /// Milliseconds spent in the relight / mesh streaming passes since the
+    /// last telemetry line — shows where frame time goes during bursts.
+    relight_ms_accum: f32,
+    mesh_ms_accum: f32,
     telemetry_frames: u32,
 }
 
@@ -424,6 +453,8 @@ impl Default for App {
             gen_rx,
 
             telemetry_accum: 0.0,
+            relight_ms_accum: 0.0,
+            mesh_ms_accum: 0.0,
             telemetry_frames: 0,
         }
     }
@@ -613,10 +644,24 @@ impl App {
             }
         }
         if any_raised {
-            // The chunk directly below may now be shadowed; relight it.
-            let below = ChunkPos::new(pos.x, pos.y - 1, pos.z);
-            if self.world.chunk(below).is_some() {
-                self.relight.insert(below);
+            // Some column height in this chunk's (x,z) footprint just became
+            // known or rose. Every loaded chunk in the SAME VERTICAL STACK must
+            // relight: a chunk lit while a column was still unknown (top_sky
+            // defaulted to covered/0, or previously to daylit under the old
+            // rule) has stale light that only a recompute can correct — this
+            // is what un-freezes the sealed-hole daylight leak. All changed
+            // columns lie within this chunk's own footprint, so the affected
+            // chunks are exactly those with matching chunk (x,z); the check is
+            // two integer compares per loaded chunk (the chunk directly below,
+            // which the new surface may now shadow, is in the stack too).
+            let mut to_relight: Vec<ChunkPos> = Vec::new();
+            for (cpos, _) in self.world.chunks() {
+                if cpos.x == pos.x && cpos.z == pos.z {
+                    to_relight.push(cpos);
+                }
+            }
+            for c in to_relight {
+                self.relight.insert(c);
             }
         }
     }
@@ -852,18 +897,32 @@ impl App {
                     &self.column_heights,
                     &sub,
                 );
-                for (pos, light, interior_changed, border_changed) in lit {
+                for (pos, light, interior_changed, border_faces) in lit {
                     if interior_changed {
                         if let Some(chunk) = self.world.chunk_mut(pos) {
                             vox_core::apply_chunk_light(chunk, &light);
                         }
                         self.dirty.insert(pos);
                     }
-                    if border_changed {
-                        for (dx, dy, dz) in NEIGHBOR_OFFSETS {
+                    // Requeue ONLY the neighbor across each face whose border
+                    // light actually changed (bit i = face i, same order as
+                    // NEIGHBOR_OFFSETS). Requeuing all six per change is what
+                    // made the convergence cascade balloon the queues during
+                    // streaming bursts. The neighbor gets BOTH a relight (its
+                    // light may now differ) and a re-mesh: its mesh samples
+                    // this chunk's border cells across the seam, so a changed
+                    // border makes it stale (the dark seam-line artifact). The
+                    // defer-while-relighting rule coalesces the two so it
+                    // still meshes once, after light settles.
+                    if border_faces != 0 {
+                        for (face, (dx, dy, dz)) in NEIGHBOR_OFFSETS.iter().enumerate() {
+                            if border_faces & (1 << face) == 0 {
+                                continue;
+                            }
                             let n = ChunkPos::new(pos.x + dx, pos.y + dy, pos.z + dz);
                             if self.world.chunk(n).is_some() {
                                 self.relight.insert(n);
+                                self.dirty.insert(n);
                             }
                         }
                     }
@@ -872,13 +931,27 @@ impl App {
                     break;
                 }
             }
+            self.relight_ms_accum += start.elapsed().as_secs_f32() * 1000.0;
         }
 
         // --- Mesh pass (time-budgeted, parallel). ---
         if !self.dirty.is_empty() {
             let start = Instant::now();
             loop {
-                let batch: Vec<ChunkPos> = self.dirty.iter().copied().take(MESH_SUBBATCH).collect();
+                // Defer any dirty chunk that is still queued for relight:
+                // meshing it now would bake stale/zero light (the dark
+                // chunk-checkerboard during streaming) and the relight would
+                // immediately re-dirty it — every streamed chunk meshed twice.
+                // Lighting first means each chunk is meshed once, already lit.
+                // Deferred chunks stay in `dirty` and are picked up on a later
+                // frame once their relight has drained.
+                let batch: Vec<ChunkPos> = self
+                    .dirty
+                    .iter()
+                    .copied()
+                    .filter(|p| !self.relight.contains(p))
+                    .take(MESH_SUBBATCH)
+                    .collect();
                 if batch.is_empty() {
                     break;
                 }
@@ -904,6 +977,7 @@ impl App {
                     break;
                 }
             }
+            self.mesh_ms_accum += start.elapsed().as_secs_f32() * 1000.0;
         }
     }
 
@@ -1236,7 +1310,7 @@ impl ApplicationHandler for App {
                     if self.telemetry_accum >= 1.0 {
                         let fps = self.telemetry_frames as f32 / self.telemetry_accum;
                         log::info!(
-                            "{:.0} fps | drawn {}/{} | loaded {} | gen {} | dirty {} | relight {}",
+                            "{:.0} fps | drawn {}/{} | loaded {} | gen {} | dirty {} | relight {} | lt {:.0}ms msh {:.0}ms",
                             fps,
                             renderer.drawn_last_frame(),
                             renderer.mesh_count(),
@@ -1244,9 +1318,13 @@ impl ApplicationHandler for App {
                             in_flight,
                             dirty,
                             relight,
+                            self.relight_ms_accum,
+                            self.mesh_ms_accum,
                         );
                         self.telemetry_accum = 0.0;
                         self.telemetry_frames = 0;
+                        self.relight_ms_accum = 0.0;
+                        self.mesh_ms_accum = 0.0;
                     }
                 }
                 if let Some(window) = &self.window {

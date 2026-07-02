@@ -132,11 +132,76 @@ beyond what the invariants above already require.
 
 ## Current status
 
-- **Active milestone:** 05 — Skylight (spec not yet written)
-- **Last completed milestone:** 04 — Block Light (2026-06-15)
+- **Active milestone:** 06 — Smooth Lighting & Ambient Occlusion
+  (`docs/milestones/06-smooth-lighting-ao.md`, ADR-0006). Next up: task 1
+  (mesh input snapshot + bench yardstick).
+- **Last completed milestone:** 05 — Skylight (2026-07-02); retrospective with
+  baseline numbers at the end of `docs/milestones/05-skylight.md`
 - Completed milestones have retrospectives in `docs/milestones/`. A future
   seed-driven LOD / far-view-distance system is noted at the end of the M04
   retro (its own milestone when scheduled).
 - Milestones 02 (Infinite World, 2026-06-14) and 03 are complete; see their
   retrospectives in `docs/milestones/`.
 - Update this section at the end of every working session.
+## Lighting & streaming invariants (added post-M05 — do not violate)
+
+These encode the root causes of the M05 sealed-cave daylight saga. Each one
+was a real shipped bug. Regression tests exist for all of them (vox-core).
+
+- **The padded border ring is light SOURCES only, never a CONDUIT.** Border
+  cells of the 34³ relight volume stand in for neighbor light; they seed
+  inward but must never receive or relay light (`LightVolume::accepts_spread`).
+  Letting the ring conduct fabricates paths along chunk boundaries through
+  space that is actually the neighbor's (possibly solid) territory — full
+  daylight rode the ring down into sealed caves.
+- **An unknown heightmap column is COVERED (top_sky = 0), never open.** During
+  async streaming, air chunks load before the terrain below them; a missing
+  column height must default dark. Assuming "open" injects daylight that the
+  uniform fast path commits and nothing ever corrects. Dark-then-brighten is
+  always safe; lit-then-frozen is the bug.
+- **When a column's height becomes known or rises, relight its whole loaded
+  chunk stack** (same chunk x,z) — chunks lit during the unknown window hold
+  stale light that only a recompute clears. Keep this O(loaded) with cheap
+  integer compares; never scan per-column against all loaded chunks.
+- **Never mesh a chunk that is still queued for relight.** Light first, mesh
+  once. Meshing before lighting bakes zero light (dark chunk checkerboard)
+  and forces a second mesh — the single biggest streaming-burst cost found.
+- **A changed border must re-mesh neighbors, not just re-light them.**
+  Neighbor meshes sample this chunk's border cells; relight alone leaves
+  stale dark seam faces.
+- **The heightmap is raise-only** (edits/digging never lower it). This is a
+  deliberate conservative choice: a too-high height only makes columns darker
+  than truth (honest propagation from the overhead plane still lights them);
+  a too-low height invents daylight. Preserve this asymmetry.
+- The live relight entry point is `compute_chunk_light_2ch` via
+  `relight_chunks_parallel`. Older single-channel functions in light.rs are
+  legacy — do not extend them.
+
+## Hard-won debugging lessons (M05 saga — read before any lighting work)
+
+1. **A fix ships only after a reproduction test that FAILS on current code.**
+   Multiple confident fixes shipped during M05 changed nothing in-game
+   because they were built against passing tests instead of a failing one.
+   The bug that ended the saga was found the same day this rule was applied.
+2. **Isolated unit tests cannot validate multi-chunk systems.** Every M05
+   root cause lived in interactions: chunk seams, async load order, the
+   relight/mesh pipeline. Write tests that model the seam and the streaming
+   order (feed real neighbor planes, vary load order), not just one chunk.
+3. **When in-game behavior contradicts passing tests, believe the game.**
+   The gap IS the diagnosis: the tests are feeding inputs the game doesn't.
+   Instrument the live game (temporary probes in `break_block` logging via
+   RUST_LOG worked well: VPROBE/SRCPROBE/PLANEDUMP pattern) instead of
+   theorizing another round. Remove probes before commit.
+4. **Take the user's bug reports literally.** Twice during M05, real bugs
+   were rationalized as "actually correct behavior" (horizontal light spread,
+   thin-terrain bleed). If Nathan says a sealed hole is lit, a sealed hole is
+   lit; find the mechanism.
+5. **"The recompute produces the same wrong value" is a diagnosis, not a
+   dead end.** If forced relights change nothing, either the inputs are
+   self-consistently contaminated or the computation itself has a
+   path-fabricating flaw — check what the algorithm treats as traversable.
+6. **Measure performance under streaming, not standing still**, and keep
+   per-chunk-load work near O(1): no scans of all loaded chunks or all
+   columns per event. Uniform chunks are ~86% of the stream — fast-path them
+   (relight, column heights), and verify the fast path against the slow path
+   in tests.

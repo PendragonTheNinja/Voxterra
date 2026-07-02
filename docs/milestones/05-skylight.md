@@ -159,3 +159,54 @@ Still to settle in the spec/early tasks:
   milestone (candidates: smooth lighting/AO, transparent blocks, the
   seed-driven LOD/far-view system from the M04 retro, or realistic worldgen +
   world floor).
+
+---
+
+## Retrospective (2026-07-02) — ACCEPTED
+
+M05 shipped, after the longest debugging arc in the project's history. The
+final system: per-column world heightmap feeding a `top_sky` boundary, honest
+downward/diffuse propagation via `compute_chunk_light_2ch` (uniform fast path
++ bucketed sky flood), survival movement, and a rebuilt streaming light/mesh
+pipeline. In-game behavior at acceptance: daylight outdoors; sealed caves and
+shafts pitch dark at every depth; open shafts lit to the bottom; horizontal
+tunnels darken along their length; sealed rooms go dark on the final block;
+no dark-chunk checkerboard while streaming.
+
+### Baseline numbers (this commit)
+
+- Relight, realistic non-uniform surface chunk (release, `bench_relight_*`):
+  **447µs/chunk** — history 1438µs (tuple-queue BFS) → 1209µs (solidity map)
+  → 447µs (bucketed flood + column pre-fill). Uniform fast path (~86% of
+  streamed chunks) remains ~205µs → effectively free.
+- Sprint-fly streaming bursts (worst case, load radius 8, ~2700 loaded):
+  **94–100 fps floor** (was 26–31 before the pipeline work), relight pass
+  ≤ ~416ms/s (was ~720), queues drain monotonically (no runaway convergence
+  cascade). Steady state 144 fps. Normal-speed flight streams invisibly.
+- Tests: 136 vox-core (+1 ignored perf yardstick) + 16 vox-mesh.
+
+### What the saga actually taught (full write-ups in the repo)
+
+Three shipped root causes, all *interaction* bugs invisible to isolated unit
+tests: the padded-border-ring light conduit (the sealed-cave daylight leak),
+the unknown-heightmap-column "open" default under async load order, and
+mesh-before-relight ordering (the dark checkerboard + double meshing). The
+mechanism-level accounts live in `docs/notes/skylight-edit-relight-bug.md`;
+the distilled invariants and debugging rules are in CLAUDE.md ("Lighting &
+streaming invariants" and "Hard-won debugging lessons") — read both before
+touching lighting or streaming. `docs/notes/code-audit-2026-07.md` holds the
+post-saga full-codebase audit (P1 items: `column_heights` unbounded growth;
+`Chunk::compact()` never called).
+
+### Decisions & open items
+
+- **Ambient floor stays 0.06 for now** — deliberately deferred, not decided:
+  deep caves render at 6% grey rather than true black. Revisit when day/night
+  or smooth lighting lands, where the contrast context will be real.
+- **Async lighting/meshing pipeline** (roadmap note, own milestone): the main
+  thread still spends up to ~7ms/frame on budgeted relight/mesh passes during
+  bursts. The end-state is compute on workers with results applied when
+  ready — zero frame cost regardless of flight speed. Pair with the LOD/
+  far-view milestone (M04 retro), since both rework the same pipeline.
+- Audit P1s (`column_heights` pruning, `compact()` on save) are good
+  first-task candidates for any session that touches streaming or storage.

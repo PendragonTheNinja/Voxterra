@@ -43,6 +43,17 @@ pub trait LightVolume {
     fn get_light(&self, x: usize, y: usize, z: usize) -> u8;
     /// Set block-light at the cell.
     fn set_light(&mut self, x: usize, y: usize, z: usize, level: u8);
+    /// Whether light may propagate INTO this cell during a flood (default:
+    /// yes). A volume whose outer shell stands in for *neighbor* light — the
+    /// padded chunk's border ring — must answer `false` for shell cells: they
+    /// are seeds that push light inward but never receive or relay it. If the
+    /// shell conducts, it fabricates paths along the chunk boundary through
+    /// space that actually belongs to the neighbor (and may be solid there):
+    /// e.g. daylight seeded high on a side plane riding the ring straight
+    /// down at full strength, past the surface, into sealed caves.
+    fn accepts_spread(&self, _x: usize, _y: usize, _z: usize) -> bool {
+        true
+    }
 }
 
 /// Flood-fill block light through `vol` from scratch: clears non-emitter
@@ -86,7 +97,7 @@ pub fn propagate_block_light(vol: &mut impl LightVolume) -> usize {
         let spread = level - 1;
 
         for (nx, ny, nz) in neighbors(x, y, z, dx, dy, dz) {
-            if vol.is_solid(nx, ny, nz) {
+            if vol.is_solid(nx, ny, nz) || !vol.accepts_spread(nx, ny, nz) {
                 continue;
             }
             if vol.get_light(nx, ny, nz) < spread {
@@ -215,7 +226,7 @@ fn bfs_spread(vol: &mut impl LightVolume, queue: &mut Vec<(usize, usize, usize)>
         }
         let spread = level - 1;
         for (nx, ny, nz) in neighbors(x, y, z, dx, dy, dz) {
-            if vol.is_solid(nx, ny, nz) {
+            if vol.is_solid(nx, ny, nz) || !vol.accepts_spread(nx, ny, nz) {
                 continue;
             }
             if vol.get_light(nx, ny, nz) < spread {
@@ -322,7 +333,7 @@ pub fn propagate_sky_light(vol: &mut impl LightVolume, top_sky: &[u8]) {
             continue;
         }
         for (nx, ny, nz) in neighbors(x, y, z, dx, dy, dz) {
-            if vol.is_solid(nx, ny, nz) {
+            if vol.is_solid(nx, ny, nz) || !vol.accepts_spread(nx, ny, nz) {
                 continue;
             }
             // Straight down means the neighbor is directly below (ny = y-1).
@@ -385,6 +396,18 @@ pub fn column_index(x: usize, z: usize) -> usize {
 /// where skylight stops descending inside the chunk.
 pub fn chunk_column_heights(chunk: &Chunk, registry: &BlockRegistry) -> Vec<Option<u8>> {
     let n = CHUNK_SIZE;
+    // Uniform fast path: ~86% of streamed chunks are a single block type
+    // (all-air above terrain, all-solid underground). Their column tops are
+    // trivial — skip the up-to-32k-cell scan, which otherwise runs for every
+    // newly loaded chunk inside the frame (a hidden streaming-burst cost).
+    if chunk.is_uniform() {
+        let top = if registry.is_solid(chunk.get(LocalPos::new(0, 0, 0))) {
+            Some((n - 1) as u8) // all-solid: every column tops at the chunk top
+        } else {
+            None // all-air: no solid anywhere
+        };
+        return vec![top; n * n];
+    }
     let mut heights = vec![None; n * n];
     for z in 0..n {
         for x in 0..n {
@@ -441,21 +464,25 @@ pub fn chunk_light_plane(chunk: &Chunk, face: usize) -> Vec<u8> {
 /// (so dims are 34³). Center cells read solidity/emission from the chunk via
 /// the registry and hold writable light; border cells carry neighbor light
 /// (injected as "emission" so it floods inward) and are never written back.
-struct PaddedChunk<'a> {
-    chunk: &'a Chunk,
-    registry: &'a BlockRegistry,
+struct PaddedChunk {
     emission: Vec<u8>, // 34³, border = neighbor light, center = block emission
     light: Vec<u8>,    // 34³ scratch
+    solid: Vec<bool>,  // 34³ precomputed solidity (border shell = false)
 }
 
 const PAD: usize = CHUNK_SIZE + 2;
 
-impl<'a> PaddedChunk<'a> {
+impl PaddedChunk {
     fn idx(x: usize, y: usize, z: usize) -> usize {
         x + y * PAD + z * PAD * PAD
     }
 
-    fn build(chunk: &'a Chunk, registry: &'a BlockRegistry, borders: &NeighborLight) -> Self {
+    fn build(
+        chunk: &Chunk,
+        registry: &BlockRegistry,
+        borders: &NeighborLight,
+        solid: Vec<bool>,
+    ) -> Self {
         let n = CHUNK_SIZE;
         let mut emission = vec![0u8; PAD * PAD * PAD];
 
@@ -495,10 +522,9 @@ impl<'a> PaddedChunk<'a> {
         }
 
         Self {
-            chunk,
-            registry,
             emission,
             light: vec![0u8; PAD * PAD * PAD],
+            solid,
         }
     }
 
@@ -515,17 +541,14 @@ impl<'a> PaddedChunk<'a> {
     }
 }
 
-impl LightVolume for PaddedChunk<'_> {
+impl LightVolume for PaddedChunk {
     fn dims(&self) -> [usize; 3] {
         [PAD, PAD, PAD]
     }
     fn is_solid(&self, x: usize, y: usize, z: usize) -> bool {
-        // Border cells are non-solid (they only feed light in). Center cells
-        // use the registry's solidity for the block.
-        match Self::center_local(x, y, z) {
-            Some(pos) => self.registry.is_solid(self.chunk.get(pos)),
-            None => false,
-        }
+        // Precomputed at build time (border shell false); no palette decode
+        // in the BFS inner loop.
+        self.solid[Self::idx(x, y, z)]
     }
     fn emission(&self, x: usize, y: usize, z: usize) -> u8 {
         self.emission[Self::idx(x, y, z)]
@@ -535,6 +558,10 @@ impl LightVolume for PaddedChunk<'_> {
     }
     fn set_light(&mut self, x: usize, y: usize, z: usize, level: u8) {
         self.light[Self::idx(x, y, z)] = level;
+    }
+    fn accepts_spread(&self, x: usize, y: usize, z: usize) -> bool {
+        // Border ring cells are light sources only — never conduits.
+        Self::center_local(x, y, z).is_some()
     }
 }
 
@@ -681,9 +708,13 @@ pub fn compute_chunk_light_2ch(
         }
     }
 
+    // One padded solidity map shared by both channels (built once; the BFS
+    // inner loops index it instead of palette-decoding per neighbor visit).
+    let solid_map = padded_solidity(chunk, registry);
+
     // --- Block light (low nibble) ---
     let block = {
-        let mut vol = PaddedChunk::build(chunk, registry, block_borders);
+        let mut vol = PaddedChunk::build(chunk, registry, block_borders, solid_map.clone());
         propagate_block_light(&mut vol);
         let mut out = vec![0u8; CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE];
         for pos in LocalPos::iter() {
@@ -698,7 +729,7 @@ pub fn compute_chunk_light_2ch(
 
     // --- Sky light (high nibble) ---
     let sky = if do_sky {
-        compute_padded_sky(chunk, registry, top_sky, sky_borders)
+        compute_padded_sky(&solid_map, top_sky, sky_borders)
     } else {
         vec![0u8; CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE]
     };
@@ -732,40 +763,80 @@ pub fn compute_chunk_light_2ch(
 /// chunk borders (e.g. under an overhang straddling a boundary). The ±Y
 /// planes are ignored — vertical sky is handled by `top_sky` (down) and not
 /// needed upward.
-fn compute_padded_sky(
-    chunk: &Chunk,
-    registry: &BlockRegistry,
-    top_sky: &[u8],
-    sky: &NeighborSky,
-) -> Vec<u8> {
+/// Padded (34³) solidity map for one chunk: border shell is non-solid, center
+/// cells resolve through the registry ONCE. Both light channels' BFS loops
+/// test this map instead of doing a palette decode (`chunk.get`) per neighbor
+/// visit — the hot inner loop of relighting touches solidity ~150k+ times per
+/// non-uniform chunk, so paying 32k decodes up front is a large net win.
+fn padded_solidity(chunk: &Chunk, registry: &BlockRegistry) -> Vec<bool> {
+    let mut solid = vec![false; PAD * PAD * PAD];
+    for pos in LocalPos::iter() {
+        if registry.is_solid(chunk.get(pos)) {
+            solid[PaddedChunk::idx(
+                pos.x() as usize + 1,
+                pos.y() as usize + 1,
+                pos.z() as usize + 1,
+            )] = true;
+        }
+    }
+    solid
+}
+
+fn compute_padded_sky(solid_map: &[bool], top_sky: &[u8], sky: &NeighborSky) -> Vec<u8> {
     let n = CHUNK_SIZE;
     let mut light = vec![0u8; PAD * PAD * PAD];
+    let idx = PaddedChunk::idx;
 
-    // Solidity lookup for a padded coord (center from blocks; border non-solid).
-    let solid = |x: usize, y: usize, z: usize| -> bool {
-        match PaddedChunk::center_local(x, y, z) {
-            Some(pos) => registry.is_solid(chunk.get(pos)),
-            None => false,
-        }
-    };
+    // Flat-index neighbor offsets for INTERIOR cells (x/y/z in 1..=n), for
+    // which all six are always in-bounds. Layout: x + y*PAD + z*PAD².
+    const OFF_X: isize = 1;
+    const OFF_Y: isize = PAD as isize;
+    const OFF_Z: isize = (PAD * PAD) as isize;
+    const OFFS: [isize; 6] = [OFF_X, -OFF_X, OFF_Y, -OFF_Y, OFF_Z, -OFF_Z];
 
-    let mut queue: Vec<(usize, usize, usize)> = Vec::new();
-    let seed = |light: &mut [u8], queue: &mut Vec<(usize, usize, usize)>, x, y, z, val: u8| {
-        if val > 0 {
-            light[PaddedChunk::idx(x, y, z)] = val;
-            queue.push((x, y, z));
-        }
-    };
+    // Level buckets (Dijkstra-style): each cell is finalized once, in
+    // decreasing light order — no re-pushes, no per-visit allocation, no
+    // coordinate math. This replaced a tuple-queue BFS that spent ~75% of
+    // the whole relight cost here (allocating a Vec per popped cell in
+    // `neighbors()` and re-visiting cells as better values raced in).
+    let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); (MAX_LIGHT as usize) + 1];
 
+    // Attempt to raise an interior cell to `val`, queueing it to spread.
+    // Border ring cells are light SOURCES only, never receivers/conduits
+    // (LightVolume::accepts_spread) — they are handled at seed time below
+    // and never enter the buckets.
+    macro_rules! try_set {
+        ($i:expr, $val:expr) => {{
+            let i = $i;
+            let val = $val;
+            if val > 0 && !solid_map[i] && light[i] < val {
+                light[i] = val;
+                if val > 1 {
+                    buckets[val as usize].push(i as u32);
+                }
+            }
+        }};
+    }
+
+    // --- Seeds. Values land on border-ring cells (kept for reference) and
+    // are pushed INWARD immediately; the ring itself never propagates. ---
     for v in 0..n {
         for u in 0..n {
-            // +X (x = n+1), plane (y,z) = (u,v)
+            // +X (x = n+1) / -X (x = 0): plane (y,z) = (u,v). Horizontal
+            // spill enters at val-1.
             if let Some(p) = &sky[0] {
-                seed(&mut light, &mut queue, n + 1, u + 1, v + 1, p[u + v * n]);
+                let val = p[u + v * n];
+                light[idx(n + 1, u + 1, v + 1)] = val;
+                if val > 1 {
+                    try_set!(idx(n, u + 1, v + 1), val - 1);
+                }
             }
-            // -X (x = 0)
             if let Some(p) = &sky[1] {
-                seed(&mut light, &mut queue, 0, u + 1, v + 1, p[u + v * n]);
+                let val = p[u + v * n];
+                light[idx(0, u + 1, v + 1)] = val;
+                if val > 1 {
+                    try_set!(idx(1, u + 1, v + 1), val - 1);
+                }
             }
             // +Y top boundary (y = n+1). Two honest sources, combined by max:
             //   - the heightmap's `top_sky` (15 for columns open to sky above
@@ -775,51 +846,72 @@ fn compute_padded_sky(
             //     shafts/through cave openings at/below the surface.
             // Above the surface the heightmap value dominates; below it (where
             // the heightmap reads 0) the overhead plane carries real skylight,
-            // so shafts stay lit and sealed/side regions go dark via honest BFS.
+            // so shafts stay lit and sealed/side regions go dark via honest
+            // propagation.
             let top_from_height = top_sky[u + v * n];
             let top_from_above = sky[2].as_ref().map_or(0, |p| p[u + v * n]);
-            seed(
-                &mut light,
-                &mut queue,
-                u + 1,
-                n + 1,
-                v + 1,
-                top_from_height.max(top_from_above),
-            );
-            // +Z (z = n+1), plane (x,y) = (u,v)
-            if let Some(p) = &sky[4] {
-                seed(&mut light, &mut queue, u + 1, v + 1, n + 1, p[u + v * n]);
+            let top = top_from_height.max(top_from_above);
+            light[idx(u + 1, n + 1, v + 1)] = top;
+            // Full-strength daylight: fill straight down through air at 15
+            // (the no-attenuation rule) as a tight column walk — this is the
+            // bulk of every surface chunk's skylight and costs zero queue
+            // traffic. Filled cells still enter the buckets so they spread
+            // sideways (at 14) in the flood below.
+            if top == MAX_LIGHT {
+                let (cu, cv) = (u + 1, v + 1);
+                let mut y = n;
+                while y >= 1 && !solid_map[idx(cu, y, cv)] {
+                    let i = idx(cu, y, cv);
+                    light[i] = MAX_LIGHT;
+                    buckets[MAX_LIGHT as usize].push(i as u32);
+                    y -= 1;
+                }
+            } else if top > 1 {
+                // Dimmer overhead light attenuates immediately going down.
+                try_set!(idx(u + 1, n, v + 1), top - 1);
             }
-            // -Z (z = 0)
+            // +Z (z = n+1) / -Z (z = 0): plane (x,y) = (u,v).
+            if let Some(p) = &sky[4] {
+                let val = p[u + v * n];
+                light[idx(u + 1, v + 1, n + 1)] = val;
+                if val > 1 {
+                    try_set!(idx(u + 1, v + 1, n), val - 1);
+                }
+            }
             if let Some(p) = &sky[5] {
-                seed(&mut light, &mut queue, u + 1, v + 1, 0, p[u + v * n]);
+                let val = p[u + v * n];
+                light[idx(u + 1, v + 1, 0)] = val;
+                if val > 1 {
+                    try_set!(idx(u + 1, v + 1, 1), val - 1);
+                }
             }
         }
     }
 
-    // BFS with the sky rule (no attenuation straight down at full strength).
-    let mut head = 0;
-    while head < queue.len() {
-        let (x, y, z) = queue[head];
-        head += 1;
-        let level = light[PaddedChunk::idx(x, y, z)];
-        if level <= 1 {
-            continue;
-        }
-        for (nx, ny, nz) in neighbors(x, y, z, PAD, PAD, PAD) {
-            if solid(nx, ny, nz) {
+    // --- Flood, strictly decreasing level. Every 15 already sits atop a
+    // solid or another 15 (the column fill runs to the first solid), so the
+    // going-down-keeps-15 rule has no remaining work: every spread here
+    // attenuates by exactly 1. Interior-only receives; the ring never
+    // conducts. Popped cells whose stored level moved on are stale — skip.
+    let interior = interior_mask();
+    for level in (2..=MAX_LIGHT as usize).rev() {
+        while let Some(i) = buckets[level].pop() {
+            let i = i as usize;
+            if light[i] as usize != level {
                 continue;
             }
-            let going_down = nx == x && nz == z && ny + 1 == y;
-            let spread = if going_down && level == MAX_LIGHT {
-                MAX_LIGHT
-            } else {
-                level - 1
-            };
-            let ni = PaddedChunk::idx(nx, ny, nz);
-            if light[ni] < spread {
-                light[ni] = spread;
-                queue.push((nx, ny, nz));
+            let spread = (level - 1) as u8;
+            for off in OFFS {
+                let ni = (i as isize + off) as usize;
+                if !interior[ni] || solid_map[ni] {
+                    continue;
+                }
+                if light[ni] < spread {
+                    light[ni] = spread;
+                    if spread > 1 {
+                        buckets[spread as usize].push(ni as u32);
+                    }
+                }
             }
         }
     }
@@ -834,6 +926,24 @@ fn compute_padded_sky(
         )];
     }
     out
+}
+
+/// Static mask of interior (non-border) cells of the padded volume; border
+/// ring cells never receive spread (sources only).
+fn interior_mask() -> &'static [bool] {
+    use std::sync::OnceLock;
+    static MASK: OnceLock<Vec<bool>> = OnceLock::new();
+    MASK.get_or_init(|| {
+        let mut m = vec![false; PAD * PAD * PAD];
+        for z in 1..=CHUNK_SIZE {
+            for y in 1..=CHUNK_SIZE {
+                for x in 1..=CHUNK_SIZE {
+                    m[PaddedChunk::idx(x, y, z)] = true;
+                }
+            }
+        }
+        m
+    })
 }
 
 /// Apply a packed light buffer (from [`compute_chunk_light_2ch`]) to a
@@ -856,6 +966,42 @@ pub fn apply_chunk_light(chunk: &mut Chunk, light: &[u8]) {
 /// Whether the outgoing border planes of a packed `new_light` (32³) buffer
 /// differ from the chunk's currently-stored packed light on any of the six
 /// faces — checking both channels at once.
+/// Bitmask of which of the six faces' outgoing border planes differ between
+/// `new_light` (packed 32³) and the chunk's stored packed light. Bit `i` set
+/// means face `i` changed, in the canonical face order +X, -X, +Y, -Y, +Z, -Z
+/// (matching `NeighborLight`/`NeighborSky` indexing). Lets a caller requeue
+/// only the neighbor across a changed face instead of all six — during
+/// streaming convergence that cuts relight/remesh cascade fanout by up to 6x.
+pub fn packed_border_changed_faces(chunk: &Chunk, new_light: &[u8]) -> u8 {
+    let n = CHUNK_SIZE;
+    let last = (n - 1) as u8;
+    let idx = |x: u8, y: u8, z: u8| LocalPos::new(x, y, z).index();
+    let current = |i: usize| {
+        let p = LocalPos::from_index(i);
+        (chunk.sky_light(p) << 4) | (chunk.block_light(p) & 0x0F)
+    };
+    let mut mask = 0u8;
+    for v in 0..n {
+        for u in 0..n {
+            let (lu, lv) = (u as u8, v as u8);
+            let faces = [
+                idx(last, lu, lv),
+                idx(0, lu, lv),
+                idx(lu, last, lv),
+                idx(lu, 0, lv),
+                idx(lu, lv, last),
+                idx(lu, lv, 0),
+            ];
+            for (face, &i) in faces.iter().enumerate() {
+                if mask & (1 << face) == 0 && current(i) != new_light[i] {
+                    mask |= 1 << face;
+                }
+            }
+        }
+    }
+    mask
+}
+
 fn packed_border_changed(chunk: &Chunk, new_light: &[u8]) -> bool {
     let n = CHUNK_SIZE;
     let last = (n - 1) as u8;
@@ -1979,5 +2125,232 @@ mod tests {
             "sealed shaft top dark (no daylight leak)"
         );
         assert_eq!(sky_at(13, 1, 3), 0, "sealed shaft bottom dark");
+    }
+    // Mirrors vox-app's top_sky_from_heightmap decision for one column so the
+    // heightmap->daylight rule is regression-tested headlessly. `h` is the
+    // column's highest-solid world-Y; `known` is whether the heightmap has an
+    // entry yet (false during streaming before the column's solid chunks load).
+    fn top_sky_decision(known: bool, h: i64, origin_y: i64) -> u8 {
+        // Unknown column => covered (never invent daylight for a column we have
+        // no height for; it self-corrects once terrain loads and relights).
+        if !known {
+            return 0;
+        }
+        // Known: full daylight only if the surface is below this whole chunk.
+        if h < origin_y { MAX_LIGHT } else { 0 }
+    }
+
+    #[test]
+    fn topsky_unknown_column_is_covered_known_open_is_lit() {
+        let origin_y = -64; // a deep-underground chunk
+        // Unknown column (solid chunks not streamed yet) must be DARK. The old
+        // rule defaulted missing columns to i64::MIN which is < origin_y and so
+        // produced full daylight underground (the sealed-hole leak source).
+        assert_eq!(top_sky_decision(false, i64::MIN, origin_y), 0);
+        // A genuinely open column (surface far below this chunk) is daylit.
+        assert_eq!(top_sky_decision(true, -100, origin_y), MAX_LIGHT);
+        // A covered column (surface in/above this chunk) is dark.
+        assert_eq!(top_sky_decision(true, 20, origin_y), 0);
+        // Surface-in-chunk boundary stays dark at the top face (daylight must
+        // arrive via the overhead plane and stop at the surface, not blanket).
+        assert_eq!(top_sky_decision(true, origin_y, origin_y), 0);
+    }
+
+    #[test]
+    fn border_ring_must_not_conduct_skylight_down_to_sealed_cave() {
+        // Regression for the sealed-cave daylight leak. One chunk: terrain
+        // surface at y=18 (solid 0..=18, open air 19..=31). A SEALED cave at
+        // x=0..=1, y=5..=8, z=10..=12 — fully enclosed by solid within this
+        // chunk, but touching the -X chunk boundary. The -X neighbor is the
+        // same terrain: its +X face is solid (sky 0) below y=19 and open lit
+        // air (sky 15) above.
+        //
+        // Correct behavior: the neighbor's face is SOLID at the cave's depth,
+        // so nothing can enter there; the 15s at y>=19 are separated from the
+        // cave by real stone in the neighbor. The cave must be DARK.
+        //
+        // The bug this guards against: the padded border ring was treated as
+        // universally non-solid, so a 15 seeded at ring cell (0, ~20, z) rode
+        // straight DOWN the ring at full strength (the going-down rule),
+        // through what is actually the neighbor's solid stone, and injected
+        // 14 sideways into the sealed cave at depth.
+        let reg = BlockRegistry::default_set();
+        let n = CHUNK_SIZE;
+        let mut chunk = Chunk::new_air();
+        for z in 0..n {
+            for x in 0..n {
+                for y in 0..=18usize {
+                    chunk.set(LocalPos::new(x as u8, y as u8, z as u8), STONE);
+                }
+            }
+        }
+        for z in 10..=12u8 {
+            for x in 0..=1u8 {
+                for y in 5..=8u8 {
+                    chunk.set(LocalPos::new(x, y, z), BlockId::AIR);
+                }
+            }
+        }
+        // -X neighbor sky plane, indexed (u,v) = (y,z): 15 above the surface,
+        // 0 in the solid below — exactly a real terrain neighbor's face.
+        let mut west = vec![0u8; n * n];
+        for z in 0..n {
+            for y in 19..n {
+                west[y + z * n] = 15;
+            }
+        }
+        let sky: NeighborSky = [None, Some(west), None, None, None, None];
+        let dark_top = vec![0u8; n * n]; // surface inside chunk -> top_sky 0
+        let (light, _) =
+            compute_chunk_light_2ch(&chunk, &reg, &no_borders(), &sky, &dark_top, true);
+        let sky_at = |x, y, z| (light[LocalPos::new(x, y, z).index()] >> 4) & 0x0F;
+        assert_eq!(
+            sky_at(0, 6, 11),
+            0,
+            "sealed cave cell on the boundary must be dark"
+        );
+        assert_eq!(sky_at(1, 6, 11), 0, "sealed cave interior must be dark");
+        // Sanity: open air above the surface still receives the side spill.
+        assert!(
+            sky_at(0, 20, 11) > 0,
+            "open air above surface still lit by side plane"
+        );
+    }
+
+    #[test]
+    fn border_ring_must_not_conduct_block_light_around_solid() {
+        // Same conduit flaw, block-light flavor. A solid chunk with a sealed
+        // pocket at the -X boundary at y=6. The -X neighbor plane carries a
+        // lamp's light at y=12 (same z) — separated from the pocket by solid
+        // in the neighbor. Without the source-not-conduit rule, the light
+        // relays DOWN the border ring (attenuating) and enters the pocket.
+        let reg = BlockRegistry::default_set();
+        let n = CHUNK_SIZE;
+        let mut chunk = Chunk::filled(STONE);
+        chunk.set(LocalPos::new(0, 6, 11), BlockId::AIR); // sealed pocket
+        let mut west = vec![0u8; n * n];
+        west[12 + 11 * n] = 14; // bright block light at (y=12, z=11)
+        let borders: NeighborLight = [None, Some(west), None, None, None, None];
+        let sky: NeighborSky = [None, None, None, None, None, None];
+        let dark_top = vec![0u8; n * n];
+        let (light, _) = compute_chunk_light_2ch(&chunk, &reg, &borders, &sky, &dark_top, true);
+        let block_at = |x, y, z| light[LocalPos::new(x, y, z).index()] & 0x0F;
+        assert_eq!(
+            block_at(0, 6, 11),
+            0,
+            "sealed pocket must not receive relayed block light"
+        );
+    }
+
+    #[test]
+    fn column_heights_uniform_fast_path_matches_scan() {
+        let reg = BlockRegistry::default_set();
+        let n = CHUNK_SIZE;
+        // All-air: every column None.
+        let air = Chunk::new_air();
+        assert!(chunk_column_heights(&air, &reg).iter().all(|h| h.is_none()));
+        // All-solid: every column tops at n-1.
+        let solid = Chunk::filled(STONE);
+        assert!(
+            chunk_column_heights(&solid, &reg)
+                .iter()
+                .all(|&h| h == Some((n - 1) as u8))
+        );
+        // Mixed chunk still uses the scan: surface at y=18 everywhere except
+        // one column carved down to y=3.
+        let mut mixed = Chunk::filled(STONE);
+        for y in 19..n as u8 {
+            for z in 0..n as u8 {
+                for x in 0..n as u8 {
+                    mixed.set(LocalPos::new(x, y, z), BlockId::AIR);
+                }
+            }
+        }
+        for y in 4..=18u8 {
+            mixed.set(LocalPos::new(5, y, 5), BlockId::AIR);
+        }
+        let h = chunk_column_heights(&mixed, &reg);
+        assert_eq!(h[column_index(4, 5)], Some(18));
+        assert_eq!(h[column_index(5, 5)], Some(3));
+    }
+
+    #[test]
+    fn border_changed_faces_reports_only_the_changed_face() {
+        let reg = BlockRegistry::default_set();
+        let chunk = Chunk::filled(STONE); // stored light: all zero
+        // A fresh light buffer identical to stored (all zero) → no faces.
+        let same = vec![0u8; CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE];
+        assert_eq!(packed_border_changed_faces(&chunk, &same), 0);
+        let _ = &reg;
+        // Change one cell on the -Z face (z = 0) only → exactly bit 5.
+        let mut z0 = same.clone();
+        z0[LocalPos::new(7, 9, 0).index()] = 0x30; // sky=3
+        assert_eq!(packed_border_changed_faces(&chunk, &z0), 1 << 5);
+        // Change a corner cell (0,0,0): lies on -X, -Y, and -Z faces.
+        let mut corner = same;
+        corner[LocalPos::new(0, 0, 0).index()] = 0x10;
+        assert_eq!(
+            packed_border_changed_faces(&chunk, &corner),
+            (1 << 1) | (1 << 3) | (1 << 5)
+        );
+    }
+
+    /// Perf yardstick, not a correctness test. Run with:
+    /// `cargo test --release -p vox-core bench_relight -- --ignored --nocapture`
+    /// History: 1438us (tuple-queue BFS) -> 1209us (solidity map)
+    ///          -> 447us (bucketed flood + column pre-fill), July 2026.
+    #[test]
+    #[ignore]
+    fn bench_relight_realistic_surface_chunk() {
+        let reg = BlockRegistry::default_set();
+        let n = CHUNK_SIZE;
+        let mut chunk = Chunk::new_air();
+        for z in 0..n {
+            for x in 0..n {
+                for y in 0..=18usize {
+                    chunk.set(LocalPos::new(x as u8, y as u8, z as u8), STONE);
+                }
+            }
+        }
+        for z in 8..=14u8 {
+            for x in 8..=14u8 {
+                for y in 4..=9u8 {
+                    chunk.set(LocalPos::new(x, y, z), BlockId::AIR);
+                }
+            }
+        }
+        for y in 2..=31u8 {
+            chunk.set(LocalPos::new(20, y, 20), BlockId::AIR);
+        }
+        let mut side = vec![0u8; n * n];
+        for z in 0..n {
+            for y in 19..n {
+                side[y + z * n] = 15;
+            }
+        }
+        let overhead = vec![15u8; n * n];
+        let sky: NeighborSky = [
+            Some(side.clone()),
+            Some(side.clone()),
+            Some(overhead),
+            None,
+            Some(side.clone()),
+            Some(side),
+        ];
+        let mut top = vec![0u8; n * n];
+        top[20 + 20 * n] = 15;
+        let iters = 300;
+        let start = std::time::Instant::now();
+        let mut sink = 0u64;
+        for _ in 0..iters {
+            let (light, _) = compute_chunk_light_2ch(&chunk, &reg, &no_borders(), &sky, &top, true);
+            sink = sink.wrapping_add(light[12345] as u64);
+        }
+        let total = start.elapsed();
+        println!(
+            "relight x{iters}: total {:?}, per-chunk {:.0}us (sink {sink})",
+            total,
+            total.as_secs_f64() * 1e6 / iters as f64
+        );
     }
 }

@@ -96,3 +96,51 @@ should PASS it.
 - Tests already added in light.rs (keep): seam_no_daylight_leak...,
   capped_shaft_below..., upward_tunnel..., overhead_plane..., covered_air...,
   no_light_from_nothing_subsurface. Add the multi-chunk varying-surface repro.
+
+---
+
+# RESOLVED — true root cause: the padded border ring was a light conduit
+
+All earlier theories in this file are superseded. The bug was reproduced
+headlessly (`border_ring_must_not_conduct_skylight_down_to_sealed_cave`
+failed with sky=14 in a sealed cave) and fixed.
+
+## Mechanism
+`compute_padded_sky` / `PaddedChunk` treat every cell of the 1-cell padded
+border shell as NON-SOLID (`center_local -> None => false`), and the BFS had
+no restriction on propagating border→border. Combined with the sky rule
+(straight-down at level 15 keeps 15), the shell became a fabricated vertical
+air shaft along every chunk boundary:
+
+1. A neighbor's face plane seeds the pad's side ring with the neighbor's
+   stored light. Above the terrain surface those cells are open air at 15.
+2. Those 15s ride STRAIGHT DOWN the ring at full strength — through what is
+   actually the neighbor's solid stone.
+3. At any depth, the ring cell spreads inward once (15→14) into any air of
+   this chunk touching the boundary — including fully sealed caves.
+
+This exactly produced the observed picture: sealed near-surface caves lit
+~13-14 (their chunk's neighbor faces contain lit above-ground cells), the
+contamination pouring across the -Y seam into the chunk below and fading
+(the lit-then-fading sealed shaft), and deep caves black (their neighbors'
+faces are all dark stone — nothing to ride). It also explains why every
+earlier isolated test passed (none fed a side plane lit ONLY up high while
+checking sealed air down low on the same face), and why forced relights
+changed nothing: the inputs were honest; recomputation regenerated the same
+contamination every time.
+
+## Fix
+Border shell cells are light SOURCES, never CONDUITS. New trait method
+`LightVolume::accepts_spread` (default true); `PaddedChunk` returns false for
+shell cells. All four spread sites refuse to propagate INTO a non-accepting
+cell: `propagate_block_light`, `bfs_spread`, `propagate_sky_light`, and the
+inline BFS in `compute_padded_sky`. Border→interior seeding (honest per-cell
+neighbor light) is unchanged, so legitimate diffuse spill across seams and
+overhead-plane flow still work.
+
+Regression tests: `border_ring_must_not_conduct_skylight_down_to_sealed_cave`
+and `border_ring_must_not_conduct_block_light_around_solid`. Suite: 134.
+
+Note: the two earlier app-side fixes (unknown heightmap columns default to
+covered; column-stack relight when heights become known) fixed a real
+secondary streaming-order mechanism and remain in place.
