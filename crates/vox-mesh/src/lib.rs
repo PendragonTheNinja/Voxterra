@@ -62,40 +62,83 @@ impl MeshData {
 /// This type — rather than `&World` — is the mesher input so that meshing
 /// stays trivially parallelizable: a meshing job borrows exactly seven
 /// chunks and nothing else.
-#[derive(Default, Clone, Copy)]
+///
+/// Task 2 (M06) widened this from the 6 face neighbors to all **26**: smooth
+/// per-vertex lighting samples diagonally, so a face on a chunk edge reads
+/// cells that live in edge- and corner-adjacent chunks. Neighbors are indexed
+/// by a `(dx,dy,dz)` offset in `{-1,0,1}³` (excluding `0,0,0`). The public
+/// constructors are unchanged (`NONE`, `of`), so callers need no edits.
+#[derive(Clone, Copy)]
 pub struct ChunkNeighbors<'a> {
-    pub neg_x: Option<&'a Chunk>,
-    pub pos_x: Option<&'a Chunk>,
-    pub neg_y: Option<&'a Chunk>,
-    pub pos_y: Option<&'a Chunk>,
-    pub neg_z: Option<&'a Chunk>,
-    pub pos_z: Option<&'a Chunk>,
+    /// Indexed by `neighbor_slot(dx,dy,dz)`; `None` = unloaded/absent (air).
+    slots: [Option<&'a Chunk>; 27],
+}
+
+impl Default for ChunkNeighbors<'_> {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
+/// Map an offset in `{-1,0,1}³` to a 0..27 slot (the center `0,0,0` slot is
+/// unused but kept so the index math is a simple base-3 pack).
+#[inline]
+fn neighbor_slot(dx: i64, dy: i64, dz: i64) -> usize {
+    (((dx + 1) * 3 + (dy + 1)) * 3 + (dz + 1)) as usize
 }
 
 impl<'a> ChunkNeighbors<'a> {
     /// No neighbors: standalone-chunk behavior (all border faces emitted).
-    pub const NONE: ChunkNeighbors<'static> = ChunkNeighbors {
-        neg_x: None,
-        pos_x: None,
-        neg_y: None,
-        pos_y: None,
-        neg_z: None,
-        pos_z: None,
-    };
+    pub const NONE: ChunkNeighbors<'static> = ChunkNeighbors { slots: [None; 27] };
 
-    /// Gather the six neighbors of `pos` from a world.
+    /// Gather all 26 neighbors of `pos` from a world.
     pub fn of(world: &'a World, pos: ChunkPos) -> Self {
-        let n = |dx: i64, dy: i64, dz: i64| {
-            world.chunk(ChunkPos::new(pos.x + dx, pos.y + dy, pos.z + dz))
-        };
-        Self {
-            neg_x: n(-1, 0, 0),
-            pos_x: n(1, 0, 0),
-            neg_y: n(0, -1, 0),
-            pos_y: n(0, 1, 0),
-            neg_z: n(0, 0, -1),
-            pos_z: n(0, 0, 1),
+        let mut slots = [None; 27];
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    if dx == 0 && dy == 0 && dz == 0 {
+                        continue;
+                    }
+                    slots[neighbor_slot(dx, dy, dz)] =
+                        world.chunk(ChunkPos::new(pos.x + dx, pos.y + dy, pos.z + dz));
+                }
+            }
         }
+        Self { slots }
+    }
+
+    /// The neighbor chunk at offset `(dx,dy,dz)` (each in -1..=1).
+    #[inline]
+    fn at(&self, dx: i64, dy: i64, dz: i64) -> Option<&'a Chunk> {
+        self.slots[neighbor_slot(dx, dy, dz)]
+    }
+
+    /// Builder: set the neighbor at offset `(dx,dy,dz)`. Chainable; mainly for
+    /// tests that supply a specific neighbor against `NONE`.
+    pub fn with(mut self, dx: i64, dy: i64, dz: i64, chunk: &'a Chunk) -> Self {
+        self.slots[neighbor_slot(dx, dy, dz)] = Some(chunk);
+        self
+    }
+
+    /// Face-neighbor builder shortcuts.
+    pub fn with_neg_x(self, c: &'a Chunk) -> Self {
+        self.with(-1, 0, 0, c)
+    }
+    pub fn with_pos_x(self, c: &'a Chunk) -> Self {
+        self.with(1, 0, 0, c)
+    }
+    pub fn with_neg_y(self, c: &'a Chunk) -> Self {
+        self.with(0, -1, 0, c)
+    }
+    pub fn with_pos_y(self, c: &'a Chunk) -> Self {
+        self.with(0, 1, 0, c)
+    }
+    pub fn with_neg_z(self, c: &'a Chunk) -> Self {
+        self.with(0, 0, -1, c)
+    }
+    pub fn with_pos_z(self, c: &'a Chunk) -> Self {
+        self.with(0, 0, 1, c)
     }
 }
 
@@ -180,40 +223,42 @@ impl MeshInput {
             }
         }
 
-        // Shell: the touching layer of each present face neighbor. Absent
+        // Shell: every cell with a component at -1 or n (edges and corners
+        // included, not just faces — smooth lighting samples diagonally). For
+        // each shell coord, the offset of the out-of-range components picks the
+        // owning neighbor; the in-range components index into it (wrapping the
+        // out-of-range ones to the neighbor's touching layer). Absent
         // neighbors stay AIR / light 0 (standalone-chunk behavior).
-        let last = (n - 1) as u8;
-        let mut fill_face =
-            |nb: Option<&Chunk>, map: &mut dyn FnMut(u8, u8) -> (i32, i32, i32, LocalPos)| {
-                let Some(nb) = nb else { return };
-                for v in 0..n as u8 {
-                    for u in 0..n as u8 {
-                        let (x, y, z, lp) = map(u, v);
-                        let i = Self::cidx(x, y, z);
-                        block[i] = nb.get(lp);
-                        light[i] = nb.block_light(lp).max(nb.sky_light(lp));
-                    }
-                }
-            };
         let sz = n as i32;
-        fill_face(neighbors.neg_x, &mut |u, v| {
-            (-1, u as i32, v as i32, LocalPos::new(last, u, v))
-        });
-        fill_face(neighbors.pos_x, &mut |u, v| {
-            (sz, u as i32, v as i32, LocalPos::new(0, u, v))
-        });
-        fill_face(neighbors.neg_y, &mut |u, v| {
-            (u as i32, -1, v as i32, LocalPos::new(u, last, v))
-        });
-        fill_face(neighbors.pos_y, &mut |u, v| {
-            (u as i32, sz, v as i32, LocalPos::new(u, 0, v))
-        });
-        fill_face(neighbors.neg_z, &mut |u, v| {
-            (u as i32, v as i32, -1, LocalPos::new(u, v, last))
-        });
-        fill_face(neighbors.pos_z, &mut |u, v| {
-            (u as i32, v as i32, sz, LocalPos::new(u, v, 0))
-        });
+        let wrap = |c: i32| -> (i64, u8) {
+            // (neighbor offset along this axis, local coord within it).
+            if c < 0 {
+                (-1, (n as i32 - 1) as u8)
+            } else if c >= sz {
+                (1, 0)
+            } else {
+                (0, c as u8)
+            }
+        };
+        for z in -1..=sz {
+            for y in -1..=sz {
+                for x in -1..=sz {
+                    if (0..sz).contains(&x) && (0..sz).contains(&y) && (0..sz).contains(&z) {
+                        continue; // interior already filled
+                    }
+                    let (dx, lx) = wrap(x);
+                    let (dy, ly) = wrap(y);
+                    let (dz, lz) = wrap(z);
+                    let Some(nb) = neighbors.at(dx, dy, dz) else {
+                        continue;
+                    };
+                    let lp = LocalPos::new(lx, ly, lz);
+                    let i = Self::cidx(x, y, z);
+                    block[i] = nb.get(lp);
+                    light[i] = nb.block_light(lp).max(nb.sky_light(lp));
+                }
+            }
+        }
 
         Self {
             block,
@@ -243,9 +288,14 @@ fn face_brightness(axis: usize, positive: bool) -> f32 {
 /// falloff looks natural, with a small ambient floor so unlit areas are dim
 /// but not pure black (caves stay barely navigable). Combined multiplicatively
 /// with the directional face shading.
-fn light_curve(level: u8) -> f32 {
+/// Map a fractional 0..=15 light amount to a brightness multiplier. Smooth
+/// per-corner light averages neighboring cells, so the value is not an
+/// integer. Non-linear (gamma) with a small ambient floor so unlit areas are
+/// dim but not pure black; combined multiplicatively with directional face
+/// shading.
+fn light_curve_f(level: f32) -> f32 {
     const AMBIENT: f32 = 0.06;
-    let t = (level as f32) / 15.0;
+    let t = (level / 15.0).clamp(0.0, 1.0);
     // Slight gamma so mid-levels read brighter; eases the linear band.
     let curved = t.powf(0.85);
     AMBIENT + (1.0 - AMBIENT) * curved
@@ -256,6 +306,62 @@ fn axis_unit(axis: usize) -> [f32; 3] {
     let mut v = [0.0; 3];
     v[axis] = 1.0;
     v
+}
+
+/// The four corners of a face, as (du, dv) in {0,1}², in emit order
+/// (0,0)→(1,0)→(1,1)→(0,1) so it matches `emit_rect`'s corner walk.
+const CORNER_DUV: [(i32, i32); 4] = [(0, 0), (1, 0), (1, 1), (0, 1)];
+
+/// Smooth per-corner light for one visible face cell (ADR-0006 / M06 task 2).
+///
+/// `cell` is the solid block's chunk-relative coords; `axis`/`positive` its
+/// outward face; `u_axis`/`v_axis` the in-plane axes (matching `FACE_DIRS`).
+/// The face's light comes from the AIR side — the plane one step out along
+/// the normal. Each corner averages the (up to 4) cells of that air-plane
+/// which touch the corner: the face cell itself, its two edge-neighbors along
+/// ±u and ±v, and the diagonal. This yields gradients across the face instead
+/// of one flat value, and darkens corners tucked against geometry.
+///
+/// Ambient-occlusion-aware averaging: a solid diagonal that sits behind two
+/// solid edges is fully occluded, so it (and its light, 0) still drags the
+/// corner down — which is exactly the soft contact-shadow AO wants. We keep
+/// the average over all four samples (solid cells contribute their light,
+/// which is ~0 inside geometry), giving smooth light and AO in one pass. The
+/// dedicated 3-neighbor AO term lands in task 3; this is the light half.
+fn corner_lights(
+    input: &MeshInput,
+    cell: [i32; 3],
+    axis: usize,
+    positive: bool,
+    u_axis: usize,
+    v_axis: usize,
+) -> [f32; 4] {
+    // The air cell directly in front of the face.
+    let mut front = cell;
+    front[axis] += if positive { 1 } else { -1 };
+
+    let sample = |du: i32, dv: i32| -> u8 {
+        let mut c = front;
+        c[u_axis] += du;
+        c[v_axis] += dv;
+        input.light(c[0], c[1], c[2])
+    };
+
+    let mut out = [0.0f32; 4];
+    for (k, &(cu, cv)) in CORNER_DUV.iter().enumerate() {
+        // Corner (cu,cv) in {0,1}² touches the front cell and its neighbors
+        // toward that corner: steps of su/sv in {-1,0} ... but expressed from
+        // the face cell, the four touching air cells are at
+        // (0,0), (su,0), (0,sv), (su,sv) where su = 2*cu-1, sv = 2*cv-1.
+        let su = 2 * cu - 1;
+        let sv = 2 * cv - 1;
+        let a = sample(0, 0);
+        let b = sample(su, 0);
+        let c = sample(0, sv);
+        let d = sample(su, sv);
+        out[k] = (a as f32 + b as f32 + c as f32 + d as f32) / 4.0;
+    }
+    out
 }
 
 /// The six face directions as (normal axis, positive sign, u axis, v axis).
@@ -285,11 +391,17 @@ fn emit_rect(
     w: f32,
     h: f32,
     layer: u32,
-    brightness: f32,
+    // Per-corner brightness in emit order (0,0)→(w,0)→(w,h)→(0,h). Smooth
+    // lighting varies these across the quad; the shader interpolates them.
+    corner_brightness: [f32; 4],
+    // Whether to flip the triangle diagonal (00-11 vs 01-10). Chosen so AO/
+    // light interpolation never produces the "butterfly" anisotropy on a
+    // gradient (M06). false = default diagonal (0,2); true = (1,3).
+    flip: bool,
 ) {
     // UVs run 0..w / 0..h so the texture-array layer tiles w×h times across
     // a greedy-merged quad under a Repeat sampler (ADR-0003).
-    let corner = |du: f32, dv: f32| Vertex {
+    let corner = |du: f32, dv: f32, bright: f32| Vertex {
         position: [
             base[0] + u_dir[0] * du + v_dir[0] * dv,
             base[1] + u_dir[1] * du + v_dir[1] * dv,
@@ -297,22 +409,32 @@ fn emit_rect(
         ],
         uv: [du, dv],
         layer,
-        brightness,
+        brightness: bright,
     };
 
     let base_index = mesh.vertices.len() as u32;
-    mesh.vertices.push(corner(0.0, 0.0));
-    mesh.vertices.push(corner(w, 0.0));
-    mesh.vertices.push(corner(w, h));
-    mesh.vertices.push(corner(0.0, h));
-    mesh.indices.extend_from_slice(&[
-        base_index,
-        base_index + 1,
-        base_index + 2,
-        base_index,
-        base_index + 2,
-        base_index + 3,
-    ]);
+    mesh.vertices.push(corner(0.0, 0.0, corner_brightness[0]));
+    mesh.vertices.push(corner(w, 0.0, corner_brightness[1]));
+    mesh.vertices.push(corner(w, h, corner_brightness[2]));
+    mesh.vertices.push(corner(0.0, h, corner_brightness[3]));
+    let b = base_index;
+    if flip {
+        // Diagonal through corners 1 and 3.
+        mesh.indices
+            .extend_from_slice(&[b + 1, b + 2, b + 3, b + 1, b + 3, b]);
+    } else {
+        // Default diagonal through corners 0 and 2.
+        mesh.indices
+            .extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
+    }
+}
+
+/// Choose the triangulation diagonal so the two triangles' shared edge runs
+/// between the corners with the CLOSER brightness — the standard fix for the
+/// anisotropic-interpolation ("butterfly") artifact on AO/light gradients.
+fn choose_flip(c: [f32; 4]) -> bool {
+    // Flip when the 0-2 diagonal spans the larger contrast.
+    (c[0] - c[2]).abs() > (c[1] - c[3]).abs()
 }
 
 // ---------------------------------------------------------------------------
@@ -355,9 +477,16 @@ pub fn mesh_chunk_naive(
             if positive {
                 base[axis] += 1.0;
             }
-            // Light the face by the cell it looks into (the air neighbor).
-            let light = input.light(neighbor[0], neighbor[1], neighbor[2]);
-            let brightness = face_brightness(axis, positive) * light_curve(light);
+            // Smooth per-corner light from the air side, times the fixed
+            // directional face shade.
+            let shade = face_brightness(axis, positive);
+            let cl = corner_lights(&input, coords, axis, positive, u_axis, v_axis);
+            let cb = [
+                shade * light_curve_f(cl[0]),
+                shade * light_curve_f(cl[1]),
+                shade * light_curve_f(cl[2]),
+                shade * light_curve_f(cl[3]),
+            ];
             emit_rect(
                 &mut mesh,
                 base,
@@ -366,7 +495,8 @@ pub fn mesh_chunk_naive(
                 1.0,
                 1.0,
                 layer_of(block, face_index),
-                brightness,
+                cb,
+                choose_flip(cb),
             );
         }
     }
@@ -397,10 +527,14 @@ pub fn mesh_chunk(
     }
 
     let size = CHUNK_SIZE;
-    // Per-slice mask: each visible face cell carries its block AND the light
-    // level of the air cell it faces. Faces only merge when BOTH match, so a
-    // light gradient correctly subdivides the merged rectangles.
-    let mut mask: Vec<Option<(BlockId, u8)>> = vec![None; size * size];
+    // Per-slice mask: each visible face cell carries its block AND its four
+    // per-corner light SUMS (each 0..=60 = sum of four 0..=15 samples — an
+    // exact integer, so the tuple is Eq/Hashable and merging is exact). Cells
+    // merge only when block AND all four corner sums match, so any smooth-
+    // light gradient correctly subdivides the merged rectangles. Corner order
+    // is emit order: (0,0),(1,0),(1,1),(0,1) in (u,v).
+    type CellMask = (BlockId, [u16; 4]);
+    let mut mask: Vec<Option<CellMask>> = vec![None; size * size];
     let at = |u: usize, v: usize| u + v * size;
 
     for (face_index, &(axis, positive, u_axis, v_axis)) in FACE_DIRS.iter().enumerate() {
@@ -429,8 +563,15 @@ pub fn mesh_chunk(
                     let mut n = coords;
                     n[axis] += if positive { 1 } else { -1 };
                     if input.is_air(n[0], n[1], n[2]) {
-                        let light = input.light(n[0], n[1], n[2]);
-                        *cell = Some((block, light));
+                        let cl = corner_lights(&input, coords, axis, positive, u_axis, v_axis);
+                        // Store as integer sums (×4) to keep the key exact.
+                        let sums = [
+                            (cl[0] * 4.0).round() as u16,
+                            (cl[1] * 4.0).round() as u16,
+                            (cl[2] * 4.0).round() as u16,
+                            (cl[3] * 4.0).round() as u16,
+                        ];
+                        *cell = Some((block, sums));
                         any = true;
                     } else {
                         *cell = None;
@@ -447,7 +588,7 @@ pub fn mesh_chunk(
                     let Some(key) = mask[at(u0, v0)] else {
                         continue;
                     };
-                    let (block, light) = key;
+                    let (block, sums) = key;
 
                     // Grow width along u.
                     let mut w = 1;
@@ -480,6 +621,13 @@ pub fn mesh_chunk(
                     base[u_axis] = u0 as f32;
                     base[v_axis] = v0 as f32;
 
+                    // Corner sums back to brightness (÷4 to recover the mean).
+                    let cb = [
+                        dir_shade * light_curve_f(sums[0] as f32 / 4.0),
+                        dir_shade * light_curve_f(sums[1] as f32 / 4.0),
+                        dir_shade * light_curve_f(sums[2] as f32 / 4.0),
+                        dir_shade * light_curve_f(sums[3] as f32 / 4.0),
+                    ];
                     emit_rect(
                         &mut mesh,
                         base,
@@ -488,7 +636,8 @@ pub fn mesh_chunk(
                         w as f32,
                         h as f32,
                         layer_of(block, face_index),
-                        dir_shade * light_curve(light),
+                        cb,
+                        choose_flip(cb),
                     );
                 }
             }
@@ -552,10 +701,7 @@ mod tests {
     fn naive_solid_neighbor_culls_shared_border() {
         let chunk = Chunk::filled(STONE);
         let neighbor = Chunk::filled(STONE);
-        let neighbors = ChunkNeighbors {
-            pos_x: Some(&neighbor),
-            ..ChunkNeighbors::NONE
-        };
+        let neighbors = ChunkNeighbors::NONE.with_pos_x(&neighbor);
         let mesh = mesh_chunk_naive(&chunk, &neighbors, WHITE);
         assert_eq!(mesh.quad_count(), 5 * N * N);
     }
@@ -564,14 +710,13 @@ mod tests {
     fn naive_fully_enclosed_chunk_meshes_to_nothing() {
         let chunk = Chunk::filled(STONE);
         let solid = Chunk::filled(STONE);
-        let neighbors = ChunkNeighbors {
-            neg_x: Some(&solid),
-            pos_x: Some(&solid),
-            neg_y: Some(&solid),
-            pos_y: Some(&solid),
-            neg_z: Some(&solid),
-            pos_z: Some(&solid),
-        };
+        let neighbors = ChunkNeighbors::NONE
+            .with_neg_x(&solid)
+            .with_pos_x(&solid)
+            .with_neg_y(&solid)
+            .with_pos_y(&solid)
+            .with_neg_z(&solid)
+            .with_pos_z(&solid);
         let mesh = mesh_chunk_naive(&chunk, &neighbors, WHITE);
         assert!(mesh.is_empty());
     }
@@ -582,10 +727,7 @@ mod tests {
         chunk.set(LocalPos::new(31, 5, 5), STONE);
         let mut neighbor = Chunk::new_air();
         neighbor.set(LocalPos::new(0, 5, 5), STONE);
-        let neighbors = ChunkNeighbors {
-            pos_x: Some(&neighbor),
-            ..ChunkNeighbors::NONE
-        };
+        let neighbors = ChunkNeighbors::NONE.with_pos_x(&neighbor);
         let mesh = mesh_chunk_naive(&chunk, &neighbors, WHITE);
         assert_eq!(mesh.quad_count(), 5);
     }
@@ -658,32 +800,52 @@ mod tests {
     // over randomized chunks with randomized neighbors.
     // -----------------------------------------------------------------
 
-    /// A unit face cell: (axis, outward sign, plane, a, b, layer).
+    /// A unit face cell: (axis, outward sign, plane, a, b, layer, bright).
+    /// `bright` is the smooth brightness sampled at the CELL CENTER (bits),
+    /// so a merged quad and its unmerged equivalent yield the same value.
     type CellKey = (usize, bool, i32, i32, i32, u32, u32);
 
-    /// Decompose a mesh into the unit face cells its quads cover.
+    /// The four quad corners in emit order (0,0),(1,0),(1,1),(0,1), recovered
+    /// from a 6-index quad regardless of which diagonal it was triangulated
+    /// on. Returns (positions, brightnesses) in that order.
+    fn quad_corners(mesh: &MeshData, quad: &[u32]) -> ([[f32; 3]; 4], [f32; 4]) {
+        // Both triangulations share all four vertices; the 4 distinct indices
+        // in ascending order are the base..base+3 block emit_rect pushed.
+        let mut idxs: Vec<u32> = quad.to_vec();
+        idxs.sort_unstable();
+        idxs.dedup();
+        assert_eq!(idxs.len(), 4, "quad must reference exactly 4 vertices");
+        let b = idxs[0] as usize;
+        assert_eq!(
+            idxs,
+            vec![b as u32, b as u32 + 1, b as u32 + 2, b as u32 + 3]
+        );
+        let pos = [
+            mesh.vertices[b].position,
+            mesh.vertices[b + 1].position,
+            mesh.vertices[b + 2].position,
+            mesh.vertices[b + 3].position,
+        ];
+        let bright = [
+            mesh.vertices[b].brightness,
+            mesh.vertices[b + 1].brightness,
+            mesh.vertices[b + 2].brightness,
+            mesh.vertices[b + 3].brightness,
+        ];
+        (pos, bright)
+    }
+
+    /// Decompose a mesh into the unit face cells its quads cover, sampling the
+    /// smooth brightness at each cell center by bilinear interpolation of the
+    /// quad's four corners.
     fn coverage(mesh: &MeshData) -> HashMap<CellKey, u32> {
         let mut map: HashMap<CellKey, u32> = HashMap::new();
 
         assert_eq!(mesh.indices.len() % 6, 0, "quads are 6 indices each");
         for quad in mesh.indices.chunks_exact(6) {
-            // emit_rect's index pattern: b, b+1, b+2, b, b+2, b+3.
-            let b = quad[0];
-            assert_eq!(
-                quad,
-                [b, b + 1, b + 2, b, b + 2, b + 3],
-                "unexpected quad index pattern"
-            );
-            let bi = b as usize;
-            let corners: [[f32; 3]; 4] = [
-                mesh.vertices[bi].position,
-                mesh.vertices[bi + 1].position,
-                mesh.vertices[bi + 2].position,
-                mesh.vertices[bi + 3].position,
-            ];
+            let bi = quad.iter().copied().min().unwrap() as usize;
+            let (corners, cbright) = quad_corners(mesh, quad);
             let layer = mesh.vertices[bi].layer;
-            let bright = mesh.vertices[bi].brightness.to_bits();
-            // All four corners of a quad must share the layer.
             assert!(
                 (0..4).all(|k| mesh.vertices[bi + k].layer == layer),
                 "quad has inconsistent layer"
@@ -695,7 +857,7 @@ mod tests {
                 .expect("quad is not axis-aligned");
             let plane = corners[0][axis] as i32;
 
-            // Outward sign from the winding normal.
+            // Outward sign from the winding normal of the first triangle.
             let e1 = sub(corners[1], corners[0]);
             let e2 = sub(corners[2], corners[0]);
             let normal = cross(e1, e2);
@@ -705,10 +867,29 @@ mod tests {
             let (a1, a2) = other_axes(axis);
             let (min1, max1) = extent(&corners, a1);
             let (min2, max2) = extent(&corners, a2);
+            // Corner positions in (a1,a2): emit order maps to
+            // c0=(0,0) c1=(w,0) c2=(w,h) c3=(0,h) in (u,v)=(a1?,a2?). Derive
+            // (u,v) origin/size from the extents; the quad spans [min,max].
+            let wf = (max1 - min1) as f32;
+            let hf = (max2 - min2) as f32;
 
             for p in min1..max1 {
                 for q in min2..max2 {
-                    *map.entry((axis, positive, plane, p, q, layer, bright))
+                    // Cell center as fractional (s,t) in [0,1] across the quad.
+                    let s = ((p - min1) as f32 + 0.5) / wf;
+                    let t = ((q - min2) as f32 + 0.5) / hf;
+                    // Bilinear over corners laid out (0,0),(1,0),(1,1),(0,1)
+                    // in (s,t). corners[0..4] follow that order in (u,v); u
+                    // corresponds to a1 or a2 consistently for both meshers
+                    // (same FACE_DIRS), so the interpolation matches.
+                    let bilinear = cbright[0] * (1.0 - s) * (1.0 - t)
+                        + cbright[1] * s * (1.0 - t)
+                        + cbright[2] * s * t
+                        + cbright[3] * (1.0 - s) * t;
+                    // Quantize to absorb float noise (both meshers share the
+                    // same arithmetic, so this is exact-ish; round to 1e-4).
+                    let bits = (bilinear * 10000.0).round() as i32 as u32;
+                    *map.entry((axis, positive, plane, p, q, layer, bits))
                         .or_insert(0) += 1;
                 }
             }
@@ -804,11 +985,13 @@ mod tests {
             // A random subset of neighbors, themselves random.
             let nx = random_chunk(&mut rng, 50, 6);
             let py = random_chunk(&mut rng, 50, 6);
-            let neighbors = ChunkNeighbors {
-                neg_x: (seed % 2 == 0).then_some(&nx),
-                pos_y: (seed % 3 == 0).then_some(&py),
-                ..ChunkNeighbors::NONE
-            };
+            let mut neighbors = ChunkNeighbors::NONE;
+            if seed % 2 == 0 {
+                neighbors = neighbors.with_neg_x(&nx);
+            }
+            if seed % 3 == 0 {
+                neighbors = neighbors.with_pos_y(&py);
+            }
 
             let naive = mesh_chunk_naive(&chunk, &neighbors, layered);
             let greedy = mesh_chunk(&chunk, &neighbors, layered);
@@ -885,10 +1068,7 @@ mod tests {
         let mut west = Chunk::filled(STONE);
         west.set(LocalPos::new(31, 7, 7), BlockId::AIR);
         west.set_block_light(LocalPos::new(31, 7, 7), 9);
-        let neighbors = ChunkNeighbors {
-            neg_x: Some(&west),
-            ..ChunkNeighbors::NONE
-        };
+        let neighbors = ChunkNeighbors::NONE.with_neg_x(&west);
         let input = MeshInput::build(&chunk, &neighbors);
         // Interior.
         assert!(!input.is_air(3, 4, 5));
@@ -908,8 +1088,9 @@ mod tests {
     /// Perf yardstick, not a correctness test. Run with:
     /// `cargo test --release -p vox-mesh bench_mesh -- --ignored --nocapture`
     /// History: 2736us (per-visit palette decodes) -> 1876us (MeshInput
-    /// snapshot, ADR-0006; build alone ~197us), July 2026. The remaining
-    /// cost is the mask/merge loops, restructured in M06 task 2.
+    /// snapshot, ADR-0006) -> 2236us (task 2: per-vertex smooth light + AO-
+    /// aware corner sampling + 26-neighbor shell; quads 20 -> 36 as gradients
+    /// subdivide merges), July 2026. Still well under the pre-snapshot 2736us.
     #[test]
     #[ignore]
     fn bench_mesh_realistic_surface_chunk() {
@@ -956,5 +1137,96 @@ mod tests {
             "mesh x{iters}: per-chunk {:.0}us, {quads} quads",
             total.as_secs_f64() * 1e6 / iters as f64
         );
+    }
+    #[test]
+    fn smooth_light_creates_gradient_across_face() {
+        let mut chunk = Chunk::filled(STONE);
+        for z in 0..CHUNK_SIZE as u8 {
+            for x in 0..CHUNK_SIZE as u8 {
+                for y in 16..CHUNK_SIZE as u8 {
+                    chunk.set(LocalPos::new(x, y, z), BlockId::AIR);
+                }
+            }
+        }
+        for z in 0..CHUNK_SIZE as u8 {
+            for x in 0..CHUNK_SIZE as u8 {
+                chunk.set_sky_light(LocalPos::new(x, 16, z), (x / 2).min(15));
+            }
+        }
+        let input = MeshInput::build(&chunk, &ChunkNeighbors::NONE);
+        let cl = corner_lights(&input, [4, 15, 4], 1, true, 2, 0);
+        let spread =
+            cl.iter().cloned().fold(0.0f32, f32::max) - cl.iter().cloned().fold(f32::MAX, f32::min);
+        assert!(
+            spread > 0.25,
+            "expected a gradient across the face, got {cl:?}"
+        );
+    }
+
+    #[test]
+    fn smooth_light_seam_continuity_across_chunk_boundary() {
+        let mut left = Chunk::new_air();
+        for y in 0..CHUNK_SIZE as u8 {
+            for z in 0..CHUNK_SIZE as u8 {
+                left.set(LocalPos::new(31, y, z), STONE);
+            }
+        }
+        let mut right = Chunk::new_air();
+        for y in 0..CHUNK_SIZE as u8 {
+            for z in 0..CHUNK_SIZE as u8 {
+                right.set_sky_light(LocalPos::new(0, y, z), 10);
+            }
+        }
+        let nb = ChunkNeighbors::NONE.with_pos_x(&right);
+        let input = MeshInput::build(&left, &nb);
+        let cl = corner_lights(&input, [31, 8, 8], 0, true, 1, 2);
+        for (k, &c) in cl.iter().enumerate() {
+            assert!((c - 10.0).abs() < 1e-6, "corner {k} = {c}");
+        }
+    }
+
+    #[test]
+    fn smooth_light_diagonal_seam_reads_edge_neighbor() {
+        // A +Y face on the chunk EDGE (x=31) samples diagonally into the
+        // +X neighbor's cells — an edge-neighbor read that the 26-neighbor
+        // shell must supply. Without it the corner would be darkened by a
+        // phantom-dark shell cell.
+        let mut chunk = Chunk::new_air();
+        // Solid floor across the top-edge row so +Y faces exist at x=31.
+        for z in 0..CHUNK_SIZE as u8 {
+            for x in 0..CHUNK_SIZE as u8 {
+                chunk.set(LocalPos::new(x, 10, z), STONE);
+            }
+        }
+        for z in 0..CHUNK_SIZE as u8 {
+            for x in 0..CHUNK_SIZE as u8 {
+                chunk.set_sky_light(LocalPos::new(x, 11, z), 15);
+            }
+        }
+        // +X neighbor: air with sky 15 at x=0 (the diagonal cell from x=31).
+        let mut east = Chunk::new_air();
+        for y in 0..CHUNK_SIZE as u8 {
+            for z in 0..CHUNK_SIZE as u8 {
+                east.set_sky_light(LocalPos::new(0, y, z), 15);
+            }
+        }
+        let nb = ChunkNeighbors::NONE.with_pos_x(&east);
+        let input = MeshInput::build(&chunk, &nb);
+        // Top face of the edge block (31,10,8): all four corners should be 15
+        // (uniform bright), including the corner that samples into +X.
+        let cl = corner_lights(&input, [31, 10, 8], 1, true, 2, 0);
+        for (k, &c) in cl.iter().enumerate() {
+            assert!(
+                (c - 15.0).abs() < 1e-6,
+                "edge corner {k} = {c}, expected 15 (no phantom-dark seam)"
+            );
+        }
+    }
+
+    #[test]
+    fn choose_flip_picks_lower_contrast_diagonal() {
+        assert!(choose_flip([1.0, 1.0, 0.0, 1.0]));
+        assert!(!choose_flip([0.5, 0.5, 0.5, 0.5]));
+        assert!(!choose_flip([1.0, 0.0, 1.0, 0.0]));
     }
 }

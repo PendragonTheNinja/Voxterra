@@ -919,10 +919,37 @@ impl App {
                             if border_faces & (1 << face) == 0 {
                                 continue;
                             }
+                            // The face neighbor is relit (its light may change,
+                            // since sky/block light crosses faces) AND remeshed
+                            // (its faces sample our border across the seam).
                             let n = ChunkPos::new(pos.x + dx, pos.y + dy, pos.z + dz);
                             if self.world.chunk(n).is_some() {
                                 self.relight.insert(n);
                                 self.dirty.insert(n);
+                            }
+                            // Smooth lighting (M06) also samples DIAGONALLY, so
+                            // the chunks sharing an EDGE with this face read our
+                            // border cells too. Light doesn't propagate
+                            // diagonally, so these need re-MESH only, not
+                            // relight. Edge neighbors = the changed-face offset
+                            // plus one step along each perpendicular axis.
+                            let ax = face / 2; // 0:X 1:Y 2:Z (face pairs)
+                            for perp in 0..3 {
+                                if perp == ax {
+                                    continue;
+                                }
+                                for step in [-1i64, 1] {
+                                    let mut off = [*dx, *dy, *dz];
+                                    off[perp] += step;
+                                    let e = ChunkPos::new(
+                                        pos.x + off[0],
+                                        pos.y + off[1],
+                                        pos.z + off[2],
+                                    );
+                                    if self.world.chunk(e).is_some() {
+                                        self.dirty.insert(e);
+                                    }
+                                }
                             }
                         }
                     }
