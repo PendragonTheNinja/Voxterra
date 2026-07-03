@@ -122,6 +122,58 @@ crates: `vox-sim`, `vox-net`, `vox-client`, `vox-server`.
 - Batch related changes; commits include a short changelog.
 - "Primary dev platform is native Windows (PowerShell); commands should be PowerShell-compatible."
 
+## AI collaborator sandbox workflow (how a Claude instance works this repo)
+
+A Claude instance runs in a **Linux sandbox** and cannot see or run the game.
+The division of labour:
+
+- **Claude:** clones the repo to `/home/claude/voxterra`, edits and *headlessly
+  verifies* `vox-core` and `vox-mesh`, then hands changed files back via
+  `present_files`. After Nathan pushes, Claude re-syncs its clone to
+  `origin/main` (`git fetch` + `reset --hard origin/main` + `clean -fd`).
+- **Nathan:** applies the files on native Windows, runs the gauntlet, compiles
+  the full app (incl. `vox-app`/`vox-render`), and is the **only** visual /
+  GPU / runtime check. `vox-app` and `vox-render` are **review-only** in the
+  sandbox — they need edition-2024 + a GPU and will not compile there.
+
+**Headless test setup (`fixcheck`).** The sandbox's stock toolchain is older
+than the project's Rust 1.96 / edition 2024, so to run `vox-core`/`vox-mesh`
+tests Claude builds a throwaway `fixcheck/` workspace: copy those two crates,
+downgrade `edition = "2024"` → `"2021"` in both Cargo.tomls, restrict the
+workspace `members` to just those two, and rewrite any edition-2024-only syntax
+to a 2021 equivalent (e.g. let-chains → nested `if`, `Option::is_none_or` →
+`map_or(true, …)`). **These shims are sandbox-only and must never be committed
+— the real files stay on edition 2024.** Find the current 2024-only constructs
+by letting the copy fail to compile; they move around as the code evolves, so
+don't hard-code a fixed list.
+
+**Clippy.** Cannot be installed in the sandbox (neither `rustup component add`
+nor apt). Claude must scan changed code manually for common 1.96 lints —
+`doc_lazy_continuation`, `needless_range_loop`, `manual_range_contains`,
+`duplicated_attributes`, `dead_code`, `identity_op`, `unnecessary_cast` — and
+Nathan runs the real clippy gauntlet natively before every commit. Lints the
+sandbox is blind to are real; treat the native clippy pass as authoritative.
+
+**The gauntlet (Nathan runs before every commit, native PowerShell):**
+
+    cargo build
+    cargo clippy --workspace --all-targets -- -D warnings
+    cargo fmt
+    cargo test
+    $env:RUST_LOG="vox_app=info"
+    cargo run -p vox-app
+
+**Recurring gotchas (each has cost a build cycle):**
+- `vox-core`'s public API is an **explicit re-export allowlist** in
+  `crates/vox-core/src/lib.rs` (`pub use light::{…}`). Any new `pub fn` that
+  `vox-app` calls must be added there; the sandbox can't catch the omission
+  because it never compiles `vox-app`.
+- **Verify file writes by reading back.** A generation script that reports
+  success but skips the actual write has shipped a mismatched signature.
+- `NEIGHBOR_OFFSETS.iter()` yields `&(i64,i64,i64)`; arithmetic auto-derefs
+  (`pos.x + dx` is fine) but building an array for element `+=` needs explicit
+  deref (`[*dx, *dy, *dz]`).
+
 ## Intentionally deferred (do not build these yet)
 
 Multiplayer/networking, modding API, audio, entities/mobs, combat, survival
@@ -132,14 +184,19 @@ beyond what the invariants above already require.
 
 ## Current status
 
-- **Active milestone:** 06 — Smooth Lighting & Ambient Occlusion
-  (`docs/milestones/06-smooth-lighting-ao.md`, ADR-0006). Next up: task 1
-  (mesh input snapshot + bench yardstick).
-- **Last completed milestone:** 05 — Skylight (2026-07-02); retrospective with
-  baseline numbers at the end of `docs/milestones/05-skylight.md`
-- Completed milestones have retrospectives in `docs/milestones/`. A future
-  seed-driven LOD / far-view-distance system is noted at the end of the M04
-  retro (its own milestone when scheduled).
+- **Active milestone:** none — M06 just closed. Next up is a fresh milestone;
+  the headline candidate is **LOD / far-view-distance + async pipeline**
+  (seed-driven far chunks, noted at the end of the M04 retro). A day/night
+  cycle (with two-channel vertex light + moon-phase night brightness) is a
+  strong second candidate — design sketch recorded at the end of
+  `docs/milestones/06-smooth-lighting-ao.md`. Write the spec before building.
+- **Last completed milestone:** 06 — Smooth Lighting & Ambient Occlusion
+  (2026-07-03); retrospective with numbers at the end of
+  `docs/milestones/06-smooth-lighting-ao.md`. Per-vertex smooth light + classic
+  vertex AO shipped; ambient floor resolved at 0.035.
+- **Prior milestone:** 05 — Skylight (2026-07-02); retrospective with baseline
+  numbers at the end of `docs/milestones/05-skylight.md`.
+- Completed milestones have retrospectives in `docs/milestones/`.
 - Milestones 02 (Infinite World, 2026-06-14) and 03 are complete; see their
   retrospectives in `docs/milestones/`.
 - Update this section at the end of every working session.

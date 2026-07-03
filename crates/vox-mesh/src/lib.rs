@@ -294,7 +294,14 @@ fn face_brightness(axis: usize, positive: bool) -> f32 {
 /// dim but not pure black; combined multiplicatively with directional face
 /// shading.
 fn light_curve_f(level: f32) -> f32 {
-    const AMBIENT: f32 = 0.06;
+    // Ambient floor: brightness of a cell that receives NO light at all — a
+    // sealed cave, an overhang underside. This is a pure geometry baseline
+    // (sky can't reach the cell), independent of time of day; a future
+    // day/night cycle dims the SKY channel above this floor, so moonlit open
+    // ground will sit brighter than this without changing it. Tuned darker
+    // than Minecraft's floor so enclosed dark reads genuinely dark, but not
+    // pure black (M06 task 5 decision).
+    const AMBIENT: f32 = 0.035;
     let t = (level / 15.0).clamp(0.0, 1.0);
     // Slight gamma so mid-levels read brighter; eases the linear band.
     let curved = t.powf(0.85);
@@ -362,6 +369,63 @@ fn corner_lights(
         out[k] = (a as f32 + b as f32 + c as f32 + d as f32) / 4.0;
     }
     out
+}
+
+/// Classic per-corner ambient occlusion (M06 task 3). Independent of light:
+/// a corner tucked into solid geometry darkens even under full skylight,
+/// which is what gives blocks their sense of contact shadow and depth.
+///
+/// For each face corner, look at the three cells that border it IN THE
+/// AIR-SIDE PLANE (one step out along the face normal): the two "side" cells
+/// (edge-adjacent along ±u and ±v toward the corner) and the "corner" cell
+/// (the diagonal). Occluders are non-air cells. The standard rule:
+///   - both sides occluded            -> level 0 (darkest)
+///   - otherwise 3 - (s1 + s2 + corn) -> level 1..3
+///
+/// Returned as a 0..=3 level per corner (emit order), mapped to a brightness
+/// factor by `ao_factor`.
+fn corner_ao(
+    input: &MeshInput,
+    cell: [i32; 3],
+    axis: usize,
+    positive: bool,
+    u_axis: usize,
+    v_axis: usize,
+) -> [u8; 4] {
+    let mut front = cell;
+    front[axis] += if positive { 1 } else { -1 };
+
+    // Occluder = non-air cell one step out, offset by (du,dv) in the plane.
+    let occ = |du: i32, dv: i32| -> u8 {
+        let mut c = front;
+        c[u_axis] += du;
+        c[v_axis] += dv;
+        u8::from(!input.is_air(c[0], c[1], c[2]))
+    };
+
+    let mut out = [3u8; 4];
+    for (k, &(cu, cv)) in CORNER_DUV.iter().enumerate() {
+        let su = 2 * cu - 1; // -1 or +1 toward this corner along u
+        let sv = 2 * cv - 1; // and along v
+        let side1 = occ(su, 0);
+        let side2 = occ(0, sv);
+        let corner = occ(su, sv);
+        out[k] = if side1 == 1 && side2 == 1 {
+            0
+        } else {
+            3 - (side1 + side2 + corner)
+        };
+    }
+    out
+}
+
+/// Map an AO level (0 darkest .. 3 none) to a brightness multiplier. Tuned in
+/// task 5 against real scenes; kept gentle so AO shapes creases without
+/// crushing them to black.
+fn ao_factor(level: u8) -> f32 {
+    // level: 0,1,2,3 -> increasing brightness. 3 = fully lit (1.0).
+    const AO: [f32; 4] = [0.55, 0.70, 0.85, 1.0];
+    AO[level as usize]
 }
 
 /// The six face directions as (normal axis, positive sign, u axis, v axis).
@@ -481,11 +545,12 @@ pub fn mesh_chunk_naive(
             // directional face shade.
             let shade = face_brightness(axis, positive);
             let cl = corner_lights(&input, coords, axis, positive, u_axis, v_axis);
+            let ao = corner_ao(&input, coords, axis, positive, u_axis, v_axis);
             let cb = [
-                shade * light_curve_f(cl[0]),
-                shade * light_curve_f(cl[1]),
-                shade * light_curve_f(cl[2]),
-                shade * light_curve_f(cl[3]),
+                shade * light_curve_f(cl[0]) * ao_factor(ao[0]),
+                shade * light_curve_f(cl[1]) * ao_factor(ao[1]),
+                shade * light_curve_f(cl[2]) * ao_factor(ao[2]),
+                shade * light_curve_f(cl[3]) * ao_factor(ao[3]),
             ];
             emit_rect(
                 &mut mesh,
@@ -530,10 +595,11 @@ pub fn mesh_chunk(
     // Per-slice mask: each visible face cell carries its block AND its four
     // per-corner light SUMS (each 0..=60 = sum of four 0..=15 samples — an
     // exact integer, so the tuple is Eq/Hashable and merging is exact). Cells
-    // merge only when block AND all four corner sums match, so any smooth-
-    // light gradient correctly subdivides the merged rectangles. Corner order
-    // is emit order: (0,0),(1,0),(1,1),(0,1) in (u,v).
-    type CellMask = (BlockId, [u16; 4]);
+    // merge only when block AND all four corner light sums AND all four AO
+    // levels match, so any smooth-light gradient or AO variation correctly
+    // subdivides the merged rectangles. Corner order is emit order
+    // (0,0),(1,0),(1,1),(0,1) in (u,v).
+    type CellMask = (BlockId, [u16; 4], [u8; 4]);
     let mut mask: Vec<Option<CellMask>> = vec![None; size * size];
     let at = |u: usize, v: usize| u + v * size;
 
@@ -564,14 +630,15 @@ pub fn mesh_chunk(
                     n[axis] += if positive { 1 } else { -1 };
                     if input.is_air(n[0], n[1], n[2]) {
                         let cl = corner_lights(&input, coords, axis, positive, u_axis, v_axis);
-                        // Store as integer sums (×4) to keep the key exact.
+                        let ao = corner_ao(&input, coords, axis, positive, u_axis, v_axis);
+                        // Store light as integer sums (×4) to keep the key exact.
                         let sums = [
                             (cl[0] * 4.0).round() as u16,
                             (cl[1] * 4.0).round() as u16,
                             (cl[2] * 4.0).round() as u16,
                             (cl[3] * 4.0).round() as u16,
                         ];
-                        *cell = Some((block, sums));
+                        *cell = Some((block, sums, ao));
                         any = true;
                     } else {
                         *cell = None;
@@ -588,7 +655,7 @@ pub fn mesh_chunk(
                     let Some(key) = mask[at(u0, v0)] else {
                         continue;
                     };
-                    let (block, sums) = key;
+                    let (block, sums, ao) = key;
 
                     // Grow width along u.
                     let mut w = 1;
@@ -621,12 +688,13 @@ pub fn mesh_chunk(
                     base[u_axis] = u0 as f32;
                     base[v_axis] = v0 as f32;
 
-                    // Corner sums back to brightness (÷4 to recover the mean).
+                    // Corner sums back to brightness (÷4 to recover the mean),
+                    // times AO.
                     let cb = [
-                        dir_shade * light_curve_f(sums[0] as f32 / 4.0),
-                        dir_shade * light_curve_f(sums[1] as f32 / 4.0),
-                        dir_shade * light_curve_f(sums[2] as f32 / 4.0),
-                        dir_shade * light_curve_f(sums[3] as f32 / 4.0),
+                        dir_shade * light_curve_f(sums[0] as f32 / 4.0) * ao_factor(ao[0]),
+                        dir_shade * light_curve_f(sums[1] as f32 / 4.0) * ao_factor(ao[1]),
+                        dir_shade * light_curve_f(sums[2] as f32 / 4.0) * ao_factor(ao[2]),
+                        dir_shade * light_curve_f(sums[3] as f32 / 4.0) * ao_factor(ao[3]),
                     ];
                     emit_rect(
                         &mut mesh,
@@ -800,10 +868,23 @@ mod tests {
     // over randomized chunks with randomized neighbors.
     // -----------------------------------------------------------------
 
-    /// A unit face cell: (axis, outward sign, plane, a, b, layer, bright).
-    /// `bright` is the smooth brightness sampled at the CELL CENTER (bits),
-    /// so a merged quad and its unmerged equivalent yield the same value.
-    type CellKey = (usize, bool, i32, i32, i32, u32, u32);
+    /// A unit face cell: (axis, outward sign, plane, a, b, layer).
+    ///
+    /// This is a GEOMETRY key: it deliberately excludes brightness. Greedy
+    /// merging must cover the exact same set of visible face cells, with the
+    /// same texture layers, as the naive mesher — that invariant is what this
+    /// oracle guards, and it is independent of light and AO.
+    ///
+    /// Brightness is intentionally NOT compared here. Smooth light is
+    /// vertex-shared, so it reconstructs affinely across a merged rectangle and
+    /// would match; but classic per-corner AO is cell-anchored (each corner
+    /// excludes its own quadrant), so a greedy run legitimately stretches an AO
+    /// gradient that the naive mesher keeps per-cell. That is an accepted
+    /// property of AO-on-greedy-meshes, not a meshing bug — greedy is the
+    /// shipping mesher and its interpolation is the intended result. Light and
+    /// AO correctness are pinned directly by the smooth-light gradient/seam
+    /// tests and the `corner_ao` truth-table test below.
+    type CellKey = (usize, bool, i32, i32, i32, u32);
 
     /// The four quad corners in emit order (0,0),(1,0),(1,1),(0,1), recovered
     /// from a 6-index quad regardless of which diagonal it was triangulated
@@ -835,16 +916,15 @@ mod tests {
         (pos, bright)
     }
 
-    /// Decompose a mesh into the unit face cells its quads cover, sampling the
-    /// smooth brightness at each cell center by bilinear interpolation of the
-    /// quad's four corners.
+    /// Decompose a mesh into the unit face cells its quads cover (geometry
+    /// only — see `CellKey` on why brightness is excluded).
     fn coverage(mesh: &MeshData) -> HashMap<CellKey, u32> {
         let mut map: HashMap<CellKey, u32> = HashMap::new();
 
         assert_eq!(mesh.indices.len() % 6, 0, "quads are 6 indices each");
         for quad in mesh.indices.chunks_exact(6) {
             let bi = quad.iter().copied().min().unwrap() as usize;
-            let (corners, cbright) = quad_corners(mesh, quad);
+            let (corners, _cbright) = quad_corners(mesh, quad);
             let layer = mesh.vertices[bi].layer;
             assert!(
                 (0..4).all(|k| mesh.vertices[bi + k].layer == layer),
@@ -867,30 +947,10 @@ mod tests {
             let (a1, a2) = other_axes(axis);
             let (min1, max1) = extent(&corners, a1);
             let (min2, max2) = extent(&corners, a2);
-            // Corner positions in (a1,a2): emit order maps to
-            // c0=(0,0) c1=(w,0) c2=(w,h) c3=(0,h) in (u,v)=(a1?,a2?). Derive
-            // (u,v) origin/size from the extents; the quad spans [min,max].
-            let wf = (max1 - min1) as f32;
-            let hf = (max2 - min2) as f32;
 
             for p in min1..max1 {
                 for q in min2..max2 {
-                    // Cell center as fractional (s,t) in [0,1] across the quad.
-                    let s = ((p - min1) as f32 + 0.5) / wf;
-                    let t = ((q - min2) as f32 + 0.5) / hf;
-                    // Bilinear over corners laid out (0,0),(1,0),(1,1),(0,1)
-                    // in (s,t). corners[0..4] follow that order in (u,v); u
-                    // corresponds to a1 or a2 consistently for both meshers
-                    // (same FACE_DIRS), so the interpolation matches.
-                    let bilinear = cbright[0] * (1.0 - s) * (1.0 - t)
-                        + cbright[1] * s * (1.0 - t)
-                        + cbright[2] * s * t
-                        + cbright[3] * (1.0 - s) * t;
-                    // Quantize to absorb float noise (both meshers share the
-                    // same arithmetic, so this is exact-ish; round to 1e-4).
-                    let bits = (bilinear * 10000.0).round() as i32 as u32;
-                    *map.entry((axis, positive, plane, p, q, layer, bits))
-                        .or_insert(0) += 1;
+                    *map.entry((axis, positive, plane, p, q, layer)).or_insert(0) += 1;
                 }
             }
         }
@@ -1228,5 +1288,90 @@ mod tests {
         assert!(choose_flip([1.0, 1.0, 0.0, 1.0]));
         assert!(!choose_flip([0.5, 0.5, 0.5, 0.5]));
         assert!(!choose_flip([1.0, 0.0, 1.0, 0.0]));
+    }
+
+    /// `corner_ao` truth table (M06 task 3). A +Y top face at (cx,10,cz):
+    /// occluders live in the air-side plane y=11, and `occ(du,dv)` probes cell
+    /// (cx+dv, 11, cz+du) since u_axis=2 (z), v_axis=0 (x). Corner emit order
+    /// is (0,0),(1,0),(1,1),(0,1) with su=2cu-1, sv=2cv-1.
+    #[test]
+    fn corner_ao_darkens_tucked_corners() {
+        let (cx, cz) = (8u8, 8u8);
+        let cell = [cx as i32, 10, cz as i32];
+
+        // One occluder on the +z side. It is `side1` (occ(su,0)) only for the
+        // su=+1 corners: k=1 (1,0) and k=2 (1,1) -> one side occluded -> 2.
+        // k=0 and k=3 face away -> fully lit (3).
+        let mut a = Chunk::new_air();
+        a.set(LocalPos::new(cx, 10, cz), STONE);
+        a.set(LocalPos::new(cx, 11, cz + 1), STONE);
+        let ia = MeshInput::build(&a, &ChunkNeighbors::NONE);
+        assert_eq!(
+            corner_ao(&ia, cell, 1, true, 2, 0),
+            [3, 2, 2, 3],
+            "single side occluder darkens that edge to level 2"
+        );
+
+        // Add the perpendicular occluder on the +x side (`side2` for cv=1).
+        // Now k=2 (1,1) has BOTH sides occluded -> hard 0; k=1 and k=3 each
+        // keep one occluded side -> 2; k=0 stays fully lit.
+        let mut b = Chunk::new_air();
+        b.set(LocalPos::new(cx, 10, cz), STONE);
+        b.set(LocalPos::new(cx, 11, cz + 1), STONE);
+        b.set(LocalPos::new(cx + 1, 11, cz), STONE);
+        let ib = MeshInput::build(&b, &ChunkNeighbors::NONE);
+        assert_eq!(
+            corner_ao(&ib, cell, 1, true, 2, 0),
+            [3, 2, 0, 2],
+            "both sides occluded -> darkest corner (0)"
+        );
+    }
+
+    /// End to end: the dedicated AO term must reach emitted vertex brightness
+    /// through the real mesher. With NO sky light, `corner_lights` is uniform,
+    /// so the emitted per-corner brightness varies ONLY by `ao_factor` — which
+    /// isolates the AO term from the smooth-light contribution.
+    #[test]
+    fn ao_factor_reaches_vertex_brightness_through_mesher() {
+        let (cx, cz) = (8u8, 8u8);
+        let mut chunk = Chunk::new_air();
+        chunk.set(LocalPos::new(cx, 10, cz), STONE);
+        chunk.set(LocalPos::new(cx, 11, cz + 1), STONE);
+        chunk.set(LocalPos::new(cx + 1, 11, cz), STONE);
+
+        let input = MeshInput::build(&chunk, &ChunkNeighbors::NONE);
+        let cell = [cx as i32, 10, cz as i32];
+        let ao = corner_ao(&input, cell, 1, true, 2, 0);
+        assert_eq!(ao, [3, 2, 0, 2]);
+
+        // Uniform (zero) light -> brightness is base * ao_factor per corner.
+        let base = face_brightness(1, true) * light_curve_f(0.0);
+        let expected: Vec<f32> = ao.iter().map(|&l| base * ao_factor(l)).collect();
+
+        let mesh = mesh_chunk_naive(&chunk, &ChunkNeighbors::NONE, WHITE);
+
+        // Recover the +Y face over (cx,10,cz): all four corners at y==11,
+        // spanning x in [cx,cx+1], z in [cz,cz+1].
+        let mut got: Option<Vec<f32>> = None;
+        for quad in mesh.indices.chunks_exact(6) {
+            let (pos, bright) = quad_corners(&mesh, quad);
+            let top = pos.iter().all(|p| (p[1] - 11.0).abs() < 1e-6);
+            let xr = cx as f32 - 1e-6..=cx as f32 + 1.0 + 1e-6;
+            let zr = cz as f32 - 1e-6..=cz as f32 + 1.0 + 1e-6;
+            let inx = pos.iter().all(|p| xr.contains(&p[0]));
+            let inz = pos.iter().all(|p| zr.contains(&p[2]));
+            if top && inx && inz {
+                got = Some(bright.to_vec());
+            }
+        }
+        let got = got.expect("no +Y face emitted over the floor cell");
+
+        // Diagonal flips may reorder corners, so match as a set within eps.
+        for e in &expected {
+            assert!(
+                got.iter().any(|g| (g - e).abs() < 1e-4),
+                "AO-scaled brightness {e} not emitted; got {got:?}, expected {expected:?}"
+            );
+        }
     }
 }
