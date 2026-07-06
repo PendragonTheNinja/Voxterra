@@ -407,6 +407,19 @@ struct App {
     relight_ms_accum: f32,
     mesh_ms_accum: f32,
     telemetry_frames: u32,
+
+    // --- Day/night (M07 task 3, ADR-0007) ---
+    /// Current world time; drives sky brightness, and later sun/moon.
+    world_time: vox_core::WorldTime,
+    /// Fractional game-tick accumulator so slow real frames still advance time
+    /// smoothly without integer rounding drift.
+    time_accum: f64,
+    /// Real seconds per full game day (pacing). Default is a 24-minute day.
+    day_length_secs: f64,
+    /// Debug: freeze time (key `T`).
+    time_paused: bool,
+    /// Debug: 60× fast-forward so a full cycle takes ~24s (key `\`).
+    time_fast: bool,
 }
 
 impl Default for App {
@@ -456,6 +469,16 @@ impl Default for App {
             relight_ms_accum: 0.0,
             mesh_ms_accum: 0.0,
             telemetry_frames: 0,
+
+            // Start mid-morning (0.30 of the day) so the world opens in clear
+            // daylight and the first cycle heads toward a visible dusk.
+            world_time: vox_core::WorldTime::from_ticks(
+                (0.30 * vox_core::TICKS_PER_DAY as f64) as u64,
+            ),
+            time_accum: 0.30 * vox_core::TICKS_PER_DAY as f64,
+            day_length_secs: vox_core::DEFAULT_DAY_LENGTH_SECS as f64,
+            time_paused: false,
+            time_fast: false,
         }
     }
 }
@@ -1206,6 +1229,54 @@ impl ApplicationHandler for App {
                             } else if code == KeyCode::KeyG {
                                 // Debug: punch a hole to exercise re-meshing.
                                 self.debug_punch_hole();
+                            } else if code == KeyCode::KeyT {
+                                // Debug: freeze/unfreeze the day/night cycle.
+                                self.time_paused = !self.time_paused;
+                                log::info!(
+                                    "time {} @ {:.2}h",
+                                    if self.time_paused {
+                                        "paused"
+                                    } else {
+                                        "running"
+                                    },
+                                    self.world_time.time_of_day() * 24.0
+                                );
+                            } else if code == KeyCode::Backslash {
+                                // Debug: 60x fast-forward (~24s per full day).
+                                self.time_fast = !self.time_fast;
+                                log::info!(
+                                    "time fast-forward {}",
+                                    if self.time_fast { "ON (60x)" } else { "off" }
+                                );
+                            } else if code == KeyCode::BracketLeft || code == KeyCode::BracketRight
+                            {
+                                // Debug: jump time by ±1 game-hour.
+                                let hour = vox_core::TICKS_PER_DAY as f64 / 24.0;
+                                let delta = if code == KeyCode::BracketRight {
+                                    hour
+                                } else {
+                                    -hour
+                                };
+                                self.time_accum = (self.time_accum + delta).max(0.0);
+                                self.world_time =
+                                    vox_core::WorldTime::from_ticks(self.time_accum as u64);
+                                log::info!(
+                                    "time -> {:.2}h (sky_scale {:.3})",
+                                    self.world_time.time_of_day() * 24.0,
+                                    self.world_time.sky_scale()
+                                );
+                            } else if code == KeyCode::KeyM {
+                                // Debug: advance one game DAY to step the moon
+                                // phase (~1/8 of a lunation) for testing new vs
+                                // full moon nights without waiting.
+                                self.time_accum += vox_core::TICKS_PER_DAY as f64;
+                                self.world_time =
+                                    vox_core::WorldTime::from_ticks(self.time_accum as u64);
+                                log::info!(
+                                    "moon phase -> {:.2} (illum {:.2})",
+                                    self.world_time.moon_phase(),
+                                    self.world_time.moon_illumination()
+                                );
                             } else if let Some(slot) = digit_slot(code) {
                                 self.select_block_slot(slot);
                             } else {
@@ -1262,6 +1333,18 @@ impl ApplicationHandler for App {
                 let now = Instant::now();
                 let dt = (now - self.last_frame).as_secs_f32().min(0.1);
                 self.last_frame = now;
+
+                // Advance world time (M07 task 3). Accumulate in fractional
+                // game-ticks so slow frames don't drift, then snapshot to the
+                // integer WorldTime the shader/sky read.
+                if !self.time_paused {
+                    let mut rate = vox_core::game_ticks_per_second(self.day_length_secs);
+                    if self.time_fast {
+                        rate *= 60.0;
+                    }
+                    self.time_accum += dt as f64 * rate;
+                    self.world_time = vox_core::WorldTime::from_ticks(self.time_accum as u64);
+                }
 
                 match self.camera.mode {
                     MoveMode::Spectator => self.camera.update_spectator(&self.keys, dt),
@@ -1328,6 +1411,13 @@ impl ApplicationHandler for App {
                     let view_proj = self
                         .camera
                         .view_proj(renderer.aspect(), render_origin_blocks);
+
+                    // Day/night (M07 task 3): push sky_scale + sun/moon to the
+                    // shaders. The sky pass needs the inverse view-projection to
+                    // turn each pixel back into a world ray; direction is
+                    // origin-independent, so floating origin doesn't matter here.
+                    renderer.set_sky(self.world_time, view_proj.inverse().to_cols_array_2d());
+
                     renderer.render(view_proj.to_cols_array_2d());
 
                     // Telemetry once per second: FPS, frustum-culling ratio,

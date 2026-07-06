@@ -24,18 +24,32 @@ use vox_core::{BlockId, CHUNK_SIZE, Chunk, ChunkPos, LocalPos, World};
 /// buffer straight to bytes for GPU upload.
 ///
 /// Milestone 03 format (texture array, ADR-0003): position, plus texture
-/// coordinates `uv` that run `0..W` / `0..H` across a greedy-merged quad
-/// (so the layer tiles W×H times under a Repeat sampler), the texture-array
-/// `layer` index for this face, and a directional `brightness` scalar that
-/// the shader multiplies into the sampled color so geometry reads as 3D
-/// before real lighting (Milestone 04).
+/// coordinates `uv` that run `0..W` / `0..H` across a greedy-merged quad (so
+/// the layer tiles W×H times under a Repeat sampler) and the texture-array
+/// `layer` index for this face.
+///
+/// M07 (ADR-0007) replaces the single baked `brightness` scalar with the two
+/// light channels kept separate so day/night can scale sky without dimming
+/// torches:
+///
+/// - `sky`, `block`: per-corner light, normalized to `0.0..=1.0` (level/15).
+///   The shader combines them as `max(sky * sky_scale, block)` — `sky_scale`
+///   is a per-frame uniform — then applies the light curve.
+/// - `shade`: the time-independent multiplier baked at mesh time — directional
+///   face brightness × ambient-occlusion factor. The shader multiplies it in
+///   after the light curve.
+///
+/// Full formula the shader evaluates:
+/// `color = tex * shade * light_curve(max(sky * sky_scale, block))`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vertex {
     pub position: [f32; 3],
     pub uv: [f32; 2],
     pub layer: u32,
-    pub brightness: f32,
+    pub sky: f32,
+    pub block: f32,
+    pub shade: f32,
 }
 
 /// CPU-side mesh: vertex + index buffers ready for GPU upload.
@@ -157,8 +171,12 @@ impl<'a> ChunkNeighbors<'a> {
 pub struct MeshInput {
     /// 34³ block ids; shell cells default to AIR.
     block: Vec<BlockId>,
-    /// 34³ light scalars (`max(block, sky)`); shell defaults to 0.
-    light: Vec<u8>,
+    /// 34³ sky light levels (0..=15); shell defaults to 0. Kept separate from
+    /// block light (M07 / ADR-0007) so the shader can scale sky by time of day
+    /// without touching torches. The M06 `max(sky, block)` collapse is gone.
+    sky: Vec<u8>,
+    /// 34³ block light levels (0..=15); shell defaults to 0.
+    block_light: Vec<u8>,
     all_air: bool,
 }
 
@@ -188,17 +206,26 @@ impl MeshInput {
         self.block[Self::cidx(x, y, z)]
     }
 
-    /// Light scalar at chunk-relative coords (0 in absent neighbors).
+    /// Sky light level (0..=15) at chunk-relative coords (0 in absent
+    /// neighbors).
     #[inline]
-    pub fn light(&self, x: i32, y: i32, z: i32) -> u8 {
-        self.light[Self::cidx(x, y, z)]
+    pub fn sky(&self, x: i32, y: i32, z: i32) -> u8 {
+        self.sky[Self::cidx(x, y, z)]
+    }
+
+    /// Block light level (0..=15) at chunk-relative coords (0 in absent
+    /// neighbors).
+    #[inline]
+    pub fn block_light(&self, x: i32, y: i32, z: i32) -> u8 {
+        self.block_light[Self::cidx(x, y, z)]
     }
 
     /// Build the snapshot from a chunk and its face neighbors.
     pub fn build(chunk: &Chunk, neighbors: &ChunkNeighbors) -> Self {
         let n = CHUNK_SIZE;
         let mut block = vec![BlockId::AIR; PAD * PAD * PAD];
-        let mut light = vec![0u8; PAD * PAD * PAD];
+        let mut sky = vec![0u8; PAD * PAD * PAD];
+        let mut block_light = vec![0u8; PAD * PAD * PAD];
 
         // Center. Uniform chunks skip the per-cell palette decode entirely.
         if chunk.is_uniform() {
@@ -217,9 +244,12 @@ impl MeshInput {
             }
         }
         for pos in LocalPos::iter() {
-            let l = chunk.block_light(pos).max(chunk.sky_light(pos));
-            if l > 0 {
-                light[Self::cidx(pos.x() as i32, pos.y() as i32, pos.z() as i32)] = l;
+            let s = chunk.sky_light(pos);
+            let b = chunk.block_light(pos);
+            if s > 0 || b > 0 {
+                let i = Self::cidx(pos.x() as i32, pos.y() as i32, pos.z() as i32);
+                sky[i] = s;
+                block_light[i] = b;
             }
         }
 
@@ -255,14 +285,16 @@ impl MeshInput {
                     let lp = LocalPos::new(lx, ly, lz);
                     let i = Self::cidx(x, y, z);
                     block[i] = nb.get(lp);
-                    light[i] = nb.block_light(lp).max(nb.sky_light(lp));
+                    sky[i] = nb.sky_light(lp);
+                    block_light[i] = nb.block_light(lp);
                 }
             }
         }
 
         Self {
             block,
-            light,
+            sky,
+            block_light,
             all_air: chunk.is_all_air(),
         }
     }
@@ -294,17 +326,17 @@ fn face_brightness(axis: usize, positive: bool) -> f32 {
 /// dim but not pure black; combined multiplicatively with directional face
 /// shading.
 fn light_curve_f(level: f32) -> f32 {
-    // Ambient floor: brightness of a cell that receives NO light at all — a
-    // sealed cave, an overhang underside. This is a pure geometry baseline
-    // (sky can't reach the cell), independent of time of day; a future
-    // day/night cycle dims the SKY channel above this floor, so moonlit open
-    // ground will sit brighter than this without changing it. Tuned darker
-    // than Minecraft's floor so enclosed dark reads genuinely dark, but not
-    // pure black (M06 task 5 decision).
-    const AMBIENT: f32 = 0.035;
+    // Ambient floor: brightness where NO light reaches (sealed cave, overhang
+    // underside). M07 task 4: a hair above zero — "almost black" rather than a
+    // dead #000, at the owner's request (softens the M06 0.035 choice). Night
+    // darkness comes from the sky channel × sky_scale, not this floor. Must
+    // match the WGSL light_curve() and the CLAUDE.md note.
+    const AMBIENT: f32 = 0.004;
     let t = (level / 15.0).clamp(0.0, 1.0);
-    // Slight gamma so mid-levels read brighter; eases the linear band.
-    let curved = t.powf(0.85);
+    // Steep falloff (exponent > 1, ~inverse-square feel) so light fades
+    // GRADUALLY into darkness across the low levels instead of holding bright
+    // then snapping to black. Higher = more dramatic; lower = flatter.
+    let curved = t.powf(1.8);
     AMBIENT + (1.0 - AMBIENT) * curved
 }
 
@@ -335,40 +367,50 @@ const CORNER_DUV: [(i32, i32); 4] = [(0, 0), (1, 0), (1, 1), (0, 1)];
 /// the average over all four samples (solid cells contribute their light,
 /// which is ~0 inside geometry), giving smooth light and AO in one pass. The
 /// dedicated 3-neighbor AO term lands in task 3; this is the light half.
-fn corner_lights(
+///
+/// M07 (ADR-0007): returns the **sky** and **block** light averages as two
+/// independent channels (each 0.0..=15.0 fractional), so the shader can scale
+/// sky by time of day while leaving block light (torches) alone. The averaging
+/// — including AO-darkening from solid neighbors contributing their ~0 light —
+/// happens per channel identically.
+fn corner_lights_2ch(
     input: &MeshInput,
     cell: [i32; 3],
     axis: usize,
     positive: bool,
     u_axis: usize,
     v_axis: usize,
-) -> [f32; 4] {
+) -> ([f32; 4], [f32; 4]) {
     // The air cell directly in front of the face.
     let mut front = cell;
     front[axis] += if positive { 1 } else { -1 };
 
-    let sample = |du: i32, dv: i32| -> u8 {
+    let sample = |du: i32, dv: i32| -> (u8, u8) {
         let mut c = front;
         c[u_axis] += du;
         c[v_axis] += dv;
-        input.light(c[0], c[1], c[2])
+        (
+            input.sky(c[0], c[1], c[2]),
+            input.block_light(c[0], c[1], c[2]),
+        )
     };
 
-    let mut out = [0.0f32; 4];
+    let mut sky = [0.0f32; 4];
+    let mut block = [0.0f32; 4];
     for (k, &(cu, cv)) in CORNER_DUV.iter().enumerate() {
         // Corner (cu,cv) in {0,1}² touches the front cell and its neighbors
-        // toward that corner: steps of su/sv in {-1,0} ... but expressed from
-        // the face cell, the four touching air cells are at
+        // toward that corner: the four touching air cells are at
         // (0,0), (su,0), (0,sv), (su,sv) where su = 2*cu-1, sv = 2*cv-1.
         let su = 2 * cu - 1;
         let sv = 2 * cv - 1;
-        let a = sample(0, 0);
-        let b = sample(su, 0);
-        let c = sample(0, sv);
-        let d = sample(su, sv);
-        out[k] = (a as f32 + b as f32 + c as f32 + d as f32) / 4.0;
+        let (sa, ba) = sample(0, 0);
+        let (sb, bb) = sample(su, 0);
+        let (sc, bc) = sample(0, sv);
+        let (sd, bd) = sample(su, sv);
+        sky[k] = (sa as f32 + sb as f32 + sc as f32 + sd as f32) / 4.0;
+        block[k] = (ba as f32 + bb as f32 + bc as f32 + bd as f32) / 4.0;
     }
-    out
+    (sky, block)
 }
 
 /// Classic per-corner ambient occlusion (M06 task 3). Independent of light:
@@ -455,9 +497,13 @@ fn emit_rect(
     w: f32,
     h: f32,
     layer: u32,
-    // Per-corner brightness in emit order (0,0)→(w,0)→(w,h)→(0,h). Smooth
-    // lighting varies these across the quad; the shader interpolates them.
-    corner_brightness: [f32; 4],
+    // Per-corner light channels + baked shade, in emit order
+    // (0,0)→(w,0)→(w,h)→(0,h). `sky`/`block` are normalized 0..=1; `shade` is
+    // face-brightness × AO. Smooth lighting varies these across the quad; the
+    // shader interpolates them (ADR-0007).
+    corner_sky: [f32; 4],
+    corner_block: [f32; 4],
+    corner_shade: [f32; 4],
     // Whether to flip the triangle diagonal (00-11 vs 01-10). Chosen so AO/
     // light interpolation never produces the "butterfly" anisotropy on a
     // gradient (M06). false = default diagonal (0,2); true = (1,3).
@@ -465,7 +511,7 @@ fn emit_rect(
 ) {
     // UVs run 0..w / 0..h so the texture-array layer tiles w×h times across
     // a greedy-merged quad under a Repeat sampler (ADR-0003).
-    let corner = |du: f32, dv: f32, bright: f32| Vertex {
+    let corner = |du: f32, dv: f32, sky: f32, block: f32, shade: f32| Vertex {
         position: [
             base[0] + u_dir[0] * du + v_dir[0] * dv,
             base[1] + u_dir[1] * du + v_dir[1] * dv,
@@ -473,14 +519,40 @@ fn emit_rect(
         ],
         uv: [du, dv],
         layer,
-        brightness: bright,
+        sky,
+        block,
+        shade,
     };
 
     let base_index = mesh.vertices.len() as u32;
-    mesh.vertices.push(corner(0.0, 0.0, corner_brightness[0]));
-    mesh.vertices.push(corner(w, 0.0, corner_brightness[1]));
-    mesh.vertices.push(corner(w, h, corner_brightness[2]));
-    mesh.vertices.push(corner(0.0, h, corner_brightness[3]));
+    mesh.vertices.push(corner(
+        0.0,
+        0.0,
+        corner_sky[0],
+        corner_block[0],
+        corner_shade[0],
+    ));
+    mesh.vertices.push(corner(
+        w,
+        0.0,
+        corner_sky[1],
+        corner_block[1],
+        corner_shade[1],
+    ));
+    mesh.vertices.push(corner(
+        w,
+        h,
+        corner_sky[2],
+        corner_block[2],
+        corner_shade[2],
+    ));
+    mesh.vertices.push(corner(
+        0.0,
+        h,
+        corner_sky[3],
+        corner_block[3],
+        corner_shade[3],
+    ));
     let b = base_index;
     if flip {
         // Diagonal through corners 1 and 3.
@@ -491,6 +563,18 @@ fn emit_rect(
         mesh.indices
             .extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
     }
+}
+
+/// Per-corner displayed brightness at **full daylight** (`sky_scale = 1`):
+/// `shade * light_curve(max(sky, block))`. Used only to pick the triangulation
+/// diagonal. The true runtime brightness depends on the per-frame `sky_scale`,
+/// but the diagonal must be baked at mesh time, so we bake it for the daytime
+/// gradient — the case where smooth gradients are brightest and butterfly
+/// artifacts most visible. At full day with no block light this equals the M06
+/// value exactly, so flip decisions are unchanged there. `sky`/`block` are the
+/// normalized (0..=1) per-corner channels.
+fn daytime_brightness(sky: [f32; 4], block: [f32; 4], shade: [f32; 4]) -> [f32; 4] {
+    std::array::from_fn(|k| shade[k] * light_curve_f(sky[k].max(block[k]) * 15.0))
 }
 
 /// Choose the triangulation diagonal so the two triangles' shared edge runs
@@ -541,17 +625,32 @@ pub fn mesh_chunk_naive(
             if positive {
                 base[axis] += 1.0;
             }
-            // Smooth per-corner light from the air side, times the fixed
-            // directional face shade.
-            let shade = face_brightness(axis, positive);
-            let cl = corner_lights(&input, coords, axis, positive, u_axis, v_axis);
+            // Smooth per-corner sky/block light from the air side (kept
+            // separate for day/night), plus the baked time-independent shade
+            // (directional face brightness × AO).
+            let dir_shade = face_brightness(axis, positive);
+            let (sky15, block15) =
+                corner_lights_2ch(&input, coords, axis, positive, u_axis, v_axis);
             let ao = corner_ao(&input, coords, axis, positive, u_axis, v_axis);
-            let cb = [
-                shade * light_curve_f(cl[0]) * ao_factor(ao[0]),
-                shade * light_curve_f(cl[1]) * ao_factor(ao[1]),
-                shade * light_curve_f(cl[2]) * ao_factor(ao[2]),
-                shade * light_curve_f(cl[3]) * ao_factor(ao[3]),
+            let c_sky = [
+                sky15[0] / 15.0,
+                sky15[1] / 15.0,
+                sky15[2] / 15.0,
+                sky15[3] / 15.0,
             ];
+            let c_block = [
+                block15[0] / 15.0,
+                block15[1] / 15.0,
+                block15[2] / 15.0,
+                block15[3] / 15.0,
+            ];
+            let c_shade = [
+                dir_shade * ao_factor(ao[0]),
+                dir_shade * ao_factor(ao[1]),
+                dir_shade * ao_factor(ao[2]),
+                dir_shade * ao_factor(ao[3]),
+            ];
+            let flip = choose_flip(daytime_brightness(c_sky, c_block, c_shade));
             emit_rect(
                 &mut mesh,
                 base,
@@ -560,8 +659,10 @@ pub fn mesh_chunk_naive(
                 1.0,
                 1.0,
                 layer_of(block, face_index),
-                cb,
-                choose_flip(cb),
+                c_sky,
+                c_block,
+                c_shade,
+                flip,
             );
         }
     }
@@ -593,13 +694,15 @@ pub fn mesh_chunk(
 
     let size = CHUNK_SIZE;
     // Per-slice mask: each visible face cell carries its block AND its four
-    // per-corner light SUMS (each 0..=60 = sum of four 0..=15 samples — an
-    // exact integer, so the tuple is Eq/Hashable and merging is exact). Cells
-    // merge only when block AND all four corner light sums AND all four AO
-    // levels match, so any smooth-light gradient or AO variation correctly
-    // subdivides the merged rectangles. Corner order is emit order
-    // (0,0),(1,0),(1,1),(0,1) in (u,v).
-    type CellMask = (BlockId, [u16; 4], [u8; 4]);
+    // per-corner light SUMS for BOTH channels (sky and block, each 0..=60 = sum
+    // of four 0..=15 samples — an exact integer, so the tuple is Eq/Hashable and
+    // merging is exact) AND its four AO levels. Cells merge only when block AND
+    // all four sky sums AND all four block sums AND all four AO levels match, so
+    // any gradient in either light channel or in AO correctly subdivides the
+    // merged rectangles. Splitting the old single `max` sum into two channels
+    // (M07/ADR-0007) is what can lower the merge ratio — measured by the bench.
+    // Corner order is emit order (0,0),(1,0),(1,1),(0,1) in (u,v).
+    type CellMask = (BlockId, [u16; 4], [u16; 4], [u8; 4]);
     let mut mask: Vec<Option<CellMask>> = vec![None; size * size];
     let at = |u: usize, v: usize| u + v * size;
 
@@ -629,16 +732,24 @@ pub fn mesh_chunk(
                     let mut n = coords;
                     n[axis] += if positive { 1 } else { -1 };
                     if input.is_air(n[0], n[1], n[2]) {
-                        let cl = corner_lights(&input, coords, axis, positive, u_axis, v_axis);
+                        let (sky15, block15) =
+                            corner_lights_2ch(&input, coords, axis, positive, u_axis, v_axis);
                         let ao = corner_ao(&input, coords, axis, positive, u_axis, v_axis);
-                        // Store light as integer sums (×4) to keep the key exact.
-                        let sums = [
-                            (cl[0] * 4.0).round() as u16,
-                            (cl[1] * 4.0).round() as u16,
-                            (cl[2] * 4.0).round() as u16,
-                            (cl[3] * 4.0).round() as u16,
+                        // Store each channel as integer sums (×4) to keep the
+                        // key exact and Hashable.
+                        let sky_sums = [
+                            (sky15[0] * 4.0).round() as u16,
+                            (sky15[1] * 4.0).round() as u16,
+                            (sky15[2] * 4.0).round() as u16,
+                            (sky15[3] * 4.0).round() as u16,
                         ];
-                        *cell = Some((block, sums, ao));
+                        let block_sums = [
+                            (block15[0] * 4.0).round() as u16,
+                            (block15[1] * 4.0).round() as u16,
+                            (block15[2] * 4.0).round() as u16,
+                            (block15[3] * 4.0).round() as u16,
+                        ];
+                        *cell = Some((block, sky_sums, block_sums, ao));
                         any = true;
                     } else {
                         *cell = None;
@@ -655,7 +766,7 @@ pub fn mesh_chunk(
                     let Some(key) = mask[at(u0, v0)] else {
                         continue;
                     };
-                    let (block, sums, ao) = key;
+                    let (block, sky_sums, block_sums, ao) = key;
 
                     // Grow width along u.
                     let mut w = 1;
@@ -688,14 +799,28 @@ pub fn mesh_chunk(
                     base[u_axis] = u0 as f32;
                     base[v_axis] = v0 as f32;
 
-                    // Corner sums back to brightness (÷4 to recover the mean),
-                    // times AO.
-                    let cb = [
-                        dir_shade * light_curve_f(sums[0] as f32 / 4.0) * ao_factor(ao[0]),
-                        dir_shade * light_curve_f(sums[1] as f32 / 4.0) * ao_factor(ao[1]),
-                        dir_shade * light_curve_f(sums[2] as f32 / 4.0) * ao_factor(ao[2]),
-                        dir_shade * light_curve_f(sums[3] as f32 / 4.0) * ao_factor(ao[3]),
+                    // Recover per-corner channels: sums ÷4 gives the mean level
+                    // (0..=15), ÷15 normalizes to 0..=1. Shade is the baked
+                    // directional × AO term.
+                    let c_sky = [
+                        sky_sums[0] as f32 / 60.0,
+                        sky_sums[1] as f32 / 60.0,
+                        sky_sums[2] as f32 / 60.0,
+                        sky_sums[3] as f32 / 60.0,
                     ];
+                    let c_block = [
+                        block_sums[0] as f32 / 60.0,
+                        block_sums[1] as f32 / 60.0,
+                        block_sums[2] as f32 / 60.0,
+                        block_sums[3] as f32 / 60.0,
+                    ];
+                    let c_shade = [
+                        dir_shade * ao_factor(ao[0]),
+                        dir_shade * ao_factor(ao[1]),
+                        dir_shade * ao_factor(ao[2]),
+                        dir_shade * ao_factor(ao[3]),
+                    ];
+                    let flip = choose_flip(daytime_brightness(c_sky, c_block, c_shade));
                     emit_rect(
                         &mut mesh,
                         base,
@@ -704,8 +829,10 @@ pub fn mesh_chunk(
                         w as f32,
                         h as f32,
                         layer_of(block, face_index),
-                        cb,
-                        choose_flip(cb),
+                        c_sky,
+                        c_block,
+                        c_shade,
+                        flip,
                     );
                 }
             }
@@ -907,13 +1034,23 @@ mod tests {
             mesh.vertices[b + 2].position,
             mesh.vertices[b + 3].position,
         ];
+        // Reconstruct the displayed brightness at full daylight (sky_scale = 1)
+        // from the split channels, so brightness-based assertions keep working
+        // after the M07 vertex-format change.
         let bright = [
-            mesh.vertices[b].brightness,
-            mesh.vertices[b + 1].brightness,
-            mesh.vertices[b + 2].brightness,
-            mesh.vertices[b + 3].brightness,
+            vertex_daytime_brightness(&mesh.vertices[b]),
+            vertex_daytime_brightness(&mesh.vertices[b + 1]),
+            vertex_daytime_brightness(&mesh.vertices[b + 2]),
+            vertex_daytime_brightness(&mesh.vertices[b + 3]),
         ];
         (pos, bright)
+    }
+
+    /// The brightness a vertex displays at full daylight: the same value the
+    /// shader computes with `sky_scale = 1`, reconstructed from the split
+    /// channels for tests that assert on brightness.
+    fn vertex_daytime_brightness(v: &Vertex) -> f32 {
+        v.shade * light_curve_f(v.sky.max(v.block) * 15.0)
     }
 
     /// Decompose a mesh into the unit face cells its quads cover (geometry
@@ -1130,27 +1267,37 @@ mod tests {
         west.set_block_light(LocalPos::new(31, 7, 7), 9);
         let neighbors = ChunkNeighbors::NONE.with_neg_x(&west);
         let input = MeshInput::build(&chunk, &neighbors);
-        // Interior.
+        // Interior: sky present, block absent — the two channels stay separate.
         assert!(!input.is_air(3, 4, 5));
         assert_eq!(input.block(3, 4, 5), STONE);
         assert!(input.is_air(3, 5, 5));
-        assert_eq!(input.light(3, 5, 5), 12);
-        // Present neighbor's touching layer (x = -1 maps to west x = 31).
+        assert_eq!(input.sky(3, 5, 5), 12);
+        assert_eq!(input.block_light(3, 5, 5), 0);
+        // Present neighbor's touching layer (x = -1 maps to west x = 31): block
+        // light present, sky absent.
         assert!(input.is_air(-1, 7, 7));
-        assert_eq!(input.light(-1, 7, 7), 9);
+        assert_eq!(input.block_light(-1, 7, 7), 9);
+        assert_eq!(input.sky(-1, 7, 7), 0);
         assert!(!input.is_air(-1, 8, 8));
-        // Absent neighbors: air, dark.
+        // Absent neighbors: air, both channels dark.
         assert!(input.is_air(32, 0, 0));
-        assert_eq!(input.light(32, 0, 0), 0);
+        assert_eq!(input.sky(32, 0, 0), 0);
+        assert_eq!(input.block_light(32, 0, 0), 0);
         assert!(input.is_air(0, -1, 0));
     }
 
     /// Perf yardstick, not a correctness test. Run with:
     /// `cargo test --release -p vox-mesh bench_mesh -- --ignored --nocapture`
     /// History: 2736us (per-visit palette decodes) -> 1876us (MeshInput
-    /// snapshot, ADR-0006) -> 2236us (task 2: per-vertex smooth light + AO-
-    /// aware corner sampling + 26-neighbor shell; quads 20 -> 36 as gradients
-    /// subdivide merges), July 2026. Still well under the pre-snapshot 2736us.
+    /// snapshot, ADR-0006) -> ~2526us (M06 task 2: per-vertex smooth light +
+    /// AO-aware corner sampling + 26-neighbor shell) -> ~2670us (M07 task 2:
+    /// two-channel sky/block vertex light, ADR-0007), July 2026. The M07 step
+    /// is +5.7% and 84 -> 84 quads (NO merge change) on this scene because it
+    /// has no block-light sources, so the block channel is all-zero and merging
+    /// stays sky-driven. The merge-ratio cost of the split only appears where a
+    /// block-light gradient diverges from sky (e.g. torches under open sky);
+    /// this bench does not exercise that — a torch-lit variant is a good future
+    /// addition. Still well under the pre-snapshot 2736us.
     #[test]
     #[ignore]
     fn bench_mesh_realistic_surface_chunk() {
@@ -1214,12 +1361,12 @@ mod tests {
             }
         }
         let input = MeshInput::build(&chunk, &ChunkNeighbors::NONE);
-        let cl = corner_lights(&input, [4, 15, 4], 1, true, 2, 0);
-        let spread =
-            cl.iter().cloned().fold(0.0f32, f32::max) - cl.iter().cloned().fold(f32::MAX, f32::min);
+        let (sky, _block) = corner_lights_2ch(&input, [4, 15, 4], 1, true, 2, 0);
+        let spread = sky.iter().cloned().fold(0.0f32, f32::max)
+            - sky.iter().cloned().fold(f32::MAX, f32::min);
         assert!(
             spread > 0.25,
-            "expected a gradient across the face, got {cl:?}"
+            "expected a gradient across the face, got {sky:?}"
         );
     }
 
@@ -1239,8 +1386,8 @@ mod tests {
         }
         let nb = ChunkNeighbors::NONE.with_pos_x(&right);
         let input = MeshInput::build(&left, &nb);
-        let cl = corner_lights(&input, [31, 8, 8], 0, true, 1, 2);
-        for (k, &c) in cl.iter().enumerate() {
+        let (sky, _block) = corner_lights_2ch(&input, [31, 8, 8], 0, true, 1, 2);
+        for (k, &c) in sky.iter().enumerate() {
             assert!((c - 10.0).abs() < 1e-6, "corner {k} = {c}");
         }
     }
@@ -1274,12 +1421,44 @@ mod tests {
         let input = MeshInput::build(&chunk, &nb);
         // Top face of the edge block (31,10,8): all four corners should be 15
         // (uniform bright), including the corner that samples into +X.
-        let cl = corner_lights(&input, [31, 10, 8], 1, true, 2, 0);
-        for (k, &c) in cl.iter().enumerate() {
+        let (sky, _block) = corner_lights_2ch(&input, [31, 10, 8], 1, true, 2, 0);
+        for (k, &c) in sky.iter().enumerate() {
             assert!(
                 (c - 15.0).abs() < 1e-6,
                 "edge corner {k} = {c}, expected 15 (no phantom-dark seam)"
             );
+        }
+    }
+
+    /// M07 task 2: sky and block light must cross a chunk seam *independently*.
+    /// The old single-channel `max` collapse could not express this — a bright
+    /// torch on one side and open sky on the other would have merged into one
+    /// scalar. Here the +X face on the seam (left x=31) reads its air-side light
+    /// from the right neighbor's x=0 plane, which carries sky=10 AND block=7.
+    /// Both channels must arrive uniform (all four corners) and unmixed.
+    #[test]
+    fn two_channel_seam_continuity_across_chunk_boundary() {
+        let mut left = Chunk::new_air();
+        for y in 0..CHUNK_SIZE as u8 {
+            for z in 0..CHUNK_SIZE as u8 {
+                left.set(LocalPos::new(31, y, z), STONE);
+            }
+        }
+        let mut right = Chunk::new_air();
+        for y in 0..CHUNK_SIZE as u8 {
+            for z in 0..CHUNK_SIZE as u8 {
+                right.set_sky_light(LocalPos::new(0, y, z), 10);
+                right.set_block_light(LocalPos::new(0, y, z), 7);
+            }
+        }
+        let nb = ChunkNeighbors::NONE.with_pos_x(&right);
+        let input = MeshInput::build(&left, &nb);
+        let (sky, block) = corner_lights_2ch(&input, [31, 8, 8], 0, true, 1, 2);
+        for (k, &s) in sky.iter().enumerate() {
+            assert!((s - 10.0).abs() < 1e-6, "sky corner {k} = {s}, expected 10");
+        }
+        for (k, &b) in block.iter().enumerate() {
+            assert!((b - 7.0).abs() < 1e-6, "block corner {k} = {b}, expected 7");
         }
     }
 

@@ -76,6 +76,19 @@ struct GpuMesh {
     offset_bind_group: wgpu::BindGroup,
 }
 
+/// Sky-pass uniform (M07 task 3b, ADR-0007). Must match `SkyUniform` in
+/// sky.wgsl exactly (std140: mat4 then three vec4s). `inv_view_proj`
+/// reconstructs per-pixel world ray directions; `sun`/`moon` carry direction +
+/// (sky_scale / illumination) in `.w`; `params.x` is the star-intensity knob.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SkyUniformData {
+    inv_view_proj: [[f32; 4]; 4],
+    sun: [f32; 4],
+    moon: [f32; 4],
+    params: [f32; 4],
+}
+
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -110,6 +123,23 @@ pub struct Renderer {
     highlight_bind_group: wgpu::BindGroup,
     /// The currently targeted block in world coords, or `None`.
     highlight_target: Option<WorldPos>,
+
+    // --- Day/night (M07 task 3, ADR-0007) ---
+    /// Sky uniform (group 3): currently a single `sky_scale` in `.x`, padded to
+    /// 16 bytes. The fragment shader multiplies the SKY light channel by it so
+    /// night dims sky-lit surfaces without touching block light. Room in .yzw
+    /// for the sky-pass additions (sun direction, moon) in task 3b.
+    sky_buffer: wgpu::Buffer,
+    sky_bind_group: wgpu::BindGroup,
+    /// Most recent sky_scale, also used to dim the background clear color until
+    /// the procedural sky pass replaces it (task 3b).
+    sky_scale: f32,
+
+    // --- Procedural sky pass (M07 task 3b) ---
+    /// Fullscreen sky pipeline (gradient + sun + moon + stars), drawn first.
+    sky_pipeline: wgpu::RenderPipeline,
+    sky_pass_buffer: wgpu::Buffer,
+    sky_pass_bind_group: wgpu::BindGroup,
 }
 
 impl Renderer {
@@ -180,6 +210,37 @@ impl Renderer {
             }],
         });
 
+        // --- Sky uniform (group 3, M07 task 3). A vec4: x = sky_scale, yzw
+        // reserved for the sky pass (task 3b). Fragment-visible. Starts at 1.0
+        // (full daylight) so first frame matches M06 until the loop drives it. ---
+        let sky_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sky uniform"),
+            size: std::mem::size_of::<[f32; 4]>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let sky_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("sky bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let sky_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sky bind group"),
+            layout: &sky_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: sky_buffer.as_entire_binding(),
+            }],
+        });
+
         // --- Per-chunk offset uniform layout (group 1), for floating
         // origin. One small uniform per chunk, rebound per draw. ---
         let chunk_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -224,7 +285,8 @@ impl Renderer {
         let texture_bind_group = create_block_texture(&device, &queue, &texture_bgl);
 
         // --- Pipeline. Vertex layout must match vox_mesh::Vertex exactly:
-        // position [f32;3], uv [f32;2], layer u32, brightness f32. ---
+        // position [f32;3], uv [f32;2], layer u32, sky f32, block f32,
+        // shade f32 (M07/ADR-0007). ---
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("chunk shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
@@ -232,20 +294,24 @@ impl Renderer {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("chunk pipeline layout"),
-            bind_group_layouts: &[&camera_bgl, &chunk_bgl, &texture_bgl],
+            bind_group_layouts: &[&camera_bgl, &chunk_bgl, &texture_bgl, &sky_bgl],
             push_constant_ranges: &[],
         });
 
         let vertex_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<vox_mesh::Vertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
-            // Matches vox_mesh::Vertex (texture array, ADR-0003):
-            // position [f32;3], uv [f32;2], layer u32, brightness f32.
+            // Matches vox_mesh::Vertex: position [f32;3], uv [f32;2],
+            // layer u32, then the M07 light channels sky f32, block f32,
+            // shade f32 (ADR-0007). The shader combines sky/block with the
+            // per-frame sky_scale, applies the light curve, then × shade.
             attributes: &wgpu::vertex_attr_array![
                 0 => Float32x3,
                 1 => Float32x2,
                 2 => Uint32,
-                3 => Float32
+                3 => Float32,
+                4 => Float32,
+                5 => Float32
             ],
         };
 
@@ -358,6 +424,82 @@ impl Renderer {
             }],
         });
 
+        // --- Procedural sky pass (M07 task 3b). Fullscreen triangle (no vertex
+        // buffer); its own uniform (inv view-proj + sun/moon + star knob). Drawn
+        // first, writes no depth, always passes depth so terrain overdraws it. ---
+        let sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("sky shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("sky.wgsl").into()),
+        });
+        let sky_pass_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sky pass uniform"),
+            size: std::mem::size_of::<SkyUniformData>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let sky_pass_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("sky pass bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let sky_pass_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sky pass bind group"),
+            layout: &sky_pass_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: sky_pass_buffer.as_entire_binding(),
+            }],
+        });
+        let sky_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("sky pipeline layout"),
+            bind_group_layouts: &[&sky_pass_bgl],
+            push_constant_ranges: &[],
+        });
+        let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("sky pipeline"),
+            layout: Some(&sky_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &sky_shader,
+                entry_point: Some("vs_sky"),
+                compilation_options: Default::default(),
+                buffers: &[], // fullscreen triangle generated from vertex_index
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            // No depth write; always pass. Drawn before terrain, which then
+            // overdraws it wherever geometry exists.
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            fragment: Some(wgpu::FragmentState {
+                module: &sky_shader,
+                entry_point: Some("fs_sky"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
+
         Self {
             surface,
             device,
@@ -377,6 +519,12 @@ impl Renderer {
             highlight_offset_buffer,
             highlight_bind_group,
             highlight_target: None,
+            sky_buffer,
+            sky_bind_group,
+            sky_scale: 1.0,
+            sky_pipeline,
+            sky_pass_buffer,
+            sky_pass_bind_group,
         }
     }
 
@@ -496,6 +644,34 @@ impl Renderer {
         self.meshes.len()
     }
 
+    /// Update everything day/night for this frame from the world time and the
+    /// camera's inverse view-projection (for the sky pass's per-pixel ray
+    /// reconstruction). Writes both the chunk-shader sky uniform (sky_scale) and
+    /// the sky-pass uniform (sun/moon directions, star knob), and stores
+    /// sky_scale for the fallback clear color.
+    pub fn set_sky(&mut self, time: vox_core::WorldTime, inv_view_proj: [[f32; 4]; 4]) {
+        let sky_scale = time.sky_scale().clamp(0.0, 1.0);
+        self.sky_scale = sky_scale;
+
+        // Chunk-shader uniform (group 3): just sky_scale in .x.
+        let chunk_uniform = [sky_scale, 0.0, 0.0, 0.0];
+        self.queue
+            .write_buffer(&self.sky_buffer, 0, bytemuck::cast_slice(&chunk_uniform));
+
+        // Sky-pass uniform.
+        let sun = time.sun_direction();
+        let moon = time.moon_direction();
+        let sky_uniform = SkyUniformData {
+            inv_view_proj,
+            sun: [sun[0], sun[1], sun[2], sky_scale],
+            moon: [moon[0], moon[1], moon[2], time.moon_illumination()],
+            // params.x = star intensity knob (tuned in-scene); yzw reserved.
+            params: [1.0, 0.0, 0.0, 0.0],
+        };
+        self.queue
+            .write_buffer(&self.sky_pass_buffer, 0, bytemuck::bytes_of(&sky_uniform));
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
@@ -545,6 +721,10 @@ impl Renderer {
             });
 
         {
+            // Daytime sky-blue, dimmed toward near-black by sky_scale so the
+            // background tracks day/night until the procedural sky pass (task
+            // 3b) replaces this flat clear with a real gradient + sun/moon.
+            let s = self.sky_scale as f64;
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -552,9 +732,9 @@ impl Renderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.45,
-                            g: 0.70,
-                            b: 0.95,
+                            r: 0.45 * s + 0.02 * (1.0 - s),
+                            g: 0.70 * s + 0.02 * (1.0 - s),
+                            b: 0.95 * s + 0.05 * (1.0 - s),
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -572,11 +752,19 @@ impl Renderer {
                 occlusion_query_set: None,
             });
 
+            // Procedural sky first (fullscreen). Writes no depth and always
+            // passes, so terrain below overdraws it wherever geometry exists.
+            pass.set_pipeline(&self.sky_pipeline);
+            pass.set_bind_group(0, &self.sky_pass_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+
             if !self.meshes.is_empty() {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
                 // Group 2 (block textures) is shared by all chunks — bind once.
                 pass.set_bind_group(2, &self.texture_bind_group, &[]);
+                // Group 3 (sky/day-night) — shared by all chunks, bind once.
+                pass.set_bind_group(3, &self.sky_bind_group, &[]);
                 // Chunk world offset is baked into vertex positions at mesh
                 // time, so all chunks share one pipeline and bind group and
                 // differ only by their vertex/index buffers.

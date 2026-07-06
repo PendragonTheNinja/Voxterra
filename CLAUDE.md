@@ -184,18 +184,22 @@ beyond what the invariants above already require.
 
 ## Current status
 
-- **Active milestone:** none — M06 just closed. Next up is a fresh milestone;
-  the headline candidate is **LOD / far-view-distance + async pipeline**
-  (seed-driven far chunks, noted at the end of the M04 retro). A day/night
-  cycle (with two-channel vertex light + moon-phase night brightness) is a
-  strong second candidate — design sketch recorded at the end of
-  `docs/milestones/06-smooth-lighting-ao.md`. Write the spec before building.
-- **Last completed milestone:** 06 — Smooth Lighting & Ambient Occlusion
-  (2026-07-03); retrospective with numbers at the end of
-  `docs/milestones/06-smooth-lighting-ao.md`. Per-vertex smooth light + classic
-  vertex AO shipped; ambient floor resolved at 0.035.
-- **Prior milestone:** 05 — Skylight (2026-07-02); retrospective with baseline
-  numbers at the end of `docs/milestones/05-skylight.md`.
+- **Active milestone:** none — M07 just closed. The headline next candidate is
+  **LOD / far view distance** — its architecture is drafted and ratified-pending
+  in `docs/decisions/0008-lod-architecture.md`, with the seed-driven-far-terrain
+  bet already proven by a headless PoC (~195× cheaper than full-res, meshes with
+  the existing greedy mesher unchanged). Proposed split: **M08** single-level LOD
+  end-to-end, **M09** full octree + polish. Write the milestone spec before
+  building.
+- **Last completed milestone:** 07 — Day/Night Cycle (2026-07-06); retrospective
+  with numbers at the end of `docs/milestones/07-day-night.md`. Shipped:
+  `vox-core::time` (WorldTime + celestial model), two-channel sky/block vertex
+  light (ADR-0007), a procedural sky pass (gradient, sun, phase-lit moon,
+  world-locked starfield), and day/night wiring with `sky_scale` as a per-frame
+  uniform (never baked into meshes). Ambient floor lowered to 0.004 (see the
+  invariants note below).
+- **Prior milestone:** 06 — Smooth Lighting & Ambient Occlusion (2026-07-03);
+  retrospective at the end of `docs/milestones/06-smooth-lighting-ao.md`.
 - Completed milestones have retrospectives in `docs/milestones/`.
 - Milestones 02 (Infinite World, 2026-06-14) and 03 are complete; see their
   retrospectives in `docs/milestones/`.
@@ -233,6 +237,21 @@ was a real shipped bug. Regression tests exist for all of them (vox-core).
 - The live relight entry point is `compute_chunk_light_2ch` via
   `relight_chunks_parallel`. Older single-channel functions in light.rs are
   legacy — do not extend them.
+- **Day/night is a per-frame UNIFORM, never baked into the mesh** (added M07).
+  `sky_scale`, sun/moon directions live in shader uniforms; the sun moving must
+  re-mesh nothing. Vertices carry sky and block light as SEPARATE channels
+  (ADR-0007) so night dims sky without touching torches; the shader combines
+  them as `max(light_curve(sky) × sky_scale, light_curve(block))` — curve each
+  source, THEN dim sky, so the falloff exponent and day/night dimming stay
+  independent (monotonicity makes daytime identical to the pre-M07 formula).
+- **Ambient floor is 0.004 ("almost black"), NOT 0.035** (changed M07,
+  reversing the M06 "dark but not pure black" choice at the owner's request).
+  Enclosed space with no light source now reads genuinely dark and requires a
+  torch. A moonless open field is kept faintly visible ABOVE this floor via
+  `vox_core::NIGHT_SKY_MIN` (skylight × sky_scale), not by the floor. The floor
+  lives in two synced spots: `vox_mesh::light_curve_f` and the WGSL
+  `light_curve()`; the falloff exponent (1.8) lives with them. Keep them in
+  sync.
 
 ## Hard-won debugging lessons (M05 saga — read before any lighting work)
 
