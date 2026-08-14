@@ -140,6 +140,12 @@ pub struct Renderer {
     sky_pipeline: wgpu::RenderPipeline,
     sky_pass_buffer: wgpu::Buffer,
     sky_pass_bind_group: wgpu::BindGroup,
+
+    // --- LOD (M08) ---
+    /// Coarse LOD node meshes, keyed by the node's origin chunk. Drawn with the
+    /// depth-biased `lod_pipeline` so full-res occludes them where they overlap.
+    lod_meshes: HashMap<ChunkPos, GpuMesh>,
+    lod_pipeline: wgpu::RenderPipeline,
 }
 
 impl Renderer {
@@ -352,9 +358,59 @@ impl Renderer {
             cache: None,
         });
 
-        // --- Targeted-block highlight pipeline (M03 task 3): a line-list
-        // wireframe cube. Reuses camera (group 0) + an offset uniform
-        // (chunk_bgl, group 1). No culling; drawn after chunks. ---
+        // --- LOD pipeline (M08): identical to the chunk pipeline but with a
+        // small depth bias that pushes coarse LOD terrain slightly back, so
+        // where a near LOD ring overlaps full-res chunks the full-res surface
+        // wins the depth test (no z-fighting, no double terrain). LOD node
+        // meshes carry the same vertex format and use the same bind groups. ---
+        let lod_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("lod pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<vox_mesh::Vertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![
+                        0 => Float32x3, 1 => Float32x2, 2 => Uint32,
+                        3 => Float32, 4 => Float32, 5 => Float32
+                    ],
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: Default::default(),
+                // Push LOD back so full-res occludes it in the overlap band.
+                bias: wgpu::DepthBiasState {
+                    constant: 16,
+                    slope_scale: 1.0,
+                    clamp: 0.0,
+                },
+            }),
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
         let highlight_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("highlight shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("highlight.wgsl").into()),
@@ -525,6 +581,8 @@ impl Renderer {
             sky_pipeline,
             sky_pass_buffer,
             sky_pass_bind_group,
+            lod_meshes: HashMap::new(),
+            lod_pipeline,
         }
     }
 
@@ -538,56 +596,83 @@ impl Renderer {
             self.meshes.remove(&pos);
             return;
         }
+        let offset = chunk_offset(pos, self.render_origin);
+        let gpu = self.build_gpu_mesh(offset, CHUNK_SIZE as f32, mesh);
+        self.meshes.insert(pos, gpu);
+    }
+
+    /// Build GPU buffers + offset uniform for a mesh whose vertices are in block
+    /// units relative to `offset` (render-relative), with a cubic AABB of the
+    /// given `span` blocks per side. Shared by chunk and LOD uploads.
+    fn build_gpu_mesh(&self, offset: Vec3, span: f32, mesh: &MeshData) -> GpuMesh {
         let vertex_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("chunk vertices"),
+                label: Some("mesh vertices"),
                 contents: bytemuck::cast_slice(&mesh.vertices),
                 usage: wgpu::BufferUsages::VERTEX,
             });
         let index_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("chunk indices"),
+                label: Some("mesh indices"),
                 contents: bytemuck::cast_slice(&mesh.indices),
                 usage: wgpu::BufferUsages::INDEX,
             });
-
-        // Render-relative offset of this chunk's min corner, plus its AABB
-        // in the same (render-relative) space the frustum uses.
-        let offset = chunk_offset(pos, self.render_origin);
-        let aabb_min = offset;
-        let aabb_max = offset + Vec3::splat(CHUNK_SIZE as f32);
-
         let offset_data = [offset.x, offset.y, offset.z, 0.0];
         let offset_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("chunk offset uniform"),
+                label: Some("mesh offset uniform"),
                 contents: bytemuck::cast_slice(&offset_data),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
         let offset_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("chunk offset bind group"),
+            label: Some("mesh offset bind group"),
             layout: &self.chunk_bgl,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: offset_buffer.as_entire_binding(),
             }],
         });
+        GpuMesh {
+            vertex_buffer,
+            index_buffer,
+            index_count: mesh.indices.len() as u32,
+            aabb_min: offset,
+            aabb_max: offset + Vec3::splat(span),
+            offset_buffer,
+            offset_bind_group,
+        }
+    }
 
-        self.meshes.insert(
-            pos,
-            GpuMesh {
-                vertex_buffer,
-                index_buffer,
-                index_count: mesh.indices.len() as u32,
-                aabb_min,
-                aabb_max,
-                offset_buffer,
-                offset_bind_group,
-            },
-        );
+    /// Upload (or replace) a coarse LOD node mesh (M08). `origin` is the node's
+    /// origin chunk; `span_blocks` is the node's world size per side
+    /// (`CHUNK_SIZE × stride`). The mesh's vertices are already scaled to block
+    /// units (baked in `mesh_lod_node`), so this reuses the chunk offset path.
+    pub fn set_lod_mesh(&mut self, origin: ChunkPos, span_blocks: f32, mesh: &MeshData) {
+        if mesh.is_empty() {
+            self.lod_meshes.remove(&origin);
+            return;
+        }
+        let offset = chunk_offset(origin, self.render_origin);
+        let gpu = self.build_gpu_mesh(offset, span_blocks, mesh);
+        self.lod_meshes.insert(origin, gpu);
+    }
+
+    /// Remove a LOD node mesh.
+    pub fn remove_lod_mesh(&mut self, origin: ChunkPos) {
+        self.lod_meshes.remove(&origin);
+    }
+
+    /// Drop all LOD meshes (e.g. when toggling LOD off).
+    pub fn clear_lod(&mut self) {
+        self.lod_meshes.clear();
+    }
+
+    /// Number of LOD node meshes currently uploaded.
+    pub fn lod_count(&self) -> usize {
+        self.lod_meshes.len()
     }
 
     /// Chunks drawn in the most recent frame, after frustum culling.
@@ -608,6 +693,16 @@ impl Renderer {
             let offset = chunk_offset(pos, origin);
             mesh.aabb_min = offset;
             mesh.aabb_max = offset + Vec3::splat(CHUNK_SIZE as f32);
+            let data = [offset.x, offset.y, offset.z, 0.0];
+            self.queue
+                .write_buffer(&mesh.offset_buffer, 0, bytemuck::cast_slice(&data));
+        }
+        // LOD meshes: same reposition, but preserve each node's (larger) span.
+        for (&pos, mesh) in self.lod_meshes.iter_mut() {
+            let extent = mesh.aabb_max - mesh.aabb_min;
+            let offset = chunk_offset(pos, origin);
+            mesh.aabb_min = offset;
+            mesh.aabb_max = offset + extent;
             let data = [offset.x, offset.y, offset.z, 0.0];
             self.queue
                 .write_buffer(&mesh.offset_buffer, 0, bytemuck::cast_slice(&data));
@@ -758,7 +853,7 @@ impl Renderer {
             pass.set_bind_group(0, &self.sky_pass_bind_group, &[]);
             pass.draw(0..3, 0..1);
 
-            if !self.meshes.is_empty() {
+            if !self.meshes.is_empty() || !self.lod_meshes.is_empty() {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
                 // Group 2 (block textures) is shared by all chunks — bind once.
@@ -778,6 +873,28 @@ impl Renderer {
                     pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..mesh.index_count, 0, 0..1);
                     drawn += 1;
+                }
+
+                // Coarse LOD nodes (M08): same camera/texture/sky bind groups,
+                // but the depth-biased LOD pipeline so full-res occludes them
+                // where they overlap. Drawn after full-res.
+                if !self.lod_meshes.is_empty() {
+                    pass.set_pipeline(&self.lod_pipeline);
+                    for mesh in self.lod_meshes.values() {
+                        if !frustum.intersects_aabb(mesh.aabb_min, mesh.aabb_max) {
+                            continue;
+                        }
+                        pass.set_bind_group(1, &mesh.offset_bind_group, &[]);
+                        pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                        pass.set_index_buffer(
+                            mesh.index_buffer.slice(..),
+                            wgpu::IndexFormat::Uint32,
+                        );
+                        pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                        drawn += 1;
+                    }
+                    // Restore the full-res pipeline for the highlight pass below.
+                    pass.set_pipeline(&self.pipeline);
                 }
 
                 // Targeted-block highlight (M03 task 3): wireframe cube on

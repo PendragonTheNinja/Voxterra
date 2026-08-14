@@ -53,11 +53,21 @@ impl Generator {
     /// vertically compute the same surface for the same column, which is
     /// what keeps cubic chunks seamless.
     pub fn surface_height(&self, wx: i64, wz: i64) -> i64 {
-        // Two octaves of value noise at different lattice spacings.
-        let base = 24.0;
-        let h1 = self.value_noise(wx, wz, 48) * 20.0; // broad rolling hills
-        let h2 = self.value_noise(wx, wz, 12) * 6.0; // finer bumps
-        (base + h1 + h2).round() as i64
+        // Placeholder terrain, tuned for LOD testing (M08 task 5, owner-
+        // approved amendment): three octaves of value noise. The mountain
+        // octave is CUBED — flats stay flat, extremes get pushed out — giving
+        // real peaks (~+116) and valleys (~-64) instead of uniform rolling
+        // hills. Range must stay inside the LOD node Y band
+        // ([LOD_Y_ORIGIN_BLOCKS, +128) in vox-app) and adjacent-column slope
+        // under the smoothness test's bound. Real geology replaces all of this
+        // in a future milestone (ADR-0008 records the coarse-query constraint
+        // it must preserve).
+        let base = 26.0;
+        let m = self.value_noise(wx, wz, 192);
+        let mountains = m * m * m * 64.0; // cubed: dramatic peaks, flat plains
+        let hills = self.value_noise(wx, wz, 48) * 20.0; // broad rolling hills
+        let detail = self.value_noise(wx, wz, 12) * 6.0; // finer bumps
+        (base + mountains + hills + detail).round() as i64
     }
 
     /// Generate the chunk at `pos` independently. Empty (all-air) chunks —
@@ -105,6 +115,74 @@ impl Generator {
         // The chunk was built with set(), which marks it modified; but this
         // IS the canonical generated state, so clear the flag. Only later
         // edits should mark it modified (and thus needing a save).
+        chunk.mark_unmodified();
+        chunk
+    }
+
+    /// Generate a coarse LOD node (M08, ADR-0008): one 32³ `Chunk` that stands
+    /// in for a `(CHUNK_SIZE·stride)³`-block region of terrain, sampled directly
+    /// from the seed WITHOUT generating the underlying full-res chunks. Each
+    /// coarse cell `(cx,cy,cz)` represents the `stride³`-block cube starting at
+    /// `origin + (cell·stride)`.
+    ///
+    /// `origin` is the world-space minimum corner of the region; the streamer
+    /// aligns it to the node size (`CHUNK_SIZE·stride`) so nodes tile without
+    /// gaps or overlap. The returned node meshes with the ordinary greedy mesher
+    /// and renders through the ordinary chunk shader — an LOD node is just a
+    /// scaled chunk (the whole point of ADR-0008).
+    ///
+    /// The surface is sampled once per coarse column (at the cell's centre), and
+    /// the cube is filled up to it, **rounding down**: the topmost solid cube is
+    /// the highest one lying entirely at or below the surface (GRASS; fully
+    /// buried cubes below are STONE, cubes above are AIR). Coarse terrain thus
+    /// never rises above the true surface — it hides beneath full-res chunks at
+    /// the boundary instead of poking through them. Dirt is dropped at this
+    /// scale (a 4-block band is invisible under 8-block cubes); coarse cell
+    /// classification is deliberately simple and is revisited under real
+    /// geology (ADR-0008 open question).
+    ///
+    /// Skylight is baked here rather than run through the (too-expensive-at-
+    /// distance) 3D relight: LOD is a heightfield with no caves, so every AIR
+    /// cell is sky-exposed and gets full skylight (15). The day/night `sky_scale`
+    /// uniform then dims the node with the near field for free (ADR-0005/0007).
+    pub fn generate_lod_node(&self, origin: vox_core::WorldPos, stride: i64) -> Chunk {
+        debug_assert!(stride >= 1, "LOD stride must be >= 1");
+        let mut chunk = Chunk::new_air();
+        for cz in 0..CHUNK_SIZE as i64 {
+            for cx in 0..CHUNK_SIZE as i64 {
+                // Sample the full-res surface at this coarse column's centre.
+                let wx = origin.x + cx * stride + stride / 2;
+                let wz = origin.z + cz * stride + stride / 2;
+                let height = self.surface_height(wx, wz);
+                for cy in 0..CHUNK_SIZE as i64 {
+                    let cell_bottom = origin.y + cy * stride;
+                    let cell_top = cell_bottom + stride - 1;
+                    // Round DOWN: a cube is solid only if it lies entirely at or
+                    // below the surface (`cell_top <= height`). The coarse
+                    // surface therefore never rises above the true terrain —
+                    // essential at the full-res boundary, where LOD underlaps
+                    // real chunks and must hide BENEATH them, never poke
+                    // through. At distance this reads as terrain sitting up to
+                    // `stride-1` blocks low, which is invisible; skirts cover
+                    // the seams (ADR-0008).
+                    let block = if cell_top > height {
+                        blocks::AIR
+                    } else if cell_top + stride > height {
+                        blocks::GRASS // the topmost fully-buried cube
+                    } else {
+                        blocks::STONE
+                    };
+                    let lp = LocalPos::new(cx as u8, cy as u8, cz as u8);
+                    if block.is_air() {
+                        // Sky-exposed (heightfield, no caves at LOD): full sky.
+                        chunk.set_sky_light(lp, 15);
+                    } else {
+                        chunk.set(lp, block);
+                    }
+                }
+            }
+        }
+        // Canonical generated state — not a user edit.
         chunk.mark_unmodified();
         chunk
     }
@@ -280,6 +358,106 @@ mod tests {
                 assert!((-1.0..=1.0).contains(&n), "noise out of range: {n}");
             }
         }
+    }
+
+    // ---- M08: coarse LOD node generation (ADR-0008) ----
+
+    const S: i64 = 8; // test stride
+    const NODE: i64 = CHUNK_SIZE as i64 * S; // node covers NODE³ blocks
+
+    /// Same seed + node origin + stride → byte-identical node, always.
+    #[test]
+    fn lod_node_is_deterministic() {
+        let g = Generator::new(0x0007_E22A_C0DE);
+        let origin = WorldPos::new(-NODE, 0, NODE);
+        let a = g.generate_lod_node(origin, S);
+        let b = g.generate_lod_node(origin, S);
+        for p in LocalPos::iter() {
+            assert_eq!(a.get(p), b.get(p), "block mismatch at {p:?}");
+            assert_eq!(a.sky_light(p), b.sky_light(p), "sky mismatch at {p:?}");
+        }
+    }
+
+    /// Round-down contract: the topmost solid cube lies entirely at or below
+    /// the true surface, and within one stride of it — so coarse terrain never
+    /// rises above real terrain (boundary safety) and never sinks more than
+    /// `stride-1` blocks (visual fidelity).
+    #[test]
+    fn lod_node_surface_cube_matches_heightmap() {
+        let g = Generator::new(42);
+        // Node whose Y range straddles the surface near y≈0.
+        let origin = WorldPos::new(0, -NODE / 2, 0);
+        let node = g.generate_lod_node(origin, S);
+        for cz in 0..CHUNK_SIZE as i64 {
+            for cx in 0..CHUNK_SIZE as i64 {
+                let wx = origin.x + cx * S + S / 2;
+                let wz = origin.z + cz * S + S / 2;
+                let height = g.surface_height(wx, wz);
+                // Find the topmost solid cube in this column.
+                let mut top_solid: Option<i64> = None;
+                for cy in (0..CHUNK_SIZE as i64).rev() {
+                    let lp = LocalPos::new(cx as u8, cy as u8, cz as u8);
+                    if !node.get(lp).is_air() {
+                        top_solid = Some(cy);
+                        break;
+                    }
+                }
+                // Only assert for columns whose surface falls inside this node.
+                if height >= origin.y + S && height < origin.y + NODE - S {
+                    let cy = top_solid.expect("surface inside node → a solid cube");
+                    let cube_top = origin.y + cy * S + S - 1;
+                    assert!(
+                        cube_top <= height,
+                        "coarse surface (cube top {cube_top}) above true surface {height}"
+                    );
+                    assert!(
+                        height - cube_top < S,
+                        "coarse surface {cube_top} more than a stride below {height}"
+                    );
+                    assert_eq!(
+                        node.get(LocalPos::new(cx as u8, cy as u8, cz as u8)),
+                        blocks::GRASS,
+                        "topmost solid cube should be grass"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Air cubes are sky-exposed (15); solid cubes carry no sky light. This is
+    /// what lets the node light itself without the 3D relight pipeline.
+    #[test]
+    fn lod_node_air_is_full_skylight_solid_is_dark() {
+        let g = Generator::new(7);
+        let origin = WorldPos::new(0, -NODE / 2, 0);
+        let node = g.generate_lod_node(origin, S);
+        for p in LocalPos::iter() {
+            if node.get(p).is_air() {
+                assert_eq!(node.sky_light(p), 15, "air cube must be full skylight");
+            } else {
+                assert_eq!(node.sky_light(p), 0, "solid cube must carry no skylight");
+            }
+        }
+    }
+
+    /// A node far above any terrain is all air (and fully sky-lit); a node far
+    /// below is all stone (and dark).
+    #[test]
+    fn lod_node_uniform_extremes() {
+        let g = Generator::new(123);
+        let high = g.generate_lod_node(WorldPos::new(0, 100 * NODE, 0), S);
+        assert!(LocalPos::iter().all(|p| high.get(p).is_air()));
+        assert!(LocalPos::iter().all(|p| high.sky_light(p) == 15));
+
+        let low = g.generate_lod_node(WorldPos::new(0, -100 * NODE, 0), S);
+        assert!(LocalPos::iter().all(|p| low.get(p) == blocks::STONE));
+    }
+
+    /// Generated nodes are canonical state, not user edits.
+    #[test]
+    fn lod_node_is_unmodified() {
+        let g = Generator::new(1);
+        assert!(!g.generate_lod_node(WorldPos::new(0, 0, 0), S).is_modified());
     }
 }
 

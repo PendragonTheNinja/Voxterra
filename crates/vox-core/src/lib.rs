@@ -7,6 +7,7 @@ pub mod block;
 pub mod chunk;
 pub mod coords;
 pub mod light;
+pub mod lod;
 pub mod raycast;
 pub mod registry;
 pub mod storage;
@@ -24,6 +25,7 @@ pub use light::{
     propagate_block_light, propagate_sky_light, relight_chunk, relight_chunk_2ch,
     remove_block_light,
 };
+pub use lod::{LodNodePos, LodRing, LodUpdate};
 pub use raycast::{RayHit, cell_overlaps_aabb, raycast_blocks, raycast_voxels};
 pub use registry::{BlockRegistry, BlockType};
 pub use storage::{StoreError, WORLD_META_VERSION, WorldStore};

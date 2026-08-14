@@ -9,10 +9,10 @@ use std::time::Instant;
 use glam::{Mat4, Vec3};
 use rayon::prelude::*;
 use vox_core::{
-    cell_overlaps_aabb, BlockId, BlockRegistry, Chunk, ChunkPos, LocalPos, RayHit, Streamer, World,
-    WorldPos, WorldStore,
+    cell_overlaps_aabb, BlockId, BlockRegistry, Chunk, ChunkPos, LocalPos, LodNodePos, LodRing,
+    RayHit, Streamer, World, WorldPos, WorldStore,
 };
-use vox_mesh::{mesh_chunk, ChunkNeighbors, MeshData};
+use vox_mesh::{mesh_chunk, mesh_lod_node, ChunkNeighbors, MeshData};
 use vox_render::Renderer;
 use vox_worldgen::Generator;
 use winit::application::ApplicationHandler;
@@ -43,6 +43,18 @@ const NEIGHBOR_OFFSETS: [(i64, i64, i64); 6] = [
 /// every direction (~2,000 chunks resident).
 const LOAD_RADIUS: i64 = 8;
 const UNLOAD_RADIUS: i64 = 10;
+
+// --- LOD (M08). One coarse level: a node is `LOD_STRIDE` chunks per side. LOD
+// fills a ring from just outside the camera node out to LOAD; it underlaps the
+// full-res region (occluded by the depth-biased LOD pipeline). Tune the radii
+// against LOAD_RADIUS if a seam gap appears. ---
+const LOD_STRIDE: i64 = 8;
+const LOD_FULL_RADIUS_NODES: i64 = 0; // LOD starts at the camera's neighbour nodes
+const LOD_LOAD_RADIUS_NODES: i64 = 4; // ~4 nodes = ~1 km horizon
+const LOD_UNLOAD_RADIUS_NODES: i64 = 5;
+const LOD_Y_ORIGIN_BLOCKS: i64 = -128; // node Y band that contains the surface
+const LOD_SKIRT_DEPTH_CELLS: i32 = 2;
+const LOD_SPAWN_BUDGET: usize = 4; // coarse nodes generated+meshed per frame
 
 /// Per-frame work budgets, to keep frame time stable while streaming.
 /// Generation is async (rayon), but we bound how many jobs we *spawn* per
@@ -368,6 +380,10 @@ struct App {
     // --- Streaming (M02 task 3) ---
     generator: Generator,
     streamer: Streamer,
+    /// Coarse LOD ring policy (M08): which distant LOD nodes are loaded.
+    lod_ring: LodRing,
+    /// Debug: LOD rendering on/off (toggled with `L`).
+    lod_enabled: bool,
     /// Block definitions: appearance + flags, the single source of truth
     /// (M03 task 1). Shared into meshing (Sync).
     registry: BlockRegistry,
@@ -400,6 +416,17 @@ struct App {
     gen_tx: Sender<(ChunkPos, Chunk)>,
     gen_rx: Receiver<(ChunkPos, Chunk)>,
 
+    /// Async LOD-node gen+mesh results (M08): coarse generation and meshing run
+    /// on the rayon pool; the main thread only uploads.
+    lod_tx: Sender<(LodNodePos, MeshData)>,
+    lod_rx: Receiver<(LodNodePos, MeshData)>,
+    lod_in_flight: HashSet<LodNodePos>,
+    /// Nodes wanted but not yet spawned (the ring is requested all at once but
+    /// generated a few per frame). The set mirrors the queue for O(1) dedupe
+    /// and cancellation.
+    lod_pending: std::collections::VecDeque<LodNodePos>,
+    lod_pending_set: HashSet<LodNodePos>,
+
     /// Telemetry: accumulate frames over ~1s to log FPS + drawn/total.
     telemetry_accum: f32,
     /// Milliseconds spent in the relight / mesh streaming passes since the
@@ -425,6 +452,7 @@ struct App {
 impl Default for App {
     fn default() -> Self {
         let (gen_tx, gen_rx) = std::sync::mpsc::channel();
+        let (lod_tx, lod_rx) = std::sync::mpsc::channel();
 
         // Open (or create) the world directory. The store's seed is
         // authoritative: a new world uses this default seed, an existing one
@@ -454,6 +482,13 @@ impl Default for App {
 
             generator: Generator::new(seed),
             streamer: Streamer::new(LOAD_RADIUS, UNLOAD_RADIUS),
+            lod_ring: LodRing::new(
+                LOD_STRIDE,
+                LOD_FULL_RADIUS_NODES,
+                LOD_LOAD_RADIUS_NODES,
+                LOD_UNLOAD_RADIUS_NODES,
+            ),
+            lod_enabled: true,
             registry: BlockRegistry::default_set(),
             store,
             gen_in_flight: HashSet::new(),
@@ -464,6 +499,11 @@ impl Default for App {
             selected_block: vox_core::registry::STONE,
             gen_tx,
             gen_rx,
+            lod_tx,
+            lod_rx,
+            lod_in_flight: HashSet::new(),
+            lod_pending: std::collections::VecDeque::new(),
+            lod_pending_set: HashSet::new(),
 
             telemetry_accum: 0.0,
             relight_ms_accum: 0.0,
@@ -1031,6 +1071,108 @@ impl App {
         }
     }
 
+    /// World-space origin chunk of a LOD node (M08). The node's Y band is fixed
+    /// (`LOD_Y_ORIGIN_BLOCKS`) for the current placeholder terrain.
+    fn lod_node_origin_chunk(n: LodNodePos) -> ChunkPos {
+        ChunkPos::new(
+            n.min_chunk_x(LOD_STRIDE),
+            LOD_Y_ORIGIN_BLOCKS / CHUNK_SIZE_I,
+            n.min_chunk_z(LOD_STRIDE),
+        )
+    }
+
+    /// M08: stream coarse LOD nodes around the camera. Gen + mesh run on the
+    /// rayon pool (both are pure CPU); the main thread only uploads. Mirrors the
+    /// chunk streaming path (`stream_tick`) but for one coarse level.
+    fn lod_tick(&mut self, camera_chunk: ChunkPos) {
+        if !self.lod_enabled {
+            return;
+        }
+        let update = self.lod_ring.update(camera_chunk);
+
+        // Unloads: drop the GPU mesh, forget the node, and cancel it if it was
+        // still queued or in flight.
+        for n in &update.to_unload {
+            let origin = Self::lod_node_origin_chunk(*n);
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.remove_lod_mesh(origin);
+            }
+            self.lod_ring.mark_unloaded(*n);
+            self.lod_in_flight.remove(n);
+            // Cancel a queued node (leaves a stale deque entry, skipped on pop).
+            self.lod_pending_set.remove(n);
+        }
+
+        // Enqueue newly-wanted nodes (the whole ring on the first update after
+        // a node change; the budget below spreads generation over frames).
+        for n in update.to_load {
+            if self.lod_in_flight.contains(&n) || self.lod_pending_set.contains(&n) {
+                continue;
+            }
+            self.lod_pending_set.insert(n);
+            self.lod_pending.push_back(n);
+        }
+
+        // Drain finished meshes and upload (skipping any cancelled mid-flight).
+        let span = (CHUNK_SIZE_I * LOD_STRIDE) as f32;
+        while let Ok((n, mesh)) = self.lod_rx.try_recv() {
+            if !self.lod_in_flight.remove(&n) {
+                continue;
+            }
+            let origin = Self::lod_node_origin_chunk(n);
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.set_lod_mesh(origin, span, &mesh);
+            }
+            self.lod_ring.mark_loaded(n);
+        }
+
+        // Spawn up to the budget from the pending queue. Coarse gen + mesh run
+        // on rayon (pure CPU); only the upload above is on the main thread.
+        let grass = vox_core::registry::GRASS;
+        let stone = vox_core::registry::STONE;
+        let grass_layers: [u32; 6] = std::array::from_fn(|f| self.registry.face_layer(grass, f));
+        let stone_layers: [u32; 6] = std::array::from_fn(|f| self.registry.face_layer(stone, f));
+
+        let mut spawned = 0;
+        while spawned < LOD_SPAWN_BUDGET {
+            let Some(n) = self.lod_pending.pop_front() else {
+                break;
+            };
+            // Cancelled while queued (unloaded before we got to it).
+            if !self.lod_pending_set.remove(&n) {
+                continue;
+            }
+            if self.lod_in_flight.contains(&n) {
+                continue;
+            }
+            self.lod_in_flight.insert(n);
+            let generator = self.generator;
+            let tx = self.lod_tx.clone();
+            let origin = WorldPos::new(
+                n.origin_block_x(LOD_STRIDE),
+                LOD_Y_ORIGIN_BLOCKS,
+                n.origin_block_z(LOD_STRIDE),
+            );
+            rayon::spawn(move || {
+                let node = generator.generate_lod_node(origin, LOD_STRIDE);
+                let mesh = mesh_lod_node(
+                    &node,
+                    |b, face| {
+                        if b == grass {
+                            grass_layers[face]
+                        } else {
+                            stone_layers[face]
+                        }
+                    },
+                    LOD_STRIDE as i32,
+                    LOD_SKIRT_DEPTH_CELLS,
+                );
+                let _ = tx.send((n, mesh));
+            });
+            spawned += 1;
+        }
+    }
+
     /// the edit persists). No-op when nothing is targeted.
     fn break_block(&mut self) {
         let Some(hit) = self.targeted else { return };
@@ -1277,6 +1419,19 @@ impl ApplicationHandler for App {
                                     self.world_time.moon_phase(),
                                     self.world_time.moon_illumination()
                                 );
+                            } else if code == KeyCode::KeyL {
+                                // Debug: toggle coarse LOD terrain (M08).
+                                self.lod_enabled = !self.lod_enabled;
+                                if !self.lod_enabled {
+                                    self.lod_ring.clear();
+                                    self.lod_in_flight.clear();
+                                    self.lod_pending.clear();
+                                    self.lod_pending_set.clear();
+                                    if let Some(renderer) = self.renderer.as_mut() {
+                                        renderer.clear_lod();
+                                    }
+                                }
+                                log::info!("LOD {}", if self.lod_enabled { "ON" } else { "off" });
                             } else if let Some(slot) = digit_slot(code) {
                                 self.select_block_slot(slot);
                             } else {
@@ -1363,6 +1518,8 @@ impl ApplicationHandler for App {
                 // Stream chunks in/out around the camera (borrows all of
                 // self), before the render borrow below.
                 self.stream_tick(origin_chunk);
+                // Stream coarse LOD nodes for the distant horizon (M08).
+                self.lod_tick(origin_chunk);
 
                 // Raycast from the camera to find the targeted block (M03
                 // task 3). Uses loaded world data; unloaded cells read as air
@@ -1427,10 +1584,11 @@ impl ApplicationHandler for App {
                     if self.telemetry_accum >= 1.0 {
                         let fps = self.telemetry_frames as f32 / self.telemetry_accum;
                         log::info!(
-                            "{:.0} fps | drawn {}/{} | loaded {} | gen {} | dirty {} | relight {} | lt {:.0}ms msh {:.0}ms",
+                            "{:.0} fps | drawn {}/{} | lod {} | loaded {} | gen {} | dirty {} | relight {} | lt {:.0}ms msh {:.0}ms",
                             fps,
                             renderer.drawn_last_frame(),
                             renderer.mesh_count(),
+                            renderer.lod_count(),
                             loaded,
                             in_flight,
                             dirty,
@@ -1465,7 +1623,10 @@ impl ApplicationHandler for App {
 }
 
 fn main() {
-    env_logger::init();
+    // Default to vox_app=info so telemetry always prints; RUST_LOG still
+    // overrides (e.g. RUST_LOG=vox_app=debug or =error to quiet it).
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("vox_app=info"))
+        .init();
 
     let event_loop = EventLoop::new().expect("failed to create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);

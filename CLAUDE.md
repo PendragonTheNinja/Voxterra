@@ -184,22 +184,21 @@ beyond what the invariants above already require.
 
 ## Current status
 
-- **Active milestone:** none — M07 just closed. The headline next candidate is
-  **LOD / far view distance** — its architecture is drafted and ratified-pending
-  in `docs/decisions/0008-lod-architecture.md`, with the seed-driven-far-terrain
-  bet already proven by a headless PoC (~195× cheaper than full-res, meshes with
-  the existing greedy mesher unchanged). Proposed split: **M08** single-level LOD
-  end-to-end, **M09** full octree + polish. Write the milestone spec before
-  building.
-- **Last completed milestone:** 07 — Day/Night Cycle (2026-07-06); retrospective
-  with numbers at the end of `docs/milestones/07-day-night.md`. Shipped:
-  `vox-core::time` (WorldTime + celestial model), two-channel sky/block vertex
-  light (ADR-0007), a procedural sky pass (gradient, sun, phase-lit moon,
-  world-locked starfield), and day/night wiring with `sky_scale` as a per-frame
-  uniform (never baked into meshes). Ambient floor lowered to 0.004 (see the
-  invariants note below).
-- **Prior milestone:** 06 — Smooth Lighting & Ambient Occlusion (2026-07-03);
-  retrospective at the end of `docs/milestones/06-smooth-lighting-ao.md`.
+- **Active milestone:** 09 — LOD Levels & Streaming Quality (spec:
+  `docs/milestones/09-lod-octree-streaming.md`). Multi-level LOD, exact
+  near-ring downsample, priority-ordered budgeted streaming (fixes the
+  transient-unlit-chunk and sprint-fly-throughput issues from the M08 retro),
+  geomorph as stretch.
+- **Last completed milestone:** 08 — Single-Level LOD (2026-07-09);
+  retrospective with numbers at the end of
+  `docs/milestones/08-lod-single-level.md`. Shipped: seed-driven coarse nodes
+  (`generate_lod_node`, round-down classification, baked skylight),
+  `mesh_lod_node` (skirts, scale+UV baking), `vox-core::lod::LodRing`
+  (disjoint partition + hysteresis), depth-biased LOD render path, budgeted
+  async node streaming. Placeholder terrain gained mountains (~[-59, +108]).
+  ADR-0008 accepted.
+- **Prior milestone:** 07 — Day/Night Cycle (2026-07-06); retrospective at the
+  end of `docs/milestones/07-day-night.md`.
 - Completed milestones have retrospectives in `docs/milestones/`.
 - Milestones 02 (Infinite World, 2026-06-14) and 03 are complete; see their
   retrospectives in `docs/milestones/`.
