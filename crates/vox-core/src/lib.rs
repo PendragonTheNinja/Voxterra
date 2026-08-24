@@ -10,6 +10,7 @@ pub mod light;
 pub mod lod;
 pub mod raycast;
 pub mod registry;
+pub mod settings;
 pub mod storage;
 pub mod streaming;
 pub mod time;
@@ -25,11 +26,12 @@ pub use light::{
     propagate_block_light, propagate_sky_light, relight_chunk, relight_chunk_2ch,
     remove_block_light,
 };
-pub use lod::{LodNodePos, LodRing, LodUpdate};
+pub use lod::{LodLevel, LodNodeId, LodRing, LodUpdate};
 pub use raycast::{RayHit, cell_overlaps_aabb, raycast_blocks, raycast_voxels};
 pub use registry::{BlockRegistry, BlockType};
+pub use settings::Settings;
 pub use storage::{StoreError, WORLD_META_VERSION, WorldStore};
-pub use streaming::{StreamUpdate, Streamer};
+pub use streaming::{StreamUpdate, Streamer, nearest_first};
 pub use time::{
     DEFAULT_DAY_LENGTH_SECS, LUNATION_DAYS, NIGHT_SKY_FULL_MOON, NIGHT_SKY_MIN, TICKS_PER_DAY,
     WorldTime, game_ticks_per_second,

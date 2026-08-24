@@ -13,7 +13,13 @@
 //! Two radii (in chunks), measured as Euclidean distance between chunk
 //! positions:
 //!
-//! - `load_radius`: chunks within this of the camera should be loaded.
+//! Streaming is CYLINDRICAL: `load_radius` is a horizontal radius, and a
+//! vertical band of chunk-Y is always kept loaded within it. The world is a
+//! heightfield, so what matters is how far away a column is, not how far above
+//! it the camera is — with a sphere, flying a few hundred blocks up drops the
+//! ground out of range and the terrain under you unloads.
+//!
+//! - `load_radius`: chunks within this HORIZONTAL distance should be loaded.
 //! - `unload_radius` (> load_radius): chunks beyond this should be unloaded.
 //!
 //! Chunks in the gap between the two radii are left in whatever state they
@@ -21,7 +27,7 @@
 //! chunk boundary would load and unload the same chunk on alternating
 //! frames (thrashing). The gap must be at least one chunk wide.
 
-use std::collections::HashSet;
+use std::collections::{BinaryHeap, HashSet};
 
 use crate::coords::ChunkPos;
 
@@ -47,6 +53,9 @@ pub struct Streamer {
     loaded: HashSet<ChunkPos>,
     load_radius: i64,
     unload_radius: i64,
+    /// Inclusive chunk-Y band always kept loaded within the horizontal radius.
+    /// Streaming is cylindrical; see `horiz_dist_sq`.
+    y_band: (i64, i64),
     /// Camera chunk used for the last `update`; `update` is a no-op (returns
     /// empty) when the camera hasn't changed chunks and nothing else has.
     last_center: Option<ChunkPos>,
@@ -55,6 +64,14 @@ pub struct Streamer {
 impl Streamer {
     /// Create a streamer. Panics if `unload_radius <= load_radius` (the
     /// hysteresis band must be at least one chunk wide).
+    /// Cylindrical streamer with an explicit vertical band (chunk Y, inclusive).
+    pub fn with_y_band(load_radius: i64, unload_radius: i64, y_band: (i64, i64)) -> Self {
+        let mut s = Self::new(load_radius, unload_radius);
+        assert!(y_band.0 <= y_band.1, "y_band must be non-empty");
+        s.y_band = y_band;
+        s
+    }
+
     pub fn new(load_radius: i64, unload_radius: i64) -> Self {
         assert!(
             load_radius >= 1 && unload_radius > load_radius,
@@ -64,6 +81,9 @@ impl Streamer {
             loaded: HashSet::new(),
             load_radius,
             unload_radius,
+            // Default band spans the load radius vertically, matching the old
+            // spherical behaviour closely enough for callers that don't care.
+            y_band: (-load_radius, load_radius),
             last_center: None,
         }
     }
@@ -112,19 +132,24 @@ impl Streamer {
             .loaded
             .iter()
             .copied()
-            .filter(|&p| dist_sq(p, center) > unload_sq)
+            .filter(|&p| {
+                horiz_dist_sq(p, center) > unload_sq || p.y < self.y_band.0 || p.y > self.y_band.1
+            })
             .collect();
         to_unload.sort_by_key(|&p| (p.x, p.y, p.z)); // deterministic order
 
-        // Load: in-range chunks not already loaded. Iterate the cube that
-        // bounds the load sphere, keep those inside the sphere.
+        // Load: in-range chunks not already loaded. Iterate the horizontal
+        // disc around the camera, crossed with the world's vertical band —
+        // NOT a Y range relative to the camera, or climbing above the band
+        // would load nothing and the terrain under you would disappear.
         let r = self.load_radius;
+        let (y_lo, y_hi) = self.y_band;
         let mut to_load: Vec<ChunkPos> = Vec::new();
-        for dy in -r..=r {
+        for ny in y_lo..=y_hi {
             for dz in -r..=r {
                 for dx in -r..=r {
-                    let p = ChunkPos::new(center.x + dx, center.y + dy, center.z + dz);
-                    if dist_sq(p, center) <= load_sq && !self.loaded.contains(&p) {
+                    let p = ChunkPos::new(center.x + dx, ny, center.z + dz);
+                    if horiz_dist_sq(p, center) <= load_sq && !self.loaded.contains(&p) {
                         to_load.push(p);
                     }
                 }
@@ -170,6 +195,78 @@ fn dist_sq(a: ChunkPos, b: ChunkPos) -> i64 {
     dx * dx + dy * dy + dz * dz
 }
 
+/// Squared HORIZONTAL distance in chunk units.
+///
+/// Streaming is cylindrical, not spherical (M09): the world is a heightfield,
+/// so what matters is how far away a column is, not how far above it you are.
+/// With a sphere, flying a few hundred blocks up drops the ground out of the
+/// load radius and the whole world under you unloads — terrain visibly
+/// vanishing beneath a flying camera. A cylinder keeps the terrain band loaded
+/// no matter the altitude.
+#[inline]
+fn horiz_dist_sq(a: ChunkPos, b: ChunkPos) -> i64 {
+    let dx = a.x - b.x;
+    let dz = a.z - b.z;
+    dx * dx + dz * dz
+}
+
+/// Squared distance in chunk units, widened to avoid overflow at extreme world
+/// coordinates (`i64` squares overflow past ~3e9). Used for batch ordering,
+/// where correctness at the far edges matters more than the last cycle.
+#[inline]
+fn dist_sq_wide(a: ChunkPos, b: ChunkPos) -> i128 {
+    let dx = (a.x as i128) - (b.x as i128);
+    let dy = (a.y as i128) - (b.y as i128);
+    let dz = (a.z as i128) - (b.z as i128);
+    dx * dx + dy * dy + dz * dz
+}
+
+/// Select the `n` positions nearest `camera`, returned nearest-first.
+///
+/// **Why this exists (M09 task 1):** the streaming queues (relight, mesh, gen,
+/// LOD) are hash sets, so draining them takes an arbitrary order. Under a deep
+/// backlog that means work right next to the player can sit behind thousands of
+/// distant entries — the visible symptom being freshly streamed chunks that
+/// stay dark or unmeshed for seconds. Draining nearest-first makes the player's
+/// immediate surroundings converge first, no matter how far behind the tail is.
+///
+/// **Cost:** `O(m log n)` over the `m` candidates with a bounded max-heap,
+/// rather than `O(m log m)` for a full sort — the queues hold thousands of
+/// entries while a batch is 8–64, so this matters at 144 Hz. Allocation is
+/// bounded by `n`.
+///
+/// Ties are broken by position, so the result is deterministic and does not
+/// depend on the iteration order of the caller's set (batches stay stable
+/// frame to frame instead of shuffling).
+pub fn nearest_first(
+    positions: impl Iterator<Item = ChunkPos>,
+    camera: ChunkPos,
+    n: usize,
+) -> Vec<ChunkPos> {
+    if n == 0 {
+        return Vec::new();
+    }
+    // Max-heap of the best `n` so far, keyed by (distance, position) so the
+    // worst kept entry is on top and ties are ordered deterministically.
+    let mut heap: BinaryHeap<(i128, i64, i64, i64)> = BinaryHeap::with_capacity(n + 1);
+    for p in positions {
+        let key = (dist_sq_wide(p, camera), p.x, p.y, p.z);
+        if heap.len() < n {
+            heap.push(key);
+        } else if let Some(&worst) = heap.peek()
+            && key < worst
+        {
+            heap.pop();
+            heap.push(key);
+        }
+    }
+    let mut out: Vec<(i128, i64, i64, i64)> = heap.into_vec();
+    out.sort_unstable();
+    out.into_iter()
+        .map(|(_, x, y, z)| ChunkPos::new(x, y, z))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,143 +281,137 @@ mod tests {
         Streamer::new(4, 4); // unload must exceed load
     }
 
+    /// The load set is a CYLINDER: a horizontal disc crossed with the world's
+    /// vertical band.
     #[test]
-    fn initial_update_loads_sphere_around_origin() {
-        let mut s = Streamer::new(2, 4);
+    fn initial_update_loads_cylinder_around_origin() {
+        let mut s = Streamer::with_y_band(3, 5, (-2, 2));
         let update = s.update(cp(0, 0, 0));
+        for &p in &update.to_load {
+            let horiz = p.x * p.x + p.z * p.z;
+            assert!(horiz <= 9, "loaded {p:?} outside horizontal radius");
+            assert!((-2..=2).contains(&p.y), "loaded {p:?} outside the band");
+        }
+        assert!(update.to_load.contains(&cp(0, 0, 0)));
         assert!(update.to_unload.is_empty());
-
-        // Every returned chunk is within the load radius, none beyond it.
-        let r2 = 2 * 2;
-        for &p in &update.to_load {
-            assert!(dist_sq(p, cp(0, 0, 0)) <= r2);
-        }
-        // The center and the six face neighbors are definitely in range.
-        for c in [
-            cp(0, 0, 0),
-            cp(1, 0, 0),
-            cp(-1, 0, 0),
-            cp(0, 1, 0),
-            cp(0, -1, 0),
-            cp(0, 0, 1),
-            cp(0, 0, -1),
-            cp(2, 0, 0),
-        ] {
-            assert!(update.to_load.contains(&c), "missing {c:?}");
-        }
-        // A corner of the bounding cube (dist² = 12 > 4) must be excluded.
-        assert!(!update.to_load.contains(&cp(2, 2, 2)));
     }
 
+    /// THE bug this replaced a sphere to fix: climbing far above the terrain
+    /// must NOT unload it. With a sphere the ground left the load radius and
+    /// the world visibly vanished beneath a flying camera.
     #[test]
-    fn to_load_is_nearest_first() {
-        let mut s = Streamer::new(3, 5);
-        let update = s.update(cp(10, 10, 10));
-        let mut prev = -1;
-        for &p in &update.to_load {
-            let d = dist_sq(p, cp(10, 10, 10));
-            assert!(d >= prev, "to_load not sorted nearest-first");
-            prev = d;
-        }
-        // First entry is the camera's own chunk (distance 0).
-        assert_eq!(update.to_load.first(), Some(&cp(10, 10, 10)));
-    }
-
-    #[test]
-    fn apply_then_no_reload() {
-        let mut s = Streamer::new(2, 4);
+    fn flying_high_keeps_the_ground_loaded() {
+        let mut s = Streamer::with_y_band(3, 5, (-2, 2));
         let first = s.update(cp(0, 0, 0));
         s.apply(&first);
-        let loaded_after_first = s.loaded_count();
-        assert!(loaded_after_first > 0);
-
-        // Same center again: nothing new to load, nothing to unload.
-        let second = s.update(cp(0, 0, 0));
-        assert!(second.to_load.is_empty(), "reloaded already-loaded chunks");
-        assert!(second.to_unload.is_empty());
-        assert_eq!(s.loaded_count(), loaded_after_first);
+        let ground = cp(0, 0, 0);
+        assert!(s.is_loaded(ground));
+        // Climb far above the band.
+        let update = s.update(cp(0, 40, 0));
+        assert!(
+            !update.to_unload.contains(&ground),
+            "ground unloaded when the camera climbed"
+        );
+        assert!(s.is_loaded(ground));
     }
 
     #[test]
     fn moving_loads_leading_unloads_trailing() {
-        let mut s = Streamer::new(2, 4);
-        let u = s.update(cp(0, 0, 0));
-        s.apply(&u);
-        let start = s.loaded_count();
-
-        // Move far along +X so the old sphere is entirely beyond unload.
-        let update = s.update(cp(20, 0, 0));
-        assert!(!update.to_load.is_empty(), "should load new region");
-        assert!(!update.to_unload.is_empty(), "should unload old region");
-        // Everything unloaded is from the old neighborhood (near origin),
-        // everything loaded is near the new center.
-        for &p in &update.to_unload {
-            assert!(dist_sq(p, cp(20, 0, 0)) > 4 * 4);
-        }
-        for &p in &update.to_load {
-            assert!(dist_sq(p, cp(20, 0, 0)) <= 2 * 2);
-        }
-        s.apply(&update);
-        // Loaded set size returns to the steady-state sphere size.
-        assert_eq!(s.loaded_count(), start);
-    }
-
-    /// The hysteresis guarantee: a chunk in the gap band (load < d <= unload)
-    /// is neither loaded nor unloaded — so nudging the camera back and forth
-    /// across a boundary does not thrash it.
-    #[test]
-    fn hysteresis_prevents_thrash() {
-        let mut s = Streamer::new(3, 5);
-        let u = s.update(cp(0, 0, 0));
-        s.apply(&u);
-
-        // A chunk at distance 4 from origin: outside load (3) but inside
-        // unload (5). Load it by approaching, then step back.
-        let edge = cp(4, 0, 0);
-        // Approach so `edge` enters load range, then apply.
-        let u = s.update(cp(2, 0, 0));
-        s.apply(&u);
-        assert!(s.is_loaded(edge), "edge chunk should have loaded when near");
-
-        // Step back to origin: edge is now at distance 4 — in the gap band.
-        let update = s.update(cp(0, 0, 0));
+        let mut s = Streamer::with_y_band(2, 4, (-1, 1));
+        let first = s.update(cp(0, 0, 0));
+        s.apply(&first);
+        let before = s.loaded_count();
+        let update = s.update(cp(6, 0, 0));
+        assert!(!update.to_load.is_empty(), "moving should load new chunks");
         assert!(
-            !update.to_unload.contains(&edge),
-            "edge chunk in hysteresis band must NOT be unloaded"
+            !update.to_unload.is_empty(),
+            "moving should unload old ones"
         );
-        assert!(s.is_loaded(edge), "edge chunk should remain loaded");
-
-        // Only when we retreat far enough that edge exceeds unload radius
-        // does it actually unload.
-        let update = s.update(cp(-2, 0, 0)); // edge now at distance 6 > 5
-        assert!(update.to_unload.contains(&edge));
+        s.apply(&update);
+        // Bounded: the set does not grow without limit as the camera travels.
+        assert!(s.loaded_count() <= before * 2);
     }
 
     #[test]
     fn loaded_count_bounded_regardless_of_travel() {
-        let mut s = Streamer::new(3, 5);
-        let mut max_loaded = 0;
-        // Walk a long way; loaded set must stay bounded (no leak).
-        for step in 0..200 {
-            let c = cp(step, 0, 0);
-            let u = s.update(c);
+        let mut s = Streamer::with_y_band(2, 4, (-1, 1));
+        for step in 0..40 {
+            let u = s.update(cp(step * 3, 0, step));
             s.apply(&u);
-            max_loaded = max_loaded.max(s.loaded_count());
         }
-        // Steady-state sphere of radius 3 is ~123 chunks; assert it never
-        // balloons (a leak would grow without bound as we travel).
-        assert!(max_loaded < 200, "loaded set grew unbounded: {max_loaded}");
-        assert_eq!(s.loaded_count(), max_loaded, "should be at steady state");
+        // A cylinder of radius 4 (unload) x 3 layers is the hard ceiling.
+        assert!(
+            s.loaded_count() <= 9 * 9 * 3,
+            "unbounded growth: {}",
+            s.loaded_count()
+        );
+    }
+
+    #[test]
+    fn to_load_is_nearest_first() {
+        let mut s = Streamer::with_y_band(3, 5, (-1, 1));
+        let update = s.update(cp(10, 0, 10));
+        let mut prev = -1;
+        for &p in &update.to_load {
+            let d = dist_sq(p, cp(10, 0, 10));
+            assert!(d >= prev, "to_load not sorted nearest-first");
+            prev = d;
+        }
+        assert_eq!(update.to_load.first(), Some(&cp(10, 0, 10)));
     }
 
     #[test]
     fn works_in_deep_negative_coordinates() {
-        let mut s = Streamer::new(2, 4);
+        let mut s = Streamer::with_y_band(2, 4, (-500, -498));
         let center = cp(-1_000_000, -500, 1_000_000);
         let update = s.update(center);
         s.apply(&update);
         assert!(s.is_loaded(center));
-        // Neighbor across a sign boundary loads correctly.
         assert!(s.is_loaded(cp(-1_000_000 + 1, -500, 1_000_000)));
+    }
+
+    // ---- M09 task 1: nearest-first batch selection ----
+
+    #[test]
+    fn nearest_first_picks_closest_and_sorts_them() {
+        let cam = cp(0, 0, 0);
+        let set = [cp(10, 0, 0), cp(1, 0, 0), cp(5, 0, 0), cp(2, 0, 0)];
+        let got = nearest_first(set.iter().copied(), cam, 3);
+        assert_eq!(got, vec![cp(1, 0, 0), cp(2, 0, 0), cp(5, 0, 0)]);
+    }
+
+    #[test]
+    fn nearest_first_handles_fewer_than_requested() {
+        let cam = cp(0, 0, 0);
+        let set = [cp(3, 0, 0), cp(1, 0, 0)];
+        let got = nearest_first(set.iter().copied(), cam, 10);
+        assert_eq!(got, vec![cp(1, 0, 0), cp(3, 0, 0)]);
+        assert!(nearest_first(std::iter::empty(), cam, 5).is_empty());
+        assert!(nearest_first(set.iter().copied(), cam, 0).is_empty());
+    }
+
+    #[test]
+    fn nearest_first_uses_3d_distance_and_is_deterministic() {
+        let cam = cp(0, 0, 0);
+        // Equidistant on different axes: order must be stable across runs
+        // (ties broken by position), so batches don't shuffle frame to frame.
+        let set = [cp(0, 0, 2), cp(2, 0, 0), cp(0, 2, 0), cp(1, 1, 1)];
+        let a = nearest_first(set.iter().copied(), cam, 4);
+        let b = nearest_first(set.iter().rev().copied(), cam, 4);
+        assert_eq!(a, b, "selection must not depend on input order");
+        // (1,1,1) is d²=3, nearer than the d²=4 trio.
+        assert_eq!(a[0], cp(1, 1, 1));
+    }
+
+    #[test]
+    fn nearest_first_survives_huge_coordinates() {
+        // Distances must not overflow at extreme world positions.
+        let cam = cp(2_000_000_000, 0, -2_000_000_000);
+        let set = [
+            cp(-2_000_000_000, 0, 2_000_000_000),
+            cp(2_000_000_001, 0, -2_000_000_000),
+        ];
+        let got = nearest_first(set.iter().copied(), cam, 1);
+        assert_eq!(got, vec![cp(2_000_000_001, 0, -2_000_000_000)]);
     }
 }

@@ -20,6 +20,12 @@ log = "0.4"
 glam = "0.29"
 bytemuck = { version = "1", features = ["derive"] }
 rayon = "1"
+# UI for the in-game settings menu (M09 amendment A3). Pinned to the versions
+# that match this workspace's wgpu 24 / winit 0.30: egui-wgpu 0.31 requires
+# wgpu ^24 and winit ^0.30.7. egui 0.32 would force a wgpu 25 upgrade.
+egui = "0.31"
+egui-wgpu = "0.31"
+egui-winit = { version = "0.31", default-features = false }
 
 [profile.dev]
 opt-level = 1          # debug builds fast enough to actually run

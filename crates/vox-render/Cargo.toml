@@ -12,3 +12,5 @@ pollster.workspace = true
 log.workspace = true
 bytemuck.workspace = true
 glam.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true

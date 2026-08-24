@@ -3,7 +3,7 @@
 //! Milestone 00, tasks 3+4+6: GPU connection, depth-tested render pipeline
 //! for chunk meshes, camera uniform, mesh upload, and the per-frame draw.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use glam::{Mat4, Vec3, Vec4};
@@ -68,6 +68,9 @@ struct GpuMesh {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     index_count: u32,
+    /// Vertex + index bytes on the GPU, tracked so the renderer can report
+    /// total buffer memory without walking every mesh each frame.
+    bytes: u64,
     aabb_min: Vec3,
     aabb_max: Vec3,
     /// Uniform holding `offset.xyz = (chunk_world_origin - render_origin)`,
@@ -87,6 +90,36 @@ struct SkyUniformData {
     sun: [f32; 4],
     moon: [f32; 4],
     params: [f32; 4],
+}
+
+/// One frame of tessellated UI, handed to [`Renderer::render`].
+///
+/// The app owns the egui context (it needs winit events), so it runs egui and
+/// passes the result here rather than the renderer driving the UI. This keeps
+/// `vox-render` free of window-event concerns.
+pub struct UiFrame<'a> {
+    pub primitives: &'a [egui::ClippedPrimitive],
+    pub textures_delta_set: &'a [(egui::TextureId, egui::epaint::ImageDelta)],
+    pub textures_delta_free: Vec<egui::TextureId>,
+    pub pixels_per_point: f32,
+}
+
+/// How terrain fades into the distance (M09 amendment A2).
+///
+/// Fog is what makes a LOD transition unreadable: contrast drops before the
+/// change in detail becomes visible, so the eye never finds the seam. Colour
+/// should track the sky near the horizon (and dim with it at night) so terrain
+/// dissolves into the sky rather than into a grey band.
+#[derive(Debug, Clone, Copy)]
+pub struct FogParams {
+    /// Linear RGB the terrain fades toward.
+    pub color: [f32; 3],
+    /// 0 disables fog; 1 is full strength at `end`.
+    pub strength: f32,
+    /// Distance (blocks) where fog begins.
+    pub start: f32,
+    /// Distance (blocks) where fog reaches full strength.
+    pub end: f32,
 }
 
 pub struct Renderer {
@@ -111,6 +144,12 @@ pub struct Renderer {
     render_origin: ChunkPos,
     /// Chunks drawn in the most recent frame (after frustum culling).
     drawn_last_frame: usize,
+    /// Triangles submitted last frame (full-res + LOD), for telemetry: mesh
+    /// count alone hides how much geometry the GPU is actually chewing.
+    tris_last_frame: usize,
+    /// Running total of vertex+index buffer bytes for all resident meshes
+    /// (chunk + LOD) — the practical ceiling on render distance.
+    buffer_bytes: u64,
 
     // --- Targeted-block highlight (M03 task 3) ---
     /// Line-list pipeline for the wireframe cube outline.
@@ -141,10 +180,26 @@ pub struct Renderer {
     sky_pass_buffer: wgpu::Buffer,
     sky_pass_bind_group: wgpu::BindGroup,
 
+    // --- UI overlay (M09 amendment A3) ---
+    /// egui's wgpu backend. The settings menu draws last, over everything.
+    egui_renderer: egui_wgpu::Renderer,
+
     // --- LOD (M08) ---
-    /// Coarse LOD node meshes, keyed by the node's origin chunk. Drawn with the
-    /// depth-biased `lod_pipeline` so full-res occludes them where they overlap.
-    lod_meshes: HashMap<ChunkPos, GpuMesh>,
+    /// LOD nodes the app has asked us not to draw this frame: their ground is
+    /// fully covered by resident full-resolution chunks.
+    ///
+    /// LOD underlaps the full-res region, so without this ANY hole the player
+    /// digs shows coarse terrain behind it — the neighbouring coarse cells'
+    /// walls, visible through the gap. Suppressing covered nodes is what makes
+    /// a dug hole show sky/cave instead of a "ghost block".
+    suppressed_lod: HashSet<(ChunkPos, u32)>,
+
+    /// Coarse LOD node meshes, keyed by (origin chunk, level). The level is
+    /// part of the key because different levels can share an origin chunk
+    /// (their node grids nest), and both may be resident briefly during
+    /// handover. Drawn with the depth-biased `lod_pipeline` so full-res
+    /// occludes them where they overlap.
+    lod_meshes: HashMap<(ChunkPos, u32), GpuMesh>,
     lod_pipeline: wgpu::RenderPipeline,
 }
 
@@ -178,9 +233,30 @@ impl Renderer {
         ))
         .expect("failed to acquire device");
 
-        let config = surface
+        let mut config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .expect("surface not supported by adapter");
+
+        // Present mode: UNCAPPED by default (Immediate → no vsync), so the
+        // frame rate shows the engine's real ceiling instead of being pinned to
+        // the display. Trade-offs are tearing and a GPU running past what the
+        // monitor shows — neither harmful. Set VOXTERRA_VSYNC=1 to force Fifo.
+        // Falls back Immediate → Mailbox → Fifo depending on adapter support.
+        if std::env::var("VOXTERRA_VSYNC").is_ok_and(|v| v != "0") {
+            log::info!("VOXTERRA_VSYNC set: present mode Fifo (vsync on)");
+        } else {
+            let caps = surface.get_capabilities(&adapter);
+            match [wgpu::PresentMode::Immediate, wgpu::PresentMode::Mailbox]
+                .into_iter()
+                .find(|m| caps.present_modes.contains(m))
+            {
+                Some(mode) => {
+                    log::info!("present mode {mode:?} (uncapped; VOXTERRA_VSYNC=1 to cap)");
+                    config.present_mode = mode;
+                }
+                None => log::warn!("adapter supports only Fifo (vsync); frame rate is capped"),
+            }
+        }
         surface.configure(&device, &config);
 
         let depth_view = create_depth_view(&device, &config);
@@ -221,7 +297,7 @@ impl Renderer {
         // (full daylight) so first frame matches M06 until the loop drives it. ---
         let sky_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sky uniform"),
-            size: std::mem::size_of::<[f32; 4]>() as u64,
+            size: std::mem::size_of::<[f32; 12]>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -556,6 +632,11 @@ impl Renderer {
             cache: None,
         });
 
+        // Build the UI renderer BEFORE the struct literal: `device` and
+        // `config` are moved into Self there, so borrowing them inside it
+        // would be a use-after-move. No depth attachment — the settings menu
+        // draws over the finished frame.
+        let egui_renderer = egui_wgpu::Renderer::new(&device, config.format, None, 1, false);
         Self {
             surface,
             device,
@@ -570,6 +651,8 @@ impl Renderer {
             meshes: HashMap::new(),
             render_origin: ChunkPos::new(0, 0, 0),
             drawn_last_frame: 0,
+            tris_last_frame: 0,
+            buffer_bytes: 0,
             highlight_pipeline,
             highlight_vertices,
             highlight_offset_buffer,
@@ -582,7 +665,9 @@ impl Renderer {
             sky_pass_buffer,
             sky_pass_bind_group,
             lod_meshes: HashMap::new(),
+            suppressed_lod: HashSet::new(),
             lod_pipeline,
+            egui_renderer,
         }
     }
 
@@ -593,18 +678,29 @@ impl Renderer {
     /// (floating origin, ADR-0002).
     pub fn set_chunk_mesh(&mut self, pos: ChunkPos, mesh: &MeshData) {
         if mesh.is_empty() {
-            self.meshes.remove(&pos);
+            if let Some(old) = self.meshes.remove(&pos) {
+                self.buffer_bytes -= old.bytes;
+            }
             return;
         }
         let offset = chunk_offset(pos, self.render_origin);
-        let gpu = self.build_gpu_mesh(offset, CHUNK_SIZE as f32, mesh);
-        self.meshes.insert(pos, gpu);
+        let gpu = self.build_gpu_mesh(offset, Vec3::splat(CHUNK_SIZE as f32), mesh);
+        self.buffer_bytes += gpu.bytes;
+        if let Some(old) = self.meshes.insert(pos, gpu) {
+            self.buffer_bytes -= old.bytes;
+        }
     }
 
     /// Build GPU buffers + offset uniform for a mesh whose vertices are in block
-    /// units relative to `offset` (render-relative), with a cubic AABB of the
-    /// given `span` blocks per side. Shared by chunk and LOD uploads.
-    fn build_gpu_mesh(&self, offset: Vec3, span: f32, mesh: &MeshData) -> GpuMesh {
+    /// units relative to `offset` (render-relative), with an AABB of the given
+    /// `extent` in blocks. Shared by chunk and LOD uploads.
+    ///
+    /// The extent must be the geometry's TRUE bounds on all three axes. A LOD
+    /// node is not a cube — it is `span` wide horizontally but spans the whole
+    /// world Y band — and using the horizontal span for height makes the box
+    /// far too short, so frustum culling drops nodes that are plainly on
+    /// screen (visible as terrain vanishing below you when flying high).
+    fn build_gpu_mesh(&self, offset: Vec3, extent: Vec3, mesh: &MeshData) -> GpuMesh {
         let vertex_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -635,39 +731,70 @@ impl Renderer {
                 resource: offset_buffer.as_entire_binding(),
             }],
         });
+        let bytes = (std::mem::size_of_val(&mesh.vertices[..])
+            + std::mem::size_of_val(&mesh.indices[..])) as u64;
         GpuMesh {
             vertex_buffer,
             index_buffer,
             index_count: mesh.indices.len() as u32,
+            bytes,
             aabb_min: offset,
-            aabb_max: offset + Vec3::splat(span),
+            aabb_max: offset + extent,
             offset_buffer,
             offset_bind_group,
         }
     }
 
     /// Upload (or replace) a coarse LOD node mesh (M08). `origin` is the node's
-    /// origin chunk; `span_blocks` is the node's world size per side
+    /// origin chunk; `span_blocks` is the node's horizontal size per side and
+    /// `height_blocks` its vertical extent (the world Y band, NOT the span)
     /// (`CHUNK_SIZE × stride`). The mesh's vertices are already scaled to block
-    /// units (baked in `mesh_lod_node`), so this reuses the chunk offset path.
-    pub fn set_lod_mesh(&mut self, origin: ChunkPos, span_blocks: f32, mesh: &MeshData) {
+    /// units (baked by `mesh_lod_heightfield`), so this reuses the chunk offset
+    /// path unchanged.
+    pub fn set_lod_mesh(
+        &mut self,
+        origin: ChunkPos,
+        level: u32,
+        span_blocks: f32,
+        height_blocks: f32,
+        mesh: &MeshData,
+    ) {
+        let key = (origin, level);
         if mesh.is_empty() {
-            self.lod_meshes.remove(&origin);
+            if let Some(old) = self.lod_meshes.remove(&key) {
+                self.buffer_bytes -= old.bytes;
+            }
             return;
         }
         let offset = chunk_offset(origin, self.render_origin);
-        let gpu = self.build_gpu_mesh(offset, span_blocks, mesh);
-        self.lod_meshes.insert(origin, gpu);
+        let gpu = self.build_gpu_mesh(
+            offset,
+            Vec3::new(span_blocks, height_blocks, span_blocks),
+            mesh,
+        );
+        self.buffer_bytes += gpu.bytes;
+        if let Some(old) = self.lod_meshes.insert(key, gpu) {
+            self.buffer_bytes -= old.bytes;
+        }
+    }
+
+    /// Set the LOD nodes to skip drawing (fully covered by full-res).
+    pub fn set_suppressed_lod(&mut self, set: HashSet<(ChunkPos, u32)>) {
+        self.suppressed_lod = set;
     }
 
     /// Remove a LOD node mesh.
-    pub fn remove_lod_mesh(&mut self, origin: ChunkPos) {
-        self.lod_meshes.remove(&origin);
+    pub fn remove_lod_mesh(&mut self, origin: ChunkPos, level: u32) {
+        if let Some(old) = self.lod_meshes.remove(&(origin, level)) {
+            self.buffer_bytes -= old.bytes;
+        }
     }
 
     /// Drop all LOD meshes (e.g. when toggling LOD off).
     pub fn clear_lod(&mut self) {
-        self.lod_meshes.clear();
+        for (_, m) in self.lod_meshes.drain() {
+            self.buffer_bytes -= m.bytes;
+        }
     }
 
     /// Number of LOD node meshes currently uploaded.
@@ -678,6 +805,16 @@ impl Renderer {
     /// Chunks drawn in the most recent frame, after frustum culling.
     pub fn drawn_last_frame(&self) -> usize {
         self.drawn_last_frame
+    }
+
+    /// Triangles submitted last frame (full-res + LOD).
+    pub fn tris_last_frame(&self) -> usize {
+        self.tris_last_frame
+    }
+
+    /// Total GPU vertex+index buffer bytes across all resident meshes.
+    pub fn buffer_bytes(&self) -> u64 {
+        self.buffer_bytes
     }
 
     /// Move the render origin (ADR-0002) and recompute every chunk's offset
@@ -698,7 +835,7 @@ impl Renderer {
                 .write_buffer(&mesh.offset_buffer, 0, bytemuck::cast_slice(&data));
         }
         // LOD meshes: same reposition, but preserve each node's (larger) span.
-        for (&pos, mesh) in self.lod_meshes.iter_mut() {
+        for (&(pos, _level), mesh) in self.lod_meshes.iter_mut() {
             let extent = mesh.aabb_max - mesh.aabb_min;
             let offset = chunk_offset(pos, origin);
             mesh.aabb_min = offset;
@@ -744,12 +881,38 @@ impl Renderer {
     /// reconstruction). Writes both the chunk-shader sky uniform (sky_scale) and
     /// the sky-pass uniform (sun/moon directions, star knob), and stores
     /// sky_scale for the fallback clear color.
-    pub fn set_sky(&mut self, time: vox_core::WorldTime, inv_view_proj: [[f32; 4]; 4]) {
+    pub fn set_sky(
+        &mut self,
+        time: vox_core::WorldTime,
+        inv_view_proj: [[f32; 4]; 4],
+        camera_rel: [f32; 3],
+        fog: FogParams,
+        star_intensity: f32,
+    ) {
         let sky_scale = time.sky_scale().clamp(0.0, 1.0);
         self.sky_scale = sky_scale;
 
-        // Chunk-shader uniform (group 3): just sky_scale in .x.
-        let chunk_uniform = [sky_scale, 0.0, 0.0, 0.0];
+        // Chunk-shader uniform (group 3), 3 vec4s:
+        //   0: camera position (render-relative) + sky_scale
+        //   1: fog colour rgb + strength
+        //   2: fog start, fog end, unused, unused
+        // The camera position is needed per-fragment to measure view distance
+        // for fog; it is render-relative so it matches vertex positions under
+        // the floating origin (ADR-0002).
+        let chunk_uniform: [f32; 12] = [
+            camera_rel[0],
+            camera_rel[1],
+            camera_rel[2],
+            sky_scale,
+            fog.color[0],
+            fog.color[1],
+            fog.color[2],
+            fog.strength,
+            fog.start,
+            fog.end,
+            0.0,
+            0.0,
+        ];
         self.queue
             .write_buffer(&self.sky_buffer, 0, bytemuck::cast_slice(&chunk_uniform));
 
@@ -760,8 +923,9 @@ impl Renderer {
             inv_view_proj,
             sun: [sun[0], sun[1], sun[2], sky_scale],
             moon: [moon[0], moon[1], moon[2], time.moon_illumination()],
-            // params.x = star intensity knob (tuned in-scene); yzw reserved.
-            params: [1.0, 0.0, 0.0, 0.0],
+            // params.x = star intensity knob, driven by the settings slider
+            // (it was a hardcoded 1.0, so the slider did nothing); yzw reserved.
+            params: [star_intensity, 0.0, 0.0, 0.0],
         };
         self.queue
             .write_buffer(&self.sky_pass_buffer, 0, bytemuck::bytes_of(&sky_uniform));
@@ -785,7 +949,11 @@ impl Renderer {
 
     /// Render one frame with the given view-projection matrix
     /// (column-major, as produced by `glam::Mat4::to_cols_array_2d`).
-    pub fn render(&mut self, view_proj: [[f32; 4]; 4]) {
+    /// Draw a frame. `ui` carries the settings menu's tessellated output when
+    /// the menu is open (M09 amendment A3); pass `None` to draw the world
+    /// alone. The UI is drawn last, over the finished frame, with no depth
+    /// attachment.
+    pub fn render(&mut self, view_proj: [[f32; 4]; 4], ui: Option<UiFrame<'_>>) {
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
@@ -804,6 +972,7 @@ impl Renderer {
         // Build the view frustum once per frame for culling.
         let frustum = Frustum::from_view_proj(Mat4::from_cols_array_2d(&view_proj));
         let mut drawn = 0usize;
+        let mut tris = 0usize;
 
         let view = frame
             .texture
@@ -873,6 +1042,7 @@ impl Renderer {
                     pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..mesh.index_count, 0, 0..1);
                     drawn += 1;
+                    tris += (mesh.index_count / 3) as usize;
                 }
 
                 // Coarse LOD nodes (M08): same camera/texture/sky bind groups,
@@ -880,7 +1050,11 @@ impl Renderer {
                 // where they overlap. Drawn after full-res.
                 if !self.lod_meshes.is_empty() {
                     pass.set_pipeline(&self.lod_pipeline);
-                    for mesh in self.lod_meshes.values() {
+                    for (key, mesh) in self.lod_meshes.iter() {
+                        // Skip nodes whose ground full-res already covers.
+                        if self.suppressed_lod.contains(key) {
+                            continue;
+                        }
                         if !frustum.intersects_aabb(mesh.aabb_min, mesh.aabb_max) {
                             continue;
                         }
@@ -892,6 +1066,7 @@ impl Renderer {
                         );
                         pass.draw_indexed(0..mesh.index_count, 0, 0..1);
                         drawn += 1;
+                        tris += (mesh.index_count / 3) as usize;
                     }
                     // Restore the full-res pipeline for the highlight pass below.
                     pass.set_pipeline(&self.pipeline);
@@ -910,6 +1085,49 @@ impl Renderer {
         }
 
         self.drawn_last_frame = drawn;
+        self.tris_last_frame = tris;
+
+        // --- UI overlay (M09 amendment A3), last so it sits over the world ---
+        if let Some(ui) = ui {
+            let desc = egui_wgpu::ScreenDescriptor {
+                size_in_pixels: [self.config.width, self.config.height],
+                pixels_per_point: ui.pixels_per_point,
+            };
+            for (id, delta) in ui.textures_delta_set {
+                self.egui_renderer
+                    .update_texture(&self.device, &self.queue, *id, delta);
+            }
+            self.egui_renderer.update_buffers(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                ui.primitives,
+                &desc,
+            );
+            {
+                let mut pass = encoder
+                    .begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("ui pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                // Keep the rendered world; the UI blends on top.
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    })
+                    .forget_lifetime();
+                self.egui_renderer.render(&mut pass, ui.primitives, &desc);
+            }
+            for id in ui.textures_delta_free {
+                self.egui_renderer.free_texture(&id);
+            }
+        }
 
         self.queue.submit(Some(encoder.finish()));
         frame.present();

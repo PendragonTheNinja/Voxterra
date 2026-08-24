@@ -842,160 +842,6 @@ pub fn mesh_chunk(
     mesh
 }
 
-/// Mesh a coarse LOD node (M08, ADR-0008): the node's top surface plus **skirt
-/// aprons** at its four horizontal borders, with vertex positions scaled from
-/// cell units to block units (`× stride`) so the result renders through the
-/// ordinary chunk pipeline at the node's true world size.
-///
-/// The four side walls (and the bottom) are culled — they would be either
-/// wasteful full-height curtains or hidden between adjacent nodes — and replaced
-/// by short skirts of `skirt_depth` cells that hang below each border's surface
-/// silhouette. Skirts hide the cracks that open where this node's edge height
-/// differs from its neighbour's (the taller side's skirt covers the gap). This
-/// is the M08 crack strategy from ADR-0008; geomorphing is M09.
-///
-/// `skirt_depth` is in coarse cells (so `skirt_depth × stride` blocks deep).
-pub fn mesh_lod_node(
-    chunk: &Chunk,
-    mut layer_of: impl FnMut(BlockId, usize) -> u32,
-    stride: i32,
-    skirt_depth: i32,
-) -> MeshData {
-    // Cull the four side walls and the bottom by presenting solid neighbours
-    // there; leave the top open (air) so the surface faces are emitted.
-    let solid = Chunk::filled(vox_core::registry::STONE);
-    let neighbors = ChunkNeighbors::NONE
-        .with_pos_x(&solid)
-        .with_neg_x(&solid)
-        .with_pos_z(&solid)
-        .with_neg_z(&solid)
-        .with_neg_y(&solid);
-
-    let mut mesh = mesh_chunk(chunk, &neighbors, &mut layer_of);
-    if skirt_depth > 0 {
-        add_skirts(&mut mesh, chunk, skirt_depth, &mut layer_of);
-    }
-
-    // Bake the cell→block scale into every vertex (terrain + skirts): positions
-    // so the node renders at world size, and UVs so the texture TILES PER BLOCK
-    // (Repeat sampler) instead of stretching one copy across each 8-block cube —
-    // without this, coarse cells read as single giant blocks.
-    if stride != 1 {
-        let s = stride as f32;
-        for v in &mut mesh.vertices {
-            v.position[0] *= s;
-            v.position[1] *= s;
-            v.position[2] *= s;
-            v.uv[0] *= s;
-            v.uv[1] *= s;
-        }
-    }
-    mesh
-}
-
-/// Highest solid cell in coarse column (cx, cz), or `None` if the column is all
-/// air.
-fn top_solid_cell(chunk: &Chunk, cx: u8, cz: u8) -> Option<i32> {
-    for cy in (0..CHUNK_SIZE as u8).rev() {
-        if !chunk.get(LocalPos::new(cx, cy, cz)).is_air() {
-            return Some(cy as i32);
-        }
-    }
-    None
-}
-
-/// Emit downward skirt aprons along the four horizontal borders. Each border
-/// column drops a vertical quad from the top of its surface cell down
-/// `skirt_depth` cells, on the node's outer plane, wound to face outward
-/// (matching `FACE_DIRS`, so back-face culling keeps them). Positions are in
-/// cell units; the caller scales them.
-fn add_skirts(
-    mesh: &mut MeshData,
-    chunk: &Chunk,
-    skirt_depth: i32,
-    layer_of: &mut impl FnMut(BlockId, usize) -> u32,
-) {
-    let n = CHUNK_SIZE as i32;
-    // Coarse LOD terrain is sky-exposed and unlit by torches; skirts read like
-    // daytime terrain sides, dimmed by sky_scale at night.
-    let sky = [1.0f32; 4];
-    let block = [0.0f32; 4];
-
-    // (axis, positive, face_index into FACE_DIRS) for the four side borders.
-    let borders = [
-        (0usize, true, 0usize),  // +X : FACE_DIRS[0] = (0,true,1,2)
-        (0usize, false, 1usize), // -X : FACE_DIRS[1] = (0,false,2,1)
-        (2usize, true, 4usize),  // +Z : FACE_DIRS[4] = (2,true,0,1)
-        (2usize, false, 5usize), // -Z : FACE_DIRS[5] = (2,false,1,0)
-    ];
-
-    for (axis, positive, face_index) in borders {
-        let shade = [face_brightness(axis, positive); 4];
-        for line in 0..n {
-            // Column coordinates on this border.
-            let (cx, cz) = if axis == 0 {
-                (if positive { n - 1 } else { 0 }, line)
-            } else {
-                (line, if positive { n - 1 } else { 0 })
-            };
-            let Some(top) = top_solid_cell(chunk, cx as u8, cz as u8) else {
-                continue;
-            };
-            let block_id = chunk.get(LocalPos::new(cx as u8, top as u8, cz as u8));
-            let y_hi = (top + 1) as f32;
-            let y_lo = (top + 1 - skirt_depth).max(0) as f32;
-            let height = y_hi - y_lo;
-            if height <= 0.0 {
-                continue;
-            }
-            let plane = if positive { n as f32 } else { 0.0 };
-            let layer = layer_of(block_id, face_index);
-
-            // Build base + u_dir/v_dir per FACE_DIRS winding for this border.
-            // u/v follow the same (u_axis, v_axis) as the matching real face so
-            // the outward normal (u×v) points out of the node.
-            let (base, u_dir, v_dir, w, h) = match (axis, positive) {
-                // +X: u=+Y (height), v=+Z (width 1)
-                (0, true) => (
-                    [plane, y_lo, line as f32],
-                    axis_unit(1),
-                    axis_unit(2),
-                    height,
-                    1.0,
-                ),
-                // -X: u=+Z (width 1), v=+Y (height)
-                (0, false) => (
-                    [plane, y_lo, line as f32],
-                    axis_unit(2),
-                    axis_unit(1),
-                    1.0,
-                    height,
-                ),
-                // +Z: u=+X (width 1), v=+Y (height)
-                (2, true) => (
-                    [line as f32, y_lo, plane],
-                    axis_unit(0),
-                    axis_unit(1),
-                    1.0,
-                    height,
-                ),
-                // -Z: u=+Y (height), v=+X (width 1)
-                (2, false) => (
-                    [line as f32, y_lo, plane],
-                    axis_unit(1),
-                    axis_unit(0),
-                    height,
-                    1.0,
-                ),
-                _ => unreachable!(),
-            };
-            emit_rect(
-                mesh, base, u_dir, v_dir, w, h, layer, sky, block, shade, false,
-            );
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1707,114 +1553,235 @@ mod tests {
             );
         }
     }
+}
 
-    // ---- M08: LOD node meshing + skirts (ADR-0008) ----
+/// Cells per side of a LOD heightfield node (matches `CHUNK_SIZE`).
+pub const LOD_CELLS: usize = CHUNK_SIZE;
 
-    /// A flat coarse node: fill every column solid up to `top`, air above.
-    fn flat_node(top: u8) -> Chunk {
-        let mut c = Chunk::new_air();
-        for z in 0..CHUNK_SIZE as u8 {
-            for x in 0..CHUNK_SIZE as u8 {
-                for y in 0..=top {
-                    c.set(LocalPos::new(x, y, z), STONE);
+/// Mesh a coarse LOD node as a **heightfield** (Milestone 09).
+///
+/// This is how distant terrain is meant to be built, and why it replaced the
+/// voxel-grid path: a voxel LOD node quantizes height to its cell size, so
+/// distant terrain reads as stacked terraces of tall slabs. A heightfield
+/// stores the *exact* surface height per coarse column and renders:
+///
+/// - a flat top quad at that exact height, and
+/// - vertical walls down to each lower horizontal neighbour.
+///
+/// Horizontal detail is still quantized to `h_stride` (that is the point of
+/// LOD), but **vertical detail is exact** — a hill 37 blocks high renders at
+/// 37, not snapped to 32 or 40. That single change is most of the visual gap
+/// between "rough estimate of the terrain" and terrain.
+///
+/// `heights[cz * LOD_CELLS + cx]` is the world Y of the column's surface (the
+/// top solid block). `origin_y` is the node's Y origin, so emitted positions are
+/// node-relative like every other mesh. Positions are already in BLOCK units —
+/// unlike the voxel path, nothing needs scaling afterwards.
+///
+/// `skirt_depth_blocks` extends the node's outer border walls downward to hide
+/// cracks against neighbouring nodes whose edge heights differ.
+pub fn mesh_lod_heightfield(
+    heights: &[i32],
+    h_stride: i32,
+    origin_y: i32,
+    mut layer_of: impl FnMut(BlockId, usize) -> u32,
+    skirt_depth_blocks: i32,
+) -> MeshData {
+    assert_eq!(
+        heights.len(),
+        LOD_CELLS * LOD_CELLS,
+        "heightfield must be 32x32"
+    );
+    let n = LOD_CELLS as i32;
+    let mut mesh = MeshData::default();
+    let grass = vox_core::registry::GRASS;
+
+    // Distant LOD is sky-lit surface only: full sky, no block light. Day/night
+    // dims it through the same `sky_scale` uniform as the near field.
+    let sky = [1.0f32; 4];
+    let block = [0.0f32; 4];
+    let top_shade = [face_brightness(1, true); 4];
+
+    let at = |cx: i32, cz: i32| -> i32 { heights[(cz * n + cx) as usize] };
+
+    for cz in 0..n {
+        for cx in 0..n {
+            let h = at(cx, cz) - origin_y;
+            let (x0, z0) = ((cx * h_stride) as f32, (cz * h_stride) as f32);
+            let w = h_stride as f32;
+            // Top face of the column, at its exact height.
+            let top = (h + 1) as f32;
+            emit_rect(
+                &mut mesh,
+                [x0, top, z0],
+                axis_unit(2),
+                axis_unit(0),
+                w,
+                w,
+                layer_of(grass, 2),
+                sky,
+                block,
+                top_shade,
+                false,
+            );
+
+            // Vertical walls down to each lower neighbour. Outside the node,
+            // fall back to a skirt so borders are covered.
+            for (axis, positive, face_index) in [
+                (0usize, true, 0usize),
+                (0, false, 1),
+                (2, true, 4),
+                (2, false, 5),
+            ] {
+                let (nx, nz) = match (axis, positive) {
+                    (0, true) => (cx + 1, cz),
+                    (0, false) => (cx - 1, cz),
+                    (2, true) => (cx, cz + 1),
+                    _ => (cx, cz - 1),
+                };
+                let neighbour = if (0..n).contains(&nx) && (0..n).contains(&nz) {
+                    at(nx, nz) - origin_y
+                } else {
+                    // Border: drop a skirt instead of assuming a height.
+                    h - skirt_depth_blocks
+                };
+                if neighbour >= h {
+                    continue; // neighbour is level or higher: nothing exposed
                 }
-                // Sky-exposed air above (like generate_lod_node bakes).
-                for y in (top + 1)..CHUNK_SIZE as u8 {
-                    c.set_sky_light(LocalPos::new(x, y, z), 15);
+                let wall_bottom = (neighbour + 1) as f32;
+                let wall_height = top - wall_bottom;
+                if wall_height <= 0.0 {
+                    continue;
                 }
+                let shade = [face_brightness(axis, positive); 4];
+                let layer = layer_of(grass, face_index);
+                let plane = if positive { w } else { 0.0 };
+                // Winding follows FACE_DIRS so back-face culling keeps these.
+                let (base, u_dir, v_dir, uw, uh) = match (axis, positive) {
+                    (0, true) => (
+                        [x0 + plane, wall_bottom, z0],
+                        axis_unit(1),
+                        axis_unit(2),
+                        wall_height,
+                        w,
+                    ),
+                    (0, false) => (
+                        [x0, wall_bottom, z0],
+                        axis_unit(2),
+                        axis_unit(1),
+                        w,
+                        wall_height,
+                    ),
+                    (2, true) => (
+                        [x0, wall_bottom, z0 + plane],
+                        axis_unit(0),
+                        axis_unit(1),
+                        w,
+                        wall_height,
+                    ),
+                    _ => (
+                        [x0, wall_bottom, z0],
+                        axis_unit(1),
+                        axis_unit(0),
+                        wall_height,
+                        w,
+                    ),
+                };
+                emit_rect(
+                    &mut mesh, base, u_dir, v_dir, uw, uh, layer, sky, block, shade, false,
+                );
             }
         }
-        c
+    }
+    mesh
+}
+
+#[cfg(test)]
+mod heightfield_tests {
+    use super::*;
+
+    fn flat(h: i32) -> Vec<i32> {
+        vec![h; LOD_CELLS * LOD_CELLS]
     }
 
-    /// Skirts add exactly one apron per border column: 4 borders × 32 columns.
+    /// A flat field emits one top quad per cell and no interior walls — only
+    /// the border skirts.
     #[test]
-    fn skirts_add_one_apron_per_border_column() {
-        let node = flat_node(10);
-        let no_skirt = mesh_lod_node(&node, layers, 1, 0);
-        let with_skirt = mesh_lod_node(&node, layers, 1, 2);
-        let added = with_skirt.quad_count() - no_skirt.quad_count();
-        assert_eq!(
-            added,
-            4 * CHUNK_SIZE,
-            "expected one skirt per border column"
-        );
+    fn flat_field_is_tops_plus_border_skirts() {
+        let mesh = mesh_lod_heightfield(&flat(20), 4, 0, |_, _| 0, 8);
+        let cells = LOD_CELLS * LOD_CELLS;
+        // 32x32 tops + 4 borders x 32 skirt walls.
+        assert_eq!(mesh.quad_count(), cells + 4 * LOD_CELLS);
     }
 
-    /// A non-LOD mesh is untouched by any of this (regression guard).
+    /// **Vertical detail is exact**: the top face sits at the column's true
+    /// height, not snapped to a cell size. This is the whole reason the
+    /// heightfield path exists.
     #[test]
-    fn plain_mesh_unaffected() {
-        let node = flat_node(10);
-        // Meshed as a plain chunk in isolation — sides emit as normal walls,
-        // no skirts, no scaling. Just confirm it still produces geometry.
-        let plain = mesh_chunk(&node, &ChunkNeighbors::NONE, layers);
-        assert!(plain.quad_count() > 0);
-    }
-
-    /// Skirts sit on the node's outer planes and hang DOWN from the surface by
-    /// `skirt_depth × stride` blocks. Checked on the +X border (plane x = 32).
-    #[test]
-    fn skirts_hang_below_the_edge_surface() {
-        let top = 10u8;
-        let stride = 8;
-        let depth = 2;
-        let node = flat_node(top);
-        let mesh = mesh_lod_node(&node, layers, stride, depth);
-
-        let plane_x = (CHUNK_SIZE as i32 * stride) as f32; // east edge, scaled
-        let surface_y = ((top as i32 + 1) * stride) as f32;
-        let skirt_bottom_y = ((top as i32 + 1 - depth) * stride) as f32;
-
-        // Collect vertices lying on the +X plane.
-        let on_plane: Vec<_> = mesh
-            .vertices
-            .iter()
-            .filter(|v| (v.position[0] - plane_x).abs() < 1e-3)
-            .collect();
-        assert!(
-            !on_plane.is_empty(),
-            "no skirt geometry on the +X edge plane"
-        );
-        // Every such vertex is between the skirt bottom and the surface top.
-        for v in &on_plane {
-            let y = v.position[1];
+    fn top_face_is_at_the_exact_height() {
+        for h in [0, 7, 37, -13] {
+            let mesh = mesh_lod_heightfield(&flat(h), 4, 0, |_, _| 0, 0);
+            let top = mesh
+                .vertices
+                .iter()
+                .map(|v| v.position[1])
+                .fold(f32::MIN, f32::max);
             assert!(
-                y >= skirt_bottom_y - 1e-3 && y <= surface_y + 1e-3,
-                "skirt vertex y={y} outside [{skirt_bottom_y}, {surface_y}]"
+                (top - (h + 1) as f32).abs() < 1e-4,
+                "height {h} rendered at {top}"
             );
         }
-        // The skirt reaches both the surface and the bottom.
+    }
+
+    /// A step between neighbouring columns produces a wall exactly spanning the
+    /// difference — no gap to see through, no overshoot.
+    #[test]
+    fn step_between_columns_emits_a_matching_wall() {
+        let mut heights = flat(10);
+        heights[0] = 20; // one raised column at (0,0)
+        let mesh = mesh_lod_heightfield(&heights, 2, 0, |_, _| 0, 0);
+        // Walls exposed by the step reach from the low top up to the high top.
+        let low_top = 11.0f32;
+        let high_top = 21.0f32;
+        let spans = mesh
+            .vertices
+            .iter()
+            .filter(|v| v.position[1] > low_top - 0.01 && v.position[1] < high_top + 0.01)
+            .count();
+        assert!(spans > 0, "no wall geometry emitted for the step");
+        let max_y = mesh
+            .vertices
+            .iter()
+            .map(|v| v.position[1])
+            .fold(f32::MIN, f32::max);
+        assert!((max_y - high_top).abs() < 1e-4);
+    }
+
+    /// Positions are already in block units — a wider stride makes a wider
+    /// node, with no post-scaling.
+    #[test]
+    fn positions_are_in_block_units() {
+        let mesh = mesh_lod_heightfield(&flat(0), 8, 0, |_, _| 0, 0);
+        let max_x = mesh
+            .vertices
+            .iter()
+            .map(|v| v.position[0])
+            .fold(f32::MIN, f32::max);
         assert!(
-            on_plane
-                .iter()
-                .any(|v| (v.position[1] - surface_y).abs() < 1e-3)
-        );
-        assert!(
-            on_plane
-                .iter()
-                .any(|v| (v.position[1] - skirt_bottom_y).abs() < 1e-3)
+            (max_x - (LOD_CELLS as f32 * 8.0)).abs() < 1e-4,
+            "got {max_x}"
         );
     }
 
-    /// Scale is baked: a node meshed at stride 8 is 8× larger than at stride 1.
+    /// Heights are node-relative via origin_y, like every other mesh.
     #[test]
-    fn stride_scales_vertex_positions() {
-        let node = flat_node(10);
-        let s1 = mesh_lod_node(&node, layers, 1, 0);
-        let s8 = mesh_lod_node(&node, layers, 8, 0);
-        let max_x1 = s1
+    fn origin_y_offsets_the_field() {
+        let mesh = mesh_lod_heightfield(&flat(100), 4, 128, |_, _| 0, 0);
+        let top = mesh
             .vertices
             .iter()
-            .map(|v| v.position[0])
-            .fold(0.0, f32::max);
-        let max_x8 = s8
-            .vertices
-            .iter()
-            .map(|v| v.position[0])
-            .fold(0.0, f32::max);
-        assert!(
-            (max_x8 - max_x1 * 8.0).abs() < 1e-3,
-            "stride scale not baked"
-        );
+            .map(|v| v.position[1])
+            .fold(f32::MIN, f32::max);
+        assert!((top - (100 - 128 + 1) as f32).abs() < 1e-4, "got {top}");
     }
 }

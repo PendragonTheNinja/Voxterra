@@ -148,11 +148,19 @@ by letting the copy fail to compile; they move around as the code evolves, so
 don't hard-code a fixed list.
 
 **Clippy.** Cannot be installed in the sandbox (neither `rustup component add`
-nor apt). Claude must scan changed code manually for common 1.96 lints —
-`doc_lazy_continuation`, `needless_range_loop`, `manual_range_contains`,
-`duplicated_attributes`, `dead_code`, `identity_op`, `unnecessary_cast` — and
-Nathan runs the real clippy gauntlet natively before every commit. Lints the
-sandbox is blind to are real; treat the native clippy pass as authoritative.
+nor apt). **Read `docs/clippy-lints.md` before handing off any Rust change** —
+it lists every lint that has actually broken this build, with fixes and a
+pre-handoff grep checklist, and it is the accumulated memory of round-trips
+already paid for. Append to it whenever a new lint bites.
+
+Note the trap it documents: clippy on edition 2024 sometimes *wants* syntax the
+sandbox cannot compile (e.g. `collapsible_if` → let-chains). Write the modern
+form in the real file and shim it only in the `fixcheck` copy.
+
+`vox-render` and `vox-app` cannot be compiled in the sandbox at all, so their
+lints surface only natively — scan those changes especially carefully. Nathan
+runs the real clippy gauntlet natively before every commit; treat that pass as
+authoritative.
 
 **The gauntlet (Nathan runs before every commit, native PowerShell):**
 
@@ -203,6 +211,10 @@ beyond what the invariants above already require.
 - Milestones 02 (Infinite World, 2026-06-14) and 03 are complete; see their
   retrospectives in `docs/milestones/`.
 - Update this section at the end of every working session.
+- **Releases:** each completed milestone is tagged and published so every
+  version stays playable — see `docs/releases.md` for the scheme, the
+  retroactive tag commands, and the release checklist (tag, build, attach the
+  binary, capture gallery media, note the fresh-world requirement).
 ## Lighting & streaming invariants (added post-M05 — do not violate)
 
 These encode the root causes of the M05 sealed-cave daylight saga. Each one

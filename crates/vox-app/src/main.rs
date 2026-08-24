@@ -9,10 +9,13 @@ use std::time::Instant;
 use glam::{Mat4, Vec3};
 use rayon::prelude::*;
 use vox_core::{
-    cell_overlaps_aabb, BlockId, BlockRegistry, Chunk, ChunkPos, LocalPos, LodNodePos, LodRing,
+    cell_overlaps_aabb, BlockId, BlockRegistry, Chunk, ChunkPos, LocalPos, LodNodeId, LodRing,
     RayHit, Streamer, World, WorldPos, WorldStore,
 };
-use vox_mesh::{mesh_chunk, mesh_lod_node, ChunkNeighbors, MeshData};
+use vox_mesh::{mesh_chunk, ChunkNeighbors, MeshData};
+
+mod settings_ui;
+use settings_ui::SettingsUi;
 use vox_render::Renderer;
 use vox_worldgen::Generator;
 use winit::application::ApplicationHandler;
@@ -44,17 +47,51 @@ const NEIGHBOR_OFFSETS: [(i64, i64, i64); 6] = [
 const LOAD_RADIUS: i64 = 8;
 const UNLOAD_RADIUS: i64 = 10;
 
-// --- LOD (M08). One coarse level: a node is `LOD_STRIDE` chunks per side. LOD
-// fills a ring from just outside the camera node out to LOAD; it underlaps the
-// full-res region (occluded by the depth-biased LOD pipeline). Tune the radii
-// against LOAD_RADIUS if a seam gap appears. ---
-const LOD_STRIDE: i64 = 8;
-const LOD_FULL_RADIUS_NODES: i64 = 0; // LOD starts at the camera's neighbour nodes
-const LOD_LOAD_RADIUS_NODES: i64 = 4; // ~4 nodes = ~1 km horizon
-const LOD_UNLOAD_RADIUS_NODES: i64 = 5;
-const LOD_Y_ORIGIN_BLOCKS: i64 = -128; // node Y band that contains the surface
-const LOD_SKIRT_DEPTH_CELLS: i32 = 2;
-const LOD_SPAWN_BUDGET: usize = 4; // coarse nodes generated+meshed per frame
+// --- LOD (M09). LOD is configured as a list of levels (finest to coarsest). Radii are in
+// CHUNKS from the camera and must be multiples of the coarsest stride (the ring
+// asserts this). LOD starts at 0 — it underlaps the full-res region, which
+// simply draws on top; see the vox-core::lod docs on why a flush inner edge
+// would open a gap. Multi-level tuning lands with the octree wiring; today this
+// is the single level M08 shipped.
+const LOD_INNER_CHUNKS: i64 = 0;
+// Finest to coarsest. Radii are CHUNKS from the camera and must be multiples of
+// the coarsest stride (the ring asserts it).
+//
+// Sizing follows the standard screen-space-error idea: a cell should subtend
+// roughly constant pixels, so each level's switch distance scales with its cell
+// size. Here every level runs out to 256 blocks of distance per block of cell
+// size (stride 2 -> 512 blocks, stride 4 -> 1024, stride 8 -> 2048) — twice the
+// detail-per-distance of the first M09 pass, which read as too chunky too close.
+// Raise the multiplier for finer distant terrain at the cost of node count
+// (nodes per level are constant, so adding detail means adding levels).
+const LOD_LEVELS: [vox_core::LodLevel; 3] = [
+    vox_core::LodLevel {
+        stride: 2,
+        outer_chunks: 16,
+    },
+    vox_core::LodLevel {
+        stride: 4,
+        outer_chunks: 32,
+    },
+    vox_core::LodLevel {
+        stride: 8,
+        outer_chunks: 64,
+    },
+];
+const LOD_UNLOAD_MARGIN_CHUNKS: i64 = 8; // multiple of the coarsest stride
+                                         // World vertical band LOD must cover. ONE node spans it at every level: cells
+                                         // are `stride` blocks wide but `band/32` blocks tall, so horizontal detail and
+                                         // vertical resolution are independent. Widen if worldgen's range grows (the
+                                         // terrain currently spans about -59..108).
+const LOD_WORLD_Y_BLOCKS: (i64, i64) = (-128, 128);
+
+// Fog (M09 amendment A2) is tuned live from the settings menu; its defaults
+// live in `vox_core::Settings`.
+const LOD_SKIRT_DEPTH_CELLS: i32 = 3; // multiplied by stride for block depth
+                                      // Coarse nodes generated+meshed per frame. Sized so a full ring (up to ~2400
+                                      // nodes with extra levels) fills in well under a second instead of appearing in
+                                      // visibly staggered rings; the work is on the rayon pool, not the frame thread.
+const LOD_SPAWN_BUDGET: usize = 48;
 
 /// Per-frame work budgets, to keep frame time stable while streaming.
 /// Generation is async (rayon), but we bound how many jobs we *spawn* per
@@ -356,8 +393,18 @@ impl FlyCamera {
     /// the render origin** (ADR-0002). `render_origin_blocks` is the world
     /// position of the render origin; subtracting it keeps the numbers fed
     /// to the matrix small regardless of absolute distance.
-    fn view_proj(&self, aspect: f32, render_origin_blocks: Vec3) -> Mat4 {
-        let proj = Mat4::perspective_rh(70f32.to_radians(), aspect, 0.1, 1000.0);
+    /// `fov_degrees` and `far` come from settings: the far plane MUST cover the
+    /// LOD horizon, or distant terrain is generated, meshed, uploaded — and
+    /// then clipped away by the projection, which reads as the world ending at
+    /// a hard line and as a "render distance" slider that does nothing.
+    fn view_proj(
+        &self,
+        aspect: f32,
+        render_origin_blocks: Vec3,
+        fov_degrees: f32,
+        far: f32,
+    ) -> Mat4 {
+        let proj = Mat4::perspective_rh(fov_degrees.to_radians(), aspect, 0.1, far);
         let rel_pos = self.position - render_origin_blocks;
         let view = Mat4::look_to_rh(rel_pos, self.forward(), Vec3::Y);
         proj * view
@@ -382,8 +429,28 @@ struct App {
     streamer: Streamer,
     /// Coarse LOD ring policy (M08): which distant LOD nodes are loaded.
     lod_ring: LodRing,
-    /// Debug: LOD rendering on/off (toggled with `L`).
-    lod_enabled: bool,
+
+    // --- Settings menu (M09 amendment A3) ---
+    /// Live-tunable values; the menu edits these and the loop applies them.
+    settings: vox_core::Settings,
+    /// Settings as of last frame, to detect edits that need a re-stream.
+    settings_applied: vox_core::Settings,
+    /// egui context + menu state. Created with the window in `resumed`.
+    ui: Option<SettingsUi>,
+    /// Outermost LOD radius in chunks; sizes the camera far plane.
+    lod_far_chunks: i64,
+    /// Diagnostic: last logged enabled/disabled state, so lod_tick logs
+    /// transitions rather than spamming every frame.
+    lod_debug_last_state: Option<bool>,
+    /// Diagnostic: nodes already reported as blocked from suppression. Cleared
+    /// periodically — reporting only once meant the log went silent exactly
+    /// when the problem was being reproduced.
+    lod_debug_reported: HashSet<LodNodeId>,
+    /// Diagnostic: level-0 nodes near the camera that FAILED suppression on the
+    /// last frame, and how many were suppressed. Shown in telemetry, because a
+    /// near node that is drawn is what shows coarse terrain through a dug hole.
+    lod_debug_near_blocked: usize,
+    lod_debug_suppressed: usize,
     /// Block definitions: appearance + flags, the single source of truth
     /// (M03 task 1). Shared into meshing (Sync).
     registry: BlockRegistry,
@@ -400,6 +467,11 @@ struct App {
     /// cross-chunk light convergence does cheap parallel relighting without
     /// forcing an expensive re-mesh of every rippled chunk (ADR-0005).
     relight: HashSet<ChunkPos>,
+    /// Chunks that have been meshed at least once (M09 task 1). A chunk's
+    /// FIRST mesh is deferred until its still-pending neighbors arrive, so it
+    /// is never baked dark/with wrong border faces from incomplete data; later
+    /// re-meshes are unrestricted. Pruned with the other per-chunk sets.
+    meshed_once: HashSet<ChunkPos>,
     /// Per-column heightmap: world `(x, z)` → highest solid block world-Y
     /// among loaded chunks. Drives the skylight top boundary directly, so each
     /// chunk computes its daylight in one pass without waiting on its vertical
@@ -418,14 +490,13 @@ struct App {
 
     /// Async LOD-node gen+mesh results (M08): coarse generation and meshing run
     /// on the rayon pool; the main thread only uploads.
-    lod_tx: Sender<(LodNodePos, MeshData)>,
-    lod_rx: Receiver<(LodNodePos, MeshData)>,
-    lod_in_flight: HashSet<LodNodePos>,
+    lod_tx: Sender<(LodNodeId, MeshData)>,
+    lod_rx: Receiver<(LodNodeId, MeshData)>,
+    lod_in_flight: HashSet<LodNodeId>,
     /// Nodes wanted but not yet spawned (the ring is requested all at once but
-    /// generated a few per frame). The set mirrors the queue for O(1) dedupe
-    /// and cancellation.
-    lod_pending: std::collections::VecDeque<LodNodePos>,
-    lod_pending_set: HashSet<LodNodePos>,
+    /// generated a few per frame). Drained nearest-camera-first, so this is a
+    /// set rather than a queue — insertion order carries no meaning.
+    lod_pending_set: HashSet<LodNodeId>,
 
     /// Telemetry: accumulate frames over ~1s to log FPS + drawn/total.
     telemetry_accum: f32,
@@ -434,6 +505,11 @@ struct App {
     relight_ms_accum: f32,
     mesh_ms_accum: f32,
     telemetry_frames: u32,
+    /// Longest single frame in the current telemetry interval, in ms. Average
+    /// fps hides hitches — a 144 fps average with one 40 ms frame reads as
+    /// smooth in the average and feels like a stutter. This is the number to
+    /// watch when optimizing streaming.
+    worst_frame_ms: f32,
 
     // --- Day/night (M07 task 3, ADR-0007) ---
     /// Current world time; drives sky brightness, and later sun/moon.
@@ -441,8 +517,6 @@ struct App {
     /// Fractional game-tick accumulator so slow real frames still advance time
     /// smoothly without integer rounding drift.
     time_accum: f64,
-    /// Real seconds per full game day (pacing). Default is a 24-minute day.
-    day_length_secs: f64,
     /// Debug: freeze time (key `T`).
     time_paused: bool,
     /// Debug: 60× fast-forward so a full cycle takes ~24s (key `\`).
@@ -481,19 +555,36 @@ impl Default for App {
             last_frame: Instant::now(),
 
             generator: Generator::new(seed),
-            streamer: Streamer::new(LOAD_RADIUS, UNLOAD_RADIUS),
-            lod_ring: LodRing::new(
-                LOD_STRIDE,
-                LOD_FULL_RADIUS_NODES,
-                LOD_LOAD_RADIUS_NODES,
-                LOD_UNLOAD_RADIUS_NODES,
+            // Cylindrical streaming: horizontal radius plus the world's
+            // vertical band, so climbing doesn't unload the ground beneath you.
+            streamer: Streamer::with_y_band(
+                LOAD_RADIUS,
+                UNLOAD_RADIUS,
+                (
+                    LOD_WORLD_Y_BLOCKS.0 / CHUNK_SIZE_I,
+                    (LOD_WORLD_Y_BLOCKS.1 - 1) / CHUNK_SIZE_I,
+                ),
             ),
-            lod_enabled: true,
+            lod_ring: LodRing::new(
+                LOD_INNER_CHUNKS,
+                &LOD_LEVELS,
+                LOD_UNLOAD_MARGIN_CHUNKS,
+                LOD_WORLD_Y_BLOCKS,
+            ),
+            settings: vox_core::Settings::default(),
+            settings_applied: vox_core::Settings::default(),
+            ui: None,
+            lod_far_chunks: LOD_LEVELS[LOD_LEVELS.len() - 1].outer_chunks,
+            lod_debug_last_state: None,
+            lod_debug_reported: HashSet::new(),
+            lod_debug_near_blocked: 0,
+            lod_debug_suppressed: 0,
             registry: BlockRegistry::default_set(),
             store,
             gen_in_flight: HashSet::new(),
             dirty: HashSet::new(),
             relight: HashSet::new(),
+            meshed_once: HashSet::new(),
             column_heights: HashMap::new(),
             targeted: None,
             selected_block: vox_core::registry::STONE,
@@ -502,13 +593,13 @@ impl Default for App {
             lod_tx,
             lod_rx,
             lod_in_flight: HashSet::new(),
-            lod_pending: std::collections::VecDeque::new(),
             lod_pending_set: HashSet::new(),
 
             telemetry_accum: 0.0,
             relight_ms_accum: 0.0,
             mesh_ms_accum: 0.0,
             telemetry_frames: 0,
+            worst_frame_ms: 0.0,
 
             // Start mid-morning (0.30 of the day) so the world opens in clear
             // daylight and the first cycle heads toward a visible dusk.
@@ -516,7 +607,6 @@ impl Default for App {
                 (0.30 * vox_core::TICKS_PER_DAY as f64) as u64,
             ),
             time_accum: 0.30 * vox_core::TICKS_PER_DAY as f64,
-            day_length_secs: vox_core::DEFAULT_DAY_LENGTH_SECS as f64,
             time_paused: false,
             time_fast: false,
         }
@@ -914,10 +1004,19 @@ impl App {
             newly_generated.push(pos);
         }
         for pos in newly_generated {
+            // A chunk that arrives already MODIFIED came from disk carrying
+            // player edits. LOD nodes stream in immediately at startup, well
+            // before saved chunks finish loading, so the node covering this
+            // column was built from seed heights and shows the terrain as it
+            // was before those edits — and nothing else would ever rebuild it.
+            let edited = self.world.chunk(pos).is_some_and(|c| c.is_modified());
             // Fold the new chunk into the column heightmap BEFORE marking it
             // dirty, so its first relight uses a correct sky top boundary.
             self.update_heightmap_for(pos);
             self.mark_dirty_with_neighbors(pos);
+            if edited {
+                self.invalidate_lod_for_chunk(pos);
+            }
         }
 
         // 5. Mesh a bounded batch of dirty chunks and upload.
@@ -932,6 +1031,9 @@ impl App {
             let world = &self.world;
             self.dirty.retain(|p| world.chunk(*p).is_some());
             self.relight.retain(|p| world.chunk(*p).is_some());
+            // Bounded with residency: an unloaded chunk must re-earn its first
+            // mesh (it will be regenerated and re-lit from scratch).
+            self.meshed_once.retain(|p| world.chunk(*p).is_some());
         }
 
         // --- Relight pass (time-budgeted, parallel). ---
@@ -941,13 +1043,16 @@ impl App {
         // changed border just queues a neighbor relight check (no re-mesh).
         if !self.relight.is_empty() {
             let start = Instant::now();
-            loop {
-                let sub: Vec<ChunkPos> = self
-                    .relight
-                    .iter()
-                    .copied()
-                    .take(RELIGHT_SUBBATCH)
-                    .collect();
+            // Select the nearest candidates ONCE per frame, then consume them
+            // in sub-batches. Re-scanning the (thousands-strong) set for every
+            // sub-batch would burn more time than the relight itself.
+            let candidates = vox_core::nearest_first(
+                self.relight.iter().copied(),
+                camera_chunk,
+                RELIGHT_SUBBATCH * 8,
+            );
+            for sub in candidates.chunks(RELIGHT_SUBBATCH) {
+                let sub: Vec<ChunkPos> = sub.to_vec();
                 if sub.is_empty() {
                     break;
                 }
@@ -1027,26 +1132,36 @@ impl App {
         // --- Mesh pass (time-budgeted, parallel). ---
         if !self.dirty.is_empty() {
             let start = Instant::now();
-            loop {
-                // Defer any dirty chunk that is still queued for relight:
-                // meshing it now would bake stale/zero light (the dark
-                // chunk-checkerboard during streaming) and the relight would
-                // immediately re-dirty it — every streamed chunk meshed twice.
-                // Lighting first means each chunk is meshed once, already lit.
-                // Deferred chunks stay in `dirty` and are picked up on a later
-                // frame once their relight has drained.
-                let batch: Vec<ChunkPos> = self
-                    .dirty
+            // Nearest-camera-first (M09 task 1), selected ONCE per frame: under
+            // a deep backlog the player's surroundings must converge before
+            // distant work, or freshly streamed chunks sit dark for seconds.
+            // Re-scanning the whole dirty set per sub-batch would cost more
+            // than the meshing. Two deferrals apply:
+            //  - chunks still queued for relight (mesh once, already lit —
+            //    otherwise every streamed chunk is meshed twice and flashes
+            //    dark in between);
+            //  - chunks awaiting their first complete neighborhood
+            //    (`ready_for_first_mesh`).
+            // Deferred chunks stay in `dirty` for a later frame.
+            let candidates: Vec<ChunkPos> = vox_core::nearest_first(
+                self.dirty
                     .iter()
                     .copied()
                     .filter(|p| !self.relight.contains(p))
-                    .take(MESH_SUBBATCH)
-                    .collect();
+                    .filter(|p| self.ready_for_first_mesh(*p, camera_chunk)),
+                camera_chunk,
+                MESH_SUBBATCH * 8,
+            );
+            for batch in candidates.chunks(MESH_SUBBATCH) {
+                let batch: Vec<ChunkPos> = batch.to_vec();
                 if batch.is_empty() {
                     break;
                 }
                 for p in &batch {
                     self.dirty.remove(p);
+                    // This chunk has now had a complete first mesh; later
+                    // re-meshes are not gated.
+                    self.meshed_once.insert(*p);
                 }
 
                 let meshes = mesh_chunks_parallel(&self.world, &self.registry, &batch);
@@ -1071,31 +1186,313 @@ impl App {
         }
     }
 
-    /// World-space origin chunk of a LOD node (M08). The node's Y band is fixed
-    /// (`LOD_Y_ORIGIN_BLOCKS`) for the current placeholder terrain.
-    fn lod_node_origin_chunk(n: LodNodePos) -> ChunkPos {
-        ChunkPos::new(
-            n.min_chunk_x(LOD_STRIDE),
-            LOD_Y_ORIGIN_BLOCKS / CHUNK_SIZE_I,
-            n.min_chunk_z(LOD_STRIDE),
-        )
+    /// World-space origin chunk of a LOD node. Y comes from the node's own
+    /// vertical index — columns stack to cover the world band (M09).
+    fn lod_node_origin_chunk(ring: &LodRing, id: LodNodeId) -> ChunkPos {
+        let (bx, by, bz) = ring.node_origin_blocks(id);
+        ChunkPos::new(bx / CHUNK_SIZE_I, by / CHUNK_SIZE_I, bz / CHUNK_SIZE_I)
+    }
+
+    /// M09 task 1: is this chunk ready for its FIRST mesh?
+    ///
+    /// Meshing a chunk before its neighbors exist bakes two errors: border
+    /// faces computed against phantom air, and (the visible one) light sampled
+    /// before skylight/blocklight can cross the seams — the "black chunk"
+    /// that then persists until a neighbor's arrival happens to re-dirty it.
+    ///
+    /// So a chunk's first mesh waits for every face neighbor that is still
+    /// *coming*. A neighbor outside the load radius is never coming, so it is
+    /// not waited on — otherwise the outermost shell would never mesh at all
+    /// and the full-res region would end in a permanent hole. Re-meshes of an
+    /// already-meshed chunk are never gated (an edit must show immediately).
+    fn ready_for_first_mesh(&self, p: ChunkPos, camera_chunk: ChunkPos) -> bool {
+        if self.meshed_once.contains(&p) {
+            return true;
+        }
+        let r2 = self.settings.load_radius * self.settings.load_radius;
+        let (band_lo, band_hi) = (
+            LOD_WORLD_Y_BLOCKS.0 / CHUNK_SIZE_I,
+            (LOD_WORLD_Y_BLOCKS.1 - 1) / CHUNK_SIZE_I,
+        );
+        NEIGHBOR_OFFSETS.iter().all(|(dx, dy, dz)| {
+            let n = ChunkPos::new(p.x + dx, p.y + dy, p.z + dz);
+            if self.world.chunk(n).is_some() {
+                return true; // present
+            }
+            // Absent: only wait if it is still COMING. Streaming is a cylinder
+            // (horizontal radius x vertical band), so a neighbour outside the
+            // band never arrives no matter how close it is horizontally.
+            // Judging that with a sphere — as this did before streaming became
+            // cylindrical — left the top and bottom layers of the band waiting
+            // forever, so they never meshed: permanent holes in the full-res
+            // terrain, showing the LOD behind them as "ghost" patches in the
+            // same places every run.
+            if n.y < band_lo || n.y > band_hi {
+                return true;
+            }
+            let (ex, ez) = (n.x - camera_chunk.x, n.z - camera_chunk.z);
+            ex * ex + ez * ez > r2
+        })
+    }
+
+    /// Outermost LOD radius in blocks, for sizing the camera's far plane and
+    /// the automatic fog range.
+    fn lod_far_blocks(&self) -> f32 {
+        (self.lod_far_chunks * CHUNK_SIZE_I) as f32
+    }
+
+    /// Recompute one column's surface height from the world.
+    ///
+    /// `update_heightmap_for` only ever RAISES a column (correct for
+    /// streaming, where chunks arrive in any order and the max wins), so it
+    /// cannot see a block being mined away. Without this the heightmap keeps
+    /// the pre-edit surface, and anything derived from it — LOD nodes, skylight
+    /// — rebuilds the terrain the player just removed: a "ghost block".
+    fn recompute_column_height(&mut self, x: i64, z: i64) {
+        let (lo, hi) = LOD_WORLD_Y_BLOCKS;
+        let mut top = i64::MIN;
+        for y in (lo..hi).rev() {
+            if !self.world.get_block(WorldPos::new(x, y, z)).is_air() {
+                top = y;
+                break;
+            }
+        }
+        self.column_heights.insert((x, z), top);
+    }
+
+    /// LOD nodes whose ground is fully covered by resident full-resolution
+    /// chunks, and which therefore must NOT be drawn.
+    ///
+    /// LOD underlaps the full-res region by design (that is what guarantees no
+    /// gaps). The cost is that any hole the player digs shows coarse terrain
+    /// behind it — the neighbouring coarse cells' walls seen through the gap,
+    /// which reads as a "ghost block" left where terrain was removed. A coarse
+    /// node cannot represent a hole; the only correct answer is to stop drawing
+    /// it wherever the real chunks already cover the ground.
+    ///
+    /// Cheap geometry pre-filter (is the whole footprint inside the streaming
+    /// radius?) before the actual residency check, so only a handful of nodes
+    /// pay for the lookups.
+    fn covered_lod_nodes(&mut self, camera_chunk: ChunkPos) -> HashSet<(ChunkPos, u32)> {
+        let mut out = HashSet::new();
+        let mut near_blocked = 0usize;
+        let r = self.settings.load_radius;
+        let (band_lo, band_hi) = (
+            LOD_WORLD_Y_BLOCKS.0 / CHUNK_SIZE_I,
+            (LOD_WORLD_Y_BLOCKS.1 - 1) / CHUNK_SIZE_I,
+        );
+        // Snapshot the ids: the loop needs &mut self for the diagnostic set.
+        let ids: Vec<LodNodeId> = self.lod_ring.loaded().iter().copied().collect();
+        for id in &ids {
+            let s = self.lod_ring.stride(id.level);
+            let (ox, oz) = self.lod_ring.node_origin_chunk_xz(*id);
+            // Pre-filter: every corner of the footprint inside the radius.
+            let far_x = (ox - camera_chunk.x)
+                .abs()
+                .max((ox + s - 1 - camera_chunk.x).abs());
+            let far_z = (oz - camera_chunk.z)
+                .abs()
+                .max((oz + s - 1 - camera_chunk.z).abs());
+            if far_x * far_x + far_z * far_z > r * r {
+                continue;
+            }
+            // Confirm every chunk in the footprint is actually resident; a node
+            // suppressed while its chunks are still streaming would be a hole.
+            let mut missing: Option<ChunkPos> = None;
+            'cols: for cz in oz..oz + s {
+                for cx in ox..ox + s {
+                    for cy in band_lo..=band_hi {
+                        let c = ChunkPos::new(cx, cy, cz);
+                        if self.world.chunk(c).is_none() {
+                            missing = Some(c);
+                            break 'cols;
+                        }
+                    }
+                }
+            }
+            match missing {
+                None => {
+                    out.insert((Self::lod_node_origin_chunk(&self.lod_ring, *id), id.level));
+                }
+                // Diagnostic: a node close to the camera that stays unsuppressed
+                // is exactly what shows coarse terrain through a dug hole.
+                // Report which chunk is blocking it, once per node.
+                Some(c) => {
+                    let near = far_x.max(far_z) <= 4;
+                    if near {
+                        near_blocked += 1;
+                    }
+                    if near && self.lod_debug_reported.insert(*id) {
+                        log::info!(
+                            "lod suppress blocked: level {} node ({},{}) waiting on chunk {:?} \
+                             (camera chunk {:?}, radius {r})",
+                            id.level,
+                            id.x,
+                            id.z,
+                            (c.x, c.y, c.z),
+                            (camera_chunk.x, camera_chunk.y, camera_chunk.z)
+                        );
+                    }
+                }
+            }
+        }
+        self.lod_debug_near_blocked = near_blocked;
+        self.lod_debug_suppressed = out.len();
+        out
+    }
+
+    /// Invalidate the LOD nodes covering a whole chunk column.
+    ///
+    /// Needed when a chunk arrives carrying edits (loaded from disk). LOD
+    /// streams immediately at startup, long before saved chunks finish
+    /// loading, so those nodes are built from SEED heights and show the
+    /// terrain as it was before the player ever touched it. Nothing later
+    /// rebuilds them — no edit happens there in this session — so the stale
+    /// surface persists in the same places every run.
+    fn invalidate_lod_for_chunk(&mut self, pos: ChunkPos) {
+        for level in 0..self.lod_ring.level_count() as u32 {
+            let id = self.lod_ring.node_containing(level, pos.x, pos.z);
+            if self.lod_ring.loaded().contains(&id) {
+                self.lod_ring.mark_unloaded(id);
+                let origin = Self::lod_node_origin_chunk(&self.lod_ring, id);
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.remove_lod_mesh(origin, id.level);
+                }
+            }
+            self.lod_pending_set.insert(id);
+            self.lod_in_flight.remove(&id);
+        }
+    }
+
+    /// Invalidate the LOD nodes covering an edited block column, so they
+    /// rebuild from the new terrain.
+    ///
+    /// Without this the coarse node keeps the pre-edit surface. LOD underlaps
+    /// the full-resolution region, so the stale surface shows through the hole
+    /// the player just dug — the block appears to still be there ("ghost
+    /// block") even though the real chunk was re-meshed correctly.
+    fn invalidate_lod_at(&mut self, pos: WorldPos) {
+        // The heightmap must reflect the edit BEFORE the node regenerates from
+        // it, or the rebuilt node restores what was just mined.
+        self.recompute_column_height(pos.x, pos.z);
+        let (cx, cz) = (
+            pos.x.div_euclid(CHUNK_SIZE_I),
+            pos.z.div_euclid(CHUNK_SIZE_I),
+        );
+        for level in 0..self.lod_ring.level_count() as u32 {
+            let id = self.lod_ring.node_containing(level, cx, cz);
+            if self.lod_ring.loaded().contains(&id) {
+                self.lod_ring.mark_unloaded(id);
+                let origin = Self::lod_node_origin_chunk(&self.lod_ring, id);
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.remove_lod_mesh(origin, id.level);
+                }
+            }
+            // Re-request even if it was only pending: its heights are stale.
+            self.lod_pending_set.insert(id);
+            self.lod_in_flight.remove(&id);
+        }
+    }
+
+    /// Rebuild the streaming rings after an expensive settings change
+    /// (M09 A3). Radius and LOD-distance edits change what the world should
+    /// have loaded, so the streamer and LOD ring are recreated and their
+    /// current sets dropped; the next tick re-requests everything.
+    fn apply_view_settings(&mut self) {
+        let s = self.settings;
+        self.streamer = Streamer::with_y_band(
+            s.load_radius,
+            s.load_radius + 2,
+            (
+                LOD_WORLD_Y_BLOCKS.0 / CHUNK_SIZE_I,
+                (LOD_WORLD_Y_BLOCKS.1 - 1) / CHUNK_SIZE_I,
+            ),
+        );
+        // Extend view distance by APPENDING coarser levels, each doubling both
+        // stride and radius. That keeps per-level node count roughly constant,
+        // so distance costs linearly in levels — where scaling the radii alone
+        // is quadratic (x4 distance once produced 10 240 nodes and 4.3 GB).
+        let mut levels: Vec<vox_core::LodLevel> = LOD_LEVELS.to_vec();
+        for _ in 0..s.lod_extra_levels {
+            let last = *levels.last().expect("at least one base level");
+            levels.push(vox_core::LodLevel {
+                stride: last.stride * 2,
+                outer_chunks: last.outer_chunks * 2,
+            });
+        }
+        // The ring requires every radius to be a multiple of the COARSEST
+        // stride, which just grew. Round each outer edge up onto that grid and
+        // keep the sequence strictly increasing — collapsing two levels onto
+        // the same radius is what panicked ("outer 8 must exceed inner 8").
+        let coarsest = levels.last().map(|l| l.stride).unwrap_or(8);
+        let mut prev = LOD_INNER_CHUNKS;
+        for l in levels.iter_mut() {
+            let aligned = ((l.outer_chunks + coarsest - 1) / coarsest) * coarsest;
+            l.outer_chunks = aligned.max(prev + coarsest);
+            prev = l.outer_chunks;
+        }
+        self.lod_far_chunks = prev;
+
+        // Actually install the new ring. Losing this line meant the ring kept
+        // every node marked loaded with its centre already set, so update()
+        // returned nothing and LOD never came back until the camera crossed a
+        // node boundary — exactly the reported symptom.
+        // The hysteresis margin has the SAME alignment requirement as the
+        // radii: a multiple of the coarsest stride, which grows with extra
+        // levels. Round it up rather than passing the base constant, or adding
+        // a level trips the ring's assertion.
+        let margin = ((LOD_UNLOAD_MARGIN_CHUNKS + coarsest - 1) / coarsest) * coarsest;
+        self.lod_ring = LodRing::new(LOD_INNER_CHUNKS, &levels, margin, LOD_WORLD_Y_BLOCKS);
+
+        self.lod_pending_set.clear();
+        self.lod_in_flight.clear();
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.clear_lod();
+        }
+        log::info!(
+            "settings applied: radius {}, {} LOD levels, horizon {} blocks",
+            s.load_radius,
+            levels.len(),
+            self.lod_far_blocks() as i64
+        );
     }
 
     /// M08: stream coarse LOD nodes around the camera. Gen + mesh run on the
     /// rayon pool (both are pure CPU); the main thread only uploads. Mirrors the
     /// chunk streaming path (`stream_tick`) but for one coarse level.
     fn lod_tick(&mut self, camera_chunk: ChunkPos) {
-        if !self.lod_enabled {
+        if !self.settings.lod_enabled {
+            // Diagnostic: log the transition only, not every frame.
+            if self.lod_debug_last_state != Some(false) {
+                self.lod_debug_last_state = Some(false);
+                log::info!("lod_tick: disabled (settings.lod_enabled = false)");
+            }
             return;
         }
+        if self.lod_debug_last_state != Some(true) {
+            self.lod_debug_last_state = Some(true);
+            log::info!(
+                "lod_tick: enabled, ring has {} levels",
+                self.lod_ring.level_count()
+            );
+        }
         let update = self.lod_ring.update(camera_chunk);
+        if !update.to_load.is_empty() || !update.to_unload.is_empty() {
+            log::info!(
+                "lod_tick: ring update -> load {} unload {} (pending {} in-flight {})",
+                update.to_load.len(),
+                update.to_unload.len(),
+                self.lod_pending_set.len(),
+                self.lod_in_flight.len()
+            );
+        }
 
         // Unloads: drop the GPU mesh, forget the node, and cancel it if it was
         // still queued or in flight.
         for n in &update.to_unload {
-            let origin = Self::lod_node_origin_chunk(*n);
+            let origin = Self::lod_node_origin_chunk(&self.lod_ring, *n);
             if let Some(renderer) = self.renderer.as_mut() {
-                renderer.remove_lod_mesh(origin);
+                renderer.remove_lod_mesh(origin, n.level);
             }
             self.lod_ring.mark_unloaded(*n);
             self.lod_in_flight.remove(n);
@@ -1110,18 +1507,26 @@ impl App {
                 continue;
             }
             self.lod_pending_set.insert(n);
-            self.lod_pending.push_back(n);
         }
 
         // Drain finished meshes and upload (skipping any cancelled mid-flight).
-        let span = (CHUNK_SIZE_I * LOD_STRIDE) as f32;
         while let Ok((n, mesh)) = self.lod_rx.try_recv() {
             if !self.lod_in_flight.remove(&n) {
                 continue;
             }
-            let origin = Self::lod_node_origin_chunk(n);
+            // Span is per-level: a coarser node covers more world.
+            let span = self.lod_ring.span_blocks(n.level) as f32;
+            // Vertical extent is the world Y band, not the horizontal span: a
+            // heightfield node is wide and (relatively) short, and a cubic AABB
+            // would be far too short at fine levels, so frustum culling would
+            // drop nodes that are plainly on screen.
+            let height = (LOD_WORLD_Y_BLOCKS.1 - LOD_WORLD_Y_BLOCKS.0) as f32;
+            let origin = Self::lod_node_origin_chunk(&self.lod_ring, n);
+            if mesh.is_empty() {
+                log::warn!("lod_tick: node {:?} produced an EMPTY mesh", n);
+            }
             if let Some(renderer) = self.renderer.as_mut() {
-                renderer.set_lod_mesh(origin, span, &mesh);
+                renderer.set_lod_mesh(origin, n.level, span, height, &mesh);
             }
             self.lod_ring.mark_loaded(n);
         }
@@ -1134,43 +1539,109 @@ impl App {
         let stone_layers: [u32; 6] = std::array::from_fn(|f| self.registry.face_layer(stone, f));
 
         let mut spawned = 0;
-        while spawned < LOD_SPAWN_BUDGET {
-            let Some(n) = self.lod_pending.pop_front() else {
-                break;
-            };
-            // Cancelled while queued (unloaded before we got to it).
-            if !self.lod_pending_set.remove(&n) {
-                continue;
-            }
-            if self.lod_in_flight.contains(&n) {
-                continue;
-            }
-            self.lod_in_flight.insert(n);
-            let generator = self.generator;
-            let tx = self.lod_tx.clone();
-            let origin = WorldPos::new(
-                n.origin_block_x(LOD_STRIDE),
-                LOD_Y_ORIGIN_BLOCKS,
-                n.origin_block_z(LOD_STRIDE),
-            );
-            rayon::spawn(move || {
-                let node = generator.generate_lod_node(origin, LOD_STRIDE);
-                let mesh = mesh_lod_node(
-                    &node,
-                    |b, face| {
-                        if b == grass {
-                            grass_layers[face]
-                        } else {
-                            stone_layers[face]
-                        }
-                    },
-                    LOD_STRIDE as i32,
-                    LOD_SKIRT_DEPTH_CELLS,
-                );
-                let _ = tx.send((n, mesh));
+        if !self.lod_pending_set.is_empty() {
+            // Nearest-first (M09 task 1): the ring is enqueued in scan order,
+            // so a naive drain fills one edge before the nodes in front of the
+            // player. Sorted by the node's distance in CHUNKS (comparable
+            // across levels, which have different node sizes), then by level so
+            // the finer, nearer detail lands first.
+            let mut wanted: Vec<LodNodeId> = self.lod_pending_set.iter().copied().collect();
+            let ring = &self.lod_ring;
+            wanted.sort_unstable_by_key(|n| {
+                let (ox, oz) = ring.node_origin_chunk_xz(*n);
+                let s = ring.stride(n.level);
+                // Centre of the node, in chunks.
+                let dx = ox + s / 2 - camera_chunk.x;
+                let dz = oz + s / 2 - camera_chunk.z;
+                (dx * dx + dz * dz, n.level, n.x, n.z)
             });
-            spawned += 1;
+            for n in wanted.into_iter().take(LOD_SPAWN_BUDGET) {
+                self.lod_pending_set.remove(&n);
+                if self.lod_in_flight.contains(&n) {
+                    continue;
+                }
+                self.lod_in_flight.insert(n);
+                let stride = self.lod_ring.stride(n.level);
+                let (bx, by, bz) = self.lod_ring.node_origin_blocks(n);
+                let origin = WorldPos::new(bx, by, bz);
+
+                // Build the node as a HEIGHTFIELD (M09). The voxel path
+                // quantized height to the cell size, which is what made distant
+                // terrain read as stacked terraces of tall slabs; a heightfield
+                // keeps vertical detail exact and only quantizes horizontally.
+                //
+                // The innermost ring takes its heights from the world's own
+                // column heightmap when available — so the boundary matches the
+                // real terrain it abuts, and player edits show up at distance,
+                // neither of which seed sampling can do. Only the height gather
+                // touches app state; building and meshing run on rayon.
+                // Build the node as a HEIGHTFIELD. For the innermost ring,
+                // take each column's height from the world where it is known
+                // and from the seed where it is not.
+                //
+                // This used to be all-or-nothing: one unknown column anywhere
+                // in the node fell back to seed generation for the WHOLE node.
+                // A node's footprint reaches past the loaded chunk radius, so
+                // that happened constantly — and seed heights cannot see player
+                // edits, so mined terrain reappeared as coarse "ghost" patches
+                // the size of a node. Per-column fallback keeps the edited
+                // columns real and only approximates the ones off the edge.
+                let cells = CHUNK_SIZE_I as usize;
+                let mut real_heights: Option<Vec<i32>> = None;
+                if n.level == 0 {
+                    let gen = self.generator;
+                    let mut hs = vec![0i32; cells * cells];
+                    for cz in 0..cells {
+                        for cx in 0..cells {
+                            let bx = origin.x + cx as i64 * stride;
+                            let bz = origin.z + cz as i64 * stride;
+                            let mut m = i64::MAX;
+                            for dz in 0..stride {
+                                for dx in 0..stride {
+                                    let (wx, wz) = (bx + dx, bz + dz);
+                                    // i64::MIN is the heightmap's "no terrain
+                                    // here yet" sentinel, not a height.
+                                    let h = match self.column_heights.get(&(wx, wz)) {
+                                        Some(&h) if h != i64::MIN => h,
+                                        _ => gen.surface_height(wx, wz),
+                                    };
+                                    m = m.min(h);
+                                }
+                            }
+                            hs[cz * cells + cx] = m as i32;
+                        }
+                    }
+                    real_heights = Some(hs);
+                }
+
+                // Copied into the rayon job for the seed-generated levels
+                // (Generator is Copy, so this is free).
+                let generator = self.generator;
+                let tx = self.lod_tx.clone();
+                let origin_y = origin.y as i32;
+                let skirt = LOD_SKIRT_DEPTH_CELLS * stride as i32;
+                rayon::spawn(move || {
+                    let heights = real_heights
+                        .unwrap_or_else(|| generator.lod_heightfield(origin.x, origin.z, stride));
+                    let mesh = vox_mesh::mesh_lod_heightfield(
+                        &heights,
+                        stride as i32,
+                        origin_y,
+                        |b, face| {
+                            if b == grass {
+                                grass_layers[face]
+                            } else {
+                                stone_layers[face]
+                            }
+                        },
+                        skirt,
+                    );
+                    let _ = tx.send((n, mesh));
+                });
+                spawned += 1;
+            }
         }
+        let _ = spawned;
     }
 
     /// the edit persists). No-op when nothing is targeted.
@@ -1183,6 +1654,7 @@ impl App {
         self.world.set_block(pos, BlockId::AIR);
         self.recompute_height_column(pos.x, pos.z);
         self.mark_dirty_with_neighbors(pos.chunk());
+        self.invalidate_lod_at(pos);
         log::info!("broke block at {:?}", (pos.x, pos.y, pos.z));
     }
 
@@ -1203,6 +1675,7 @@ impl App {
         self.world.set_block(pos, self.selected_block);
         self.recompute_height_column(pos.x, pos.z);
         self.mark_dirty_with_neighbors(pos.chunk());
+        self.invalidate_lod_at(pos);
         log::info!("placed block at {:?}", (pos.x, pos.y, pos.z));
     }
 
@@ -1328,6 +1801,7 @@ impl ApplicationHandler for App {
             UNLOAD_RADIUS
         );
 
+        self.ui = Some(SettingsUi::new(&window));
         self.renderer = Some(renderer);
         self.window = Some(window);
         self.last_frame = Instant::now();
@@ -1335,6 +1809,20 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // The settings menu sees events first. If egui consumed one (a click
+        // on a slider, a keystroke in a text field), the game must ignore it —
+        // otherwise dragging a slider would also swing the camera or break a
+        // block behind the menu. Resize and close still fall through below.
+        if !matches!(event, WindowEvent::CloseRequested | WindowEvent::Resized(_)) {
+            let consumed = match (self.ui.as_mut(), self.window.as_ref()) {
+                (Some(ui), Some(window)) => ui.on_window_event(window, &event),
+                _ => false,
+            };
+            if consumed {
+                return;
+            }
+        }
+
         match event {
             WindowEvent::CloseRequested => {
                 self.save_all_modified();
@@ -1352,7 +1840,21 @@ impl ApplicationHandler for App {
                     match event.state {
                         ElementState::Pressed => {
                             if code == KeyCode::Escape {
-                                self.set_cursor_captured(false);
+                                // ESC toggles the settings menu (M09 A3). The
+                                // cursor is released while it is open so the
+                                // sliders can be used, and re-captured on
+                                // close so mouse-look resumes.
+                                let was_open = self.ui.as_ref().is_some_and(|u| u.open);
+                                let now_closed = match self.ui.as_mut() {
+                                    Some(ui) if was_open => ui.on_escape(),
+                                    Some(ui) => {
+                                        ui.open = true;
+                                        false
+                                    }
+                                    None => true,
+                                };
+                                // Cursor is free while the menu is up.
+                                self.set_cursor_captured(now_closed);
                             } else if code == KeyCode::KeyF {
                                 // Toggle spectator (noclip free-fly) <-> survival.
                                 self.camera.mode = match self.camera.mode {
@@ -1421,17 +1923,28 @@ impl ApplicationHandler for App {
                                 );
                             } else if code == KeyCode::KeyL {
                                 // Debug: toggle coarse LOD terrain (M08).
-                                self.lod_enabled = !self.lod_enabled;
-                                if !self.lod_enabled {
+                                // Single source of truth: the L key edits the
+                                // SAME flag the settings menu does. Two flags
+                                // ANDed together meant toggling off with one
+                                // and on with the other left LOD permanently
+                                // dead until the camera crossed a node border.
+                                self.settings.lod_enabled = !self.settings.lod_enabled;
+                                if !self.settings.lod_enabled {
                                     self.lod_ring.clear();
                                     self.lod_in_flight.clear();
-                                    self.lod_pending.clear();
                                     self.lod_pending_set.clear();
                                     if let Some(renderer) = self.renderer.as_mut() {
                                         renderer.clear_lod();
                                     }
                                 }
-                                log::info!("LOD {}", if self.lod_enabled { "ON" } else { "off" });
+                                log::info!(
+                                    "LOD {}",
+                                    if self.settings.lod_enabled {
+                                        "ON"
+                                    } else {
+                                        "off"
+                                    }
+                                );
                             } else if let Some(slot) = digit_slot(code) {
                                 self.select_block_slot(slot);
                             } else {
@@ -1486,14 +1999,20 @@ impl ApplicationHandler for App {
 
             WindowEvent::RedrawRequested => {
                 let now = Instant::now();
-                let dt = (now - self.last_frame).as_secs_f32().min(0.1);
+                let raw_dt = (now - self.last_frame).as_secs_f32();
+                // Physics/streaming use a clamped dt so a long stall can't
+                // teleport the player; telemetry uses the RAW value, or a real
+                // 300 ms hitch would be reported as the 100 ms clamp.
+                let dt = raw_dt.min(0.1);
                 self.last_frame = now;
+                self.worst_frame_ms = self.worst_frame_ms.max(raw_dt * 1000.0);
 
                 // Advance world time (M07 task 3). Accumulate in fractional
                 // game-ticks so slow frames don't drift, then snapshot to the
                 // integer WorldTime the shader/sky read.
-                if !self.time_paused {
-                    let mut rate = vox_core::game_ticks_per_second(self.day_length_secs);
+                if !self.time_paused && !self.settings.time_paused {
+                    let mut rate =
+                        vox_core::game_ticks_per_second(self.settings.day_length_secs as f64);
                     if self.time_fast {
                         rate *= 60.0;
                     }
@@ -1546,6 +2065,62 @@ impl ApplicationHandler for App {
                 let dirty = self.dirty.len();
                 let relight = self.relight.len();
 
+                // --- Settings menu (M09 amendment A3) ---
+                // Run the UI before borrowing the renderer, then hand its
+                // tessellated output to render(). Costs nothing while closed.
+                // Mirror the running clock into the slider so it reads the
+                // current time when the menu opens (and tracks while open).
+                self.settings.time_of_day = self.world_time.time_of_day();
+                self.settings_applied.time_of_day = self.settings.time_of_day;
+                if let Some(ui) = self.ui.as_mut() {
+                    if ui.open {
+                        ui.status = format!(
+                            "loaded {loaded}  dirty {dirty}  relight {relight}  lod {}",
+                            self.lod_ring.loaded().len()
+                        );
+                    }
+                }
+                let ui_output = match (self.ui.as_mut(), self.window.as_ref()) {
+                    (Some(ui), Some(window)) => ui.run(window, &mut self.settings),
+                    _ => None,
+                };
+                // "Save and Quit" from the pause screen.
+                if self.ui.as_ref().is_some_and(|u| u.quit_requested) {
+                    self.save_all_modified();
+                    event_loop.exit();
+                    return;
+                }
+                // The menu can close itself (Back to Game); recapture the
+                // cursor so mouse-look resumes without needing ESC.
+                let menu_open = self.ui.as_ref().is_some_and(|u| u.open);
+                if !menu_open && !self.cursor_captured {
+                    self.set_cursor_captured(true);
+                }
+                // Expensive edits (radius, LOD distance) re-stream the world,
+                // so they are applied deliberately here rather than on every
+                // slider pixel.
+                if self.settings.rebuild_needed(&self.settings_applied) {
+                    self.apply_view_settings();
+                }
+                // Scrubbing time of day: only act when the SLIDER moved, not
+                // every frame, or writing the clock back would fight the clock
+                // advancing and time would freeze.
+                if (self.settings.time_of_day - self.settings_applied.time_of_day).abs() > 1e-6 {
+                    let day = vox_core::TICKS_PER_DAY as f64;
+                    let day_index = (self.time_accum / day).floor();
+                    self.time_accum = (day_index + self.settings.time_of_day as f64) * day;
+                    self.world_time = vox_core::WorldTime::from_ticks(self.time_accum as u64);
+                }
+                self.settings_applied = self.settings;
+
+                // Far plane must reach past the outermost LOD ring (plus
+                // headroom for looking across it from altitude). Computed
+                // before borrowing the renderer: it reads &self.
+                let far = (self.lod_far_blocks() * 1.6).max(1000.0);
+                // Nodes whose ground full-res already covers must not draw, or
+                // every dug hole shows coarse terrain behind it.
+                let covered = self.covered_lod_nodes(origin_chunk);
+
                 if let Some(renderer) = self.renderer.as_mut() {
                     // Floating origin (ADR-0002): keep the render origin at
                     // the camera's current chunk so vertex math stays precise
@@ -1565,17 +2140,51 @@ impl ApplicationHandler for App {
                         origin_blocks.y as f32,
                         origin_blocks.z as f32,
                     );
-                    let view_proj = self
-                        .camera
-                        .view_proj(renderer.aspect(), render_origin_blocks);
+                    let view_proj = self.camera.view_proj(
+                        renderer.aspect(),
+                        render_origin_blocks,
+                        self.settings.fov_degrees,
+                        far,
+                    );
 
                     // Day/night (M07 task 3): push sky_scale + sun/moon to the
                     // shaders. The sky pass needs the inverse view-projection to
                     // turn each pixel back into a world ray; direction is
                     // origin-independent, so floating origin doesn't matter here.
-                    renderer.set_sky(self.world_time, view_proj.inverse().to_cols_array_2d());
+                    // Fog colour tracks the sky it fades into: the daytime
+                    // horizon tint, dimmed by sky_scale so distant terrain goes
+                    // dark with the night rather than glowing grey.
+                    let sky_scale = self.world_time.sky_scale();
+                    let (fog_start, fog_end) = self.settings.fog_range(far / 1.6);
+                    let fog = vox_render::FogParams {
+                        color: [
+                            (0.68 * sky_scale).max(0.012),
+                            (0.82 * sky_scale).max(0.018),
+                            (0.95 * sky_scale).max(0.038),
+                        ],
+                        strength: self.settings.effective_fog_strength(),
+                        // Scaled to the current LOD horizon in auto mode, so
+                        // changing LOD levels doesn't require re-tuning fog.
+                        start: fog_start,
+                        end: fog_end,
+                    };
+                    let cam_rel = self.camera.position - render_origin_blocks;
+                    renderer.set_sky(
+                        self.world_time,
+                        view_proj.inverse().to_cols_array_2d(),
+                        [cam_rel.x, cam_rel.y, cam_rel.z],
+                        fog,
+                        self.settings.star_intensity,
+                    );
 
-                    renderer.render(view_proj.to_cols_array_2d());
+                    let ui_frame = ui_output.as_ref().map(|o| vox_render::UiFrame {
+                        primitives: &o.primitives,
+                        textures_delta_set: &o.textures_set,
+                        textures_delta_free: o.textures_free.clone(),
+                        pixels_per_point: o.pixels_per_point,
+                    });
+                    renderer.set_suppressed_lod(covered);
+                    renderer.render(view_proj.to_cols_array_2d(), ui_frame);
 
                     // Telemetry once per second: FPS, frustum-culling ratio,
                     // and streaming state (resident chunks, gen queue, dirty).
@@ -1583,12 +2192,19 @@ impl ApplicationHandler for App {
                     self.telemetry_frames += 1;
                     if self.telemetry_accum >= 1.0 {
                         let fps = self.telemetry_frames as f32 / self.telemetry_accum;
+                        let lod_backlog = self.lod_pending_set.len() + self.lod_in_flight.len();
                         log::info!(
-                            "{:.0} fps | drawn {}/{} | lod {} | loaded {} | gen {} | dirty {} | relight {} | lt {:.0}ms msh {:.0}ms",
+                            "{:.0} fps (worst {:.1}ms) | drawn {}/{} | {:.2}M tris | {:.0}MB gpu | sup {}/{}blk | lod {}+{} | loaded {} | gen {} | dirty {} | relight {} | lt {:.0}ms msh {:.0}ms",
                             fps,
+                            self.worst_frame_ms,
                             renderer.drawn_last_frame(),
                             renderer.mesh_count(),
+                            renderer.tris_last_frame() as f32 / 1.0e6,
+                            renderer.buffer_bytes() as f32 / 1.048576e6,
+                            self.lod_debug_suppressed,
+                            self.lod_debug_near_blocked,
                             renderer.lod_count(),
+                            lod_backlog,
                             loaded,
                             in_flight,
                             dirty,
@@ -1600,6 +2216,10 @@ impl ApplicationHandler for App {
                         self.telemetry_frames = 0;
                         self.relight_ms_accum = 0.0;
                         self.mesh_ms_accum = 0.0;
+                        self.worst_frame_ms = 0.0;
+                        // Re-arm the per-node reporter so a block that appears
+                        // mid-session is named, not just startup transients.
+                        self.lod_debug_reported.clear();
                     }
                 }
                 if let Some(window) = &self.window {

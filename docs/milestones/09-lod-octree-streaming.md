@@ -66,11 +66,47 @@ floor during sprint-fly no lower than M08's ~90.
 7. **Bookkeeping.** Retro with numbers; CLAUDE.md status; note in ADR-0008
    that the octree + near-ring halves are now implemented.
 
-## Stretch (explicitly optional)
+## Amendments (owner-approved, added mid-milestone)
 
-- **Geomorph transitions:** lerp vertex heights across a band at ring
-  boundaries so level swaps are invisible. Attempt only after criteria 1–6
-  are green; if it slips, record it as the M10 candidate.
+Criteria 1–5 were met with voxel-grid LOD nodes, but testing showed the result
+still read as obviously-not-terrain. Two corrections and three additions were
+approved rather than deferred, on the grounds that the milestone's goal is
+"make the horizon good", not "ship the planned tasks".
+
+- **A1 — LOD is a heightfield, not a voxel grid (design correction).** ADR-0008
+  had LOD nodes reuse the 32³ `Chunk` and the greedy mesher. That reuse was
+  elegant and shipped fast, but a voxel grid quantizes *height* to the cell
+  size, so distant terrain rendered as stacked terraces of tall slabs — the
+  visual ceiling three rounds of stride tuning could not lift. LOD now stores
+  exact per-column heights and meshes a top quad plus walls down to lower
+  neighbours (`vox_mesh::mesh_lod_heightfield`): horizontal detail is still
+  quantized, vertical detail is exact. This supersedes the "scaled chunk"
+  claim in ADR-0008.
+- **A2 — Distance fog.** Terrain fades toward the sky as it recedes. Not
+  decoration: it is what makes a detail transition unreadable, by dropping
+  contrast before the LOD change becomes visible. Its absence was the single
+  largest remaining reason the falloff was obvious.
+- **A3 — Settings menu (ESC).** Live sliders for render distance, LOD level
+  radii, fog, and time of day. Every visual decision in this milestone cost a
+  recompile-and-squint cycle; live tuning collapses that to seconds and is the
+  tool the remaining work needs.
+- **A4 — Geomorph transitions** (was the optional stretch, now committed):
+  lerp heights across a band at ring boundaries so level swaps are invisible.
+  Attempt after A2 and A3, since fog may make the steps much less visible and
+  the sliders make tuning the band cheap.
+
+## Notes on cost, for tuning
+
+Each level holds roughly the same node count regardless of stride, and each
+node costs about the same, while every level covers **twice** the radius of the
+one before. View distance therefore scales *logarithmically* in cost — adding a
+coarse level is cheap. What is expensive is fine detail near the camera (the
+stride-2 ring is the memory hog). Tune accordingly: reach for another coarse
+level before widening a fine one.
+
+A large unclaimed optimization: the heightfield emits one quad per column even
+across flat ground. Greedy-merging equal-height neighbours would collapse flat
+regions substantially.
 
 ## Non-goals
 

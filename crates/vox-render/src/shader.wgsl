@@ -34,10 +34,17 @@ var block_tex: texture_2d_array<f32>;
 @group(2) @binding(1)
 var block_sampler: sampler;
 
-// Sky / day-night uniform (M07 task 3, ADR-0007). x = sky_scale (0..1); yzw
-// reserved for the sky pass (task 3b).
+// Sky / day-night / fog uniform (group 3).
+//   cam_scale : xyz = camera position (render-relative), w = sky_scale
+//   fog_color : rgb = colour terrain fades toward, w = strength (0 = off)
+//   fog_range : x = start distance, y = end distance (blocks)
+struct SkyChunk {
+    cam_scale: vec4<f32>,
+    fog_color: vec4<f32>,
+    fog_range: vec4<f32>,
+};
 @group(3) @binding(0)
-var<uniform> sky: vec4<f32>;
+var<uniform> sky: SkyChunk;
 
 struct VsIn {
     @location(0) position: vec3<f32>,
@@ -55,6 +62,8 @@ struct VsOut {
     @location(2) sky: f32,
     @location(3) block: f32,
     @location(4) shade: f32,
+    // Render-relative world position, for measuring view distance (fog).
+    @location(5) world_rel: vec3<f32>,
 };
 
 @vertex
@@ -67,6 +76,7 @@ fn vs_main(in: VsIn) -> VsOut {
     out.sky = in.sky;
     out.block = in.block;
     out.shade = in.shade;
+    out.world_rel = world_rel;
     return out;
 }
 
@@ -93,7 +103,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     // Day/night: dim the SKY channel by sky_scale, leaving block light (torches)
     // untouched. sky_scale is driven per-frame by vox_core::WorldTime.
-    let sky_scale = sky.x;
+    let sky_scale = sky.cam_scale.w;
 
     // Curve each light source FIRST, then combine. This keeps the falloff
     // exponent (spatial shading, in light_curve) separate from the day/night
@@ -105,5 +115,21 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let sky_lit = light_curve(in.sky) * sky_scale;
     let block_lit = light_curve(in.block);
     let brightness = in.shade * max(sky_lit, block_lit);
-    return vec4<f32>(tex.rgb * brightness, 1.0);
+    var color = tex.rgb * brightness;
+
+    // Distance fog (M09 amendment A2). Terrain fades toward the sky as it
+    // recedes, which is what makes the LOD detail transitions unreadable:
+    // contrast drops before the change in resolution becomes visible. Squaring
+    // the ramp keeps nearby terrain crisp and concentrates the fade far out.
+    let fog_strength = sky.fog_color.w;
+    if (fog_strength > 0.0) {
+        let dist = length(in.world_rel - sky.cam_scale.xyz);
+        let t = clamp(
+            (dist - sky.fog_range.x) / max(sky.fog_range.y - sky.fog_range.x, 1.0),
+            0.0,
+            1.0,
+        );
+        color = mix(color, sky.fog_color.rgb, t * t * fog_strength);
+    }
+    return vec4<f32>(color, 1.0);
 }
