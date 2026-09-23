@@ -149,3 +149,165 @@ regions substantially.
 - Per-level constants live where M08 put the single level's (top of
   `vox-app/main.rs`); keep them together.
 - Read the M08 retro's "Known limitations" — criteria 1–4 map to it 1:1.
+
+---
+
+# Retrospective (2026-08-25)
+
+## What shipped
+
+**Streaming (criteria 1–2).** A distance-keyed batch selector in `vox-core`
+drains the relight, mesh, gen and LOD queues **nearest-camera-first**, replacing
+arbitrary `HashSet` order. Paired with a first-light gate so a chunk whose first
+relight ran without all six neighbours is not meshed dark and forgotten. Between
+them these closed the black-chunk defect carried since M08 and cut the relight
+bill by roughly 3×.
+
+**Multi-level LOD (criteria 3–5).** `LodRing` generalized to per-level
+(stride, outer) pairs — shipped as strides 2/4/8 at 512/1024/2048 blocks — with
+an exact inter-level partition and per-level hysteresis, headlessly tested per
+boundary. The near ring reads real column heights where they are known and falls
+back to seed sampling elsewhere.
+
+**A1 — heightfield LOD (design correction).** Criteria 1–5 were met with
+voxel-grid nodes and the result still read as obviously-not-terrain: a voxel
+grid quantizes *height* to the cell size, so distant terrain came out as stacked
+terraces. LOD now stores exact per-column heights and meshes a top quad plus
+walls down to lower neighbours. Horizontal detail is quantized; vertical detail
+is exact. Supersedes the "LOD node = scaled chunk" claim in ADR-0008.
+
+**A2 — distance fog.** The single largest remaining reason the falloff was
+obvious. Fog drops contrast before a detail change becomes readable.
+
+**A3 — settings menu (ESC).** Live sliders for render distance, LOD radii, fog,
+geomorph band, and time of day. Every visual decision in this milestone
+previously cost a recompile-and-squint cycle. This paid for itself repeatedly
+and is the reason the geomorph bugs below were findable at all.
+
+**A4 — geomorph (ADR-0009).** Each LOD vertex carries the Y it takes at the next
+coarser level, and the vertex shader lerps toward it so a handover swaps
+geometry for geometry that already matches. The enabling property: strides nest
+2:1 and every level takes the *minimum* surface over its cell, and minimum is
+associative — so a coarse cell is exactly the minimum of the four fine cells
+inside it, computable locally with no extra sampling.
+
+**Crosshair.** A centre dot, drawn through the existing egui pass rather than a
+dedicated wgpu pipeline.
+
+## Numbers (owner's machine, 3 levels, load radius 8, ~1 km horizon)
+
+| | M08 | M09 |
+|---|---|---|
+| Stationary, drained | — | **851–967 fps**, worst frame 3.3 ms |
+| Sprint-fly, per-second | ~92–97 fps | **127–564 fps**, median ~180, min 127 |
+| Sprint-fly, worst frame | — | 16–33 ms typical, one 61.5 ms outlier |
+| Dirty backlog | ~2000, **plateaued** | **0–410, repeatedly drains to 0** |
+| Relight | ~390 ms/s | **95–130 ms/s** |
+| Mesh | ~500 ms/s | 500–590 ms/s (unchanged) |
+| LOD backlog | — | **0 in every sample** |
+
+- LOD nodes resident: 640 at spawn, peak 864, settling ~752. GPU 309 MB idle,
+  380–434 MB in flight. 0.7–1.4 M triangles drawn of ~700–850 meshes.
+- Criterion 6's fps envelope is **met on the per-second average** (floor 127 vs
+  the ≥ 90 target) and **not met on worst-frame** — a 26–33 ms frame is 30–38 fps
+  instantaneously, and one outlier hit 61.5 ms. Reporting both rather than
+  picking the flattering reading.
+- The backlog result is the headline: M08's ~2000 was a *plateau* that never
+  drained during flight. M09 peaks at 410 and returns to 0 repeatedly, so the
+  queue is keeping up rather than falling behind.
+- Headless tests at close: vox-core 190, vox-mesh 35, vox-worldgen 12.
+
+## Bugs found and fixed along the way
+
+Every one of these was found by playing the build, not by reading the code.
+
+1. **Ghost blocks I — phantom nodes.** Both LOD invalidation paths pushed a node
+   id into the pending queue for *every* level unconditionally. Level 1's
+   annulus starts 16 chunks out, so breaking a block queued a stride-4 and a
+   stride-8 node **at the player's feet**, built from seed heights, on top of the
+   full-res terrain — where suppression can't reach it (its footprint fails the
+   whole-footprint-inside-radius pre-filter) and nothing unloads it until the
+   camera travels 256 blocks. Now only nodes the ring already wanted are
+   re-requested.
+2. **Ghost blocks II — coarse levels never saw edits.** Real heights were gated
+   behind `if n.level == 0`, so strides 4 and 8 were built from the seed forever.
+   Fixed with `EditedColumns`, a sparse chunk-bucketed overlay applied at every
+   level. Sparse because the dense alternative is 32×32×stride² lookups per node
+   — 65 536 at stride 8, nearly all misses on columns no chunk has loaded.
+3. **White speckling across the LOD.** The morph lowers each cell to its *own*
+   2×2 group minimum, so the two ends of a wall sink at different rates: a
+   neighbour that starts level or higher can finish well below (a face never
+   emitted), and an existing wall's top can sink beneath its bottom (winding
+   flips, back-face culling deletes it). Both are see-through holes that widen
+   with the band. The mesher now emits a wall if the cells differ at *either* end
+   of the morph, and the invariant is tested directly.
+4. **White flash on ring re-centre.** The unload loop dropped ~150 meshes in the
+   frame the ring re-centred while replacements took many frames to build. Nodes
+   are now *retired* rather than deleted — a node's geometry depends only on its
+   own id and the terrain, never the camera, so a retired mesh stays correct and
+   can keep drawing until its replacement lands (or be adopted back unchanged).
+5. **Geomorph silently disabled by the floating origin.** Each node's morph
+   completion distance rides in the offset uniform's `.w`, previously commented
+   "unused padding" — and `set_render_origin` rewrote that uniform with `.w = 0`.
+   The render origin moves every chunk crossing, so morphing switched itself off
+   across the whole world within 32 blocks of walking.
+6. **Geomorph measured from the wrong reference.** ADR-0009 originally measured
+   morph distance from the ring's *snapped centre*, on the reasoning that this is
+   where the annuli are measured from, so `t` would reach 1.0 exactly at the
+   handover. That ignored time: the snapped centre is frozen between ring
+   updates, then teleports 256 blocks at the instant of the swap. `t` never
+   animated — it was a step function firing simultaneously with the thing it
+   existed to hide. Now measured from the camera. **A reference frame that is
+   exact but quantised is useless for smoothing.**
+
+## Process notes
+
+- **Only the owner can see the renderer.** `vox-render` and `vox-app` cannot be
+  compiled in the sandbox — not for missing system libraries, but because Cargo
+  1.75 cannot parse the winit/wgpu dependency tree, so no amount of installing
+  reaches them. Three separate handoff failures this milestone came from
+  changing one side of a contract that crosses that boundary. The mechanical
+  checks that replace the compiler are now written down in
+  `docs/notes/clippy-lints.md`: grep the repo for every changed shared type, run
+  `cargo build --workspace --all-targets` and expect empty output, and audit
+  bind-group `visibility` flags against every shader stage that reads them.
+- **Net totals hide gaps.** The white-flash investigation was misdirected for
+  two rounds by reading a LOD mesh *total* that rose (+48 loaded, −24 dropped)
+  while coverage genuinely had a hole. Instrument the thing that is wrong, not
+  the aggregate that contains it.
+- **The owner's observations beat the assistant's theories, repeatedly.** "It
+  scales with the band slider" and "it's the sky behind the chunks" each cut
+  straight to a root cause that reasoning from the code had missed.
+
+## Known limitations → M10
+
+1. **Edits are invisible to coarse LOD across sessions.** `EditedColumns` is
+   session-local, so reopening a world and approaching an old dig site from far
+   away shows pre-edit coarse terrain until the chunk loads. Closing this means
+   reading edit metadata from storage, which brushes M09's "no persistence of
+   LOD nodes" non-goal.
+2. **Full-res meshing is the remaining hitch.** 500–590 ms/s during flight,
+   unchanged from M08, and the source of the 26–33 ms worst frames. Relight was
+   fixed by prioritisation; meshing was not, because the cost is throughput, not
+   ordering. The unclaimed greedy-merge optimisation (collapsing equal-height
+   neighbours) is the obvious lever — note that it must preserve morph targets
+   as well as heights, or it reintroduces bug 3 above.
+3. **The horizon is uniformly green.** Distant terrain is hard to *evaluate*,
+   let alone enjoy, because there is nothing for the eye to catch. Height-based
+   tint was considered and deliberately deferred rather than shipped as a
+   placeholder: altitude banding is what real biome data produces, and any ramp
+   tuned against the current placeholder relief ([-59, +108]) is throwaway. This
+   belongs to worldgen, applied to both pipelines from shared code.
+4. **Level radii and skirt depths were never deliberately tuned** — 512/1024/2048
+   with strides 2/4/8 is the original proposal, kept because it looked right in
+   play. Tuned by inspection, not by measurement.
+5. **Residual pop at handover.** Camera-relative morph cannot complete exactly at
+   a swap radius measured from the snapped centre. If a wide band does not hide
+   it, ADR-0009 records the next step: a per-node factor animated over *time*
+   when the ring retires a node, riding on the retirement machinery from bug 4.
+
+## Next
+
+**M10 — worldgen.** Real terrain: geology, climate, biomes. It is also what
+makes the LOD work above finally judgeable, and where limitation 3 gets its
+proper answer.

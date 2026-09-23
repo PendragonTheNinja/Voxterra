@@ -34,14 +34,18 @@ var block_tex: texture_2d_array<f32>;
 @group(2) @binding(1)
 var block_sampler: sampler;
 
-// Sky / day-night / fog uniform (group 3).
+// Sky / day-night / fog / morph uniform (group 3). ONE buffer, shared with
+// lod.wgsl — both files must declare the same layout even though each ignores
+// some of it.
 //   cam_scale : xyz = camera position (render-relative), w = sky_scale
 //   fog_color : rgb = colour terrain fades toward, w = strength (0 = off)
-//   fog_range : x = start distance, y = end distance (blocks)
+//   fog_range : x = fog start, y = fog end (blocks), zw reserved
+//   morph     : x = geomorph band width in blocks — lod.wgsl only (ADR-0009)
 struct SkyChunk {
     cam_scale: vec4<f32>,
     fog_color: vec4<f32>,
     fog_range: vec4<f32>,
+    morph: vec4<f32>,
 };
 @group(3) @binding(0)
 var<uniform> sky: SkyChunk;

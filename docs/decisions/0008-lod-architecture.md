@@ -153,3 +153,45 @@ claim are validated by a headless PoC against the real worldgen (numbers above).
 The lighting and seam decisions are design choices grounded in ADR-0005 and
 established LOD practice, not yet prototyped — M08 is where they get built and
 proven.
+
+---
+
+## Implementation status (2026-08-25, after M09)
+
+Both halves this ADR deferred to M09 are now implemented, with two claims
+superseded.
+
+**Implemented:**
+
+- **The octree half.** Multiple concentric levels (strides 2/4/8 at
+  512/1024/2048 blocks), with an exact inter-level partition and per-level
+  hysteresis in `vox_core::lod::LodRing`. The depth-bias overlap trick remains
+  *only* at the full-res edge, as designed; between LOD levels the partition is
+  exact.
+- **The near-ring half.** The innermost ring uses real column heights where they
+  are known, falling back to seed sampling elsewhere.
+- **Async budgeting.** LOD generation and meshing run on the rayon pool behind a
+  per-frame spawn budget, drained nearest-camera-first. LOD backlog measured 0
+  in every telemetry sample of the M09 close-out run.
+
+**Superseded:**
+
+- **"An LOD node is a scaled chunk, reusing the greedy mesher."** Wrong, and
+  wrong for a reason worth recording: a voxel grid quantizes *height* to the
+  cell size, so distant terrain rendered as stacked terraces that three rounds
+  of stride tuning could not lift. M09 amendment A1 replaced it with a
+  heightfield — exact per-column heights, meshed as a top quad plus walls down
+  to lower neighbours. Horizontal detail is quantized; vertical detail is exact.
+  The reuse was elegant and shipped fast; it was also the visual ceiling.
+- **The coarse-cell classification question** (which block id represents a mixed
+  cube) is moot under a heightfield — there are no mixed cubes, only column
+  heights. The *geology* version of the question survives: which surface
+  material represents a coarse cell once rock types vary. That returns with
+  worldgen.
+
+**Still open, as flagged here:** per-level radii, level count, and skirt depths
+remain tuning knobs. M09 shipped the original proposal unchanged because it
+looked right in play — tuned by inspection, not by measurement.
+
+Geomorph transitions, listed here as an M09 item, are specified separately in
+ADR-0009.

@@ -18,6 +18,9 @@
 //!   forever. This is what makes a world reproducible from a seed and lets
 //!   the streamer regenerate instead of always loading from disk.
 
+pub mod elevation;
+
+use elevation::Elevation;
 use vox_core::{BlockId, CHUNK_SIZE, Chunk, ChunkPos, LocalPos};
 
 /// Block ids used by the placeholder generator. These now come from the
@@ -34,11 +37,22 @@ const DIRT_DEPTH: i64 = 4;
 #[derive(Clone, Copy, Debug)]
 pub struct Generator {
     seed: u64,
+    elevation: Elevation,
 }
 
 impl Generator {
     pub fn new(seed: u64) -> Self {
-        Self { seed }
+        Self {
+            seed,
+            elevation: Elevation::new(seed),
+        }
+    }
+
+    /// The elevation field backing [`Self::surface_height`]. Exposed so callers
+    /// can query individual stages (debug views, tuning) without duplicating
+    /// the composition.
+    pub fn elevation(&self) -> &Elevation {
+        &self.elevation
     }
 
     pub fn seed(&self) -> u64 {
@@ -53,21 +67,7 @@ impl Generator {
     /// vertically compute the same surface for the same column, which is
     /// what keeps cubic chunks seamless.
     pub fn surface_height(&self, wx: i64, wz: i64) -> i64 {
-        // Placeholder terrain, tuned for LOD testing (M08 task 5, owner-
-        // approved amendment): three octaves of value noise. The mountain
-        // octave is CUBED — flats stay flat, extremes get pushed out — giving
-        // real peaks (~+116) and valleys (~-64) instead of uniform rolling
-        // hills. Range must stay inside the LOD node Y band
-        // ([LOD_Y_ORIGIN_BLOCKS, +128) in vox-app) and adjacent-column slope
-        // under the smoothness test's bound. Real geology replaces all of this
-        // in a future milestone (ADR-0008 records the coarse-query constraint
-        // it must preserve).
-        let base = 26.0;
-        let m = self.value_noise(wx, wz, 192);
-        let mountains = m * m * m * 64.0; // cubed: dramatic peaks, flat plains
-        let hills = self.value_noise(wx, wz, 48) * 20.0; // broad rolling hills
-        let detail = self.value_noise(wx, wz, 12) * 6.0; // finer bumps
-        (base + mountains + hills + detail).round() as i64
+        self.elevation.height(wx, wz)
     }
 
     /// Generate the chunk at `pos` independently. Empty (all-air) chunks —
@@ -168,54 +168,6 @@ impl Generator {
             blocks::STONE
         }
     }
-
-    /// Value noise in [-1, 1] at a lattice spacing of `cell` blocks.
-    /// Hash the four surrounding lattice corners, smoothstep-interpolate.
-    fn value_noise(&self, wx: i64, wz: i64, cell: i64) -> f32 {
-        let x0 = wx.div_euclid(cell);
-        let z0 = wz.div_euclid(cell);
-        let fx = (wx.rem_euclid(cell)) as f32 / cell as f32;
-        let fz = (wz.rem_euclid(cell)) as f32 / cell as f32;
-
-        let c00 = self.lattice_value(x0, z0);
-        let c10 = self.lattice_value(x0 + 1, z0);
-        let c01 = self.lattice_value(x0, z0 + 1);
-        let c11 = self.lattice_value(x0 + 1, z0 + 1);
-
-        let sx = smoothstep(fx);
-        let sz = smoothstep(fz);
-        let top = lerp(c00, c10, sx);
-        let bottom = lerp(c01, c11, sx);
-        lerp(top, bottom, sz)
-    }
-
-    /// Deterministic hashed value in [-1, 1] for a lattice point.
-    fn lattice_value(&self, lx: i64, lz: i64) -> f32 {
-        let h = hash3(self.seed, lx as u64, lz as u64);
-        // Map u64 → [-1, 1].
-        (h as f64 / u64::MAX as f64) as f32 * 2.0 - 1.0
-    }
-}
-
-fn smoothstep(t: f32) -> f32 {
-    t * t * (3.0 - 2.0 * t)
-}
-
-fn lerp(a: f32, b: f32, t: f32) -> f32 {
-    a + (b - a) * t
-}
-
-/// Mix three u64s into a well-distributed hash (SplitMix-style finalizer
-/// over a seeded combination). Deterministic and platform-independent.
-fn hash3(seed: u64, a: u64, b: u64) -> u64 {
-    let mut z = seed;
-    for v in [a, b] {
-        z = z.wrapping_add(v).wrapping_add(0x9E3779B97F4A7C15);
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-        z ^= z >> 31;
-    }
-    z
 }
 
 #[cfg(test)]
@@ -236,11 +188,20 @@ mod tests {
     }
 
     /// Different seeds should (almost always) produce different terrain.
+    ///
+    /// Compares SURFACE HEIGHTS across a wide spread rather than one chunk's
+    /// blocks. Since M10 the world is mostly ocean thousands of blocks below
+    /// Y = 0, so the chunk at the origin is usually empty air under every seed
+    /// — a comparison that would pass or fail on where the coastline happened
+    /// to fall rather than on whether the seeds differ.
     #[test]
     fn different_seeds_differ() {
-        let a = Generator::new(1).generate_chunk(ChunkPos::new(0, 0, 0));
-        let b = Generator::new(2).generate_chunk(ChunkPos::new(0, 0, 0));
-        let differ = LocalPos::iter().any(|p| a.get(p) != b.get(p));
+        let a = Generator::new(1);
+        let b = Generator::new(2);
+        let differ = (0..64).any(|i| {
+            let (x, z) = (i * 1_511, i * 977 - 30_000);
+            a.surface_height(x, z) != b.surface_height(x, z)
+        });
         assert!(differ, "two seeds produced identical terrain");
     }
 
@@ -321,7 +282,7 @@ mod tests {
         let worldgen = Generator::new(123);
         for x in -100..100 {
             for z in (-100..100).step_by(7) {
-                let n = worldgen.value_noise(x, z, 16);
+                let n = worldgen.elevation().value_noise(x, z, 16);
                 assert!((-1.0..=1.0).contains(&n), "noise out of range: {n}");
             }
         }

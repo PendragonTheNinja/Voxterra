@@ -75,23 +75,30 @@ impl SettingsUi {
         self.state.on_window_event(window, event).consumed
     }
 
-    /// Build the menu for this frame and return the tessellated output, or
-    /// `None` when the menu is closed (no UI work at all while playing).
+    /// Build this frame's UI and return the tessellated output.
+    ///
+    /// Runs even when the menu is closed, because the crosshair is drawn here
+    /// too — see [`Self::crosshair`] for why that is worth a per-frame egui
+    /// pass. While closed the pass paints two circles and nothing else, and
+    /// egui receives no events (`on_window_event` returns early), so there is
+    /// no interaction cost.
     pub fn run(
         &mut self,
         window: &winit::window::Window,
         settings: &mut Settings,
     ) -> Option<UiOutput> {
-        if !self.open {
-            return None;
-        }
         let raw_input = self.state.take_egui_input(window);
         let status = self.status.clone();
         let screen = &mut self.screen;
         let mut close = false;
         let mut quit = false;
 
+        let menu_open = self.open;
         let full = self.ctx.run(raw_input, |ctx| {
+            if !menu_open {
+                Self::crosshair(ctx);
+                return;
+            }
             // Dim the world behind the menu, so the UI reads as a layer over a
             // paused game rather than a panel floating in the scene.
             egui::Area::new(egui::Id::new("menu_dim"))
@@ -142,6 +149,35 @@ impl SettingsUi {
             textures_free: full.textures_delta.free,
             pixels_per_point: full.pixels_per_point,
         })
+    }
+
+    /// A small dot at the exact centre of the screen, marking where the
+    /// raycast is aimed.
+    ///
+    /// Drawn through egui rather than a dedicated wgpu pass: egui is already
+    /// wired up (A3) and this costs two tessellated circles, where a
+    /// screen-space quad would need its own shader, pipeline, vertex buffer
+    /// and resize handling for the same two circles.
+    ///
+    /// Dark disc under a light one, rather than a single dot, so it stays
+    /// readable against both bright sky and dark stone without needing a
+    /// blend mode or an inverting shader.
+    fn crosshair(ctx: &egui::Context) {
+        let centre = ctx.screen_rect().center();
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("crosshair"),
+        ));
+        painter.circle_filled(
+            centre,
+            CROSSHAIR_RADIUS + 1.0,
+            egui::Color32::from_black_alpha(150),
+        );
+        painter.circle_filled(
+            centre,
+            CROSSHAIR_RADIUS,
+            egui::Color32::from_white_alpha(230),
+        );
     }
 
     /// The pause screen: title and a stack of equally sized buttons.
@@ -275,6 +311,24 @@ impl SettingsUi {
                         });
                     });
 
+                    Self::section(ui, "LOD geomorph", |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "How far before a LOD ring boundary terrain starts \
+                                 morphing into the next coarser level. 0 = off.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                        ui.add(
+                            egui::Slider::new(
+                                &mut settings.lod_morph_band,
+                                ranges::LOD_MORPH_BAND.0..=ranges::LOD_MORPH_BAND.1,
+                            )
+                            .text("morph band (blocks)"),
+                        );
+                    });
+
                     Self::section(ui, "Time & sky", |ui| {
                         ui.checkbox(&mut settings.time_paused, "pause day/night");
                         ui.add(
@@ -358,6 +412,9 @@ pub enum Screen {
     Options,
 }
 
+/// Crosshair dot radius in logical pixels. Small enough not to obscure the
+/// block being aimed at, large enough to find on a busy skyline.
+const CROSSHAIR_RADIUS: f32 = 2.0;
 const MENU_WIDTH: f32 = 380.0;
 const BUTTON_HEIGHT: f32 = 34.0;
 const BUTTON_GAP: f32 = 8.0;

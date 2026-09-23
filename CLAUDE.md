@@ -192,12 +192,21 @@ beyond what the invariants above already require.
 
 ## Current status
 
-- **Active milestone:** 09 — LOD Levels & Streaming Quality (spec:
-  `docs/milestones/09-lod-octree-streaming.md`). Multi-level LOD, exact
-  near-ring downsample, priority-ordered budgeted streaming (fixes the
-  transient-unlit-chunk and sprint-fly-throughput issues from the M08 retro),
-  geomorph as stretch.
-- **Last completed milestone:** 08 — Single-Level LOD (2026-07-09);
+- **Active milestone:** none — M09 closed 2026-08-25. Next is 10 — Worldgen
+  (geology, climate, biomes); spec not yet written.
+- **Last completed milestone:** 09 — LOD Levels & Streaming Quality
+  (2026-08-25); retrospective with numbers at the end of
+  `docs/milestones/09-lod-octree-streaming.md`. Shipped: nearest-camera-first
+  draining of every streaming queue plus a first-light gate (black chunks
+  fixed; relight ~390 ms/s → ~100 ms/s; dirty backlog no longer plateaus at
+  ~2000, now peaks ~410 and drains); multi-level `LodRing` (strides 2/4/8,
+  exact inter-level partition, per-level hysteresis); heightfield LOD
+  (`mesh_lod_heightfield`) replacing voxel-grid nodes; distance fog; an ESC
+  settings menu with live sliders; geomorph (ADR-0009, `LodVertex` +
+  `lod.wgsl`); `EditedColumns` so player edits reach every LOD level; LOD node
+  *retirement* instead of immediate unload; a crosshair. ADR-0009 accepted;
+  ADR-0008's "LOD node = scaled chunk" claim superseded.
+- **Prior milestone:** 08 — Single-Level LOD (2026-07-09);
   retrospective with numbers at the end of
   `docs/milestones/08-lod-single-level.md`. Shipped: seed-driven coarse nodes
   (`generate_lod_node`, round-down classification, baked skylight),
@@ -205,8 +214,8 @@ beyond what the invariants above already require.
   (disjoint partition + hysteresis), depth-biased LOD render path, budgeted
   async node streaming. Placeholder terrain gained mountains (~[-59, +108]).
   ADR-0008 accepted.
-- **Prior milestone:** 07 — Day/Night Cycle (2026-07-06); retrospective at the
-  end of `docs/milestones/07-day-night.md`.
+- Milestone 07 — Day/Night Cycle (2026-07-06); retrospective at the end of
+  `docs/milestones/07-day-night.md`.
 - Completed milestones have retrospectives in `docs/milestones/`.
 - Milestones 02 (Infinite World, 2026-06-14) and 03 are complete; see their
   retrospectives in `docs/milestones/`.

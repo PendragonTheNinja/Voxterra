@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use glam::{Mat4, Vec3, Vec4};
 use vox_core::{CHUNK_SIZE, ChunkPos, WorldPos};
-use vox_mesh::MeshData;
+use vox_mesh::{LodMeshData, MeshData};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
@@ -73,10 +73,18 @@ struct GpuMesh {
     bytes: u64,
     aabb_min: Vec3,
     aabb_max: Vec3,
+    /// The AABB's offset from the mesh's own origin. Zero for chunks; for LOD
+    /// nodes it is the mesh's `y_min`, so a render-origin move can reposition
+    /// the box without flattening it back onto the node origin.
+    aabb_offset: Vec3,
     /// Uniform holding `offset.xyz = (chunk_world_origin - render_origin)`,
     /// rewritten when the render origin moves.
     offset_buffer: wgpu::Buffer,
     offset_bind_group: wgpu::BindGroup,
+    /// The uniform's `.w`, kept so a render-origin move can rewrite `.xyz`
+    /// WITHOUT destroying it. LOD nodes carry their geomorph completion
+    /// distance there (ADR-0009); full-res chunks carry 0.
+    offset_w: f32,
 }
 
 /// Sky-pass uniform (M07 task 3b, ADR-0007). Must match `SkyUniform` in
@@ -120,6 +128,23 @@ pub struct FogParams {
     pub start: f32,
     /// Distance (blocks) where fog reaches full strength.
     pub end: f32,
+}
+
+/// Geomorph inputs for one frame (M09 amendment A4, ADR-0009).
+///
+/// Distant LOD lerps toward the next coarser level's silhouette as the camera
+/// nears a ring boundary, so the handover swaps geometry for geometry that
+/// already matches. Per-node data (where each level's morph completes) rides in
+/// that node's offset uniform; these two values are global to the frame.
+#[derive(Debug, Clone, Copy)]
+pub struct MorphParams {
+    /// Width in blocks of the band before each boundary over which the morph
+    /// runs. 0 disables morphing.
+    ///
+    /// Distance is measured from the CAMERA (`cam_scale.xyz`, already in this
+    /// uniform for fog) rather than the ring's snapped centre, because the
+    /// snapped centre is frozen between ring updates — see lod.wgsl.
+    pub band: f32,
 }
 
 pub struct Renderer {
@@ -292,12 +317,19 @@ impl Renderer {
             }],
         });
 
-        // --- Sky uniform (group 3, M07 task 3). A vec4: x = sky_scale, yzw
-        // reserved for the sky pass (task 3b). Fragment-visible. Starts at 1.0
-        // (full daylight) so first frame matches M06 until the loop drives it. ---
+        // --- Sky / day-night / fog / morph uniform (group 3, M07 task 3).
+        // Starts zeroed; the first `set_sky` fills it before anything draws.
+        //
+        // VERTEX_FRAGMENT, not FRAGMENT: lighting and fog read it per-fragment,
+        // but geomorph reads the snapped LOD centre and band width in lod.wgsl's
+        // VERTEX stage to place each vertex (ADR-0009). A stage missing from
+        // these flags is a pipeline-creation panic, not a compile error. ---
         let sky_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sky uniform"),
-            size: std::mem::size_of::<[f32; 12]>() as u64,
+            // 4 vec4s: camera+sky_scale, fog colour, fog range + snapped LOD
+            // centre, morph params (ADR-0009). Must match `SkyChunk` in both
+            // shader.wgsl and lod.wgsl.
+            size: std::mem::size_of::<[f32; 16]>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -305,7 +337,7 @@ impl Renderer {
             label: Some("sky bgl"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -439,16 +471,26 @@ impl Renderer {
         // where a near LOD ring overlaps full-res chunks the full-res surface
         // wins the depth test (no z-fighting, no double terrain). LOD node
         // meshes carry the same vertex format and use the same bind groups. ---
+        // Coarse LOD gets its OWN shader (ADR-0009): its vertices carry a
+        // geomorph target where full-res carries block light, and it is
+        // skylight-only by design. Same bind groups, same uniforms.
+        let lod_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("lod shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("lod.wgsl").into()),
+        });
         let lod_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("lod pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
+                module: &lod_shader,
+                entry_point: Some("vs_lod"),
                 compilation_options: Default::default(),
                 buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<vox_mesh::Vertex>() as u64,
+                    array_stride: std::mem::size_of::<vox_mesh::LodVertex>() as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
+                    // Matches vox_mesh::LodVertex: position, uv, layer, sky,
+                    // morph_y, shade. Slot 4 is the MORPH TARGET here, where
+                    // the full-res layout has block light.
                     attributes: &wgpu::vertex_attr_array![
                         0 => Float32x3, 1 => Float32x2, 2 => Uint32,
                         3 => Float32, 4 => Float32, 5 => Float32
@@ -456,8 +498,8 @@ impl Renderer {
                 }],
             },
             fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
+                module: &lod_shader,
+                entry_point: Some("fs_lod"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: config.format,
@@ -684,7 +726,13 @@ impl Renderer {
             return;
         }
         let offset = chunk_offset(pos, self.render_origin);
-        let gpu = self.build_gpu_mesh(offset, Vec3::splat(CHUNK_SIZE as f32), mesh);
+        let gpu = self.build_gpu_mesh(
+            offset,
+            Vec3::splat(CHUNK_SIZE as f32),
+            0.0,
+            &mesh.vertices,
+            &mesh.indices,
+        );
         self.buffer_bytes += gpu.bytes;
         if let Some(old) = self.meshes.insert(pos, gpu) {
             self.buffer_bytes -= old.bytes;
@@ -700,22 +748,50 @@ impl Renderer {
     /// world Y band — and using the horizontal span for height makes the box
     /// far too short, so frustum culling drops nodes that are plainly on
     /// screen (visible as terrain vanishing below you when flying high).
-    fn build_gpu_mesh(&self, offset: Vec3, extent: Vec3, mesh: &MeshData) -> GpuMesh {
+    /// Upload one mesh. Generic over the vertex type so the full-resolution
+    /// and LOD formats (`vox_mesh::Vertex` / `LodVertex`) share it — they
+    /// differ only in what slot 4 means (ADR-0009).
+    ///
+    /// `extra` rides in the offset uniform's unused `.w`: the LOD path puts
+    /// the node's geomorph completion distance there; full-res passes 0.
+    fn build_gpu_mesh<V: bytemuck::Pod>(
+        &self,
+        offset: Vec3,
+        extent: Vec3,
+        extra: f32,
+        vertices: &[V],
+        indices: &[u32],
+    ) -> GpuMesh {
+        self.build_gpu_mesh_at(offset, Vec3::ZERO, extent, extra, vertices, indices)
+    }
+
+    /// As [`Self::build_gpu_mesh`], but with the culling AABB offset from the
+    /// mesh's own origin — LOD nodes are wide and (relative to a 20 000-block
+    /// world) short, and sit at whatever height their terrain does.
+    fn build_gpu_mesh_at<V: bytemuck::Pod>(
+        &self,
+        offset: Vec3,
+        aabb_offset: Vec3,
+        extent: Vec3,
+        extra: f32,
+        vertices: &[V],
+        indices: &[u32],
+    ) -> GpuMesh {
         let vertex_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("mesh vertices"),
-                contents: bytemuck::cast_slice(&mesh.vertices),
+                contents: bytemuck::cast_slice(vertices),
                 usage: wgpu::BufferUsages::VERTEX,
             });
         let index_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("mesh indices"),
-                contents: bytemuck::cast_slice(&mesh.indices),
+                contents: bytemuck::cast_slice(indices),
                 usage: wgpu::BufferUsages::INDEX,
             });
-        let offset_data = [offset.x, offset.y, offset.z, 0.0];
+        let offset_data = [offset.x, offset.y, offset.z, extra];
         let offset_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -731,15 +807,16 @@ impl Renderer {
                 resource: offset_buffer.as_entire_binding(),
             }],
         });
-        let bytes = (std::mem::size_of_val(&mesh.vertices[..])
-            + std::mem::size_of_val(&mesh.indices[..])) as u64;
+        let bytes = (std::mem::size_of_val(vertices) + std::mem::size_of_val(indices)) as u64;
         GpuMesh {
+            offset_w: extra,
             vertex_buffer,
             index_buffer,
-            index_count: mesh.indices.len() as u32,
+            index_count: indices.len() as u32,
             bytes,
-            aabb_min: offset,
-            aabb_max: offset + extent,
+            aabb_min: offset + aabb_offset,
+            aabb_max: offset + aabb_offset + extent,
+            aabb_offset,
             offset_buffer,
             offset_bind_group,
         }
@@ -756,8 +833,8 @@ impl Renderer {
         origin: ChunkPos,
         level: u32,
         span_blocks: f32,
-        height_blocks: f32,
-        mesh: &MeshData,
+        morph_end_blocks: f32,
+        mesh: &LodMeshData,
     ) {
         let key = (origin, level);
         if mesh.is_empty() {
@@ -767,10 +844,16 @@ impl Renderer {
             return;
         }
         let offset = chunk_offset(origin, self.render_origin);
-        let gpu = self.build_gpu_mesh(
+        // Vertical extent comes from the MESH, not the world's Y band. With
+        // M10's ~20 000-block world a band-height AABB would span everything
+        // and vertical frustum culling would stop rejecting anything.
+        let gpu = self.build_gpu_mesh_at(
             offset,
-            Vec3::new(span_blocks, height_blocks, span_blocks),
-            mesh,
+            Vec3::new(0.0, mesh.y_min, 0.0),
+            Vec3::new(span_blocks, mesh.y_max - mesh.y_min, span_blocks),
+            morph_end_blocks,
+            &mesh.vertices,
+            &mesh.indices,
         );
         self.buffer_bytes += gpu.bytes;
         if let Some(old) = self.lod_meshes.insert(key, gpu) {
@@ -830,17 +913,25 @@ impl Renderer {
             let offset = chunk_offset(pos, origin);
             mesh.aabb_min = offset;
             mesh.aabb_max = offset + Vec3::splat(CHUNK_SIZE as f32);
-            let data = [offset.x, offset.y, offset.z, 0.0];
+            let data = [offset.x, offset.y, offset.z, mesh.offset_w];
             self.queue
                 .write_buffer(&mesh.offset_buffer, 0, bytemuck::cast_slice(&data));
         }
-        // LOD meshes: same reposition, but preserve each node's (larger) span.
+        // LOD meshes: same reposition, but preserve each node's (larger) span
+        // AND its vertical offset — the AABB hugs the node's terrain, which is
+        // rarely at the node's own origin in a 20 000-block-tall world.
+        //
+        // `.w` MUST be carried through, not re-zeroed. It holds the node's
+        // geomorph completion distance, and the render origin moves every time
+        // the camera crosses a chunk — every 32 blocks. Zeroing it here silently
+        // switched morphing off for the entire world a few steps into any walk,
+        // which is exactly when morphing is the thing you would notice.
         for (&(pos, _level), mesh) in self.lod_meshes.iter_mut() {
             let extent = mesh.aabb_max - mesh.aabb_min;
             let offset = chunk_offset(pos, origin);
-            mesh.aabb_min = offset;
-            mesh.aabb_max = offset + extent;
-            let data = [offset.x, offset.y, offset.z, 0.0];
+            mesh.aabb_min = offset + mesh.aabb_offset;
+            mesh.aabb_max = mesh.aabb_min + extent;
+            let data = [offset.x, offset.y, offset.z, mesh.offset_w];
             self.queue
                 .write_buffer(&mesh.offset_buffer, 0, bytemuck::cast_slice(&data));
         }
@@ -888,18 +979,26 @@ impl Renderer {
         camera_rel: [f32; 3],
         fog: FogParams,
         star_intensity: f32,
+        morph: MorphParams,
     ) {
         let sky_scale = time.sky_scale().clamp(0.0, 1.0);
         self.sky_scale = sky_scale;
 
-        // Chunk-shader uniform (group 3), 3 vec4s:
+        // Chunk-shader uniform (group 3), 4 vec4s:
         //   0: camera position (render-relative) + sky_scale
         //   1: fog colour rgb + strength
-        //   2: fog start, fog end, unused, unused
+        //   2: fog start, fog end, reserved, reserved
+        //   3: geomorph band width, reserved, reserved, reserved
         // The camera position is needed per-fragment to measure view distance
         // for fog; it is render-relative so it matches vertex positions under
-        // the floating origin (ADR-0002).
-        let chunk_uniform: [f32; 12] = [
+        // the floating origin (ADR-0002). Geomorph reuses it in the VERTEX
+        // stage (ADR-0009), which is why `sky_bgl` is VERTEX_FRAGMENT.
+        //
+        // The reserved slots are written as 0 here. If one ever gains a
+        // meaning, check every writer of the whole uniform first — see the
+        // "unused padding is a promise that expires" note in
+        // docs/notes/clippy-lints.md.
+        let chunk_uniform: [f32; 16] = [
             camera_rel[0],
             camera_rel[1],
             camera_rel[2],
@@ -910,6 +1009,10 @@ impl Renderer {
             fog.strength,
             fog.start,
             fog.end,
+            0.0,
+            0.0,
+            morph.band,
+            0.0,
             0.0,
             0.0,
         ];

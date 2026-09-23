@@ -58,7 +58,7 @@
 //! crisp: a region dropped by one level is picked up by its neighbour in the
 //! same update, so it is always covered by exactly one level.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::coords::{CHUNK_SIZE, ChunkPos};
 
@@ -273,6 +273,19 @@ impl LodRing {
         self.levels[level as usize].stride
     }
 
+    /// Distance in BLOCKS from the snapped centre at which `level` hands over
+    /// to the next coarser one — where geomorph must be complete (ADR-0009).
+    ///
+    /// Returns `None` for the coarsest level, which has nothing to morph
+    /// toward: the caller holds its morph factor at 0.
+    #[inline]
+    pub fn morph_end_blocks(&self, level: u32) -> Option<i64> {
+        if level as usize + 1 >= self.levels.len() {
+            return None;
+        }
+        Some(self.levels[level as usize].outer_chunks * CHUNK_SIZE as i64)
+    }
+
     /// World size in blocks of one node side at `level`.
     #[inline]
     pub fn span_blocks(&self, level: u32) -> i64 {
@@ -408,6 +421,127 @@ impl LodRing {
     pub fn clear(&mut self) {
         self.loaded.clear();
         self.last_center = None;
+    }
+}
+
+/// Surface heights for columns the player has CHANGED, kept sparse so that
+/// *every* LOD level can honour edits.
+///
+/// ## Why this exists
+///
+/// A coarse cell's height is the MINIMUM real surface over the cell — the
+/// safety contract enforced by `lod_heightfield_never_exceeds_real_terrain`:
+/// coarse may sit below real ground (harmless, it is hidden) but never above
+/// it (it pokes through). Seed sampling honours that for untouched terrain,
+/// and untouched terrain is nearly all of it. A mined column is exactly where
+/// seed and reality diverge, and the seed always reads *higher* — so the
+/// coarse surface floats where the player dug, visible through the hole
+/// because LOD underlaps the full-resolution region. That is the "ghost
+/// block".
+///
+/// Reading real heights for every column of every node would fix it and cost
+/// `32 x 32 x stride^2` map lookups per node — 65 536 at stride 8, nearly all
+/// of them misses on columns no chunk has ever loaded. Edits are sparse, so
+/// store only the edits and lower the affected cells afterwards. An untouched
+/// world costs one `is_empty` check.
+///
+/// Bucketed by chunk column so a node visits only the edits inside its own
+/// footprint, never the whole map.
+#[derive(Debug, Default, Clone)]
+pub struct EditedColumns {
+    /// chunk (x, z) -> world (x, z) -> surface height in blocks.
+    by_chunk: HashMap<(i64, i64), HashMap<(i64, i64), i32>>,
+}
+
+impl EditedColumns {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_chunk.is_empty()
+    }
+
+    /// Number of recorded columns.
+    pub fn len(&self) -> usize {
+        self.by_chunk.values().map(HashMap::len).sum()
+    }
+
+    /// Record a column's TRUE surface height (highest solid block), replacing
+    /// any previous value.
+    ///
+    /// Replace rather than min: the caller rescans the column, so this is the
+    /// current truth, and refilling a hole must be able to undo the drop.
+    pub fn record(&mut self, x: i64, z: i64, surface_y: i32) {
+        let key = (
+            x.div_euclid(CHUNK_SIZE as i64),
+            z.div_euclid(CHUNK_SIZE as i64),
+        );
+        self.by_chunk
+            .entry(key)
+            .or_default()
+            .insert((x, z), surface_y);
+    }
+
+    /// The recorded height for a column, if it has been edited.
+    pub fn get(&self, x: i64, z: i64) -> Option<i32> {
+        let key = (
+            x.div_euclid(CHUNK_SIZE as i64),
+            z.div_euclid(CHUNK_SIZE as i64),
+        );
+        self.by_chunk.get(&key)?.get(&(x, z)).copied()
+    }
+
+    /// Lower this node's cells to account for the edits inside its footprint.
+    ///
+    /// `heights` is a `32 x 32` cell grid (row-major, Z-major) as produced by
+    /// seed sampling; `origin_x`/`origin_z` are the node's world-block origin
+    /// and `h_stride` its blocks-per-cell. `floor_y` bounds the result: a
+    /// column mined out entirely reports no terrain, and an unbounded sentinel
+    /// would mesh a wall to negative infinity.
+    ///
+    /// Only lowering is applied. A cell already at or below the edit keeps its
+    /// value, and a column the player built UP does not raise the cell —
+    /// raising would break the never-exceed-real-terrain contract for the
+    /// other columns sharing that cell.
+    pub fn apply_to_node(
+        &self,
+        heights: &mut [i32],
+        origin_x: i64,
+        origin_z: i64,
+        h_stride: i64,
+        floor_y: i32,
+    ) {
+        if self.by_chunk.is_empty() {
+            return;
+        }
+        let cells = CHUNK_SIZE as i64;
+        debug_assert_eq!(heights.len(), (cells * cells) as usize);
+        debug_assert!(h_stride >= 1);
+        // A node side is `cells * h_stride` blocks, which is exactly `h_stride`
+        // chunks, and its origin is chunk-aligned — so the footprint is a
+        // h_stride x h_stride block of chunk columns.
+        let c0x = origin_x.div_euclid(cells);
+        let c0z = origin_z.div_euclid(cells);
+        for cz in c0z..c0z + h_stride {
+            for cx in c0x..c0x + h_stride {
+                let Some(bucket) = self.by_chunk.get(&(cx, cz)) else {
+                    continue;
+                };
+                for (&(wx, wz), &h) in bucket {
+                    let ix = (wx - origin_x).div_euclid(h_stride);
+                    let iz = (wz - origin_z).div_euclid(h_stride);
+                    if !(0..cells).contains(&ix) || !(0..cells).contains(&iz) {
+                        continue;
+                    }
+                    let idx = (iz * cells + ix) as usize;
+                    let h = h.max(floor_y);
+                    if h < heights[idx] {
+                        heights[idx] = h;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -791,5 +925,167 @@ mod tests {
             let ring = LodRing::new(0, &built, round_up(base_margin), TEST_Y);
             assert_eq!(ring.level_count(), built.len());
         }
+    }
+
+    // --- Player edits at every LOD level (M09 ghost-block fix) ---------------
+
+    /// The three shipped levels, for resolving a column to its node at each.
+    fn edit_test_ring() -> LodRing {
+        LodRing::new(
+            0,
+            &[
+                LodLevel {
+                    stride: 2,
+                    outer_chunks: 16,
+                },
+                LodLevel {
+                    stride: 4,
+                    outer_chunks: 32,
+                },
+                LodLevel {
+                    stride: 8,
+                    outer_chunks: 64,
+                },
+            ],
+            8,
+            TEST_Y,
+        )
+    }
+
+    /// Build one node's cell grid the way the app does: flat seed heights,
+    /// then the player's edits folded in.
+    fn node_heights(
+        ring: &LodRing,
+        level: u32,
+        col: (i64, i64),
+        seed: i32,
+        edits: &EditedColumns,
+    ) -> (Vec<i32>, usize) {
+        let cells = CHUNK_SIZE as i64;
+        let id = ring.node_containing(level, col.0.div_euclid(cells), col.1.div_euclid(cells));
+        let (ox, _oy, oz) = ring.node_origin_blocks(id);
+        let stride = ring.stride(level);
+        let mut heights = vec![seed; (cells * cells) as usize];
+        edits.apply_to_node(&mut heights, ox, oz, stride, TEST_Y.0 as i32);
+        let ix = (col.0 - ox).div_euclid(stride);
+        let iz = (col.1 - oz).div_euclid(stride);
+        let idx = (iz * cells + ix) as usize;
+        (heights, idx)
+    }
+
+    /// THE reproduction. A mined column must lower the coarse surface at
+    /// EVERY level, not just the finest.
+    ///
+    /// Before the fix, `lod_tick` gated real heights behind `if n.level == 0`,
+    /// so strides 4 and 8 were built from the seed forever. The seed always
+    /// reads higher than dug ground, so the coarse surface floated above the
+    /// hole and showed through it — the reported "ghost block".
+    #[test]
+    fn a_mined_column_lowers_the_cell_at_every_level() {
+        const SEED: i32 = 40;
+        const DUG: i32 = 34;
+        let col = (37i64, 70i64);
+        let ring = edit_test_ring();
+        let mut edits = EditedColumns::new();
+        edits.record(col.0, col.1, DUG);
+
+        for level in 0..3u32 {
+            let (heights, idx) = node_heights(&ring, level, col, SEED, &edits);
+            assert_eq!(
+                heights[idx],
+                DUG,
+                "level {level} (stride {}) kept the seed surface over a mined column",
+                ring.stride(level)
+            );
+            let changed = heights.iter().filter(|&&h| h != SEED).count();
+            assert_eq!(
+                changed, 1,
+                "level {level} disturbed cells it should not have"
+            );
+        }
+    }
+
+    /// Negative world coordinates resolve to the same cell (div_euclid, not
+    /// truncating division — CLAUDE.md's coordinate rule).
+    #[test]
+    fn edits_apply_in_negative_coordinates() {
+        const SEED: i32 = 12;
+        let col = (-37i64, -70i64);
+        let ring = edit_test_ring();
+        let mut edits = EditedColumns::new();
+        edits.record(col.0, col.1, 5);
+        for level in 0..3u32 {
+            let (heights, idx) = node_heights(&ring, level, col, SEED, &edits);
+            assert_eq!(
+                heights[idx], 5,
+                "level {level} missed a negative-coord edit"
+            );
+            assert_eq!(heights.iter().filter(|&&h| h != SEED).count(), 1);
+        }
+    }
+
+    /// An edit in a neighbouring node must not leak into this one.
+    #[test]
+    fn edits_outside_the_footprint_are_ignored() {
+        let cells = CHUNK_SIZE as i64;
+        let mut edits = EditedColumns::new();
+        edits.record(-1, -1, 0); // just outside the node at origin (0, 0)
+        edits.record(cells * 8, 0, 0); // just past the widest node's far edge
+        for stride in [2i64, 4, 8] {
+            let mut heights = vec![50i32; (cells * cells) as usize];
+            edits.apply_to_node(&mut heights, 0, 0, stride, -128);
+            assert!(
+                heights.iter().all(|&h| h == 50),
+                "stride {stride} pulled in an edit from outside its footprint"
+            );
+        }
+    }
+
+    /// Building UP must not raise a cell: the cell stands for every column in
+    /// it, and raising would push coarse terrain above the real ground of the
+    /// neighbours sharing it (the never-exceed contract).
+    #[test]
+    fn a_placed_block_never_raises_a_cell() {
+        let cells = CHUNK_SIZE as i64;
+        let mut edits = EditedColumns::new();
+        edits.record(5, 5, 90);
+        let mut heights = vec![40i32; (cells * cells) as usize];
+        edits.apply_to_node(&mut heights, 0, 0, 4, -128);
+        assert!(heights.iter().all(|&h| h == 40));
+    }
+
+    /// A column mined out completely clamps to the band floor rather than
+    /// meshing a wall to the sentinel value.
+    #[test]
+    fn a_fully_mined_column_clamps_to_the_floor() {
+        let cells = CHUNK_SIZE as i64;
+        let mut edits = EditedColumns::new();
+        edits.record(5, 5, i32::MIN);
+        let mut heights = vec![40i32; (cells * cells) as usize];
+        edits.apply_to_node(&mut heights, 0, 0, 4, -128);
+        assert_eq!(heights[(cells + 1) as usize], -128);
+    }
+
+    /// The common case — an untouched world — costs nothing and changes
+    /// nothing.
+    #[test]
+    fn no_edits_is_a_no_op() {
+        let cells = CHUNK_SIZE as i64;
+        let edits = EditedColumns::new();
+        assert!(edits.is_empty());
+        let mut heights = vec![7i32; (cells * cells) as usize];
+        edits.apply_to_node(&mut heights, 0, 0, 8, -128);
+        assert!(heights.iter().all(|&h| h == 7));
+    }
+
+    /// Re-recording a column replaces it, so refilling a hole restores the
+    /// surface instead of leaving the dug height behind forever.
+    #[test]
+    fn recording_a_column_twice_keeps_the_latest() {
+        let mut edits = EditedColumns::new();
+        edits.record(5, 5, 20);
+        edits.record(5, 5, 30);
+        assert_eq!(edits.get(5, 5), Some(30));
+        assert_eq!(edits.len(), 1);
     }
 }

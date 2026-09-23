@@ -69,6 +69,66 @@ impl MeshData {
     }
 }
 
+/// Vertex format for coarse LOD terrain (ADR-0009).
+///
+/// Deliberately a separate type from [`Vertex`], not a reuse of it:
+///
+/// - LOD carries no **block light**. "No block light / caves at distance;
+///   LOD stays skylight-only surface" is an explicit M09 non-goal, so that
+///   channel was hard-coded `0.0` on every LOD vertex — a field that existed
+///   only to be zero.
+/// - LOD carries a **morph target** that full-resolution terrain has no use
+///   for: the Y this vertex takes at the next coarser level, which the vertex
+///   shader lerps toward as the camera approaches the ring boundary so the
+///   level swap replaces geometry with geometry that already matches
+///   (ADR-0009).
+///
+/// Trading one for the other keeps this at the same 32 bytes as [`Vertex`],
+/// so the honest format costs nothing over aliasing the block-light slot,
+/// which would have left `Vertex::block` meaning two different things
+/// depending on which pipeline read it.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct LodVertex {
+    pub position: [f32; 3],
+    pub uv: [f32; 2],
+    pub layer: u32,
+    pub sky: f32,
+    /// Y this vertex morphs to at full morph, in the same node-local space as
+    /// `position`. Always emitted — the mesher does not know its node's level —
+    /// so the coarsest ring, which has no coarser neighbour to morph toward,
+    /// is handled by the shader instead (its morph distance is set to 0,
+    /// which holds the factor at 0).
+    pub morph_y: f32,
+    pub shade: f32,
+}
+
+/// CPU-side LOD mesh, ready for GPU upload.
+#[derive(Debug, Default)]
+pub struct LodMeshData {
+    pub vertices: Vec<LodVertex>,
+    pub indices: Vec<u32>,
+    /// Node-local Y bounds of everything this mesh can occupy, morph targets
+    /// and skirts included.
+    ///
+    /// The renderer builds the culling AABB from these rather than from the
+    /// world's Y band. That mattered little when the world was 256 blocks tall;
+    /// with M10's ~20 000-block range, a band-height AABB would span the whole
+    /// world and vertical frustum culling would stop rejecting anything.
+    pub y_min: f32,
+    pub y_max: f32,
+}
+
+impl LodMeshData {
+    pub fn is_empty(&self) -> bool {
+        self.indices.is_empty()
+    }
+
+    pub fn quad_count(&self) -> usize {
+        self.indices.len() / 6
+    }
+}
+
 /// Read-only views of a chunk's six face-neighbors, used for cross-chunk
 /// face culling. A `None` neighbor (unloaded / nonexistent chunk) is
 /// treated as air, so faces on the edge of the loaded world are emitted.
@@ -1580,38 +1640,94 @@ pub const LOD_CELLS: usize = CHUNK_SIZE;
 ///
 /// `skirt_depth_blocks` extends the node's outer border walls downward to hide
 /// cracks against neighbouring nodes whose edge heights differ.
+/// Emit one LOD quad. Mirrors `emit_rect` but writes [`LodVertex`]: per-corner
+/// morph targets instead of block light, and no diagonal flip (the heightfield
+/// has uniform light per quad, so there is no gradient to make anisotropic).
+#[allow(clippy::too_many_arguments)]
+fn emit_lod_rect(
+    mesh: &mut LodMeshData,
+    base: [f32; 3],
+    u_dir: [f32; 3],
+    v_dir: [f32; 3],
+    w: f32,
+    h: f32,
+    layer: u32,
+    sky: f32,
+    shade: f32,
+    // Morph target Y per corner, in emit order (0,0)→(w,0)→(w,h)→(0,h).
+    corner_morph_y: [f32; 4],
+) {
+    let corner = |du: f32, dv: f32, morph_y: f32| LodVertex {
+        position: [
+            base[0] + u_dir[0] * du + v_dir[0] * dv,
+            base[1] + u_dir[1] * du + v_dir[1] * dv,
+            base[2] + u_dir[2] * du + v_dir[2] * dv,
+        ],
+        uv: [du, dv],
+        layer,
+        sky,
+        morph_y,
+        shade,
+    };
+    let b = mesh.vertices.len() as u32;
+    mesh.vertices.push(corner(0.0, 0.0, corner_morph_y[0]));
+    mesh.vertices.push(corner(w, 0.0, corner_morph_y[1]));
+    mesh.vertices.push(corner(w, h, corner_morph_y[2]));
+    mesh.vertices.push(corner(0.0, h, corner_morph_y[3]));
+    mesh.indices
+        .extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
+}
+
 pub fn mesh_lod_heightfield(
     heights: &[i32],
     h_stride: i32,
     origin_y: i32,
     mut layer_of: impl FnMut(BlockId, usize) -> u32,
     skirt_depth_blocks: i32,
-) -> MeshData {
+) -> LodMeshData {
     assert_eq!(
         heights.len(),
         LOD_CELLS * LOD_CELLS,
         "heightfield must be 32x32"
     );
     let n = LOD_CELLS as i32;
-    let mut mesh = MeshData::default();
+    let mut mesh = LodMeshData::default();
     let grass = vox_core::registry::GRASS;
 
-    // Distant LOD is sky-lit surface only: full sky, no block light. Day/night
-    // dims it through the same `sky_scale` uniform as the near field.
-    let sky = [1.0f32; 4];
-    let block = [0.0f32; 4];
-    let top_shade = [face_brightness(1, true); 4];
+    // Distant LOD is sky-lit surface only. Day/night dims it through the same
+    // `sky_scale` uniform as the near field.
+    let sky = 1.0f32;
+    let top_shade = face_brightness(1, true);
 
     let at = |cx: i32, cz: i32| -> i32 { heights[(cz * n + cx) as usize] };
+
+    // The height this cell takes at the NEXT COARSER level (ADR-0009).
+    //
+    // Strides nest 2:1 and every level's cell is the MINIMUM real surface over
+    // its footprint. Minimum is associative, so a coarse cell is exactly the
+    // minimum of the four fine cells inside it — no extra sampling, no
+    // neighbour data, no second generation pass. `LOD_CELLS` is even and node
+    // origins are multiples of `LOD_CELLS * stride`, so the 2x2 grouping lines
+    // up with the coarser grid exactly; `bx + 1` / `bz + 1` are always in
+    // range.
+    let coarse_at = |cx: i32, cz: i32| -> i32 {
+        let (bx, bz) = (cx & !1, cz & !1);
+        at(bx, bz)
+            .min(at(bx + 1, bz))
+            .min(at(bx, bz + 1))
+            .min(at(bx + 1, bz + 1))
+    };
 
     for cz in 0..n {
         for cx in 0..n {
             let h = at(cx, cz) - origin_y;
+            let coarse_h = coarse_at(cx, cz) - origin_y;
             let (x0, z0) = ((cx * h_stride) as f32, (cz * h_stride) as f32);
             let w = h_stride as f32;
             // Top face of the column, at its exact height.
             let top = (h + 1) as f32;
-            emit_rect(
+            let coarse_top = (coarse_h + 1) as f32;
+            emit_lod_rect(
                 &mut mesh,
                 [x0, top, z0],
                 axis_unit(2),
@@ -1620,9 +1736,8 @@ pub fn mesh_lod_heightfield(
                 w,
                 layer_of(grass, 2),
                 sky,
-                block,
                 top_shade,
-                false,
+                [coarse_top; 4],
             );
 
             // Vertical walls down to each lower neighbour. Outside the node,
@@ -1639,31 +1754,60 @@ pub fn mesh_lod_heightfield(
                     (2, true) => (cx, cz + 1),
                     _ => (cx, cz - 1),
                 };
-                let neighbour = if (0..n).contains(&nx) && (0..n).contains(&nz) {
+                let inside = (0..n).contains(&nx) && (0..n).contains(&nz);
+                let neighbour = if inside {
                     at(nx, nz) - origin_y
                 } else {
                     // Border: drop a skirt instead of assuming a height.
                     h - skirt_depth_blocks
                 };
-                if neighbour >= h {
-                    continue; // neighbour is level or higher: nothing exposed
+                // Where this wall's bottom edge ends up at full morph. Inside
+                // the node that is the neighbour's coarse height; on the border
+                // the skirt hangs the same depth below the coarse top. When
+                // both cells belong to the same 2x2 group these agree with
+                // `coarse_top`, so the wall collapses to zero height — which is
+                // exactly the coarser level having one cell where this level
+                // has four.
+                let coarse_neighbour = if inside {
+                    coarse_at(nx, nz) - origin_y
+                } else {
+                    coarse_h - skirt_depth_blocks
+                };
+                // Emit if the two cells differ at EITHER end of the morph.
+                //
+                // Testing only `neighbour >= h` (the t = 0 heights) was wrong:
+                // morphing lowers each cell to its own group's minimum, at
+                // different rates, so a neighbour that starts level or higher
+                // can finish well below — exposing a face that was never
+                // emitted. Conversely a wall that exists at t = 0 must not
+                // invert on the way to t = 1, or its winding flips and
+                // back-face culling deletes it. Either way the result is a
+                // see-through hole that widens with the morph band (ADR-0009).
+                let flat_now = neighbour >= h;
+                let flat_morphed = coarse_neighbour >= coarse_h;
+                if flat_now && flat_morphed {
+                    continue; // level at both ends: nothing is ever exposed
                 }
-                let wall_bottom = (neighbour + 1) as f32;
+                // Clamp the bottom to its own top at each end, so a wall that
+                // is degenerate at one end has ZERO height there rather than
+                // negative height (which would be an inverted quad). It opens
+                // up smoothly as the morph carries it to the other end.
+                let wall_bottom = (neighbour.min(h) + 1) as f32;
                 let wall_height = top - wall_bottom;
-                if wall_height <= 0.0 {
-                    continue;
-                }
-                let shade = [face_brightness(axis, positive); 4];
+                let shade = face_brightness(axis, positive);
                 let layer = layer_of(grass, face_index);
                 let plane = if positive { w } else { 0.0 };
                 // Winding follows FACE_DIRS so back-face culling keeps these.
-                let (base, u_dir, v_dir, uw, uh) = match (axis, positive) {
+                // `u_vertical` records which of the two quad axes runs UP, so
+                // the morph targets land on the right corners.
+                let (base, u_dir, v_dir, uw, uh, u_vertical) = match (axis, positive) {
                     (0, true) => (
                         [x0 + plane, wall_bottom, z0],
                         axis_unit(1),
                         axis_unit(2),
                         wall_height,
                         w,
+                        true,
                     ),
                     (0, false) => (
                         [x0, wall_bottom, z0],
@@ -1671,6 +1815,7 @@ pub fn mesh_lod_heightfield(
                         axis_unit(1),
                         w,
                         wall_height,
+                        false,
                     ),
                     (2, true) => (
                         [x0, wall_bottom, z0 + plane],
@@ -1678,6 +1823,7 @@ pub fn mesh_lod_heightfield(
                         axis_unit(1),
                         w,
                         wall_height,
+                        false,
                     ),
                     _ => (
                         [x0, wall_bottom, z0],
@@ -1685,14 +1831,48 @@ pub fn mesh_lod_heightfield(
                         axis_unit(0),
                         wall_height,
                         w,
+                        true,
                     ),
                 };
-                emit_rect(
-                    &mut mesh, base, u_dir, v_dir, uw, uh, layer, sky, block, shade, false,
+                let morph_top = coarse_top;
+                let morph_bottom = (coarse_neighbour.min(coarse_h) + 1) as f32;
+                // Corners run (0,0)→(uw,0)→(uw,uh)→(0,uh).
+                let corner_morph_y = if u_vertical {
+                    [morph_bottom, morph_top, morph_top, morph_bottom]
+                } else {
+                    [morph_bottom, morph_bottom, morph_top, morph_top]
+                };
+                emit_lod_rect(
+                    &mut mesh,
+                    base,
+                    u_dir,
+                    v_dir,
+                    uw,
+                    uh,
+                    layer,
+                    sky,
+                    shade,
+                    corner_morph_y,
                 );
             }
         }
     }
+    // Bounds over BOTH the resting position and the morph target: a vertex
+    // sits somewhere between them at any moment, so an AABB built from
+    // positions alone would clip geometry mid-morph.
+    let mut lo = f32::MAX;
+    let mut hi = f32::MIN;
+    for v in &mesh.vertices {
+        lo = lo.min(v.position[1]).min(v.morph_y);
+        hi = hi.max(v.position[1]).max(v.morph_y);
+    }
+    if mesh.vertices.is_empty() {
+        lo = 0.0;
+        hi = 0.0;
+    }
+    mesh.y_min = lo;
+    mesh.y_max = hi;
+
     mesh
 }
 
@@ -1783,5 +1963,249 @@ mod heightfield_tests {
             .map(|v| v.position[1])
             .fold(f32::MIN, f32::max);
         assert!((top - (100 - 128 + 1) as f32).abs() < 1e-4, "got {top}");
+    }
+
+    // --- Geomorph (ADR-0009) ---------------------------------------------
+
+    /// Heights that vary WITHIN every 2x2 group but share a minimum of `base`,
+    /// so the next coarser level is perfectly flat.
+    fn bumpy_but_flat_when_coarse(base: i32) -> Vec<i32> {
+        let n = LOD_CELLS as i32;
+        let mut h = vec![0i32; LOD_CELLS * LOD_CELLS];
+        for cz in 0..n {
+            for cx in 0..n {
+                h[(cz * n + cx) as usize] = base + (cx & 1) + (cz & 1);
+            }
+        }
+        h
+    }
+
+    /// THE geomorph contract: at full morph the node is geometrically the
+    /// coarser level. Here the coarse level is flat, so every vertex — tops
+    /// and walls alike — must morph to the same Y, which means every interior
+    /// wall collapses to zero height.
+    #[test]
+    fn at_full_morph_the_node_becomes_the_coarser_level() {
+        let base = 20;
+        let mesh = mesh_lod_heightfield(&bumpy_but_flat_when_coarse(base), 4, 0, |_, _| 0, 0);
+        let expected = (base + 1) as f32;
+        for v in &mesh.vertices {
+            assert!(
+                (v.morph_y - expected).abs() < 1e-4,
+                "vertex at {:?} morphs to {}, expected the flat coarse top {expected}",
+                v.position,
+                v.morph_y
+            );
+        }
+        // Every quad is therefore zero-height once morphed: no wall survives.
+        for quad in mesh.vertices.chunks(4) {
+            let lo = quad.iter().map(|v| v.morph_y).fold(f32::MAX, f32::min);
+            let hi = quad.iter().map(|v| v.morph_y).fold(f32::MIN, f32::max);
+            assert!((hi - lo).abs() < 1e-4, "a wall survived full morph");
+        }
+    }
+
+    /// The morph target of a top quad is the MINIMUM of its 2x2 group — the
+    /// property that makes a coarse cell computable locally (min is
+    /// associative, so the coarse level's own sampling gives the same answer).
+    #[test]
+    fn morph_target_is_the_coarse_group_minimum() {
+        let n = LOD_CELLS as i32;
+        let mut heights = vec![0i32; LOD_CELLS * LOD_CELLS];
+        for cz in 0..n {
+            for cx in 0..n {
+                // Deterministic, varied, and not symmetric under the 2x2
+                // grouping — so a wrong group alignment would show.
+                heights[(cz * n + cx) as usize] = (cx * 7 + cz * 13) % 23 - 5;
+            }
+        }
+        let mesh = mesh_lod_heightfield(&heights, 2, 0, |_, _| 0, 0);
+        for cz in 0..n {
+            for cx in 0..n {
+                let (bx, bz) = (cx & !1, cz & !1);
+                let want = [(bx, bz), (bx + 1, bz), (bx, bz + 1), (bx + 1, bz + 1)]
+                    .iter()
+                    .map(|&(x, z)| heights[(z * n + x) as usize])
+                    .min()
+                    .expect("four cells");
+                // Find this cell's top quad by its X/Z corner.
+                let (x0, z0) = ((cx * 2) as f32, (cz * 2) as f32);
+                // Several quads share this corner — the cell's top face, and
+                // the bottom edge of any wall clamped up to it. Ask whether the
+                // TOP FACE is among them rather than picking the first match.
+                let found = mesh.vertices.iter().any(|v| {
+                    v.position[0] == x0
+                        && v.position[2] == z0
+                        && (v.position[1] - (heights[(cz * n + cx) as usize] + 1) as f32).abs()
+                            < 1e-4
+                        && (v.morph_y - (want + 1) as f32).abs() < 1e-4
+                });
+                assert!(
+                    found,
+                    "cell ({cx},{cz}) has no top face morphing to its 2x2 minimum {want}"
+                );
+            }
+        }
+    }
+
+    /// Morphing may only LOWER the surface. Coarse LOD that rises above real
+    /// terrain pokes through the ground; the never-exceed contract has to
+    /// survive the morph, not just the sampling.
+    #[test]
+    fn morph_never_raises_the_surface() {
+        let n = LOD_CELLS as i32;
+        let mut heights = vec![0i32; LOD_CELLS * LOD_CELLS];
+        for cz in 0..n {
+            for cx in 0..n {
+                heights[(cz * n + cx) as usize] = (cx * 5 + cz * 11) % 31 - 12;
+            }
+        }
+        for stride in [2, 4, 8] {
+            let mesh = mesh_lod_heightfield(&heights, stride, 0, |_, _| 0, 3);
+            for v in &mesh.vertices {
+                assert!(
+                    v.morph_y <= v.position[1] + 1e-4,
+                    "morph raised a vertex from {} to {}",
+                    v.position[1],
+                    v.morph_y
+                );
+            }
+        }
+    }
+
+    /// Flat ground is already its own coarse level, so morphing is a no-op —
+    /// no ripple as the factor sweeps across a plain.
+    #[test]
+    fn flat_ground_does_not_move_under_morph() {
+        let mesh = mesh_lod_heightfield(&flat(14), 4, 0, |_, _| 0, 6);
+        for v in &mesh.vertices {
+            assert!((v.morph_y - v.position[1]).abs() < 1e-4);
+        }
+    }
+
+    /// The morph target respects `origin_y`, like `position` does — both are
+    /// node-local, so the shader can lerp between them directly.
+    #[test]
+    fn morph_target_is_node_local_like_position() {
+        let a = mesh_lod_heightfield(&bumpy_but_flat_when_coarse(20), 4, 0, |_, _| 0, 0);
+        let b = mesh_lod_heightfield(&bumpy_but_flat_when_coarse(20), 4, -128, |_, _| 0, 0);
+        for (va, vb) in a.vertices.iter().zip(&b.vertices) {
+            assert!((vb.morph_y - va.morph_y - 128.0).abs() < 1e-4);
+            assert!((vb.position[1] - va.position[1] - 128.0).abs() < 1e-4);
+        }
+    }
+
+    /// A field where cell (1,0) is LOWER than its +x neighbour (2,0), but that
+    /// neighbour's 2x2 group contains a much lower cell — so the neighbour
+    /// DROPS BELOW cell (1,0) as the morph runs.
+    fn heights_where_the_neighbour_sinks_below() -> Vec<i32> {
+        let n = LOD_CELLS as i32;
+        let mut h = vec![30i32; LOD_CELLS * LOD_CELLS];
+        let set = |h: &mut Vec<i32>, x: i32, z: i32, v: i32| h[(z * n + x) as usize] = v;
+        for z in 0..2 {
+            set(&mut h, 0, z, 20);
+            set(&mut h, 1, z, 20); // coarse group min = 20
+            set(&mut h, 2, z, 22); // higher than cell 1 at t = 0 ...
+            set(&mut h, 3, z, 10); // ... but its group min is 10
+        }
+        h
+    }
+
+    /// THE crack, as a universal invariant: **the morph must never turn a quad
+    /// inside out.**
+    ///
+    /// If corner A sits below corner B on a quad, it must still sit at or below
+    /// B at full morph. Morphing only ever lowers, but it lowers each cell to
+    /// its OWN 2x2 group minimum — so a wall's top (this cell) and bottom (the
+    /// neighbour) sink at different rates, and the top can end up beneath the
+    /// bottom. That quad's winding flips, back-face culling deletes it, and
+    /// what is left is a see-through hole showing sky through the terrain.
+    ///
+    /// It gets worse the wider the morph band, because more ground is
+    /// mid-morph at any moment — which is exactly how it presented: white
+    /// speckling across the LOD that intensified with the band slider.
+    #[test]
+    fn the_morph_never_inverts_a_quad() {
+        for (label, heights) in [
+            (
+                "neighbour sinks below",
+                heights_where_the_neighbour_sinks_below(),
+            ),
+            ("varied terrain", {
+                let n = LOD_CELLS as i32;
+                let mut h = vec![0i32; LOD_CELLS * LOD_CELLS];
+                for cz in 0..n {
+                    for cx in 0..n {
+                        h[(cz * n + cx) as usize] = (cx * 7 + cz * 13) % 23 - 5;
+                    }
+                }
+                h
+            }),
+        ] {
+            for stride in [2, 4, 8] {
+                let mesh = mesh_lod_heightfield(&heights, stride, 0, |_, _| 0, 4);
+                for (q, quad) in mesh.vertices.chunks(4).enumerate() {
+                    for a in 0..4 {
+                        for b in 0..4 {
+                            if quad[a].position[1] < quad[b].position[1] - 1e-4 {
+                                assert!(
+                                    quad[a].morph_y <= quad[b].morph_y + 1e-4,
+                                    "{label}, stride {stride}, quad {q}: corner at y={} \
+                                     morphs to {} while corner at y={} morphs to {} — \
+                                     the quad turns inside out and culls away",
+                                    quad[a].position[1],
+                                    quad[a].morph_y,
+                                    quad[b].position[1],
+                                    quad[b].morph_y
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The culling AABB must contain the mesh at EVERY point of the morph, not
+    /// just at rest — a vertex sits between its position and its morph target
+    /// at any given moment.
+    #[test]
+    fn reported_y_bounds_contain_positions_and_morph_targets() {
+        let n = LOD_CELLS as i32;
+        let mut heights = vec![0i32; LOD_CELLS * LOD_CELLS];
+        for cz in 0..n {
+            for cx in 0..n {
+                heights[(cz * n + cx) as usize] = (cx * 7 + cz * 13) % 23 - 5;
+            }
+        }
+        for stride in [2, 4, 8] {
+            let mesh = mesh_lod_heightfield(&heights, stride, -11_264, |_, _| 0, 4);
+            for v in &mesh.vertices {
+                assert!(
+                    v.position[1] >= mesh.y_min && v.position[1] <= mesh.y_max,
+                    "stride {stride}: position {} outside reported bounds {}..{}",
+                    v.position[1],
+                    mesh.y_min,
+                    mesh.y_max
+                );
+                assert!(
+                    v.morph_y >= mesh.y_min && v.morph_y <= mesh.y_max,
+                    "stride {stride}: morph target {} outside reported bounds",
+                    v.morph_y
+                );
+            }
+        }
+    }
+
+    /// The bounds must be TIGHT, not the whole world band — that is the point
+    /// of reporting them once the world is ~20 000 blocks tall.
+    #[test]
+    fn reported_y_bounds_are_tight_not_the_world_band() {
+        let mesh = mesh_lod_heightfield(&flat(14), 4, -11_264, |_, _| 0, 6);
+        let span = mesh.y_max - mesh.y_min;
+        assert!(
+            span < 64.0,
+            "flat terrain reported a {span}-block tall node; bounds are not tight"
+        );
     }
 }

@@ -8,6 +8,7 @@ pub mod chunk;
 pub mod coords;
 pub mod light;
 pub mod lod;
+pub mod planet;
 pub mod raycast;
 pub mod registry;
 pub mod settings;
@@ -26,7 +27,12 @@ pub use light::{
     propagate_block_light, propagate_sky_light, relight_chunk, relight_chunk_2ch,
     remove_block_light,
 };
-pub use lod::{LodLevel, LodNodeId, LodRing, LodUpdate};
+pub use lod::{EditedColumns, LodLevel, LodNodeId, LodRing, LodUpdate};
+pub use planet::{
+    POLE_TO_EQUATOR_BLOCKS, SEA_LEVEL_BLOCKS, WORLD_HALF_EXTENT_BLOCKS, WORLD_Y_MAX_BLOCKS,
+    WORLD_Y_MIN_BLOCKS, clamp_xz, contains_chunk, find_spawn, in_bounds, in_bounds_xz,
+    latitude_degrees, latitude_fraction,
+};
 pub use raycast::{RayHit, cell_overlaps_aabb, raycast_blocks, raycast_voxels};
 pub use registry::{BlockRegistry, BlockType};
 pub use settings::Settings;

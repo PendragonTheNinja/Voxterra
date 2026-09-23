@@ -53,6 +53,21 @@ pub struct Settings {
     /// 0 = off, 1 = full.
     pub fog_strength: f32,
 
+    // --- Geomorph (ADR-0009) ---
+    /// Width in blocks of the band before each LOD ring boundary over which
+    /// that level's terrain morphs into the next coarser level's silhouette.
+    ///
+    /// Too narrow and the morph itself reads as a ripple sweeping the ground;
+    /// too wide and near terrain is flattened toward coarse detail long before
+    /// it needs to be. 0 disables morphing.
+    ///
+    /// Measured from the camera, while the handover radius is measured from the
+    /// ring's snapped centre — which can sit up to a coarsest-stride (256
+    /// blocks) away. A band narrower than that offset can leave the morph
+    /// incomplete when the swap fires, so the useful range starts wider than
+    /// intuition suggests.
+    pub lod_morph_band: f32,
+
     // --- Time ---
     /// Freeze the day/night cycle.
     pub time_paused: bool,
@@ -85,6 +100,7 @@ impl Default for Settings {
             fog_start: 420.0,
             fog_end: 2000.0,
             fog_strength: 1.0,
+            lod_morph_band: 192.0,
             time_paused: false,
             day_length_secs: 24.0 * 60.0,
             time_of_day: 0.3,
@@ -111,6 +127,7 @@ pub mod ranges {
     pub const FOG_END: (f32, f32) = (16.0, 16000.0);
     pub const FOG_STRENGTH: (f32, f32) = (0.0, 1.0);
     pub const FOG_FRAC: (f32, f32) = (0.0, 1.0);
+    pub const LOD_MORPH_BAND: (f32, f32) = (0.0, 512.0);
     pub const DAY_LENGTH_SECS: (f32, f32) = (10.0, 86_400.0);
     pub const STAR_INTENSITY: (f32, f32) = (0.0, 3.0);
 }
@@ -144,6 +161,9 @@ impl Settings {
         self.fog_strength = self
             .fog_strength
             .clamp(ranges::FOG_STRENGTH.0, ranges::FOG_STRENGTH.1);
+        self.lod_morph_band = self
+            .lod_morph_band
+            .clamp(ranges::LOD_MORPH_BAND.0, ranges::LOD_MORPH_BAND.1);
         self.fog_start_frac = self
             .fog_start_frac
             .clamp(ranges::FOG_FRAC.0, ranges::FOG_FRAC.1);

@@ -13,23 +13,43 @@
 //! Two radii (in chunks), measured as Euclidean distance between chunk
 //! positions:
 //!
-//! Streaming is CYLINDRICAL: `load_radius` is a horizontal radius, and a
-//! vertical band of chunk-Y is always kept loaded within it. The world is a
-//! heightfield, so what matters is how far away a column is, not how far above
-//! it the camera is — with a sphere, flying a few hundred blocks up drops the
-//! ground out of range and the terrain under you unloads.
+//! Streaming is CYLINDRICAL: `load_radius` is a horizontal radius. The world is
+//! a heightfield, so what matters is how far away a column is, not how far
+//! above it the camera is — with a sphere, flying a few hundred blocks up drops
+//! the ground out of range and the terrain under you unloads.
 //!
 //! - `load_radius`: chunks within this HORIZONTAL distance should be loaded.
 //! - `unload_radius` (> load_radius): chunks beyond this should be unloaded.
+//!
+//! ## Vertically, streaming FOLLOWS THE SURFACE (M10 task 2)
+//!
+//! Until M10 the vertical extent was a fixed band of chunk-Y, which worked only
+//! because the world was 256 blocks tall — 8 chunk layers, cheap to keep loaded
+//! everywhere. M10 opens the world to roughly −11 000 … +9 000 so that Everest
+//! and ocean trenches both fit, which is 640 layers. Loading a full-height
+//! cylinder at that scale is ~80× more chunks and the engine stops.
+//!
+//! The answer is not a bigger budget. Terrain is a surface, and a player
+//! interacts with the part of a column near that surface — so each column loads
+//! a window around its OWN terrain height rather than a band shared by the
+//! whole world. Total world height then costs nothing: a trench column loads
+//! chunks 300 layers down, a summit column loads chunks 250 layers up, and both
+//! load the same handful of chunks.
+//!
+//! The caller supplies the surface as a **span** of chunk-Y per chunk column,
+//! not a single height. A chunk column is 32 blocks wide and can contain a
+//! cliff face spanning many chunk layers; asking for one height would load the
+//! top of the cliff and leave a hole down its face.
 //!
 //! Chunks in the gap between the two radii are left in whatever state they
 //! are already in. Without this hysteresis band, a camera sitting on a
 //! chunk boundary would load and unload the same chunk on alternating
 //! frames (thrashing). The gap must be at least one chunk wide.
 
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use crate::coords::ChunkPos;
+use crate::coords::{CHUNK_SIZE, ChunkPos};
+use crate::planet;
 
 /// What the [`Streamer`] wants the caller to do this update.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -53,22 +73,33 @@ pub struct Streamer {
     loaded: HashSet<ChunkPos>,
     load_radius: i64,
     unload_radius: i64,
-    /// Inclusive chunk-Y band always kept loaded within the horizontal radius.
-    /// Streaming is cylindrical; see `horiz_dist_sq`.
-    y_band: (i64, i64),
+    /// Chunk layers kept loaded below and above each column's surface span.
+    below_chunks: i64,
+    above_chunks: i64,
     /// Camera chunk used for the last `update`; `update` is a no-op (returns
     /// empty) when the camera hasn't changed chunks and nothing else has.
     last_center: Option<ChunkPos>,
 }
 
 impl Streamer {
-    /// Create a streamer. Panics if `unload_radius <= load_radius` (the
-    /// hysteresis band must be at least one chunk wide).
-    /// Cylindrical streamer with an explicit vertical band (chunk Y, inclusive).
-    pub fn with_y_band(load_radius: i64, unload_radius: i64, y_band: (i64, i64)) -> Self {
+    /// Create a streamer that keeps `below_chunks` layers beneath and
+    /// `above_chunks` layers above each column's terrain surface.
+    ///
+    /// Panics if `unload_radius <= load_radius` (the hysteresis band must be at
+    /// least one chunk wide) or if either vertical margin is negative.
+    pub fn surface_following(
+        load_radius: i64,
+        unload_radius: i64,
+        below_chunks: i64,
+        above_chunks: i64,
+    ) -> Self {
+        assert!(
+            below_chunks >= 0 && above_chunks >= 0,
+            "vertical margins must be non-negative (got {below_chunks}, {above_chunks})"
+        );
         let mut s = Self::new(load_radius, unload_radius);
-        assert!(y_band.0 <= y_band.1, "y_band must be non-empty");
-        s.y_band = y_band;
+        s.below_chunks = below_chunks;
+        s.above_chunks = above_chunks;
         s
     }
 
@@ -81,11 +112,35 @@ impl Streamer {
             loaded: HashSet::new(),
             load_radius,
             unload_radius,
-            // Default band spans the load radius vertically, matching the old
-            // spherical behaviour closely enough for callers that don't care.
-            y_band: (-load_radius, load_radius),
+            below_chunks: load_radius,
+            above_chunks: load_radius,
             last_center: None,
         }
+    }
+
+    /// Chunk layers kept below and above each column's surface span.
+    pub fn vertical_margins(&self) -> (i64, i64) {
+        (self.below_chunks, self.above_chunks)
+    }
+
+    /// The chunk-Y range this column should keep loaded, given its surface
+    /// span. Clamped to the world's vertical bounds so a seabed column near the
+    /// floor does not request chunks below the world.
+    ///
+    /// Public because several callers must agree with the streamer about which
+    /// chunks will EVER exist for a column — a first-mesh gate waiting on a
+    /// neighbour outside this window waits forever, and a LOD node checking
+    /// residency outside it never suppresses. Both were real M09 defects when
+    /// the equivalent judgement was made independently.
+    pub fn window_for(&self, surface_span: (i64, i64)) -> (i64, i64) {
+        let s = CHUNK_SIZE as i64;
+        let (world_lo, world_hi) = (
+            planet::WORLD_Y_MIN_BLOCKS / s,
+            planet::WORLD_Y_MAX_BLOCKS / s - 1,
+        );
+        let lo = (surface_span.0 - self.below_chunks).clamp(world_lo, world_hi);
+        let hi = (surface_span.1 + self.above_chunks).clamp(world_lo, world_hi);
+        (lo, hi)
     }
 
     pub fn load_radius(&self) -> i64 {
@@ -121,35 +176,73 @@ impl Streamer {
     /// in-flight chunks as "to be loaded"; callers that fulfill
     /// asynchronously should mark a chunk loaded when its data is ready, and
     /// should avoid duplicate work by tracking their own in-flight set.
-    pub fn update(&mut self, center: ChunkPos) -> StreamUpdate {
+    /// `surface_span(cx, cz)` returns the INCLUSIVE chunk-Y span of terrain
+    /// surface within that chunk column — lowest and highest surface chunk. It
+    /// is a span rather than a height because a 32-block-wide column can hold a
+    /// cliff face crossing many layers, and a single height would load the top
+    /// of the cliff and leave a hole down its face.
+    ///
+    /// The query is called at most once per column per update (results are
+    /// memoized), so a caller backing it with real worldgen pays per column,
+    /// not per chunk.
+    pub fn update(
+        &mut self,
+        center: ChunkPos,
+        surface_span: impl Fn(i64, i64) -> (i64, i64),
+    ) -> StreamUpdate {
         self.last_center = Some(center);
 
         let load_sq = self.load_radius * self.load_radius;
         let unload_sq = self.unload_radius * self.unload_radius;
 
-        // Unload: loaded chunks beyond the unload radius.
-        let mut to_unload: Vec<ChunkPos> = self
-            .loaded
-            .iter()
-            .copied()
-            .filter(|&p| {
-                horiz_dist_sq(p, center) > unload_sq || p.y < self.y_band.0 || p.y > self.y_band.1
-            })
-            .collect();
+        // One query per column, not per chunk: a column contributes several
+        // loaded layers, and the unload scan revisits every one of them.
+        let mut windows: HashMap<(i64, i64), (i64, i64)> = HashMap::new();
+        let mut window_of = |cx: i64, cz: i64, this: &Self| -> (i64, i64) {
+            *windows
+                .entry((cx, cz))
+                .or_insert_with(|| this.window_for(surface_span(cx, cz)))
+        };
+
+        // Unload: loaded chunks beyond the unload radius, outside their
+        // column's window, or outside the world.
+        //
+        // No vertical hysteresis is needed, and adding it would be noise: a
+        // column's window depends only on its own terrain, which does not
+        // change as the camera moves, so a chunk cannot oscillate in and out of
+        // it the way a horizontal radius makes chunks oscillate at its edge.
+        let mut to_unload: Vec<ChunkPos> = Vec::new();
+        for &p in &self.loaded {
+            let (lo, hi) = window_of(p.x, p.z, self);
+            if horiz_dist_sq(p, center) > unload_sq
+                || p.y < lo
+                || p.y > hi
+                || !planet::contains_chunk(p)
+            {
+                to_unload.push(p);
+            }
+        }
         to_unload.sort_by_key(|&p| (p.x, p.y, p.z)); // deterministic order
 
-        // Load: in-range chunks not already loaded. Iterate the horizontal
-        // disc around the camera, crossed with the world's vertical band —
-        // NOT a Y range relative to the camera, or climbing above the band
-        // would load nothing and the terrain under you would disappear.
+        // Load: for each column in the horizontal disc, the layers around that
+        // column's own surface. Not a Y range relative to the camera — climbing
+        // above it would load nothing and the terrain under you would vanish.
         let r = self.load_radius;
-        let (y_lo, y_hi) = self.y_band;
         let mut to_load: Vec<ChunkPos> = Vec::new();
-        for ny in y_lo..=y_hi {
-            for dz in -r..=r {
-                for dx in -r..=r {
-                    let p = ChunkPos::new(center.x + dx, ny, center.z + dz);
-                    if horiz_dist_sq(p, center) <= load_sq && !self.loaded.contains(&p) {
+        for dz in -r..=r {
+            for dx in -r..=r {
+                let (cx, cz) = (center.x + dx, center.z + dz);
+                if horiz_dist_sq(
+                    ChunkPos::new(cx, 0, cz),
+                    ChunkPos::new(center.x, 0, center.z),
+                ) > load_sq
+                {
+                    continue;
+                }
+                let (lo, hi) = window_of(cx, cz, self);
+                for ny in lo..=hi {
+                    let p = ChunkPos::new(cx, ny, cz);
+                    if planet::contains_chunk(p) && !self.loaded.contains(&p) {
                         to_load.push(p);
                     }
                 }
@@ -275,18 +368,31 @@ mod tests {
         ChunkPos::new(x, y, z)
     }
 
+    /// Perfectly flat terrain at chunk-Y 0. The degenerate case, and the one
+    /// that reproduces the pre-M10 fixed band.
+    fn flat(_cx: i64, _cz: i64) -> (i64, i64) {
+        (0, 0)
+    }
+
+    /// A long ramp: the surface climbs one chunk layer every four columns of X.
+    /// Deep enough to prove the window tracks terrain rather than the camera.
+    fn ramp(cx: i64, _cz: i64) -> (i64, i64) {
+        let y = cx.div_euclid(4);
+        (y, y)
+    }
+
     #[test]
     #[should_panic]
     fn rejects_bad_radii() {
         Streamer::new(4, 4); // unload must exceed load
     }
 
-    /// The load set is a CYLINDER: a horizontal disc crossed with the world's
-    /// vertical band.
+    /// Flat terrain reduces to the old fixed band: a horizontal disc crossed
+    /// with a constant vertical window.
     #[test]
-    fn initial_update_loads_cylinder_around_origin() {
-        let mut s = Streamer::with_y_band(3, 5, (-2, 2));
-        let update = s.update(cp(0, 0, 0));
+    fn flat_terrain_loads_a_cylinder_around_origin() {
+        let mut s = Streamer::surface_following(3, 5, 2, 2);
+        let update = s.update(cp(0, 0, 0), flat);
         for &p in &update.to_load {
             let horiz = p.x * p.x + p.z * p.z;
             assert!(horiz <= 9, "loaded {p:?} outside horizontal radius");
@@ -301,13 +407,13 @@ mod tests {
     /// the world visibly vanished beneath a flying camera.
     #[test]
     fn flying_high_keeps_the_ground_loaded() {
-        let mut s = Streamer::with_y_band(3, 5, (-2, 2));
-        let first = s.update(cp(0, 0, 0));
+        let mut s = Streamer::surface_following(3, 5, 2, 2);
+        let first = s.update(cp(0, 0, 0), flat);
         s.apply(&first);
         let ground = cp(0, 0, 0);
         assert!(s.is_loaded(ground));
-        // Climb far above the band.
-        let update = s.update(cp(0, 40, 0));
+        // Climb far above the surface window.
+        let update = s.update(cp(0, 40, 0), flat);
         assert!(
             !update.to_unload.contains(&ground),
             "ground unloaded when the camera climbed"
@@ -317,11 +423,11 @@ mod tests {
 
     #[test]
     fn moving_loads_leading_unloads_trailing() {
-        let mut s = Streamer::with_y_band(2, 4, (-1, 1));
-        let first = s.update(cp(0, 0, 0));
+        let mut s = Streamer::surface_following(2, 4, 1, 1);
+        let first = s.update(cp(0, 0, 0), flat);
         s.apply(&first);
         let before = s.loaded_count();
-        let update = s.update(cp(6, 0, 0));
+        let update = s.update(cp(6, 0, 0), flat);
         assert!(!update.to_load.is_empty(), "moving should load new chunks");
         assert!(
             !update.to_unload.is_empty(),
@@ -334,9 +440,9 @@ mod tests {
 
     #[test]
     fn loaded_count_bounded_regardless_of_travel() {
-        let mut s = Streamer::with_y_band(2, 4, (-1, 1));
+        let mut s = Streamer::surface_following(2, 4, 1, 1);
         for step in 0..40 {
-            let u = s.update(cp(step * 3, 0, step));
+            let u = s.update(cp(step * 3, 0, step), flat);
             s.apply(&u);
         }
         // A cylinder of radius 4 (unload) x 3 layers is the hard ceiling.
@@ -349,8 +455,8 @@ mod tests {
 
     #[test]
     fn to_load_is_nearest_first() {
-        let mut s = Streamer::with_y_band(3, 5, (-1, 1));
-        let update = s.update(cp(10, 0, 10));
+        let mut s = Streamer::surface_following(3, 5, 1, 1);
+        let update = s.update(cp(10, 0, 10), flat);
         let mut prev = -1;
         for &p in &update.to_load {
             let d = dist_sq(p, cp(10, 0, 10));
@@ -362,12 +468,152 @@ mod tests {
 
     #[test]
     fn works_in_deep_negative_coordinates() {
-        let mut s = Streamer::with_y_band(2, 4, (-500, -498));
-        let center = cp(-1_000_000, -500, 1_000_000);
-        let update = s.update(center);
+        let mut s = Streamer::surface_following(2, 4, 1, 1);
+        // Deep in the negative quadrant, but inside the world (M10 bounds).
+        let center = cp(-3_000, -300, -3_000);
+        let deep = |_: i64, _: i64| (-300, -300);
+        let update = s.update(center, deep);
         s.apply(&update);
         assert!(s.is_loaded(center));
-        assert!(s.is_loaded(cp(-1_000_000 + 1, -500, 1_000_000)));
+        assert!(s.is_loaded(cp(-2_999, -300, -3_000)));
+    }
+
+    // ---- M10 task 2: surface-following vertical extent ----
+
+    /// THE property. Every resident chunk sits within the margins of its OWN
+    /// column's surface — not a band shared by the world. This is what makes a
+    /// 640-layer world affordable: a trench column and a summit column each
+    /// load the same handful of chunks, 600 layers apart.
+    #[test]
+    fn every_resident_chunk_tracks_its_own_column_surface() {
+        let (below, above) = (2, 3);
+        let mut s = Streamer::surface_following(6, 8, below, above);
+        // Travel along the ramp so columns enter and leave from every side.
+        for step in 0..30 {
+            let cx = step * 2;
+            let u = s.update(cp(cx, ramp(cx, 0).0, 0), ramp);
+            s.apply(&u);
+        }
+        for p in s.loaded() {
+            let (lo, hi) = ramp(p.x, p.z);
+            assert!(
+                p.y >= lo - below && p.y <= hi + above,
+                "chunk {p:?} is outside its column's window {:?}",
+                (lo - below, hi + above)
+            );
+        }
+    }
+
+    /// A 640-layer world must not cost 640 layers. With a surface window the
+    /// resident set is bounded by the disc area times the window height,
+    /// independent of how tall the world is or how far the terrain climbs.
+    #[test]
+    fn resident_count_is_independent_of_world_height() {
+        let (r, below, above): (i64, i64, i64) = (4, 2, 2);
+        let mut s = Streamer::surface_following(r, r + 2, below, above);
+        // A surface that swings across hundreds of chunk layers.
+        let wild = |cx: i64, _cz: i64| {
+            let y = (cx * 37).rem_euclid(600) - 300;
+            (y, y)
+        };
+        for step in 0..40 {
+            let u = s.update(cp(step, wild(step, 0).0, 0), wild);
+            s.apply(&u);
+        }
+        let disc = ((2 * (r + 2) + 1) * (2 * (r + 2) + 1)) as usize;
+        let window = (below + above + 1) as usize;
+        assert!(
+            s.loaded_count() <= disc * window,
+            "resident set {} exceeds the disc x window ceiling {}",
+            s.loaded_count(),
+            disc * window
+        );
+    }
+
+    /// A chunk column 32 blocks wide can hold a cliff face crossing many
+    /// layers. The query returns a SPAN for exactly this reason — asking for a
+    /// single height would load the cliff top and leave a hole down its face.
+    #[test]
+    fn a_cliff_column_loads_its_whole_face() {
+        let mut s = Streamer::surface_following(2, 4, 1, 1);
+        // One column is a 10-layer cliff; its neighbours are flat.
+        let cliff = |cx: i64, _cz: i64| if cx == 1 { (0, 9) } else { (0, 0) };
+        let u = s.update(cp(0, 0, 0), cliff);
+        s.apply(&u);
+        for y in 0..=9 {
+            assert!(
+                s.is_loaded(cp(1, y, 0)),
+                "layer {y} of the cliff face was never loaded"
+            );
+        }
+    }
+
+    /// The window clamps to the world's vertical bounds, so a seabed column
+    /// near the floor does not request chunks below the world.
+    #[test]
+    fn the_window_clamps_to_the_world_floor_and_ceiling() {
+        let mut s = Streamer::surface_following(2, 4, 8, 8);
+        let sc = CHUNK_SIZE as i64;
+        let floor = planet::WORLD_Y_MIN_BLOCKS / sc;
+        let ceiling = planet::WORLD_Y_MAX_BLOCKS / sc - 1;
+        for surface in [floor, ceiling] {
+            let mut s2 = Streamer::surface_following(2, 4, 8, 8);
+            let u = s2.update(cp(0, surface, 0), |_, _| (surface, surface));
+            for p in &u.to_load {
+                assert!(
+                    (floor..=ceiling).contains(&p.y),
+                    "requested {p:?} outside the world's vertical bounds"
+                );
+            }
+        }
+        let u = s.update(cp(0, floor, 0), |_, _| (floor, floor));
+        assert!(!u.to_load.is_empty(), "the floor column loaded nothing");
+    }
+
+    /// Chunks outside the world are never requested, and any that somehow
+    /// became resident are released.
+    #[test]
+    fn chunks_outside_the_world_are_never_requested() {
+        let sc = CHUNK_SIZE as i64;
+        let edge = planet::WORLD_HALF_EXTENT_BLOCKS / sc - 1;
+        let mut s = Streamer::surface_following(4, 6, 2, 2);
+        let u = s.update(cp(edge, 0, edge), flat);
+        for p in &u.to_load {
+            assert!(
+                planet::contains_chunk(*p),
+                "requested {p:?} outside the world"
+            );
+        }
+        s.apply(&u);
+        assert!(s.loaded().all(planet::contains_chunk));
+    }
+
+    /// A column's window depends only on its own terrain, never on the camera,
+    /// so a camera sitting still must produce no vertical churn at all — and a
+    /// camera oscillating across a chunk boundary must not thrash either.
+    #[test]
+    fn a_settled_camera_produces_no_further_work() {
+        let mut s = Streamer::surface_following(3, 5, 2, 2);
+        let first = s.update(cp(0, 0, 0), ramp);
+        s.apply(&first);
+        let second = s.update(cp(0, 0, 0), ramp);
+        assert!(
+            second.is_empty(),
+            "settled camera still churning: {second:?}"
+        );
+
+        // Oscillate across a boundary; the hysteresis band must absorb it.
+        for _ in 0..8 {
+            let a = s.update(cp(1, 0, 0), ramp);
+            s.apply(&a);
+            let b = s.update(cp(0, 0, 0), ramp);
+            s.apply(&b);
+            assert!(
+                b.to_unload.is_empty(),
+                "oscillating camera unloaded chunks: {:?}",
+                b.to_unload
+            );
+        }
     }
 
     // ---- M09 task 1: nearest-first batch selection ----
