@@ -83,8 +83,21 @@ crates: `vox-sim`, `vox-net`, `vox-client`, `vox-server`.
 
 ## Coordinate conventions
 
-- Right-handed, **Y-up**. World coordinates are `i64` per axis (effectively
-  unbounded world). Local (in-chunk) coordinates are `0..32` per axis.
+- Right-handed, **Y-up**. World coordinates are `i64` per axis. Local
+  (in-chunk) coordinates are `0..32` per axis.
+- **The world is a torus (ADR-0012).** X and Z wrap; Y does not. Horizontal
+  positions are stored only in canonical form, `[0, period)` per axis, and
+  **every horizontal difference goes through `vox_core::planet::delta`** — never
+  subtract two horizontal coordinates directly, or distances break at the seam.
+  Every system that uses horizontal distance needs a test that straddles the
+  seam. World size is a per-world value recorded in `world.meta`, quantised to
+  8 192 blocks; nothing may assume a fixed size.
+- **Latitude loops** and is equal-area: one lap of Z passes equator, north pole,
+  equator, south pole. Query it through `planet`, never derive it locally.
+- **World positions are `f64`** where they can be far from the origin (camera,
+  player, physics). `f32` is used only after conversion to render-relative
+  coordinates (ADR-0002). At 100 000 blocks an `f32` resolves only 0.0078, and
+  high-frame-rate movement is lost to rounding entirely.
 - `ChunkPos` = world position >> 5 (arithmetic shift; correct for negatives).
   Local = world & 31. NEVER use `/ 32` and `% 32` on signed integers for this —
   it is wrong for negative coordinates. Use the shared helpers in
@@ -135,6 +148,18 @@ The division of labour:
   the full app (incl. `vox-app`/`vox-render`), and is the **only** visual /
   GPU / runtime check. `vox-app` and `vox-render` are **review-only** in the
   sandbox — they need edition-2024 + a GPU and will not compile there.
+- **Commit and push at every task boundary, not just at milestone ends.** The
+  sandbox is wiped between sessions, so an unpushed change exists in exactly one
+  place. M09's completion and four M10 tasks once sat uncommitted on one disk for
+  weeks, and the `v0.9.0-m09` tag was cut from the in-progress commit because the
+  tagging steps omitted `git add`/`git commit`. **Commit before tagging.**
+  Commit messages are a single line (multi-line `-m` breaks in PowerShell).
+- **At the start of a session, verify the remote before trusting it.** Check
+  `git log` on a fresh clone; if the work under discussion isn't there, stop and
+  say so before auditing or editing anything.
+- **Judge terrain at ground speed.** Survival sprint is 5.612 m/s; spectator
+  sprint-flight is 120 m/s, **21× faster**. One minute of flight is twenty-one
+  minutes on foot. Every walking-time figure in the docs is ground sprint.
 
 **Headless test setup (`fixcheck`).** The sandbox's stock toolchain is older
 than the project's Rust 1.96 / edition 2024, so to run `vox-core`/`vox-mesh`
@@ -148,7 +173,7 @@ by letting the copy fail to compile; they move around as the code evolves, so
 don't hard-code a fixed list.
 
 **Clippy.** Cannot be installed in the sandbox (neither `rustup component add`
-nor apt). **Read `docs/clippy-lints.md` before handing off any Rust change** —
+nor apt). **Read `docs/notes/clippy-lints.md` before handing off any Rust change** —
 it lists every lint that has actually broken this build, with fixes and a
 pre-handoff grep checklist, and it is the accumulated memory of round-trips
 already paid for. Append to it whenever a new lint bites.
@@ -192,8 +217,19 @@ beyond what the invariants above already require.
 
 ## Current status
 
-- **Active milestone:** none — M09 closed 2026-08-25. Next is 10 — Worldgen
-  (geology, climate, biomes); spec not yet written.
+- **Active milestone:** 10 — Terrain & the Deep Vertical
+  (`docs/milestones/10-terrain-and-deep-vertical.md`). Tasks 1–4 done and
+  pushed. Amendments A1 (transparency + water, ADR-0011), A2 (torus topology,
+  ADR-0012) and A3 (audit fixes) remain, then tuning and the retro.
+- **Roadmap after M10:** 11 — The Horizon
+  (`docs/milestones/11-the-horizon.md`: 32–64 km view via per-level LOD ring
+  centring, Earth-radius curvature, flat-cell merging, reverse-Z depth); then
+  12 — Climate & Biomes (spec not yet written). Climate was originally M11 and was deliberately moved
+  behind the horizon and topology work, which it depends on.
+- **Numbering:** milestones (`M10`, `M11`…) and ADRs (`ADR-0010`, `ADR-0011`…)
+  are separate counters. ADRs number decisions in the order they are made;
+  milestones number work in the order it is built. Matching numbers are
+  coincidence — ADR-0011 (transparency) belongs to milestone M10.
 - **Last completed milestone:** 09 — LOD Levels & Streaming Quality
   (2026-08-25); retrospective with numbers at the end of
   `docs/milestones/09-lod-octree-streaming.md`. Shipped: nearest-camera-first

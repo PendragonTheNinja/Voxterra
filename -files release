@@ -1,0 +1,50 @@
+warning: in the working copy of 'docs/milestones/10-terrain-and-deep-vertical.md', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'docs/decisions/10-terrain-and-deep-vertical.md', LF will be replaced by CRLF the next time Git touches it
+[1mdiff --git a/docs/milestones/10-terrain-and-deep-vertical.md b/docs/decisions/10-terrain-and-deep-vertical.md[m
+[1mindex 8121298..d35a252 100644[m
+[1m--- a/docs/milestones/10-terrain-and-deep-vertical.md[m
+[1m+++ b/docs/decisions/10-terrain-and-deep-vertical.md[m
+[36m@@ -117,20 +117,10 @@[m [mground were ever loaded.[m
+ 6. **Elevation field.** Continental structure — landmasses, shelves, basins —[m
+    with mountain ranges that run in coherent lines rather than as isolated[m
+    noise bumps, and a sea level. Peak height obeys the earned-by-extent rule.[m
+[31m-[m
+[31m-   **An explicit relief control is required**, separate from amplitude. Fractal[m
+[31m-   noise defaults to rough *everywhere*, which produces medium-relief hills wall[m
+[31m-   to wall and no true plains — and then the mountains mean nothing, because[m
+[31m-   there is nothing dull to contrast them against. Earth is mostly flat: abyssal[m
+[31m-   plains, continental shelves, the Great Plains, the Siberian lowlands. A[m
+[31m-   low-relief region here must be genuinely, boringly flat across tens of[m
+[31m-   thousands of blocks.[m
+[31m-[m
+    Headless: sampled over a large area, the elevation histogram is plausible[m
+[31m-   (most land low, mountains rare, ocean basins the largest single band); a[m
+[31m-   measurable fraction of land area has near-zero local gradient; and the field[m
+[31m-   is deterministic and identical between the chunk generator and the LOD[m
+[31m-   sampler.[m
+[32m+[m[32m   (most land low, mountains rare, ocean basins the largest single band), and[m
+[32m+[m[32m   the field is deterministic and identical between the chunk generator and the[m
+[32m+[m[32m   LOD sampler.[m
+ 7. **Water.** Oceans and seas fill to sea level. Static water only — no flow,[m
+    no rivers, no lakes above sea level (those need hydrology). Beaches and[m
+    shelves where the elevation field produces them.[m
+[36m@@ -196,19 +186,6 @@[m [mground were ever loaded.[m
+   M09's geomorph hard to judge. Consider a temporary elevation-tint debug view[m
+   (a toggle, not a shipped feature) so the field can be seen while it is tuned.[m
+ [m
+[31m-## Scale correction, mid-milestone[m
+[31m-[m
+[31m-The first implementation of task 4 used literal Earth relief — 4 300-block ocean[m
+[31m-basins, peaks near 8 300. It passed every test written for it and was unplayable:[m
+[31m-a 200 km world holds one continent's corner at those dimensions, and flying for[m
+[31m-minutes found a continental margin mistaken for a mountain, an abyssal plain,[m
+[31m-and one hill.[m
+[31m-[m
+[31m-**ADR-0010** records the correction and the reasoning. Vertical scale ÷5,[m
+[31m-horizontal wavelengths ÷3, massif interior detail ×3 — mirror Earth's systems,[m
+[31m-scale its dimensions. Criteria 5 and 6 are unchanged in intent; only the numbers[m
+[31m-they produce moved.[m
+[31m-[m
+ ## Decisions taken during scoping[m
+ [m
+ - **Finite, square, 200 000 × 200 000.** A rectangle was considered and[m

@@ -5,7 +5,7 @@ elevation with Earth-like vertical scale — mountains that take real effort to
 climb, oceans with real basins and rare trenches — and the streaming rework
 that makes a 20 000-block-tall world affordable.
 
-This is the first half of worldgen. Climate and biomes are M11 and depend on
+This is the first half of worldgen. Climate and biomes are M12 and depend on
 everything here: you cannot compute a rain shadow before there are mountains to
 cast it.
 
@@ -96,14 +96,14 @@ ground were ever loaded.
    first position satisfying a **predicate**, deterministic from the seed
    alone. M10 passes "is land above sea level" and starts at the world centre,
    so the first thing a player sees is equatorial and habitable. The predicate
-   is the point: M11 passes "is land AND is temperate forest" for
+   is the point: M12 passes "is land AND is temperate forest" for
    biome-selected spawns without touching the resolver. Headless: same seed
    yields the same spawn; a centre that falls in ocean still resolves to valid
    land.
 3. **Latitude axis.** Z maps to latitude, poles at Z = ±100 000, equator at
    Z = 0. Exposed as a pure function of position so both the chunk generator
    and the LOD sampler read the same value. Nothing consumes it yet beyond
-   diagnostics — M11 does — but the axis and its scale are fixed here.
+   diagnostics — M12 does — but the axis and its scale are fixed here.
 4. **Surface-following streaming.** `Streamer` loads a band of chunk layers
    around each column's terrain height rather than the full Y band. Headless:
    for a synthetic heightfield the resident set tracks the surface, contains no
@@ -166,7 +166,7 @@ ground were ever loaded.
 
 ## Non-goals
 
-- **No climate, no biomes, no vegetation.** M11. Surface materials stay as they
+- **No climate, no biomes, no vegetation.** M12. Surface materials stay as they
   are — the world will still be green. Judge terrain *shape* here.
 - **No rivers, lakes, or erosion.** These need a cached region-simulation pass
   (a second storage system), because a river must know its upstream. Its own
@@ -196,6 +196,44 @@ ground were ever loaded.
   M09's geomorph hard to judge. Consider a temporary elevation-tint debug view
   (a toggle, not a shipped feature) so the field can be seen while it is tuned.
 
+## Amendments (owner-approved, added mid-milestone)
+
+- **A1 — Transparency and water (ADR-0011).** The engine had no transparency,
+  and oceans cover ~58% of the world. `solid` splits into physical `solid` and
+  visual `opaque`/`renders`; the mesher culls a face when its neighbour is
+  opaque or the same block; transparent geometry draws in a second pass.
+  Supersedes the implementation approach of criterion 7; its intent stands.
+- **A2 — The world is a torus (ADR-0012).** Both horizontal axes wrap, latitude
+  loops and is equal-area, and world size becomes a per-world value quantised to
+  8 192 blocks (default 204 800). **Supersedes criteria 1 and 2.** Every system
+  measuring horizontal distance becomes seam-aware and gets a seam-straddling
+  test.
+- **A3 — Audit fixes (2026-09).** Found in a whole-codebase audit, each either a
+  live bug or a cost that grows with the world:
+  - **World positions become `f64`.** At the world's edge an `f32` camera can't
+    move at 2 000 fps and walks 81% fast at 1 000; walking is already 10% slow
+    at the default spawn. Done together with A2, which touches the same code.
+  - **`column_heights` is pruned when a chunk column unloads.** It was never
+    freed — ~0.26 GB per 10 km flown. The level-0 LOD real-height gather that
+    also read it is removed: seed heights plus `EditedColumns` are identical,
+    and it cost ~4 000 main-thread lookups per level-0 node.
+  - **`world.meta` records the generator version and world size.** This is
+    criterion 9, widened: a world is meaningless without its period.
+  - **The LOD sampler goes sparse beyond level 0.** Exact minimum over every
+    block is needed only where LOD overlaps full-resolution terrain; elsewhere
+    a 4×4 sample per cell costs ~3 ms per node at any stride. This is the cause
+    of the ~60 ms spikes that currently fail criterion 8, and the enabling
+    change for M11's horizon. Narrows ADR-0008's never-exceed contract, so it
+    gets an ADR amendment.
+  - Cleanup: delete the orphaned `vox-core/src/downsample.rs` (no `mod`
+    declaration anywhere) and the stray `docs/decisions/voxterra.code-workspace`;
+    deduplicate the surface-span sampler in `vox-app`; replace
+    `LOD_WORLD_Y_BLOCKS` with the planet constants it now duplicates.
+
+**Order of remaining work:** A2 with the `f64` rework → the rest of A3 → A1 →
+tuning and retro. Water goes last so the criterion-8 performance numbers are
+taken with oceans actually meshed.
+
 ## Scale correction, mid-milestone
 
 The first implementation of task 4 used literal Earth relief — 4 300-block ocean
@@ -204,9 +242,11 @@ a 200 km world holds one continent's corner at those dimensions, and flying for
 minutes found a continental margin mistaken for a mountain, an abyssal plain,
 and one hill.
 
-**ADR-0010** records the correction and the reasoning. Vertical scale ÷5,
-horizontal wavelengths ÷3, massif interior detail ×3 — mirror Earth's systems,
-scale its dimensions. Criteria 5 and 6 are unchanged in intent; only the numbers
+**ADR-0010** records the correction and the reasoning: mirror Earth's systems,
+scale its dimensions. A first pass (vertical ÷5, horizontal ÷3) was still wrong
+because it was judged from spectator flight; the field is now tuned to ground
+walking time — detail every ~2.4 minutes, a range crossed in ~21, the next
+mountain belt in ~39. Criteria 5 and 6 are unchanged in intent; only the numbers
 they produce moved.
 
 ## Decisions taken during scoping
@@ -220,9 +260,9 @@ they produce moved.
   and mean it. Horizontal scale is compressed ~100×; vertical is not. The
   earned-by-extent rule is what keeps that from producing walls.
 - **Spawn at the world centre, on land.** Equatorial and habitable. Delivered
-  through a predicate-based resolver so biome-selected spawns are an M11 game
+  through a predicate-based resolver so biome-selected spawns are an M12 game
   feature rather than an M10 rewrite.
 - **Split from the original M10 scope.** Climate, precipitation, biome
-  classification and surface materials moved to M11. The vertical range
+  classification and surface materials moved to M12. The vertical range
   decision turned out to require a streaming rework, which is a milestone's
   work on its own, and climate depends on elevation existing first.

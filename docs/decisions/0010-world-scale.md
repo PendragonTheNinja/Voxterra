@@ -74,7 +74,7 @@ wavelength and slope is what decides whether ground is traversable: peaks to
 from 3.5% to 13% of a massif's height, so a range is a range and not a dome.
 
 Proportions within a landform stay Earth-like — a 1:3 flank is still 1:3, ranges
-still run in lines, rain shadows will still work in M11. What changed is
+still run in lines, rain shadows will still work with climate (M12). What changed is
 density: 200 km now holds a continent's worth of variety rather than one
 continent's corner.
 
@@ -90,8 +90,11 @@ Measured on the same seed, at the median land start: a 3-minute walk now spans
   elevation spread across a 10 km walk at the median land start; it reads 134
   blocks now against 83 at the wavelengths it replaced.
 - **Judge terrain at walking speed, not flying speed.** Both wrong tunings
-  survived review because they were assessed from a spectator camera at four
-  times sprint. Flight compresses an hour of walking into a minute and makes an
+  survived review because they were assessed from a spectator camera, whose
+  sprint-flight is 120 m/s — twenty-one times a survival player's ground sprint
+  of 5.612 m/s. (An earlier revision of this ADR said "four times"; that was the
+  spectator sprint multiplier mistaken for the ratio to walking.) One minute of
+  flight covers what takes twenty-one minutes on foot, which makes an
   empty world look merely large.
 - **Every threshold in the elevation tests is now a fraction of the field's own
   constants**, not an absolute block height. Scale has changed once and may
