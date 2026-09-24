@@ -1446,8 +1446,15 @@ impl App {
             if far_x * far_x + far_z * far_z > r * r {
                 continue;
             }
-            // Confirm every chunk in the footprint is actually resident; a node
-            // suppressed while its chunks are still streaming would be a hole.
+            // Confirm every chunk in the footprint is actually DRAWN — resident
+            // AND meshed at least once. Residency alone is not enough: a
+            // chunk's first mesh is deliberately held back until its neighbors
+            // arrive (so it never bakes dark), and behind a meshing queue. A
+            // node suppressed in that window hides the coarse terrain while the
+            // real chunk draws nothing, and the sky shows through — a brief
+            // flash at the edge of the full-res region at radius 8, and a
+            // band hundreds of blocks wide at radius 24, where the mesh
+            // backlog runs to thousands of chunks.
             let mut missing = false;
             'cols: for cz in oz..oz + s {
                 for cx in ox..ox + s {
@@ -1457,7 +1464,8 @@ impl App {
                     // not load them.
                     let (band_lo, band_hi) = self.surface_window_chunks(cx, cz);
                     for cy in band_lo..=band_hi {
-                        if self.world.chunk(ChunkPos::new(cx, cy, cz)).is_none() {
+                        let c = ChunkPos::new(cx, cy, cz);
+                        if self.world.chunk(c).is_none() || !self.meshed_once.contains(&c) {
                             missing = true;
                             break 'cols;
                         }

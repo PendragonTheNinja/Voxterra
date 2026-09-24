@@ -227,6 +227,19 @@ ground were ever loaded.
     of the ~60 ms spikes that currently fail criterion 8, and the enabling
     change for M11's horizon. Narrows ADR-0008's never-exceed contract, so it
     gets an ADR amendment.
+  - **LOD suppression waits for chunks to be DRAWN, not just resident.**
+    (Done.) Suppressing a node over chunks whose first mesh was still queued
+    showed sky through the gap: a flash at the edge of the full-res region at
+    radius 8, a band hundreds of blocks wide at radius 24.
+  - **Streaming follows the camera as well as the ground.** Surface-following
+    loads only a few chunk layers below the surface, so a player who digs more
+    than ~100 blocks down walks out of the loaded world. The vertical window
+    must also cover the camera's own neighbourhood. Done with the `f64`
+    rework, which is the same question — where the player actually is.
+  - **No faces toward chunks that will never load.** The mesher reads an
+    unloaded neighbour as air, so every column's lowest loaded chunk draws a
+    black floor into the void beneath it — invisible from above, but real
+    geometry, and plainly visible from underground in spectator.
   - Cleanup: delete the orphaned `vox-core/src/downsample.rs` (no `mod`
     declaration anywhere) and the stray `docs/decisions/voxterra.code-workspace`;
     deduplicate the surface-span sampler in `vox-app`; replace
