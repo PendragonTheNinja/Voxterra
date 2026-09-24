@@ -229,14 +229,21 @@ beyond what the invariants above already require.
 ## Current status
 
 - **Active milestone:** 10 — Terrain & the Deep Vertical
-  (`docs/milestones/10-terrain-and-deep-vertical.md`). Tasks 1–4 done and
-  pushed. Amendments A1 (transparency + water, ADR-0011), A2 (torus topology,
-  ADR-0012) and A3 (audit fixes) remain, then tuning and the retro.
+  (`docs/milestones/10-terrain-and-deep-vertical.md`). **The exact state and the
+  ordered list of remaining work is in that spec's "Status and remaining work —
+  START HERE" section; begin at its first unchecked item.** As of 2026-09-24:
+  tasks 1–4, A2 (the torus) and one A3 fix are done and pushed; next is A3 item
+  1, `f64` world positions with camera-following streaming.
+- **Starting a new session:** clone fresh, confirm `git log` matches the
+  commits the checklist names as done, run the headless tests (expect
+  vox-core 218, vox-mesh 37, vox-worldgen 26 passing as of `249644e`), then
+  start the first unchecked item.
 - **Roadmap after M10:** 11 — The Horizon
   (`docs/milestones/11-the-horizon.md`: 32–64 km view via per-level LOD ring
   centring, Earth-radius curvature, flat-cell merging, reverse-Z depth); then
-  12 — Climate & Biomes (spec not yet written). Climate was originally M11 and was deliberately moved
-  behind the horizon and topology work, which it depends on.
+  12 — Climate & Biomes (spec not yet written). Climate was originally M11 and
+  was deliberately moved behind the horizon and topology work, which it depends
+  on.
 - **Numbering:** milestones (`M10`, `M11`…) and ADRs (`ADR-0010`, `ADR-0011`…)
   are separate counters. ADRs number decisions in the order they are made;
   milestones number work in the order it is built. Matching numbers are

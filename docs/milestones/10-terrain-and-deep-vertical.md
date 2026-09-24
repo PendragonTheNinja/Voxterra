@@ -214,7 +214,7 @@ ground were ever loaded.
   live bug or a cost that grows with the world:
   - **World positions become `f64`.** At the world's edge an `f32` camera can't
     move at 2 000 fps and walks 81% fast at 1 000; walking is already 10% slow
-    at the default spawn. Done together with A2, which touches the same code.
+    at the default spawn.
   - **`column_heights` is pruned when a chunk column unloads.** It was never
     freed — ~0.26 GB per 10 km flown. The level-0 LOD real-height gather that
     also read it is removed: seed heights plus `EditedColumns` are identical,
@@ -245,9 +245,73 @@ ground were ever loaded.
     deduplicate the surface-span sampler in `vox-app`; replace
     `LOD_WORLD_Y_BLOCKS` with the planet constants it now duplicates.
 
-**Order of remaining work:** A2 with the `f64` rework → the rest of A3 → A1 →
-tuning and retro. Water goes last so the criterion-8 performance numbers are
-taken with oceans actually meshed.
+## Status and remaining work — START HERE
+
+*Kept current at every task boundary. A new session reads this list, verifies
+the remote matches it, and starts at the first unchecked item.*
+
+### Done
+
+- [x] **Tasks 1–4** — world shape, surface-following streaming, deep vertical
+  range, elevation field (retuned twice; ADR-0010). Commit `91ea4bf`.
+- [x] **A2 — torus world** (ADR-0012), including `world.meta` recording world
+  size and generator version (criterion 9), per-world coastline calibration,
+  and the fixed-point noise lattice. Commit `aab4d93`.
+- [x] **A3 — LOD suppression waits for chunks to be drawn.** Removed the sky
+  flash at the edge of the full-res region and the wide band at large radii.
+  Commit `249644e`; confirmed in play 2026-09-24.
+
+### Remaining, in order
+
+1. **A3 — `f64` world positions, and streaming that follows the camera.** One
+   batch: both are "where is the player actually standing". Camera, player
+   physics, collision and the raycast origin move to `f64`, converting to
+   render-relative `f32` only at the GPU (ADR-0002). The streamer's vertical
+   window becomes the surface window *plus* a window around the camera's own
+   height, so a player who digs deep stays in the loaded world. The camera
+   stays in the unwrapped frame (ADR-0012 §4) — it must never be canonicalised.
+   Streaming changes are headless-testable in `vox-core`; the rest is
+   review-only in `vox-app`.
+2. **A3 — no faces toward chunks that will never load.** The mesher needs to
+   know which absent neighbours are *never coming* (below/above the column's
+   window) and treat those as solid rather than air. The first-mesh gate
+   already answers "is this neighbour coming?" — reuse it, don't re-derive it.
+3. **A3 — `column_heights` pruning** on chunk-column unload, and removal of the
+   redundant level-0 LOD real-height gather.
+4. **A3 — sparse LOD sampler** beyond level 0, with an ADR-0008 amendment
+   narrowing the never-exceed contract to where LOD overlaps full-resolution
+   terrain. This is what removes the `lod +N` burst frames (13–26 fps in every
+   2026-09 log) and it is M11's prerequisite.
+5. **A3 — LOD grid lines. Diagnose before fixing.** Faint straight lines run
+   across distant terrain; the owner confirmed with the L toggle (2026-09-24)
+   that they belong to the LOD, not full-resolution chunks. First establish
+   whether they sit on node borders — 64, 128 and 256-block spacing for levels
+   0, 1 and 2. Leads, unverified: skirt faces showing where neighbouring nodes'
+   edge cells differ; a morph-target mismatch where levels meet; depth-bias
+   z-fighting between a node's skirt and its neighbour's top. If the cause is
+   tied to the shared ring centre or cell layout, which M11 replaces, record it
+   and defer rather than fix it twice.
+6. **A3 — cleanup.** Delete the orphaned `vox-core/src/downsample.rs` and the
+   stray `docs/decisions/voxterra.code-workspace`; deduplicate the surface-span
+   sampler in `vox-app`; replace `LOD_WORLD_Y_BLOCKS` with the planet constants.
+7. **A1 — transparency and water** (ADR-0011, Accepted, all decisions taken:
+   distant water opaque with a pre-blended colour, no light attenuation in M10,
+   no swimming). An earlier sandbox implementation of the registry split and
+   the mesher rule was never handed off and is lost; build from the ADR. Water
+   goes after the A3 items so the performance numbers below are taken with
+   oceans meshed.
+8. **Tuning and retro.** Criterion-8 numbers at radius 8, on foot and flying,
+   against M09's (stationary 851–967 fps; sprint-fly median ~180). Append the
+   retrospective here, update CLAUDE.md status, then **commit before tagging**
+   `v0.10.0-m10`.
+
+### Known performance state (2026-09-24 logs)
+
+At radius 8 with 3 LOD levels: ~800–880 fps settled. At radius 24 with 5 LOD
+levels: ~14 000 resident chunks, ~1.2–2 GB GPU, 13–55 fps while streaming, and a
+mesh and relight backlog of ~11 000 chunks that takes over a minute to drain.
+Lighting (`lt`) is now as costly as meshing per second. Large radii are not the
+road to a long view — M11's horizon comes from LOD.
 
 ## Scale correction, mid-milestone
 

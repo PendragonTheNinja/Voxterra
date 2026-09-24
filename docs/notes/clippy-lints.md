@@ -204,6 +204,14 @@ Two cautions when using the sandbox `rustfmt`:
    a scratch dir, `rustfmt --edition 2021`, then diff.
 2. **Ignore its import ordering.** 1.75 sorts `{ChunkPos, CHUNK_SIZE}`;
    edition-2024 style sorts `{CHUNK_SIZE, ChunkPos}`. Taking its suggestion
-   there would churn every file and lose on Nathan's run. Everything else it
+   there would churn every file and lose on Nathan's run. Most of what else it
    changes is `max_width`/`chain_width`/`fn_call_width` wrapping, which is
-   edition-independent and safe to port.
+   safe to port.
+3. **It is not the authority — Nathan's `cargo fmt` is.** The 2024 style
+   differs in more than import order: it keeps a short `if … { a } else { b }`
+   on one line where 1.75 splits it, and packs re-sorted import lists
+   differently. So after Nathan runs the gauntlet, a pushed file may differ
+   from the sandbox copy in formatting alone (seen with `planet.rs` and
+   `vox-core/src/lib.rs`, 2026-09-24). When verifying the remote against a
+   handoff, a formatting-only diff is expected — check that the code is
+   identical, not the bytes.
