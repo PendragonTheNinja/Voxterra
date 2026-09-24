@@ -21,7 +21,7 @@
 pub mod elevation;
 
 use elevation::Elevation;
-use vox_core::{BlockId, CHUNK_SIZE, Chunk, ChunkPos, LocalPos};
+use vox_core::{BlockId, CHUNK_SIZE, Chunk, ChunkPos, LocalPos, WorldShape};
 
 /// Block ids used by the placeholder generator. These now come from the
 /// canonical block registry in vox-core (Milestone 03); re-exported here so
@@ -37,15 +37,37 @@ const DIRT_DEPTH: i64 = 4;
 #[derive(Clone, Copy, Debug)]
 pub struct Generator {
     seed: u64,
+    shape: WorldShape,
     elevation: Elevation,
 }
 
+/// Version of the terrain this generator produces for a given seed and world
+/// size. Recorded in `world.meta`; a world made by a different version is
+/// refused rather than opened with its edited chunks stranded in new terrain.
+///
+/// **Bump this whenever terrain output changes** — any change to the elevation
+/// field's constants, stages or noise. `terrain_fingerprint_is_pinned` fails
+/// when output changes, so a change cannot slip through unversioned: it forces
+/// a decision to bump this and re-pin the fingerprint in the same commit.
+///
+/// History: 1 — the M10 torus (ADR-0012), the first version recorded.
+pub const GENERATOR_VERSION: u32 = 1;
+
 impl Generator {
-    pub fn new(seed: u64) -> Self {
+    /// A generator for one world: its seed and its size. The size is part of
+    /// the terrain, not a detail — noise tiles with the world's period
+    /// (ADR-0012), so the same seed makes different ground at different sizes.
+    pub fn new(seed: u64, shape: WorldShape) -> Self {
         Self {
             seed,
-            elevation: Elevation::new(seed),
+            shape,
+            elevation: Elevation::new(seed, shape),
         }
+    }
+
+    /// The size of the world this generator makes.
+    pub fn shape(&self) -> WorldShape {
+        self.shape
     }
 
     /// The elevation field backing [`Self::surface_height`]. Exposed so callers
@@ -60,8 +82,8 @@ impl Generator {
     }
 
     /// Surface height (the Y of the topmost solid/grass block) at world
-    /// column (wx, wz). Smooth value noise: bilinearly interpolate a hashed
-    /// lattice so adjacent columns agree and chunk borders line up exactly.
+    /// column (wx, wz), which may be on any lap of the world. See
+    /// [`Elevation::height`].
     ///
     /// Independent of Y and of chunk boundaries — two chunks stacked
     /// vertically compute the same surface for the same column, which is
@@ -178,7 +200,7 @@ mod tests {
     /// THE invariant: same seed + same position → byte-identical chunk.
     #[test]
     fn generation_is_deterministic() {
-        let worldgen = Generator::new(0x0007_E22A_C0DE);
+        let worldgen = Generator::new(0x0007_E22A_C0DE, WorldShape::DEFAULT);
         let pos = ChunkPos::new(3, 0, -2);
         let a = worldgen.generate_chunk(pos);
         let b = worldgen.generate_chunk(pos);
@@ -196,8 +218,8 @@ mod tests {
     /// to fall rather than on whether the seeds differ.
     #[test]
     fn different_seeds_differ() {
-        let a = Generator::new(1);
-        let b = Generator::new(2);
+        let a = Generator::new(1, WorldShape::DEFAULT);
+        let b = Generator::new(2, WorldShape::DEFAULT);
         let differ = (0..64).any(|i| {
             let (x, z) = (i * 1_511, i * 977 - 30_000);
             a.surface_height(x, z) != b.surface_height(x, z)
@@ -210,7 +232,7 @@ mod tests {
     /// This is the cubic-chunk seam guarantee.
     #[test]
     fn vertically_stacked_chunks_are_seamless() {
-        let worldgen = Generator::new(42);
+        let worldgen = Generator::new(42, WorldShape::DEFAULT);
         let lower = worldgen.generate_chunk(ChunkPos::new(0, 0, 0));
         let upper = worldgen.generate_chunk(ChunkPos::new(0, 1, 0));
 
@@ -246,7 +268,7 @@ mod tests {
     /// Chunks far above any surface are all air and stored uniformly.
     #[test]
     fn high_chunks_are_uniform_air() {
-        let worldgen = Generator::new(7);
+        let worldgen = Generator::new(7, WorldShape::DEFAULT);
         let chunk = worldgen.generate_chunk(ChunkPos::new(0, 100, 0)); // y 3200+
         assert!(chunk.is_all_air());
         assert!(chunk.is_uniform());
@@ -255,7 +277,7 @@ mod tests {
     /// Chunks far below any surface are all stone and stored uniformly.
     #[test]
     fn deep_chunks_are_uniform_stone() {
-        let worldgen = Generator::new(7);
+        let worldgen = Generator::new(7, WorldShape::DEFAULT);
         let chunk = worldgen.generate_chunk(ChunkPos::new(0, -100, 0)); // y -3200..
         assert!(chunk.is_uniform());
         // Confirm it's stone, not air.
@@ -266,7 +288,7 @@ mod tests {
     /// chunk-local coordinate leaking into the noise).
     #[test]
     fn surface_height_is_global() {
-        let worldgen = Generator::new(99);
+        let worldgen = Generator::new(99, WorldShape::DEFAULT);
         // Column at world x=32 is local x=0 of chunk 1 and "x=32" globally;
         // it must have one canonical height regardless.
         let h = worldgen.surface_height(32, 5);
@@ -278,14 +300,54 @@ mod tests {
 
     /// Noise stays in range so heights are bounded and sane.
     #[test]
-    fn noise_is_bounded() {
-        let worldgen = Generator::new(123);
-        for x in -100..100 {
-            for z in (-100..100).step_by(7) {
-                let n = worldgen.elevation().value_noise(x, z, 16);
-                assert!((-1.0..=1.0).contains(&n), "noise out of range: {n}");
+    fn stages_stay_in_their_ranges() {
+        let e = *Generator::new(123, WorldShape::DEFAULT).elevation();
+        for x in (-4_000..4_000).step_by(37) {
+            for z in (-4_000..4_000).step_by(211) {
+                for v in [e.continent(x, z), e.detail(x, z)] {
+                    assert!((-1.0..=1.0).contains(&v), "signed stage out of range: {v}");
+                }
+                for v in [e.relief(x, z), e.orogeny(x, z)] {
+                    assert!((0.0..=1.0).contains(&v), "unit stage out of range: {v}");
+                }
             }
         }
+    }
+
+    /// Terrain sampled at fixed places, folded into one number.
+    fn terrain_fingerprint() -> u64 {
+        let g = Generator::new(0x0007_E22A_C0DE, WorldShape::DEFAULT);
+        let mut h = 0xCBF2_9CE4_8422_2325u64; // FNV-1a
+        for i in 0..512i64 {
+            let (x, z) = (i * 7_919 - 1_000_000, i * 104_729 + 3);
+            for b in g.surface_height(x, z).to_le_bytes() {
+                h = (h ^ b as u64).wrapping_mul(0x0100_0000_01B3);
+            }
+        }
+        h
+    }
+
+    /// **Terrain output is pinned to [`GENERATOR_VERSION`].**
+    ///
+    /// Saves record the generator version so a world is never reopened under
+    /// different terrain. That only works if the version actually changes when
+    /// the terrain does. This fails on ANY change to terrain output, forcing the
+    /// person making it to bump the version and re-pin in the same commit.
+    ///
+    /// It is also a determinism check: the same code must produce the same
+    /// terrain on every machine. If this fails on one platform and passes on
+    /// another with no code change, that is a real bug, not a stale pin.
+    #[test]
+    fn terrain_fingerprint_is_pinned() {
+        const PINNED: (u32, u64) = (1, 0x3808_a5be_8a75_2e0e);
+        let got = terrain_fingerprint();
+        assert_eq!(
+            (GENERATOR_VERSION, got),
+            PINNED,
+            "terrain output changed. If intended, bump GENERATOR_VERSION and set \
+             PINNED to (new version, {got:#018x}); existing worlds will then be refused \
+             rather than opened with mismatched terrain."
+        );
     }
 
     // ---- LOD heightfield generation (M09) ----
@@ -295,7 +357,7 @@ mod tests {
     /// Same seed + origin + stride -> identical heightfield, always.
     #[test]
     fn lod_heightfield_is_deterministic() {
-        let g = Generator::new(0x0007_E22A_C0DE);
+        let g = Generator::new(0x0007_E22A_C0DE, WorldShape::DEFAULT);
         assert_eq!(
             g.lod_heightfield(-256, 256, S),
             g.lod_heightfield(-256, 256, S)
@@ -307,7 +369,7 @@ mod tests {
     /// through real ground and is solid to walk into. Checks every real column.
     #[test]
     fn lod_heightfield_never_exceeds_real_terrain() {
-        let g = Generator::new(42);
+        let g = Generator::new(42, WorldShape::DEFAULT);
         let (ox, oz) = (0i64, 0i64);
         let hf = g.lod_heightfield(ox, oz, S);
         let n = CHUNK_SIZE as i64;
@@ -328,7 +390,7 @@ mod tests {
     /// cell, not an arbitrary sample).
     #[test]
     fn lod_heightfield_tracks_the_surface() {
-        let g = Generator::new(7);
+        let g = Generator::new(7, WorldShape::DEFAULT);
         let hf = g.lod_heightfield(0, 0, 1); // stride 1: exact
         let n = CHUNK_SIZE as i64;
         for cz in 0..n {
@@ -340,7 +402,7 @@ mod tests {
 
     #[test]
     fn lod_heightfield_has_one_entry_per_cell() {
-        let g = Generator::new(1);
+        let g = Generator::new(1, WorldShape::DEFAULT);
         assert_eq!(g.lod_heightfield(0, 0, 4).len(), CHUNK_SIZE * CHUNK_SIZE);
     }
 }
@@ -350,7 +412,7 @@ mod modflag_tests {
     use super::*;
     #[test]
     fn generated_chunks_are_unmodified() {
-        let g = Generator::new(0x0007_E22A_C0DE);
+        let g = Generator::new(0x0007_E22A_C0DE, WorldShape::DEFAULT);
         // Mixed (surface) chunk and uniform chunks alike must be unmodified.
         assert!(!g.generate_chunk(ChunkPos::new(0, 0, 0)).is_modified());
         assert!(!g.generate_chunk(ChunkPos::new(0, 100, 0)).is_modified()); // air

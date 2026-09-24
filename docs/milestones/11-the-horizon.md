@@ -64,12 +64,15 @@ numbers were taken on.
    node grid, instead of all levels sharing one centre snapped to the coarsest
    grid. At 64 km the coarsest cell is 8 km, and a shared centre could sit
    kilometres from the player. The exact, gapless partition between levels
-   (ADR-0008) is preserved and **seam-aware** (ADR-0012). Headless: every chunk
-   column within the horizon is covered by exactly one level, at many camera
-   positions including ones straddling the seam.
-2. **Levels to 64 km.** Eight levels (strides 2–256 chunks), ~1 600 nodes. The
-   coarsest node span equals ADR-0012's world-size quantum (8 192 blocks), so
-   nodes never straddle the seam misaligned.
+   (ADR-0008) is preserved. The rings stay in the player's **unwrapped** frame
+   and must not canonicalise anything — the world's seam lives only in
+   generation, saves and the edit overlay (ADR-0012 §4), so a correct ring
+   needs no seam handling at all. Headless: every chunk column within the
+   horizon is covered by exactly one level, at many camera positions including
+   ones several laps from the origin.
+2. **Levels to 64 km.** Eight levels (strides 2–256 chunks), ~1 600 nodes. Node
+   alignment relative to the world's seam does not matter: nodes sample
+   periodic terrain in the unwrapped frame (ADR-0012 §4).
 3. **View distance clamps to less than half the world's period** (ADR-0012
    rule 3), so no terrain is ever visible twice around the world.
 4. **Earth-radius curvature** in both terrain shaders — `shader.wgsl` and
@@ -101,8 +104,8 @@ numbers were taken on.
 
 ## Tasks
 
-1. **Per-level centring (`vox-core`, headless).** The ring redesign, seam-aware
-   from the start, with partition tests at many positions. Everything else
+1. **Per-level centring (`vox-core`, headless).** The ring redesign, in the
+   unwrapped frame, with partition tests at many positions. Everything else
    depends on this, so it lands first and alone.
 2. **More levels + view-distance clamp.** Extend to eight levels behind the
    existing settings slider; clamp to half the period.

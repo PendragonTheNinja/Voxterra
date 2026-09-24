@@ -205,9 +205,11 @@ ground were ever loaded.
   Supersedes the implementation approach of criterion 7; its intent stands.
 - **A2 — The world is a torus (ADR-0012).** Both horizontal axes wrap, latitude
   loops and is equal-area, and world size becomes a per-world value quantised to
-  8 192 blocks (default 204 800). **Supersedes criteria 1 and 2.** Every system
-  measuring horizontal distance becomes seam-aware and gets a seam-straddling
-  test.
+  8 192 blocks (default 204 800). **Supersedes criteria 1 and 2.** The seam
+  lives only where content is addressed — generation, saves and the LOD edit
+  overlay — while the player's frame never wraps, so streaming, LOD, rendering
+  and physics are untouched (ADR-0012 §4). Each world also calibrates its own
+  coastline so land fraction no longer depends on the seed.
 - **A3 — Audit fixes (2026-09).** Found in a whole-codebase audit, each either a
   live bug or a cost that grows with the world:
   - **World positions become `f64`.** At the world's edge an `f32` camera can't

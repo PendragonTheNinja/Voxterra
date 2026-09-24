@@ -85,15 +85,26 @@ crates: `vox-sim`, `vox-net`, `vox-client`, `vox-server`.
 
 - Right-handed, **Y-up**. World coordinates are `i64` per axis. Local
   (in-chunk) coordinates are `0..32` per axis.
-- **The world is a torus (ADR-0012).** X and Z wrap; Y does not. Horizontal
-  positions are stored only in canonical form, `[0, period)` per axis, and
-  **every horizontal difference goes through `vox_core::planet::delta`** — never
-  subtract two horizontal coordinates directly, or distances break at the seam.
-  Every system that uses horizontal distance needs a test that straddles the
-  seam. World size is a per-world value recorded in `world.meta`, quantised to
-  8 192 blocks; nothing may assume a fixed size.
+- **The world is a torus (ADR-0012), and the seam lives only where content is
+  addressed.** X and Z wrap; Y does not. The player's frame **never wraps**:
+  the camera and every loaded chunk use unwrapped coordinates that keep counting
+  past the world's width, so streaming, LOD, rendering, physics and the raycast
+  subtract positions directly. Exactly three things canonicalise — terrain
+  generation (noise tiles with the period), the save layer, and the LOD edit
+  overlay — and each has a seam-straddling test. **Do not canonicalise
+  positions anywhere else**; it puts the seam back into code that is free of it.
+  `planet::delta_x/z` is only for comparing positions that may be on different
+  laps. World size is a per-world `WorldShape` recorded in `world.meta`,
+  quantised to 8 192 blocks; nothing may assume a fixed size.
 - **Latitude loops** and is equal-area: one lap of Z passes equator, north pole,
-  equator, south pole. Query it through `planet`, never derive it locally.
+  equator, south pole. Query it through `WorldShape::latitude_sine` (for
+  generation) or `latitude_degrees` (for display), never derive it locally.
+- **Terrain output is versioned.** Any change to what the generator produces
+  for a given seed and size must bump `vox_worldgen::GENERATOR_VERSION` and
+  re-pin `terrain_fingerprint_is_pinned` in the same commit; worlds made by
+  another version are refused rather than opened with mismatched terrain.
+  (Re-pinning *without* a bump is only correct before a version has ever been
+  written to a world — as with version 1 during M10.)
 - **World positions are `f64`** where they can be far from the origin (camera,
   player, physics). `f32` is used only after conversion to render-relative
   coordinates (ADR-0002). At 100 000 blocks an `f32` resolves only 0.0078, and

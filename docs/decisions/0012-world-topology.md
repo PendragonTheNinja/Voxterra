@@ -73,10 +73,12 @@ live in `vox_core::planet`, so nothing else has to know them:
    `period / round(period / target_wavelength)`, so a whole number of cells fits
    around the world. At 204.8 km the adjustment is a few percent and invisible;
    it works identically at 50 km or 2 000 km.
-2. **Sizes are quantised** to a multiple of the largest LOD node span,
-   **8 192 blocks** (256 chunks). A node can then never straddle the seam at a
-   misaligned offset. The default world becomes **204 800 blocks** (25 quanta)
-   rather than 200 000.
+2. **Sizes are quantised** to **8 192 blocks** (256 chunks). The default world
+   becomes **204 800 blocks** (25 quanta) rather than 200 000. *Revised:* this
+   was first justified as keeping LOD nodes from straddling the seam at a
+   misaligned offset, which section 4's unwrapped frame made irrelevant. The
+   hard requirement is only whole chunks, for the save layer; the coarser step
+   is kept to give size choices a sensible menu.
 3. **The view distance is less than half the period.** Otherwise the same
    terrain is visible twice, around the world in both directions. Irrelevant at
    the default size; for small worlds the horizon clamps.
@@ -84,20 +86,45 @@ live in `vox_core::planet`, so nothing else has to know them:
    meaningless without its period, and the audit already requires the generator
    version there.
 
-### 4. Seams are made hard to get wrong
+### 4. The seam exists only where content is addressed
 
-The classic failure of wrapped worlds is a system that compares or subtracts
-horizontal positions without wrapping — chunks that fail to load across the
-seam, LOD rings that tear, physics that teleports.
+*Revised during implementation.* The first version of this section made every
+system seam-aware: positions stored only in canonical form, every horizontal
+difference routed through a wrap-aware `delta`, and a seam-straddling test for
+streaming, LOD rings, suppression, the renderer, physics, the raycast, spawn and
+saves. Nine systems, most of them in crates the sandbox cannot compile — and
+seam bugs are the classic failure of wrapped worlds.
 
-- Horizontal positions are stored **only in canonical form**, in
-  `[0, period)` per axis. Nothing downstream ever sees an out-of-range X or Z.
-- **Every horizontal difference goes through one function**, `planet::delta`,
-  returning the shortest signed separation. There is no other sanctioned way to
-  subtract two horizontal positions.
-- **Every system that uses horizontal distance gets a test that straddles the
-  seam**: streaming, LOD ring membership, suppression, render offsets,
-  collision, raycast, spawn search, save round-trips.
+The seam does not need to be where positions are *compared*. It only needs to
+be where the world's *content* is *looked up*. So:
+
+- **The player's frame never wraps.** The camera, the player and every loaded
+  chunk live in unwrapped coordinates: walk east past the far side of the
+  world and x keeps counting, 204 800, 204 801, … Streaming, LOD rings,
+  suppression, rendering, physics and the raycast subtract positions directly
+  and never meet a discontinuity. **None of them changed.**
+- **The world's content is periodic.** Exactly three things map an unwrapped
+  position to a canonical one, and they are the only places the seam exists:
+  1. **Terrain generation** — noise tiles with the world's period, so x and
+     x + size generate identical ground.
+  2. **The save layer** — chunk files are keyed canonically, so an edit made on
+     one lap is found on every other.
+  3. **The LOD edit overlay** — keyed canonically for the same reason.
+- **Each has a seam test** that deliberately straddles it, and each lives in a
+  crate the sandbox can build and test.
+- **Rule 3 is what makes this sound.** Because the view never reaches halfway
+  round the world, the same place can never be loaded under two unwrapped
+  positions at once, so the unwrapped frame never contradicts itself.
+
+`planet::delta_x` / `delta_z` still exist, for the case they genuinely serve:
+comparing positions that may be on *different* laps — a saved home marker
+against the player's current position. Positions in the loaded world share a
+lap and are subtracted directly.
+
+**Do not canonicalise positions anywhere else.** It is the one way to put the
+seam back into code that is currently free of it. Spawn is the worked example:
+the search returns the unwrapped position it found near its start, and only
+display and saving canonicalise it.
 
 ### 5. Visual curvature uses Earth's radius, not the torus's
 
@@ -128,23 +155,52 @@ originally planned:
 rather than Earth's dimensions, and climate belts are no exception. All walking
 times in this ADR are ground sprint (5.612 m/s), never spectator flight.
 
+## Found during implementation
+
+**One noise cell around the world is no noise at all.** The continent octave's
+target wavelength (56 km) exceeds the smallest legal world, so rule 1 rounded it
+to a single cell — one value repeated everywhere — and that world came out as
+one unbroken ocean. Every octave now has at least **three** cells around the
+world, the fewest that still produce highs and lows on every axis.
+
+**Land fraction was an accident of the seed.** Testing more than one world
+exposed it: across 200 seeds at the default size, land ran from 15% to 91%, and
+30% of seeds were over 60% land. The 42% chosen during M10 had been tuned on a
+single seed. Each world now **calibrates its own coastline** at construction —
+sampling its continent field and shifting it so the target share is land. All
+200 seeds now land at 41–42%, and small worlds at 40–44%. It costs about a
+millisecond, once per world, and is the knob a future "more land / more ocean"
+creation option would turn.
+
+**Tiled noise must not be tiled in floating point.** The pre-torus field divided
+by wavelengths that were compile-time constants, which the compiler turns into a
+cheap multiply-and-shift. Tiling divides by per-world values, and doing that in
+floating point measured ~55% slower for the whole field. The lattice is computed
+in 32.32 fixed point instead — one integer multiply per axis per octave — and
+the field ends up **~38% faster** than before the torus (≈176 ns per column
+against ≈285, whole-world sample, same machine).
+
+**Terrain output is now pinned to a version.** `vox_worldgen::GENERATOR_VERSION`
+is recorded in `world.meta`, and a test fingerprints terrain at fixed points, so
+any change to terrain output fails until the version is bumped and re-pinned in
+the same commit. It doubles as a determinism check across machines.
+
 ## Consequences
 
-- `planet.rs` changes from bounds to periods. `in_bounds_xz` and `clamp_xz`
-  become `wrap_xz` and `delta`; `latitude_fraction` becomes the looped
-  equal-area mapping.
-- **Every horizontal-distance consumer changes** — the streamer, the LOD ring,
-  coverage suppression, the renderer's floating origin, physics, the raycast,
-  the spawn search, and saves. This is the substance of the work and the reason
-  to do it now: after climate (M12) is built on the current model, every one
-  of these is harder to change.
-- The `f64` world-position rework from the audit touches most of the same code,
-  so the two are done together.
-- The Horizon milestone's per-level ring centring must be written seam-aware
-  from the start.
-- The elevation field's wavelengths are re-derived under rule 1. Measured
-  landform statistics should be re-checked, but changes of a few percent in
-  wavelength are within what ADR-0010's tuning tolerates.
-- The spawn search no longer needs to skip out-of-bounds candidates; it wraps.
+- `planet.rs` changes from bounds to a `WorldShape` value with periods; the
+  bounds functions become vertical-only (`in_vertical_bounds`,
+  `chunk_in_vertical_bounds`), and latitude becomes the looped equal-area
+  mapping, queried through the shape.
+- **Three systems change: generation, saves, the edit overlay.** Streaming, LOD,
+  suppression, rendering, physics and the raycast do not (section 4).
+- `world.meta` moves to version 2, recording the world's size and generator
+  version. Version-1 worlds are refused with an explanation rather than opened
+  with mismatched terrain.
+- The `f64` world-position rework from the audit is still needed and becomes
+  more so: the unwrapped frame lets coordinates grow with every lap.
+- The Horizon milestone's per-level ring centring needs no seam handling of its
+  own, provided it stays in the unwrapped frame — and it must, per section 4.
+- The spawn search stops at half the world instead of the world's edge, and
+  returns unwrapped positions.
 - The world has no pole *points* — polar regions are full-width bands. Climate
   (M12) makes them ice, and that is where the ends of the world used to be.

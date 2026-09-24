@@ -10,7 +10,7 @@ use glam::{Mat4, Vec3};
 use rayon::prelude::*;
 use vox_core::{
     cell_overlaps_aabb, BlockId, BlockRegistry, Chunk, ChunkPos, EditedColumns, LocalPos,
-    LodNodeId, LodRing, RayHit, Streamer, World, WorldPos, WorldStore,
+    LodNodeId, LodRing, RayHit, Streamer, World, WorldMeta, WorldPos, WorldShape, WorldStore,
 };
 use vox_mesh::{mesh_chunk, ChunkNeighbors, LodMeshData, MeshData};
 
@@ -579,14 +579,30 @@ impl Default for App {
         let (gen_tx, gen_rx) = std::sync::mpsc::channel();
         let (lod_tx, lod_rx) = std::sync::mpsc::channel();
 
-        // Open (or create) the world directory. The store's seed is
-        // authoritative: a new world uses this default seed, an existing one
-        // reuses its saved seed so terrain regenerates identically.
+        // Open (or create) the world directory. What `world.meta` records is
+        // authoritative: a new world is created with these values, an existing
+        // one keeps its own seed and size so terrain regenerates identically.
+        // A world made by a different terrain generator is refused rather than
+        // opened with its edited chunks stranded in new terrain.
         const DEFAULT_SEED: u64 = 0x0007_E22A_C0DE;
-        let store =
-            WorldStore::open("world", DEFAULT_SEED).expect("failed to open world directory");
+        let new_world = WorldMeta {
+            seed: DEFAULT_SEED,
+            shape: WorldShape::DEFAULT,
+            generator_version: vox_worldgen::GENERATOR_VERSION,
+        };
+        // Display, not `expect`: `expect` prints the error's Debug form, which
+        // turns "this world predates…; move or delete it" into `LegacyWorld`.
+        let store = WorldStore::open("world", new_world)
+            .unwrap_or_else(|e| panic!("cannot open the world at \"world\": {e}"));
         let seed = store.seed();
-        log::info!("world at {:?}, seed {:#x}", store.root(), seed);
+        let shape = store.shape();
+        log::info!(
+            "world at {:?}, seed {:#x}, {} x {} km",
+            store.root(),
+            seed,
+            shape.size_x() / 1000,
+            shape.size_z() / 1000
+        );
 
         // Find land before placing the camera. The world centre is on the
         // equator by construction, but since M10 it is as likely to be ocean as
@@ -595,17 +611,26 @@ impl Default for App {
         //
         // Streaming follows the SURFACE, so a camera far from any surface loads
         // terrain it cannot see: the chunks are resident, just 3 km below.
-        let generator = Generator::new(seed);
-        let (spawn_x, spawn_z) =
-            vox_core::find_spawn(0, 0, SPAWN_SEARCH_STRIDE, SPAWN_SEARCH_RINGS, |x, z| {
-                generator.surface_height(x, z) > vox_core::SEA_LEVEL_BLOCKS + 4
-            })
-            .unwrap_or((0, 0));
+        let generator = Generator::new(seed, shape);
+        let (spawn_x, spawn_z) = vox_core::find_spawn(
+            shape,
+            0,
+            0,
+            SPAWN_SEARCH_STRIDE,
+            SPAWN_SEARCH_RINGS,
+            |x, z| generator.surface_height(x, z) > vox_core::SEA_LEVEL_BLOCKS + 4,
+        )
+        .unwrap_or((0, 0));
         let spawn_y = generator.surface_height(spawn_x, spawn_z) as f32 + SPAWN_EYE_HEIGHT;
+        // The search returns the unwrapped position near the origin, which is
+        // where the camera goes; the log shows the canonical one, since that is
+        // the address a player would recognise and return to.
         log::info!(
-            "spawn at ({spawn_x}, {:.0}, {spawn_z}), latitude {:.1} deg",
+            "spawn at ({}, {:.0}, {}), latitude {:.1} deg",
+            shape.canonical_x(spawn_x),
             spawn_y,
-            vox_core::latitude_degrees(spawn_z)
+            shape.canonical_z(spawn_z),
+            shape.latitude_degrees(spawn_z)
         );
 
         Self {
@@ -650,7 +675,7 @@ impl Default for App {
             relight: HashSet::new(),
             meshed_once: HashSet::new(),
             column_heights: HashMap::new(),
-            edited_columns: Arc::new(EditedColumns::new()),
+            edited_columns: Arc::new(EditedColumns::new(shape)),
             targeted: None,
             selected_block: vox_core::registry::STONE,
             gen_tx,

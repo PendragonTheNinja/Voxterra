@@ -217,7 +217,7 @@ impl Streamer {
             if horiz_dist_sq(p, center) > unload_sq
                 || p.y < lo
                 || p.y > hi
-                || !planet::contains_chunk(p)
+                || !planet::chunk_in_vertical_bounds(p)
             {
                 to_unload.push(p);
             }
@@ -242,7 +242,7 @@ impl Streamer {
                 let (lo, hi) = window_of(cx, cz, self);
                 for ny in lo..=hi {
                     let p = ChunkPos::new(cx, ny, cz);
-                    if planet::contains_chunk(p) && !self.loaded.contains(&p) {
+                    if planet::chunk_in_vertical_bounds(p) && !self.loaded.contains(&p) {
                         to_load.push(p);
                     }
                 }
@@ -570,22 +570,46 @@ mod tests {
         assert!(!u.to_load.is_empty(), "the floor column loaded nothing");
     }
 
-    /// Chunks outside the world are never requested, and any that somehow
-    /// became resident are released.
+    /// The streamer knows nothing about the torus, deliberately (ADR-0012).
+    ///
+    /// The camera lives in coordinates that never wrap, so on a second or third
+    /// lap of the world it is simply at large X. Streaming there must behave
+    /// exactly as it does at the origin: same resident set, offset by whole
+    /// laps. If this ever needed a seam, the unwrapped-coordinate scheme would
+    /// have failed and the seam would be leaking into spatial code.
     #[test]
-    fn chunks_outside_the_world_are_never_requested() {
+    fn streaming_is_identical_on_every_lap_of_the_world() {
+        let lap = crate::planet::DEFAULT_WORLD_SIZE_BLOCKS / CHUNK_SIZE as i64;
+        let mut here = Streamer::surface_following(4, 6, 2, 2);
+        let mut there = Streamer::surface_following(4, 6, 2, 2);
+        let a = here.update(cp(3, 0, -2), flat);
+        let b = there.update(cp(3 + 3 * lap, 0, -2 - 5 * lap), flat);
+        let shifted: HashSet<ChunkPos> = b
+            .to_load
+            .iter()
+            .map(|p| cp(p.x - 3 * lap, p.y, p.z + 5 * lap))
+            .collect();
+        let original: HashSet<ChunkPos> = a.to_load.iter().copied().collect();
+        assert_eq!(original, shifted);
+    }
+
+    /// Chunks outside the world's VERTICAL bounds are never requested.
+    /// Horizontally there is nothing to be outside of.
+    #[test]
+    fn chunks_outside_the_vertical_bounds_are_never_requested() {
         let sc = CHUNK_SIZE as i64;
-        let edge = planet::WORLD_HALF_EXTENT_BLOCKS / sc - 1;
-        let mut s = Streamer::surface_following(4, 6, 2, 2);
-        let u = s.update(cp(edge, 0, edge), flat);
+        let top = planet::WORLD_Y_MAX_BLOCKS / sc - 1;
+        let mut s = Streamer::surface_following(4, 6, 8, 8);
+        let u = s.update(cp(0, top, 0), |_, _| (top, top));
+        assert!(!u.to_load.is_empty());
         for p in &u.to_load {
             assert!(
-                planet::contains_chunk(*p),
+                planet::chunk_in_vertical_bounds(*p),
                 "requested {p:?} outside the world"
             );
         }
         s.apply(&u);
-        assert!(s.loaded().all(planet::contains_chunk));
+        assert!(s.loaded().all(planet::chunk_in_vertical_bounds));
     }
 
     /// A column's window depends only on its own terrain, never on the camera,

@@ -61,6 +61,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::coords::{CHUNK_SIZE, ChunkPos};
+use crate::planet::WorldShape;
 
 /// A LOD node: its level plus its `(x, z)` cell in that level's node grid.
 /// The grid is fixed to the world, not camera-relative.
@@ -447,15 +448,27 @@ impl LodRing {
 ///
 /// Bucketed by chunk column so a node visits only the edits inside its own
 /// footprint, never the whole map.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct EditedColumns {
-    /// chunk (x, z) -> world (x, z) -> surface height in blocks.
+    /// Canonical chunk (x, z) -> canonical world (x, z) -> surface height.
+    ///
+    /// CANONICAL, because this is one of the three places the world's seam
+    /// exists (ADR-0012, `planet` module docs). An edit made on one lap of the
+    /// world has to reach the LOD on every lap, so it is stored under the
+    /// canonical position and mapped back to whichever lap a node is on.
     by_chunk: HashMap<(i64, i64), HashMap<(i64, i64), i32>>,
+    shape: WorldShape,
 }
 
 impl EditedColumns {
-    pub fn new() -> Self {
-        Self::default()
+    /// An empty overlay for a world of the given shape. No `Default`: an
+    /// overlay built for the wrong world size would silently misplace every
+    /// edit across the seam.
+    pub fn new(shape: WorldShape) -> Self {
+        Self {
+            by_chunk: HashMap::new(),
+            shape,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -468,11 +481,12 @@ impl EditedColumns {
     }
 
     /// Record a column's TRUE surface height (highest solid block), replacing
-    /// any previous value.
+    /// any previous value. `x`/`z` may be on any lap of the world.
     ///
     /// Replace rather than min: the caller rescans the column, so this is the
     /// current truth, and refilling a hole must be able to undo the drop.
     pub fn record(&mut self, x: i64, z: i64, surface_y: i32) {
+        let (x, z) = (self.shape.canonical_x(x), self.shape.canonical_z(z));
         let key = (
             x.div_euclid(CHUNK_SIZE as i64),
             z.div_euclid(CHUNK_SIZE as i64),
@@ -483,8 +497,10 @@ impl EditedColumns {
             .insert((x, z), surface_y);
     }
 
-    /// The recorded height for a column, if it has been edited.
+    /// The recorded height for a column, if it has been edited. `x`/`z` may be
+    /// on any lap of the world.
     pub fn get(&self, x: i64, z: i64) -> Option<i32> {
+        let (x, z) = (self.shape.canonical_x(x), self.shape.canonical_z(z));
         let key = (
             x.div_euclid(CHUNK_SIZE as i64),
             z.div_euclid(CHUNK_SIZE as i64),
@@ -496,9 +512,10 @@ impl EditedColumns {
     ///
     /// `heights` is a `32 x 32` cell grid (row-major, Z-major) as produced by
     /// seed sampling; `origin_x`/`origin_z` are the node's world-block origin
-    /// and `h_stride` its blocks-per-cell. `floor_y` bounds the result: a
-    /// column mined out entirely reports no terrain, and an unbounded sentinel
-    /// would mesh a wall to negative infinity.
+    /// — unwrapped, on whatever lap the node is — and `h_stride` its
+    /// blocks-per-cell. `floor_y` bounds the result: a column mined out
+    /// entirely reports no terrain, and an unbounded sentinel would mesh a wall
+    /// to negative infinity.
     ///
     /// Only lowering is applied. A cell already at or below the edit keeps its
     /// value, and a column the player built UP does not raise the cell —
@@ -525,12 +542,16 @@ impl EditedColumns {
         let c0z = origin_z.div_euclid(cells);
         for cz in c0z..c0z + h_stride {
             for cx in c0x..c0x + h_stride {
-                let Some(bucket) = self.by_chunk.get(&(cx, cz)) else {
+                // Look the bucket up canonically, then carry each edit back to
+                // the lap this footprint chunk is on.
+                let canon = self.shape.canonical_chunk(ChunkPos::new(cx, 0, cz));
+                let Some(bucket) = self.by_chunk.get(&(canon.x, canon.z)) else {
                     continue;
                 };
+                let (lap_x, lap_z) = ((cx - canon.x) * cells, (cz - canon.z) * cells);
                 for (&(wx, wz), &h) in bucket {
-                    let ix = (wx - origin_x).div_euclid(h_stride);
-                    let iz = (wz - origin_z).div_euclid(h_stride);
+                    let ix = (wx + lap_x - origin_x).div_euclid(h_stride);
+                    let iz = (wz + lap_z - origin_z).div_euclid(h_stride);
                     if !(0..cells).contains(&ix) || !(0..cells).contains(&iz) {
                         continue;
                     }
@@ -986,7 +1007,7 @@ mod tests {
         const DUG: i32 = 34;
         let col = (37i64, 70i64);
         let ring = edit_test_ring();
-        let mut edits = EditedColumns::new();
+        let mut edits = EditedColumns::new(WorldShape::DEFAULT);
         edits.record(col.0, col.1, DUG);
 
         for level in 0..3u32 {
@@ -1005,6 +1026,51 @@ mod tests {
         }
     }
 
+    /// An edit is visible on EVERY lap of the world (ADR-0012).
+    ///
+    /// The overlay is one of the three places the seam exists: an edit made at
+    /// one unwrapped position must show up in a node covering the same place
+    /// one lap east, one lap west, or straight across the seam from where it
+    /// was recorded. Before the torus this was structurally impossible to get
+    /// wrong; now it is the overlay's whole job.
+    #[test]
+    fn an_edit_is_seen_on_every_lap_of_the_world() {
+        const SEED: i32 = 40;
+        const DUG: i32 = 31;
+        let lap = WorldShape::DEFAULT.size_x();
+        let ring = edit_test_ring();
+        // Recorded just WEST of the seam, via a negative unwrapped coordinate.
+        let mut edits = EditedColumns::new(WorldShape::DEFAULT);
+        edits.record(-5, 70, DUG);
+        for col in [
+            (-5i64, 70i64),     // where it was made
+            (lap - 5, 70),      // the same place, canonically
+            (-5 + 3 * lap, 70), // three laps east
+            (-5 - 2 * lap, 70), // two laps west
+            (-5, 70 + 4 * lap), // four laps north
+        ] {
+            for level in 0..3u32 {
+                let (heights, idx) = node_heights(&ring, level, col, SEED, &edits);
+                assert_eq!(
+                    heights[idx], DUG,
+                    "level {level}: the edit is missing at {col:?}"
+                );
+                assert_eq!(
+                    heights.iter().filter(|&&h| h != SEED).count(),
+                    1,
+                    "level {level} at {col:?} disturbed cells it should not have"
+                );
+            }
+        }
+        assert_eq!(edits.get(lap - 5, 70), Some(DUG));
+        assert_eq!(edits.get(-5 + 7 * lap, 70 - lap), Some(DUG));
+        assert_eq!(
+            edits.len(),
+            1,
+            "one place, one entry, however it was addressed"
+        );
+    }
+
     /// Negative world coordinates resolve to the same cell (div_euclid, not
     /// truncating division — CLAUDE.md's coordinate rule).
     #[test]
@@ -1012,7 +1078,7 @@ mod tests {
         const SEED: i32 = 12;
         let col = (-37i64, -70i64);
         let ring = edit_test_ring();
-        let mut edits = EditedColumns::new();
+        let mut edits = EditedColumns::new(WorldShape::DEFAULT);
         edits.record(col.0, col.1, 5);
         for level in 0..3u32 {
             let (heights, idx) = node_heights(&ring, level, col, SEED, &edits);
@@ -1028,7 +1094,7 @@ mod tests {
     #[test]
     fn edits_outside_the_footprint_are_ignored() {
         let cells = CHUNK_SIZE as i64;
-        let mut edits = EditedColumns::new();
+        let mut edits = EditedColumns::new(WorldShape::DEFAULT);
         edits.record(-1, -1, 0); // just outside the node at origin (0, 0)
         edits.record(cells * 8, 0, 0); // just past the widest node's far edge
         for stride in [2i64, 4, 8] {
@@ -1047,7 +1113,7 @@ mod tests {
     #[test]
     fn a_placed_block_never_raises_a_cell() {
         let cells = CHUNK_SIZE as i64;
-        let mut edits = EditedColumns::new();
+        let mut edits = EditedColumns::new(WorldShape::DEFAULT);
         edits.record(5, 5, 90);
         let mut heights = vec![40i32; (cells * cells) as usize];
         edits.apply_to_node(&mut heights, 0, 0, 4, -128);
@@ -1059,7 +1125,7 @@ mod tests {
     #[test]
     fn a_fully_mined_column_clamps_to_the_floor() {
         let cells = CHUNK_SIZE as i64;
-        let mut edits = EditedColumns::new();
+        let mut edits = EditedColumns::new(WorldShape::DEFAULT);
         edits.record(5, 5, i32::MIN);
         let mut heights = vec![40i32; (cells * cells) as usize];
         edits.apply_to_node(&mut heights, 0, 0, 4, -128);
@@ -1071,7 +1137,7 @@ mod tests {
     #[test]
     fn no_edits_is_a_no_op() {
         let cells = CHUNK_SIZE as i64;
-        let edits = EditedColumns::new();
+        let edits = EditedColumns::new(WorldShape::DEFAULT);
         assert!(edits.is_empty());
         let mut heights = vec![7i32; (cells * cells) as usize];
         edits.apply_to_node(&mut heights, 0, 0, 8, -128);
@@ -1082,7 +1148,7 @@ mod tests {
     /// surface instead of leaving the dug height behind forever.
     #[test]
     fn recording_a_column_twice_keeps_the_latest() {
-        let mut edits = EditedColumns::new();
+        let mut edits = EditedColumns::new(WorldShape::DEFAULT);
         edits.record(5, 5, 20);
         edits.record(5, 5, 30);
         assert_eq!(edits.get(5, 5), Some(30));

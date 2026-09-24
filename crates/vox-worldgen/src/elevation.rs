@@ -44,18 +44,33 @@
 //! nothing, because there is nothing flat to contrast them against. Earth is
 //! mostly abyssal plain, shelf, steppe and lowland.
 
-use vox_core::{WORLD_Y_MAX_BLOCKS, WORLD_Y_MIN_BLOCKS};
+use vox_core::{WORLD_Y_MAX_BLOCKS, WORLD_Y_MIN_BLOCKS, WorldShape};
 
 // --- Continental shape -----------------------------------------------------
 
 /// Wavelengths (blocks) of the continent field. The coarse octave sets
 /// continent size against a 200 000-block world; the fine one breaks up
 /// coastlines so they are not ellipses.
-const CONTINENT_CELLS: [i64; 3] = [56_000, 21_000, 7_500];
+const CONTINENT_WAVELENGTHS: [i64; 3] = [56_000, 21_000, 7_500];
 const CONTINENT_WEIGHTS: [f32; 3] = [1.0, 0.30, 0.09];
 
 /// Continent value at which land begins and at which it is fully inland. The
 /// gap is the coastal blend.
+/// Share of the world that is land, for every seed and every world size.
+///
+/// A design parameter, not an outcome. The continent field is a handful of
+/// random lattice values, so left alone the land fraction is an accident of the
+/// seed: measured across 200 seeds at the default size it ran from 15% to 91%,
+/// with 30% of seeds over 60% land. Each world therefore calibrates its own
+/// coastline at construction to hit this figure. It is also exactly the knob a
+/// future "more land / more ocean" world-creation option would turn.
+const TARGET_LAND_FRACTION: f32 = 0.42;
+
+/// Continent-field samples per axis used to calibrate the coastline. Coarse on
+/// purpose: the continent field is the lowest-frequency stage, and this runs
+/// once per world, at construction.
+const CALIBRATION_GRID: i64 = 96;
+
 const COAST_LO: f32 = -0.10;
 const COAST_HI: f32 = 0.05;
 
@@ -85,7 +100,7 @@ const ABYSSAL_DEPTH: f32 = 260.0;
 
 // --- Trenches --------------------------------------------------------------
 
-const TRENCH_CELL: i64 = 6_000;
+const TRENCH_WAVELENGTH: i64 = 6_000;
 /// Ridge value above which a trench forms. High, because trenches are rare.
 const TRENCH_THRESHOLD: f32 = 0.94;
 /// A second, independent low-frequency gate. A threshold on the ridge alone
@@ -93,7 +108,7 @@ const TRENCH_THRESHOLD: f32 = 0.94;
 /// threshold is a fixed fraction of the map, so rarity has to be bought by
 /// narrowing it into a crack. Gating on a separate field instead restricts
 /// trenches to a few stretches of the line, leaving those stretches full width.
-const TRENCH_GATE_CELL: i64 = 12_000;
+const TRENCH_GATE_WAVELENGTH: i64 = 12_000;
 const TRENCH_GATE_LO: f32 = 0.56;
 const TRENCH_GATE_HI: f32 = 0.80;
 /// Extra depth below the abyssal plain, in blocks.
@@ -101,12 +116,12 @@ const TRENCH_EXTRA: f32 = 340.0;
 
 // --- Relief ----------------------------------------------------------------
 
-const RELIEF_CELLS: [i64; 2] = [2_600, 900];
+const RELIEF_WAVELENGTHS: [i64; 2] = [2_600, 900];
 const RELIEF_WEIGHTS: [f32; 2] = [1.0, 0.5];
 
 // --- Orogeny ---------------------------------------------------------------
 
-const OROGENY_CELLS: [i64; 2] = [7_000, 2_600];
+const OROGENY_WAVELENGTHS: [i64; 2] = [7_000, 2_600];
 const OROGENY_WEIGHTS: [f32; 2] = [1.0, 0.25];
 /// Orogeny below this produces no uplift at all. Mountain building is a
 /// threshold process — most continental crust is not being shortened — and
@@ -116,7 +131,7 @@ const OROGENY_WEIGHTS: [f32; 2] = [1.0, 0.25];
 /// rarity by narrowing them: only a thin strip near each ridge crest clears the
 /// bar, so the whole rise is crammed into a few thousand blocks and the flanks
 /// come out at 2:1. Rarity has to be bought somewhere that does not cost
-/// extent — see [`OROGENY_GATE_CELL`].
+/// extent — see [`OROGENY_GATE_WAVELENGTH`].
 const OROGENY_FLOOR: f32 = 0.42;
 
 /// An independent low-frequency gate on mountain building.
@@ -126,7 +141,7 @@ const OROGENY_FLOOR: f32 = 0.42;
 /// a separate wide field restricts ranges to a handful of belts while leaving
 /// each belt its full width. Rare AND broad, which a threshold on the ridge
 /// field alone cannot give you.
-const OROGENY_GATE_CELL: i64 = 13_000;
+const OROGENY_GATE_WAVELENGTH: i64 = 13_000;
 const OROGENY_GATE_LO: f32 = 0.10;
 const OROGENY_GATE_HI: f32 = 0.52;
 /// Uplift at full orogeny, in blocks. The ceiling a summit can reach, and only
@@ -135,7 +150,7 @@ const MAX_UPLIFT: f32 = 1_150.0;
 
 // --- Detail ----------------------------------------------------------------
 
-const DETAIL_CELLS: [i64; 3] = [800, 280, 90];
+const DETAIL_WAVELENGTHS: [i64; 3] = [800, 280, 90];
 /// Weights fall roughly in proportion to wavelength, NOT on a fixed
 /// persistence. Amplitude divided by wavelength is what the eye reads as slope,
 /// so octaves that keep a constant ratio while the wavelength shrinks 3-4x per
@@ -154,40 +169,133 @@ const DETAIL_OCEAN_SCALE: f32 = 0.42;
 /// generates into the last chunk layer.
 const BOUND_MARGIN: i64 = 64;
 
-/// The elevation field for one world seed.
+/// One noise octave, tiled to the world's period.
+///
+/// ## Why octaves are per-world now (ADR-0012)
+///
+/// The world is a torus, so terrain must repeat exactly every world width:
+/// generation is one of the three places the seam exists. Noise repeats only if
+/// a whole number of lattice cells fits around the world, so each octave rounds
+/// its target wavelength to the nearest size that does
+/// ([`WorldShape::cells_around_x`]) — a few percent at the default size, and
+/// correct at any legal size. The wavelength constants above are therefore
+/// TARGETS, not exact cell sizes.
+#[derive(Clone, Copy, Debug)]
+struct Octave {
+    /// Lattice cells around the world along each axis.
+    nx: u32,
+    nz: u32,
+    /// Cells per block, `n / size`, in 32.32 fixed point. See [`lattice`].
+    scale_x: u64,
+    scale_z: u64,
+    /// Hash salt: the TARGET wavelength, not the rounded one, so octaves stay
+    /// decorrelated from one another and each hashes identically at every
+    /// world size.
+    salt: u64,
+}
+
+impl Octave {
+    fn new(shape: WorldShape, target_wavelength: i64) -> Self {
+        let nx = shape.cells_around_x(target_wavelength);
+        let nz = shape.cells_around_z(target_wavelength);
+        Self {
+            nx,
+            nz,
+            scale_x: fixed_scale(nx, shape.size_x()),
+            scale_z: fixed_scale(nz, shape.size_z()),
+            salt: target_wavelength as u64,
+        }
+    }
+}
+
+/// The elevation field for one world: its seed and its size.
 #[derive(Clone, Copy, Debug)]
 pub struct Elevation {
     seed: u64,
+    shape: WorldShape,
+    /// Subtracted from the continent field so this world's land fraction lands
+    /// on [`TARGET_LAND_FRACTION`]. See [`Elevation::calibrate_coastline`].
+    continent_offset: f32,
+    continent: [Octave; 3],
+    relief: [Octave; 2],
+    orogeny: [Octave; 2],
+    orogeny_gate: Octave,
+    trench: Octave,
+    trench_gate: Octave,
+    detail: [Octave; 3],
 }
 
 impl Elevation {
-    pub fn new(seed: u64) -> Self {
-        Self { seed }
+    pub fn new(seed: u64, shape: WorldShape) -> Self {
+        let oct = |w: i64| Octave::new(shape, w);
+        let mut e = Self {
+            seed,
+            shape,
+            continent_offset: 0.0,
+            continent: CONTINENT_WAVELENGTHS.map(oct),
+            relief: RELIEF_WAVELENGTHS.map(oct),
+            orogeny: OROGENY_WAVELENGTHS.map(oct),
+            orogeny_gate: oct(OROGENY_GATE_WAVELENGTH),
+            trench: oct(TRENCH_WAVELENGTH),
+            trench_gate: oct(TRENCH_GATE_WAVELENGTH),
+            detail: DETAIL_WAVELENGTHS.map(oct),
+        };
+        e.continent_offset = e.calibrate_coastline();
+        e
+    }
+
+    /// The continent-field shift that makes [`TARGET_LAND_FRACTION`] of this
+    /// world land.
+    ///
+    /// Samples the raw continent field on a coarse grid covering exactly one
+    /// lap of the world, and finds the value that the target share of samples
+    /// exceed. The coastline sits where [`coastal_profile`] crosses sea level —
+    /// a fixed continent value, found once by bisection — so the offset moves
+    /// the field until that crossing falls at the right quantile.
+    ///
+    /// Deterministic from the seed and size alone, so the chunk generator and
+    /// the LOD sampler, which share this struct, always agree.
+    fn calibrate_coastline(&self) -> f32 {
+        let (sx, sz) = (self.shape.size_x(), self.shape.size_z());
+        let mut samples = Vec::with_capacity((CALIBRATION_GRID * CALIBRATION_GRID) as usize);
+        for j in 0..CALIBRATION_GRID {
+            for i in 0..CALIBRATION_GRID {
+                samples
+                    .push(self.continent_c(i * sx / CALIBRATION_GRID, j * sz / CALIBRATION_GRID));
+            }
+        }
+        samples.sort_by(|a, b| a.total_cmp(b));
+        let sea_share = 1.0 - TARGET_LAND_FRACTION;
+        let at = ((samples.len() as f32 * sea_share) as usize).min(samples.len() - 1);
+        samples[at] - shoreline_continent_value()
     }
 
     /// Surface height in blocks at world column `(x, z)`. Sea level is 0.
     ///
+    /// `x`/`z` may be on any lap of the world; the result repeats exactly every
+    /// world width. The column is wrapped ONCE here and every stage below works
+    /// in canonical coordinates, rather than each octave wrapping for itself.
+    pub fn height(&self, x: i64, z: i64) -> i64 {
+        self.height_canonical(self.shape.canonical_x(x), self.shape.canonical_z(z))
+    }
+
     /// The single composition point. Every stage feeds in here and nowhere
     /// else, so a future erosion pass has one place to attach.
-    pub fn height(&self, x: i64, z: i64) -> i64 {
-        let c = self.continent(x, z);
-        let land = smoothstep01((c - COAST_LO) / (COAST_HI - COAST_LO));
-        let sea = 1.0 - land;
-
-        // Continental rise on land, shelf then slope then abyssal plain at sea.
-        // Both terms are continuous through the coast, so there is no step.
-        let shelf = smoothstep01(sea / SHELF_FRAC);
-        let deep = smoothstep01((sea - SHELF_FRAC) / SLOPE_FRAC);
-        let mut base =
-            land * LOWLAND_RISE - shelf * SHELF_DEPTH - deep * (ABYSSAL_DEPTH - SHELF_DEPTH);
+    fn height_canonical(&self, x: i64, z: i64) -> i64 {
+        let c = self.continent_c(x, z) - self.continent_offset;
+        let CoastalProfile {
+            mut base,
+            land,
+            deep,
+        } = coastal_profile(c);
 
         // Trenches: rare, linear, and only in genuinely deep water. Gated on
         // `deep` so one cannot appear off a beach.
         if deep > 0.0 {
-            let t = self.ridge(x, z, TRENCH_CELL);
+            let t = self.ridge(x, z, &self.trench);
             let line = smoothstep01((t - TRENCH_THRESHOLD) / (1.0 - TRENCH_THRESHOLD));
             if line > 0.0 {
-                let g = self.value_noise(x, z, TRENCH_GATE_CELL);
+                let g = self.value_noise(x, z, &self.trench_gate);
                 let gate = smoothstep01((g - TRENCH_GATE_LO) / (TRENCH_GATE_HI - TRENCH_GATE_LO));
                 base -= line * gate * deep * TRENCH_EXTRA;
             }
@@ -197,8 +305,8 @@ impl Elevation {
         // low-frequency, so a high value implies a wide region, and cubing makes
         // the payoff for width steep.
         let massif = if land > 0.0 {
-            let raw = self.orogeny(x, z);
-            let g = self.value_noise(x, z, OROGENY_GATE_CELL);
+            let raw = self.orogeny_c(x, z);
+            let g = self.value_noise(x, z, &self.orogeny_gate);
             let belt = smoothstep01((g - OROGENY_GATE_LO) / (OROGENY_GATE_HI - OROGENY_GATE_LO));
             let u = ((raw - OROGENY_FLOOR) / (1.0 - OROGENY_FLOOR)).clamp(0.0, 1.0) * land * belt;
             // Squared smoothstep, not a raw cube. Both make high uplift rare,
@@ -215,31 +323,43 @@ impl Elevation {
 
         // Roughness is its own field, not a function of height — that is what
         // lets a high plateau be flat and a low region be broken.
-        let relief = self.relief(x, z);
+        let relief = self.relief_c(x, z);
         let calm = smoothstep01(base.abs() / COASTAL_CALM_BLOCKS);
         let amplitude = (DETAIL_FLOOR + relief * DETAIL_PER_RELIEF + massif * DETAIL_PER_MASSIF)
             * lerp(DETAIL_OCEAN_SCALE, 1.0, land)
             * lerp(COASTAL_CALM_FLOOR, 1.0, calm);
 
-        let h = base + massif + self.detail(x, z) * amplitude;
+        let h = base + massif + self.detail_c(x, z) * amplitude;
         (h.round() as i64).clamp(
             WORLD_Y_MIN_BLOCKS + BOUND_MARGIN,
             WORLD_Y_MAX_BLOCKS - BOUND_MARGIN,
         )
     }
 
+    // --- Stages. Each has a public form taking any (x, z) — for tuning and
+    // --- debug views — and a `_c` form taking canonical coordinates, which is
+    // --- what the composition calls so the column is wrapped only once.
+
     /// Stage 1 — continentalness in roughly `[-1, 1]`. Above [`COAST_HI`] is
     /// solidly inland; below [`COAST_LO`] is sea.
     pub fn continent(&self, x: i64, z: i64) -> f32 {
-        self.fbm(x, z, &CONTINENT_CELLS, &CONTINENT_WEIGHTS)
+        self.continent_c(self.shape.canonical_x(x), self.shape.canonical_z(z))
+    }
+
+    fn continent_c(&self, x: i64, z: i64) -> f32 {
+        self.fbm(x, z, &self.continent, &CONTINENT_WEIGHTS)
     }
 
     /// Stage 2 — how rough this region is, in `[0, 1]`, independent of height.
     ///
-    /// Biased hard toward 0 by [`RELIEF_BIAS`]: without it, fractal noise makes
+    /// Biased hard toward 0 by squaring: without it, fractal noise makes
     /// everywhere equally lumpy and the world has no plains.
     pub fn relief(&self, x: i64, z: i64) -> f32 {
-        let t = (self.fbm(x, z, &RELIEF_CELLS, &RELIEF_WEIGHTS) * 0.5 + 0.5).clamp(0.0, 1.0);
+        self.relief_c(self.shape.canonical_x(x), self.shape.canonical_z(z))
+    }
+
+    fn relief_c(&self, x: i64, z: i64) -> f32 {
+        let t = (self.fbm(x, z, &self.relief, &RELIEF_WEIGHTS) * 0.5 + 0.5).clamp(0.0, 1.0);
         // Squared, by multiplication rather than `powf`. The bias itself is the
         // point — it is what gives the world plains instead of uniform
         // lumpiness — but `powf` is a transcendental call in the hottest
@@ -254,10 +374,14 @@ impl Elevation {
     /// narrow because they follow plate boundaries, and plain fbm gives
     /// isolated round lumps that read as noise rather than geology.
     pub fn orogeny(&self, x: i64, z: i64) -> f32 {
+        self.orogeny_c(self.shape.canonical_x(x), self.shape.canonical_z(z))
+    }
+
+    fn orogeny_c(&self, x: i64, z: i64) -> f32 {
         let mut sum = 0.0;
         let mut norm = 0.0;
-        for (cell, w) in OROGENY_CELLS.iter().zip(OROGENY_WEIGHTS.iter()) {
-            sum += self.ridge(x, z, *cell) * w;
+        for (oct, w) in self.orogeny.iter().zip(OROGENY_WEIGHTS.iter()) {
+            sum += self.ridge(x, z, oct) * w;
             norm += w;
         }
         (sum / norm).clamp(0.0, 1.0)
@@ -266,39 +390,48 @@ impl Elevation {
     /// Stage 4 — local texture in `[-1, 1]`. Amplitude is applied by the
     /// caller, from relief, so this is shape only.
     pub fn detail(&self, x: i64, z: i64) -> f32 {
-        self.fbm(x, z, &DETAIL_CELLS, &DETAIL_WEIGHTS)
+        self.detail_c(self.shape.canonical_x(x), self.shape.canonical_z(z))
+    }
+
+    fn detail_c(&self, x: i64, z: i64) -> f32 {
+        self.fbm(x, z, &self.detail, &DETAIL_WEIGHTS)
     }
 
     /// Weighted sum of value-noise octaves, normalized to roughly `[-1, 1]`.
-    fn fbm(&self, x: i64, z: i64, cells: &[i64], weights: &[f32]) -> f32 {
+    /// Canonical coordinates.
+    fn fbm(&self, x: i64, z: i64, octaves: &[Octave], weights: &[f32]) -> f32 {
         let mut sum = 0.0;
         let mut norm = 0.0;
-        for (cell, w) in cells.iter().zip(weights.iter()) {
-            sum += self.value_noise(x, z, *cell) * w;
+        for (oct, w) in octaves.iter().zip(weights.iter()) {
+            sum += self.value_noise(x, z, oct) * w;
             norm += w;
         }
         sum / norm
     }
 
     /// Ridge noise in `[0, 1]`: peaks along the zero crossings of value noise,
-    /// which form connected lines rather than isolated blobs.
-    fn ridge(&self, x: i64, z: i64, cell: i64) -> f32 {
-        1.0 - self.value_noise(x, z, cell).abs()
+    /// which form connected lines rather than isolated blobs. Canonical
+    /// coordinates.
+    fn ridge(&self, x: i64, z: i64, oct: &Octave) -> f32 {
+        1.0 - self.value_noise(x, z, oct).abs()
     }
 
-    /// Value noise in `[-1, 1]` at a lattice spacing of `cell` blocks. Hash the
-    /// four surrounding lattice corners and smoothstep-interpolate, so adjacent
-    /// columns agree and chunk borders line up exactly.
-    pub fn value_noise(&self, x: i64, z: i64, cell: i64) -> f32 {
-        let x0 = x.div_euclid(cell);
-        let z0 = z.div_euclid(cell);
-        let fx = x.rem_euclid(cell) as f32 / cell as f32;
-        let fz = z.rem_euclid(cell) as f32 / cell as f32;
+    /// Value noise in `[-1, 1]` for one octave, at CANONICAL coordinates. Hash
+    /// the four surrounding lattice corners and smoothstep-interpolate, so
+    /// adjacent columns agree and chunk borders line up exactly.
+    ///
+    /// The lattice wraps: the corner past the last cell is cell 0. That single
+    /// rule is what makes terrain continuous across the world's seam.
+    fn value_noise(&self, x: i64, z: i64, oct: &Octave) -> f32 {
+        let (ix, fx) = lattice(x, oct.scale_x, oct.nx);
+        let (iz, fz) = lattice(z, oct.scale_z, oct.nz);
+        let ix1 = if ix + 1 == oct.nx { 0 } else { ix + 1 };
+        let iz1 = if iz + 1 == oct.nz { 0 } else { iz + 1 };
 
-        let c00 = self.lattice_value(x0, z0, cell);
-        let c10 = self.lattice_value(x0 + 1, z0, cell);
-        let c01 = self.lattice_value(x0, z0 + 1, cell);
-        let c11 = self.lattice_value(x0 + 1, z0 + 1, cell);
+        let c00 = self.lattice_value(ix, iz, oct.salt);
+        let c10 = self.lattice_value(ix1, iz, oct.salt);
+        let c01 = self.lattice_value(ix, iz1, oct.salt);
+        let c11 = self.lattice_value(ix1, iz1, oct.salt);
 
         let sx = smoothstep(fx);
         let sz = smoothstep(fz);
@@ -307,22 +440,98 @@ impl Elevation {
 
     /// Deterministic hashed value in `[-1, 1]` for a lattice point.
     ///
-    /// The cell size is mixed into the hash so two octaves whose lattices
+    /// The octave's salt is mixed into the hash so two octaves whose lattices
     /// coincide at some point do not return the same value there, which would
     /// leave a visible grid of correlated spots.
-    fn lattice_value(&self, lx: i64, lz: i64, cell: i64) -> f32 {
+    fn lattice_value(&self, lx: u32, lz: u32, salt: u64) -> f32 {
         let h = mix64(
             self.seed
-                ^ (cell as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                ^ salt.wrapping_mul(0x9E37_79B9_7F4A_7C15)
                 ^ (lx as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93)
                 ^ (lz as u64).wrapping_mul(0xA076_1D64_78BD_642F),
         );
         // Top 24 bits are plenty for a noise lattice, and dividing an integer
-        // beats the u64 -> f64 conversion this used to do — `surface_height` is
-        // called on the order of a million times a second by chunk generation
-        // and the LOD sampler together, four times per octave.
+        // beats a u64 -> f64 conversion — this runs four times per octave.
         ((h >> 40) as f32) * (2.0 / 16_777_215.0) - 1.0
     }
+}
+
+/// The continental base elevation for a continent value, before trenches,
+/// mountains and detail: rise on land; shelf, then slope, then abyssal plain at
+/// sea. Continuous through the coast, so there is no step.
+///
+/// Factored out because the coastline calibration must use exactly the same
+/// curve the terrain does — a copy would drift.
+struct CoastalProfile {
+    base: f32,
+    /// 0 at sea, 1 fully inland.
+    land: f32,
+    /// 0 on the shelf, 1 over the abyssal plain.
+    deep: f32,
+}
+
+fn coastal_profile(c: f32) -> CoastalProfile {
+    let land = smoothstep01((c - COAST_LO) / (COAST_HI - COAST_LO));
+    let sea = 1.0 - land;
+    let shelf = smoothstep01(sea / SHELF_FRAC);
+    let deep = smoothstep01((sea - SHELF_FRAC) / SLOPE_FRAC);
+    CoastalProfile {
+        base: land * LOWLAND_RISE - shelf * SHELF_DEPTH - deep * (ABYSSAL_DEPTH - SHELF_DEPTH),
+        land,
+        deep,
+    }
+}
+
+/// The continent value at which the coastal profile crosses sea level: where
+/// the shoreline falls, before detail. Found by bisection — the profile rises
+/// monotonically with the continent value.
+fn shoreline_continent_value() -> f32 {
+    let (mut lo, mut hi) = (COAST_LO - 1.0, COAST_HI + 1.0);
+    for _ in 0..40 {
+        let mid = 0.5 * (lo + hi);
+        if coastal_profile(mid).base < 0.0 {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    0.5 * (lo + hi)
+}
+
+/// `n / period` in 32.32 fixed point: cells per block, scaled by 2^32.
+fn fixed_scale(n: u32, period: i64) -> u64 {
+    (((n as u128) << 32) / period as u128) as u64
+}
+
+/// A canonical coordinate's lattice cell and fractional position within it.
+///
+/// ## Why fixed point
+///
+/// This runs twice per octave per column — tens of millions of times a second
+/// across chunk generation and the LOD sampler — and its cost is the cost of
+/// the elevation field.
+///
+/// Before the torus, octave wavelengths were compile-time constants, and the
+/// compiler turns division by a constant into a cheap multiply-and-shift. Tiled
+/// octaves divide by a per-world value instead. Doing that in floating point
+/// costs a chain of int→float→int conversions, and measured ~55% slower for the
+/// whole field. In 32.32 fixed point it is one integer multiply: the high 32
+/// bits are the cell, the low 32 the position within it.
+///
+/// `scale` truncates by under 2⁻³² cells per block, which shifts cell
+/// boundaries by at most a few ten-thousandths of a cell across the largest
+/// legal world — deterministic, continuous, and identical for the chunk
+/// generator and the LOD sampler, which is what matters.
+#[inline]
+fn lattice(c: i64, scale: u64, n: u32) -> (u32, f32) {
+    debug_assert!(c >= 0, "lattice() takes canonical coordinates");
+    // c < 2^22 and scale <= 2^32, so the product fits comfortably in a u64.
+    let u = c as u64 * scale;
+    let cell = (u >> 32) as u32;
+    // Top 24 bits of the fraction: exactly representable in an f32.
+    let frac = (((u >> 8) & 0x00FF_FFFF) as i32) as f32 * (1.0 / 16_777_216.0);
+    // Clamp guards the (theoretical) case of rounding up to exactly n.
+    (cell.min(n - 1), frac)
 }
 
 fn smoothstep(t: f32) -> f32 {
@@ -358,8 +567,8 @@ mod tests {
     /// Sample the whole world on a coarse, prime-ish lattice — a round step
     /// would alias against the field wavelengths and measure the wrong thing.
     fn survey() -> Vec<i64> {
-        let e = Elevation::new(SEED);
-        let half = vox_core::WORLD_HALF_EXTENT_BLOCKS;
+        let e = Elevation::new(SEED, WorldShape::DEFAULT);
+        let half = WorldShape::DEFAULT.size_x() / 2;
         let step = 997usize;
         let mut hs = Vec::new();
         for z in (-half..half).step_by(step) {
@@ -374,10 +583,93 @@ mod tests {
         hs.iter().filter(|&&h| f(h)).count() as f64 / hs.len() as f64
     }
 
+    /// **Terrain repeats exactly every world width** (ADR-0012).
+    ///
+    /// Generation is one of the three places the seam exists: the player's
+    /// coordinates never wrap, so the same place is generated at a different
+    /// unwrapped position on every lap, and it must come out identical.
+    #[test]
+    fn terrain_tiles_with_the_world() {
+        let w = WorldShape::DEFAULT;
+        let e = Elevation::new(SEED, w);
+        let (px, pz) = (w.size_x(), w.size_z());
+        for i in 0..400i64 {
+            let (x, z) = (i * 7_919 % px, i * 104_729 % pz);
+            let h = e.height(x, z);
+            for (dx, dz) in [(px, 0), (0, pz), (-3 * px, 2 * pz), (5 * px, -7 * pz)] {
+                assert_eq!(e.height(x + dx, z + dz), h, "({x}, {z}) differs a lap away");
+            }
+        }
+    }
+
+    /// **The seam is invisible.** Terrain must be as continuous across the
+    /// world's wrap line as anywhere else.
+    ///
+    /// Tiling alone is not enough: noise can repeat exactly and still jump at
+    /// the seam if the lattice's last cell does not interpolate into its first.
+    /// That would show as a cliff running the full length of the world. The
+    /// bound compares the seam against ordinary one-block steps elsewhere, so
+    /// it holds at any tuning.
+    #[test]
+    fn terrain_is_continuous_across_the_seam() {
+        let w = WorldShape::DEFAULT;
+        let e = Elevation::new(SEED, w);
+        let (px, pz) = (w.size_x(), w.size_z());
+        let (mut seam, mut interior) = (0i64, 0i64);
+        for i in 0..2_000i64 {
+            let t = i * 97;
+            // Across the X seam, and across the Z seam.
+            seam = seam.max((e.height(px - 1, t) - e.height(px, t)).abs());
+            seam = seam.max((e.height(t, pz - 1) - e.height(t, pz)).abs());
+            // The same one-block step well away from any seam.
+            interior = interior.max((e.height(px / 2, t) - e.height(px / 2 + 1, t)).abs());
+            interior = interior.max((e.height(t, pz / 2) - e.height(t, pz / 2 + 1)).abs());
+        }
+        assert!(
+            seam <= (interior * 2).max(8),
+            "a {seam}-block step at the seam, against {interior} anywhere else"
+        );
+    }
+
+    /// **Land fraction is a property of the world, not an accident of the seed.**
+    ///
+    /// Before calibration, 200 seeds at the default size ran from 15% to 91%
+    /// land — the target of 42% had been tuned on a single seed. Every seed and
+    /// every legal size must now land on target, and must tile and stay inside
+    /// the world while doing it.
+    #[test]
+    fn every_world_hits_its_land_target() {
+        for size in [
+            vox_core::MIN_WORLD_SIZE_BLOCKS,
+            10 * vox_core::WORLD_SIZE_QUANTUM_BLOCKS,
+            vox_core::DEFAULT_WORLD_SIZE_BLOCKS,
+        ] {
+            let w = WorldShape::new(size, size).unwrap();
+            for seed in 0..12u64 {
+                let e = Elevation::new(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15), w);
+                let (mut land, n) = (0, 1_600i64);
+                for i in 0..n {
+                    let (x, z) = (i * 7_919 % size, i * 104_729 % size);
+                    let h = e.height(x, z);
+                    assert!(h > vox_core::WORLD_Y_MIN_BLOCKS && h < vox_core::WORLD_Y_MAX_BLOCKS);
+                    assert_eq!(e.height(x + size, z - size), h);
+                    if h > 0 {
+                        land += 1;
+                    }
+                }
+                let f = land as f32 / n as f32;
+                assert!(
+                    (f - TARGET_LAND_FRACTION).abs() < 0.05,
+                    "size {size}, seed {seed}: land fraction {f:.2}, target {TARGET_LAND_FRACTION}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn is_deterministic() {
-        let a = Elevation::new(SEED);
-        let b = Elevation::new(SEED);
+        let a = Elevation::new(SEED, WorldShape::DEFAULT);
+        let b = Elevation::new(SEED, WorldShape::DEFAULT);
         for (x, z) in [(0, 0), (1_234, -5_678), (-99_999, 99_999), (37, 41)] {
             assert_eq!(a.height(x, z), b.height(x, z));
         }
@@ -387,7 +679,7 @@ mod tests {
     /// horizontal bounds — the LOD sampler queries beyond the edge.
     #[test]
     fn never_generates_outside_the_world() {
-        let e = Elevation::new(SEED);
+        let e = Elevation::new(SEED, WorldShape::DEFAULT);
         for h in survey() {
             assert!(h > vox_core::WORLD_Y_MIN_BLOCKS && h < vox_core::WORLD_Y_MAX_BLOCKS);
         }
@@ -428,8 +720,8 @@ mod tests {
     /// mean nothing, because nothing dull is left to contrast them against.
     #[test]
     fn most_land_is_flat() {
-        let e = Elevation::new(SEED);
-        let half = vox_core::WORLD_HALF_EXTENT_BLOCKS;
+        let e = Elevation::new(SEED, WorldShape::DEFAULT);
+        let half = WorldShape::DEFAULT.size_x() / 2;
         let mut flat = 0usize;
         let mut total = 0usize;
         for z in (-half..half).step_by(1_009) {
@@ -502,8 +794,8 @@ mod tests {
     /// unclimbable walls, so it is asserted rather than assumed.
     #[test]
     fn a_summit_implies_a_massif_around_it() {
-        let e = Elevation::new(SEED);
-        let half = vox_core::WORLD_HALF_EXTENT_BLOCKS;
+        let e = Elevation::new(SEED, WorldShape::DEFAULT);
+        let half = WorldShape::DEFAULT.size_x() / 2;
         let mut best = (i64::MIN, 0, 0);
         for z in (-half..half).step_by(1_009) {
             for x in (-half..half).step_by(1_009) {
@@ -523,7 +815,7 @@ mod tests {
         // fixed radius asks a different question every time the field is
         // rescaled — and did exactly that once, failing a perfectly good
         // mountain for not being wider than any real one.
-        let r = OROGENY_CELLS[0] / 4;
+        let r = OROGENY_WAVELENGTHS[0] / 4;
         let d = (r as f64 * std::f64::consts::FRAC_1_SQRT_2) as i64;
         let mut sum = 0i64;
         let mut n = 0i64;
@@ -552,8 +844,8 @@ mod tests {
     /// walls are the steepest features here, and none may become a sheer step.
     #[test]
     fn there_are_no_cliff_discontinuities() {
-        let e = Elevation::new(SEED);
-        let half = vox_core::WORLD_HALF_EXTENT_BLOCKS;
+        let e = Elevation::new(SEED, WorldShape::DEFAULT);
+        let half = WorldShape::DEFAULT.size_x() / 2;
         let mut worst = 0i64;
         for z in (-half..half).step_by(1_009) {
             for x in (-half..half).step_by(1_009) {
@@ -585,8 +877,8 @@ mod tests {
     /// 10 km walk spanned 83 blocks; it now spans 134.
     #[test]
     fn terrain_changes_as_you_travel() {
-        let e = Elevation::new(SEED);
-        let half = vox_core::WORLD_HALF_EXTENT_BLOCKS;
+        let e = Elevation::new(SEED, WorldShape::DEFAULT);
+        let half = WorldShape::DEFAULT.size_x() / 2;
         const SPAN: i64 = 10_000;
         let mut spreads = Vec::new();
         for z in (-half..half).step_by(4_001) {

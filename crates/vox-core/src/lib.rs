@@ -29,14 +29,14 @@ pub use light::{
 };
 pub use lod::{EditedColumns, LodLevel, LodNodeId, LodRing, LodUpdate};
 pub use planet::{
-    POLE_TO_EQUATOR_BLOCKS, SEA_LEVEL_BLOCKS, WORLD_HALF_EXTENT_BLOCKS, WORLD_Y_MAX_BLOCKS,
-    WORLD_Y_MIN_BLOCKS, clamp_xz, contains_chunk, find_spawn, in_bounds, in_bounds_xz,
-    latitude_degrees, latitude_fraction,
+    DEFAULT_WORLD_SIZE_BLOCKS, MAX_WORLD_SIZE_BLOCKS, MIN_WORLD_SIZE_BLOCKS, SEA_LEVEL_BLOCKS,
+    WORLD_SIZE_QUANTUM_BLOCKS, WORLD_Y_MAX_BLOCKS, WORLD_Y_MIN_BLOCKS, WorldShape, WorldShapeError,
+    chunk_in_vertical_bounds, find_spawn, in_vertical_bounds,
 };
 pub use raycast::{RayHit, cell_overlaps_aabb, raycast_blocks, raycast_voxels};
 pub use registry::{BlockRegistry, BlockType};
 pub use settings::Settings;
-pub use storage::{StoreError, WORLD_META_VERSION, WorldStore};
+pub use storage::{StoreError, WORLD_META_VERSION, WorldMeta, WorldStore};
 pub use streaming::{StreamUpdate, Streamer, nearest_first};
 pub use time::{
     DEFAULT_DAY_LENGTH_SECS, LUNATION_DAYS, NIGHT_SKY_FULL_MOON, NIGHT_SKY_MIN, TICKS_PER_DAY,
