@@ -41,6 +41,24 @@
 //! cliff face spanning many chunk layers; asking for one height would load the
 //! top of the cliff and leave a hole down its face.
 //!
+//! ## …and also FOLLOWS THE CAMERA (M10 amendment A3)
+//!
+//! The surface window alone strands a player who leaves it: dig more than
+//! `below` layers down, or build more than `above` layers up, and you walk out
+//! of the loaded world. So every column of the disc ALSO loads a window around
+//! the camera's own chunk layer. Near the ground the two windows overlap and
+//! cost nothing extra; underground or at altitude the camera window is what
+//! keeps the player's own neighbourhood resident. A column's resident layers
+//! are therefore up to two disjoint ranges — see [`ColumnWindow`].
+//!
+//! Unlike the surface window, the camera window MOVES, so it gets one layer of
+//! vertical hysteresis: layers load within `camera_chunks` of the camera and
+//! unload only beyond `camera_chunks + 1`. Without it a camera bobbing across a
+//! chunk-layer boundary would load and unload a whole disc of chunks per bob.
+//!
+//! The camera is in the unwrapped frame (ADR-0012 §4): `center` is never
+//! canonicalised, and nothing here knows the world wraps.
+//!
 //! Chunks in the gap between the two radii are left in whatever state they
 //! are already in. Without this hysteresis band, a camera sitting on a
 //! chunk boundary would load and unload the same chunk on alternating
@@ -68,6 +86,74 @@ impl StreamUpdate {
     }
 }
 
+/// The chunk-Y layers one column keeps resident: its surface window together
+/// with the camera window (M10 A3).
+///
+/// Up to two disjoint, ascending, inclusive ranges. Overlapping or adjacent
+/// windows are merged into one, so [`ColumnWindow::layers`] never yields a
+/// layer twice and walks no gap. The camera window may be empty (camera above
+/// or below the world); the surface window never is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnWindow {
+    ranges: [(i64, i64); 2],
+    len: usize,
+}
+
+impl ColumnWindow {
+    /// Union of two inclusive ranges; a range with `lo > hi` is empty.
+    fn union(a: (i64, i64), b: (i64, i64)) -> Self {
+        let empty = |r: (i64, i64)| r.0 > r.1;
+        match (empty(a), empty(b)) {
+            (true, true) => Self {
+                ranges: [(0, -1); 2],
+                len: 0,
+            },
+            (false, true) => Self {
+                ranges: [a, (0, -1)],
+                len: 1,
+            },
+            (true, false) => Self {
+                ranges: [b, (0, -1)],
+                len: 1,
+            },
+            (false, false) => {
+                let (lower, upper) = if a.0 <= b.0 { (a, b) } else { (b, a) };
+                // `+ 1`: adjacent ranges merge too, so there is never a
+                // zero-width gap between the two.
+                if upper.0 <= lower.1 + 1 {
+                    Self {
+                        ranges: [(lower.0, lower.1.max(upper.1)), (0, -1)],
+                        len: 1,
+                    }
+                } else {
+                    Self {
+                        ranges: [lower, upper],
+                        len: 2,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether chunk layer `y` is in the window.
+    pub fn contains(&self, y: i64) -> bool {
+        self.ranges().iter().any(|&(lo, hi)| (lo..=hi).contains(&y))
+    }
+
+    /// The disjoint inclusive ranges, ascending.
+    pub fn ranges(&self) -> &[(i64, i64)] {
+        &self.ranges[..self.len]
+    }
+
+    /// Every layer in the window, ascending; `.rev()` for a top-down scan.
+    pub fn layers(self) -> impl DoubleEndedIterator<Item = i64> {
+        self.ranges
+            .into_iter()
+            .take(self.len)
+            .flat_map(|(lo, hi)| lo..=hi)
+    }
+}
+
 /// Tracks the loaded-chunk set and computes streaming deltas.
 pub struct Streamer {
     loaded: HashSet<ChunkPos>,
@@ -76,6 +162,9 @@ pub struct Streamer {
     /// Chunk layers kept loaded below and above each column's surface span.
     below_chunks: i64,
     above_chunks: i64,
+    /// Chunk layers kept loaded below and above the CAMERA's layer, in every
+    /// column of the disc (M10 A3). Unloads only beyond this plus one.
+    camera_chunks: i64,
     /// Camera chunk used for the last `update`; `update` is a no-op (returns
     /// empty) when the camera hasn't changed chunks and nothing else has.
     last_center: Option<ChunkPos>,
@@ -83,23 +172,27 @@ pub struct Streamer {
 
 impl Streamer {
     /// Create a streamer that keeps `below_chunks` layers beneath and
-    /// `above_chunks` layers above each column's terrain surface.
+    /// `above_chunks` layers above each column's terrain surface, plus
+    /// `camera_chunks` layers either side of the camera's own layer.
     ///
     /// Panics if `unload_radius <= load_radius` (the hysteresis band must be at
-    /// least one chunk wide) or if either vertical margin is negative.
+    /// least one chunk wide) or if any vertical margin is negative.
     pub fn surface_following(
         load_radius: i64,
         unload_radius: i64,
         below_chunks: i64,
         above_chunks: i64,
+        camera_chunks: i64,
     ) -> Self {
         assert!(
-            below_chunks >= 0 && above_chunks >= 0,
-            "vertical margins must be non-negative (got {below_chunks}, {above_chunks})"
+            below_chunks >= 0 && above_chunks >= 0 && camera_chunks >= 0,
+            "vertical margins must be non-negative \
+             (got {below_chunks}, {above_chunks}, {camera_chunks})"
         );
         let mut s = Self::new(load_radius, unload_radius);
         s.below_chunks = below_chunks;
         s.above_chunks = above_chunks;
+        s.camera_chunks = camera_chunks;
         s
     }
 
@@ -114,6 +207,7 @@ impl Streamer {
             unload_radius,
             below_chunks: load_radius,
             above_chunks: load_radius,
+            camera_chunks: load_radius,
             last_center: None,
         }
     }
@@ -123,24 +217,75 @@ impl Streamer {
         (self.below_chunks, self.above_chunks)
     }
 
-    /// The chunk-Y range this column should keep loaded, given its surface
-    /// span. Clamped to the world's vertical bounds so a seabed column near the
-    /// floor does not request chunks below the world.
+    /// Chunk layers kept loaded either side of the camera's layer.
+    pub fn camera_margin(&self) -> i64 {
+        self.camera_chunks
+    }
+
+    /// The chunk-Y range kept loaded around this column's terrain surface,
+    /// given its surface span. Clamped to the world's vertical bounds so a
+    /// seabed column near the floor does not request chunks below the world.
     ///
-    /// Public because several callers must agree with the streamer about which
-    /// chunks will EVER exist for a column — a first-mesh gate waiting on a
-    /// neighbour outside this window waits forever, and a LOD node checking
-    /// residency outside it never suppresses. Both were real M09 defects when
-    /// the equivalent judgement was made independently.
-    pub fn window_for(&self, surface_span: (i64, i64)) -> (i64, i64) {
-        let s = CHUNK_SIZE as i64;
-        let (world_lo, world_hi) = (
-            planet::WORLD_Y_MIN_BLOCKS / s,
-            planet::WORLD_Y_MAX_BLOCKS / s - 1,
-        );
+    /// This is the part of a column's residency that belongs to the TERRAIN,
+    /// independent of where the camera is. LOD coverage asks exactly this:
+    /// whether the ground under a node is drawn. Questions about what will be
+    /// resident at all go through [`Streamer::column_window`] or
+    /// [`Streamer::wants`] instead.
+    pub fn surface_window(&self, surface_span: (i64, i64)) -> (i64, i64) {
+        let (world_lo, world_hi) = world_layers();
         let lo = (surface_span.0 - self.below_chunks).clamp(world_lo, world_hi);
         let hi = (surface_span.1 + self.above_chunks).clamp(world_lo, world_hi);
         (lo, hi)
+    }
+
+    /// The camera window, `margin` layers either side of `center.y`,
+    /// intersected with the world. Empty (`lo > hi`) when the camera is far
+    /// enough outside the world's vertical bounds — a spectator above the
+    /// ceiling must not pin the ceiling layer of the whole disc.
+    fn camera_window(center: ChunkPos, margin: i64) -> (i64, i64) {
+        let (world_lo, world_hi) = world_layers();
+        (
+            (center.y - margin).max(world_lo),
+            (center.y + margin).min(world_hi),
+        )
+    }
+
+    /// Every chunk layer this column LOADS for a camera at `center`: its
+    /// surface window together with the camera window.
+    ///
+    /// Public because several callers must agree with the streamer about which
+    /// chunks will be resident — a first-mesh gate waiting on a neighbour
+    /// outside this window waits forever, and an edit's column scan that stops
+    /// short of it misses what the player built. Both were real defects when
+    /// the equivalent judgement was made independently (M09, M10).
+    pub fn column_window(&self, center: ChunkPos, surface_span: (i64, i64)) -> ColumnWindow {
+        ColumnWindow::union(
+            self.surface_window(surface_span),
+            Self::camera_window(center, self.camera_chunks),
+        )
+    }
+
+    /// The wider window a column KEEPS once loaded: the camera window gets one
+    /// layer of hysteresis, the surface window needs none (it never moves).
+    fn keep_window(&self, center: ChunkPos, surface_span: (i64, i64)) -> ColumnWindow {
+        ColumnWindow::union(
+            self.surface_window(surface_span),
+            Self::camera_window(center, self.camera_chunks + 1),
+        )
+    }
+
+    /// Whether `pos` is in the set this streamer loads for a camera at
+    /// `center` — inside the horizontal load radius and its column's
+    /// [`column_window`](Streamer::column_window). `surface_span` is `pos`'s
+    /// column's span.
+    ///
+    /// This is "is this chunk coming?". An absent chunk for which it is false
+    /// will not arrive while the camera stays where it is, so nothing should
+    /// wait on it.
+    pub fn wants(&self, pos: ChunkPos, center: ChunkPos, surface_span: (i64, i64)) -> bool {
+        horiz_dist_sq(pos, center) <= self.load_radius * self.load_radius
+            && planet::chunk_in_vertical_bounds(pos)
+            && self.column_window(center, surface_span).contains(pos.y)
     }
 
     pub fn load_radius(&self) -> i64 {
@@ -197,26 +342,21 @@ impl Streamer {
 
         // One query per column, not per chunk: a column contributes several
         // loaded layers, and the unload scan revisits every one of them.
-        let mut windows: HashMap<(i64, i64), (i64, i64)> = HashMap::new();
-        let mut window_of = |cx: i64, cz: i64, this: &Self| -> (i64, i64) {
-            *windows
+        let mut spans: HashMap<(i64, i64), (i64, i64)> = HashMap::new();
+        let mut span_of = |cx: i64, cz: i64| -> (i64, i64) {
+            *spans
                 .entry((cx, cz))
-                .or_insert_with(|| this.window_for(surface_span(cx, cz)))
+                .or_insert_with(|| surface_span(cx, cz))
         };
 
         // Unload: loaded chunks beyond the unload radius, outside their
-        // column's window, or outside the world.
-        //
-        // No vertical hysteresis is needed, and adding it would be noise: a
-        // column's window depends only on its own terrain, which does not
-        // change as the camera moves, so a chunk cannot oscillate in and out of
-        // it the way a horizontal radius makes chunks oscillate at its edge.
+        // column's KEEP window, or outside the world. The keep window is the
+        // load window with one extra camera layer each way — the vertical
+        // hysteresis for the one part of the window that moves.
         let mut to_unload: Vec<ChunkPos> = Vec::new();
         for &p in &self.loaded {
-            let (lo, hi) = window_of(p.x, p.z, self);
             if horiz_dist_sq(p, center) > unload_sq
-                || p.y < lo
-                || p.y > hi
+                || !self.keep_window(center, span_of(p.x, p.z)).contains(p.y)
                 || !planet::chunk_in_vertical_bounds(p)
             {
                 to_unload.push(p);
@@ -225,8 +365,9 @@ impl Streamer {
         to_unload.sort_by_key(|&p| (p.x, p.y, p.z)); // deterministic order
 
         // Load: for each column in the horizontal disc, the layers around that
-        // column's own surface. Not a Y range relative to the camera — climbing
-        // above it would load nothing and the terrain under you would vanish.
+        // column's own surface AND around the camera. The surface part is why
+        // climbing never unloads the ground; the camera part is why digging or
+        // building never walks out of the world.
         let r = self.load_radius;
         let mut to_load: Vec<ChunkPos> = Vec::new();
         for dz in -r..=r {
@@ -239,8 +380,7 @@ impl Streamer {
                 {
                     continue;
                 }
-                let (lo, hi) = window_of(cx, cz, self);
-                for ny in lo..=hi {
+                for ny in self.column_window(center, span_of(cx, cz)).layers() {
                     let p = ChunkPos::new(cx, ny, cz);
                     if planet::chunk_in_vertical_bounds(p) && !self.loaded.contains(&p) {
                         to_load.push(p);
@@ -277,6 +417,15 @@ impl Streamer {
             self.loaded.remove(&p);
         }
     }
+}
+
+/// The world's chunk layers, inclusive.
+fn world_layers() -> (i64, i64) {
+    let s = CHUNK_SIZE as i64;
+    (
+        planet::WORLD_Y_MIN_BLOCKS / s,
+        planet::WORLD_Y_MAX_BLOCKS / s - 1,
+    )
 }
 
 /// Squared Euclidean distance between two chunk positions (in chunk units).
@@ -391,7 +540,7 @@ mod tests {
     /// with a constant vertical window.
     #[test]
     fn flat_terrain_loads_a_cylinder_around_origin() {
-        let mut s = Streamer::surface_following(3, 5, 2, 2);
+        let mut s = Streamer::surface_following(3, 5, 2, 2, 2);
         let update = s.update(cp(0, 0, 0), flat);
         for &p in &update.to_load {
             let horiz = p.x * p.x + p.z * p.z;
@@ -407,7 +556,7 @@ mod tests {
     /// the world visibly vanished beneath a flying camera.
     #[test]
     fn flying_high_keeps_the_ground_loaded() {
-        let mut s = Streamer::surface_following(3, 5, 2, 2);
+        let mut s = Streamer::surface_following(3, 5, 2, 2, 2);
         let first = s.update(cp(0, 0, 0), flat);
         s.apply(&first);
         let ground = cp(0, 0, 0);
@@ -423,7 +572,7 @@ mod tests {
 
     #[test]
     fn moving_loads_leading_unloads_trailing() {
-        let mut s = Streamer::surface_following(2, 4, 1, 1);
+        let mut s = Streamer::surface_following(2, 4, 1, 1, 1);
         let first = s.update(cp(0, 0, 0), flat);
         s.apply(&first);
         let before = s.loaded_count();
@@ -440,7 +589,7 @@ mod tests {
 
     #[test]
     fn loaded_count_bounded_regardless_of_travel() {
-        let mut s = Streamer::surface_following(2, 4, 1, 1);
+        let mut s = Streamer::surface_following(2, 4, 1, 1, 1);
         for step in 0..40 {
             let u = s.update(cp(step * 3, 0, step), flat);
             s.apply(&u);
@@ -455,7 +604,7 @@ mod tests {
 
     #[test]
     fn to_load_is_nearest_first() {
-        let mut s = Streamer::surface_following(3, 5, 1, 1);
+        let mut s = Streamer::surface_following(3, 5, 1, 1, 1);
         let update = s.update(cp(10, 0, 10), flat);
         let mut prev = -1;
         for &p in &update.to_load {
@@ -468,7 +617,7 @@ mod tests {
 
     #[test]
     fn works_in_deep_negative_coordinates() {
-        let mut s = Streamer::surface_following(2, 4, 1, 1);
+        let mut s = Streamer::surface_following(2, 4, 1, 1, 1);
         // Deep in the negative quadrant, but inside the world (M10 bounds).
         let center = cp(-3_000, -300, -3_000);
         let deep = |_: i64, _: i64| (-300, -300);
@@ -481,36 +630,43 @@ mod tests {
     // ---- M10 task 2: surface-following vertical extent ----
 
     /// THE property. Every resident chunk sits within the margins of its OWN
-    /// column's surface — not a band shared by the world. This is what makes a
-    /// 640-layer world affordable: a trench column and a summit column each
-    /// load the same handful of chunks, 600 layers apart.
+    /// column's surface, or within the camera's own neighbourhood — never in a
+    /// band shared by the world. This is what makes a 640-layer world
+    /// affordable: a trench column and a summit column each load the same
+    /// handful of chunks, 600 layers apart.
     #[test]
-    fn every_resident_chunk_tracks_its_own_column_surface() {
-        let (below, above) = (2, 3);
-        let mut s = Streamer::surface_following(6, 8, below, above);
+    fn every_resident_chunk_tracks_its_column_surface_or_the_camera() {
+        let (below, above, cam) = (2, 3, 1);
+        let mut s = Streamer::surface_following(6, 8, below, above, cam);
         // Travel along the ramp so columns enter and leave from every side.
+        let mut center = cp(0, 0, 0);
         for step in 0..30 {
             let cx = step * 2;
-            let u = s.update(cp(cx, ramp(cx, 0).0, 0), ramp);
+            center = cp(cx, ramp(cx, 0).0, 0);
+            let u = s.update(center, ramp);
             s.apply(&u);
         }
         for p in s.loaded() {
             let (lo, hi) = ramp(p.x, p.z);
+            let in_surface = (lo - below..=hi + above).contains(&p.y);
+            // `+ 1`: the camera window's hysteresis layer.
+            let near_camera = (p.y - center.y).abs() <= cam + 1;
             assert!(
-                p.y >= lo - below && p.y <= hi + above,
-                "chunk {p:?} is outside its column's window {:?}",
+                in_surface || near_camera,
+                "chunk {p:?} is outside both its column's surface window {:?} \
+                 and the camera's neighbourhood",
                 (lo - below, hi + above)
             );
         }
     }
 
-    /// A 640-layer world must not cost 640 layers. With a surface window the
-    /// resident set is bounded by the disc area times the window height,
+    /// A 640-layer world must not cost 640 layers. The resident set is bounded
+    /// by the disc area times the surface window plus the camera window,
     /// independent of how tall the world is or how far the terrain climbs.
     #[test]
     fn resident_count_is_independent_of_world_height() {
-        let (r, below, above): (i64, i64, i64) = (4, 2, 2);
-        let mut s = Streamer::surface_following(r, r + 2, below, above);
+        let (r, below, above, cam): (i64, i64, i64, i64) = (4, 2, 2, 1);
+        let mut s = Streamer::surface_following(r, r + 2, below, above, cam);
         // A surface that swings across hundreds of chunk layers.
         let wild = |cx: i64, _cz: i64| {
             let y = (cx * 37).rem_euclid(600) - 300;
@@ -521,7 +677,8 @@ mod tests {
             s.apply(&u);
         }
         let disc = ((2 * (r + 2) + 1) * (2 * (r + 2) + 1)) as usize;
-        let window = (below + above + 1) as usize;
+        // Surface window, plus the camera's keep window (hysteresis included).
+        let window = ((below + above + 1) + (2 * (cam + 1) + 1)) as usize;
         assert!(
             s.loaded_count() <= disc * window,
             "resident set {} exceeds the disc x window ceiling {}",
@@ -535,7 +692,7 @@ mod tests {
     /// single height would load the cliff top and leave a hole down its face.
     #[test]
     fn a_cliff_column_loads_its_whole_face() {
-        let mut s = Streamer::surface_following(2, 4, 1, 1);
+        let mut s = Streamer::surface_following(2, 4, 1, 1, 1);
         // One column is a 10-layer cliff; its neighbours are flat.
         let cliff = |cx: i64, _cz: i64| if cx == 1 { (0, 9) } else { (0, 0) };
         let u = s.update(cp(0, 0, 0), cliff);
@@ -552,12 +709,12 @@ mod tests {
     /// near the floor does not request chunks below the world.
     #[test]
     fn the_window_clamps_to_the_world_floor_and_ceiling() {
-        let mut s = Streamer::surface_following(2, 4, 8, 8);
+        let mut s = Streamer::surface_following(2, 4, 8, 8, 8);
         let sc = CHUNK_SIZE as i64;
         let floor = planet::WORLD_Y_MIN_BLOCKS / sc;
         let ceiling = planet::WORLD_Y_MAX_BLOCKS / sc - 1;
         for surface in [floor, ceiling] {
-            let mut s2 = Streamer::surface_following(2, 4, 8, 8);
+            let mut s2 = Streamer::surface_following(2, 4, 8, 8, 8);
             let u = s2.update(cp(0, surface, 0), |_, _| (surface, surface));
             for p in &u.to_load {
                 assert!(
@@ -580,8 +737,8 @@ mod tests {
     #[test]
     fn streaming_is_identical_on_every_lap_of_the_world() {
         let lap = crate::planet::DEFAULT_WORLD_SIZE_BLOCKS / CHUNK_SIZE as i64;
-        let mut here = Streamer::surface_following(4, 6, 2, 2);
-        let mut there = Streamer::surface_following(4, 6, 2, 2);
+        let mut here = Streamer::surface_following(4, 6, 2, 2, 2);
+        let mut there = Streamer::surface_following(4, 6, 2, 2, 2);
         let a = here.update(cp(3, 0, -2), flat);
         let b = there.update(cp(3 + 3 * lap, 0, -2 - 5 * lap), flat);
         let shifted: HashSet<ChunkPos> = b
@@ -599,7 +756,7 @@ mod tests {
     fn chunks_outside_the_vertical_bounds_are_never_requested() {
         let sc = CHUNK_SIZE as i64;
         let top = planet::WORLD_Y_MAX_BLOCKS / sc - 1;
-        let mut s = Streamer::surface_following(4, 6, 8, 8);
+        let mut s = Streamer::surface_following(4, 6, 8, 8, 8);
         let u = s.update(cp(0, top, 0), |_, _| (top, top));
         assert!(!u.to_load.is_empty());
         for p in &u.to_load {
@@ -612,12 +769,12 @@ mod tests {
         assert!(s.loaded().all(planet::chunk_in_vertical_bounds));
     }
 
-    /// A column's window depends only on its own terrain, never on the camera,
-    /// so a camera sitting still must produce no vertical churn at all — and a
-    /// camera oscillating across a chunk boundary must not thrash either.
+    /// A camera sitting still must produce no further work, and a camera
+    /// oscillating across a horizontal chunk boundary must not thrash — the
+    /// unload radius's hysteresis band absorbs it.
     #[test]
     fn a_settled_camera_produces_no_further_work() {
-        let mut s = Streamer::surface_following(3, 5, 2, 2);
+        let mut s = Streamer::surface_following(3, 5, 2, 2, 2);
         let first = s.update(cp(0, 0, 0), ramp);
         s.apply(&first);
         let second = s.update(cp(0, 0, 0), ramp);
@@ -638,6 +795,165 @@ mod tests {
                 b.to_unload
             );
         }
+    }
+
+    // ---- M10 A3: streaming follows the camera as well as the ground ----
+
+    /// THE bug: surface-following alone loads a few layers below the surface,
+    /// so a player who digs deeper walks out of the loaded world. The camera's
+    /// own neighbourhood must be resident wherever the camera is — across the
+    /// whole disc, since a tunnel runs sideways too.
+    #[test]
+    fn digging_deep_keeps_the_camera_neighbourhood_loaded() {
+        let mut s = Streamer::surface_following(3, 5, 2, 2, 2);
+        let deep = cp(0, -20, 0);
+        let u = s.update(deep, flat);
+        s.apply(&u);
+        for y in -22..=-18 {
+            for (x, z) in [(0, 0), (3, 0), (0, -3), (2, 2)] {
+                assert!(
+                    s.is_loaded(cp(x, y, z)),
+                    "{:?} near the camera was not loaded",
+                    cp(x, y, z)
+                );
+            }
+        }
+        // ...and the ground above is still there to walk back up to.
+        assert!(s.is_loaded(cp(0, 0, 0)), "the surface unloaded");
+        // The gap between the two windows is not loaded: the camera window is
+        // a window, not a column.
+        assert!(!s.is_loaded(cp(0, -10, 0)), "loaded the whole column");
+    }
+
+    /// The same, upward: a build more than `above` layers over the terrain
+    /// stays resident while the player is up there with it.
+    #[test]
+    fn building_high_keeps_the_camera_neighbourhood_loaded() {
+        let mut s = Streamer::surface_following(3, 5, 2, 2, 2);
+        let u = s.update(cp(1, 15, -1), flat);
+        s.apply(&u);
+        for y in 13..=17 {
+            assert!(s.is_loaded(cp(1, y, -1)), "layer {y} not loaded");
+        }
+        assert!(s.is_loaded(cp(1, 0, -1)), "the ground unloaded");
+    }
+
+    /// The camera window follows the camera: descending loads the layers
+    /// ahead and releases the ones left behind (beyond the hysteresis layer),
+    /// so the resident set does not grow into a shaft down the whole descent.
+    #[test]
+    fn the_camera_window_moves_with_the_camera() {
+        let mut s = Streamer::surface_following(2, 4, 1, 1, 1);
+        let mut peak = 0;
+        for y in (-40..=-10).rev() {
+            let u = s.update(cp(0, y, 0), flat);
+            s.apply(&u);
+            peak = peak.max(s.loaded_count());
+        }
+        assert!(s.is_loaded(cp(0, -41, 0)), "the layer below was not loaded");
+        assert!(!s.is_loaded(cp(0, -20, 0)), "layers above were never freed");
+        assert!(s.is_loaded(cp(0, 0, 0)), "the surface unloaded");
+        // Disc of radius 2 (13 columns) x (surface 3 + camera keep 5 layers).
+        assert!(
+            peak <= 13 * 8,
+            "resident set grew to {peak} while descending"
+        );
+    }
+
+    /// The camera window moves, so it needs its own hysteresis: a camera
+    /// bobbing across a chunk-layer boundary must not load and unload a whole
+    /// disc of chunks per bob.
+    #[test]
+    fn a_camera_bobbing_across_a_layer_does_not_thrash() {
+        let mut s = Streamer::surface_following(3, 5, 1, 1, 2);
+        let a = s.update(cp(0, -20, 0), flat);
+        s.apply(&a);
+        let b = s.update(cp(0, -21, 0), flat);
+        s.apply(&b);
+        for _ in 0..8 {
+            for y in [-20, -21] {
+                let u = s.update(cp(0, y, 0), flat);
+                assert!(
+                    u.to_unload.is_empty(),
+                    "bobbing to layer {y} unloaded {:?}",
+                    u.to_unload
+                );
+                s.apply(&u);
+            }
+        }
+    }
+
+    /// A camera far outside the world's vertical bounds pins nothing: the
+    /// camera window is intersected with the world, not clamped onto it, so a
+    /// spectator above the ceiling does not load the ceiling layer of the
+    /// whole disc.
+    #[test]
+    fn a_camera_outside_the_world_loads_only_the_surface() {
+        let sc = CHUNK_SIZE as i64;
+        let ceiling = planet::WORLD_Y_MAX_BLOCKS / sc - 1;
+        let mut s = Streamer::surface_following(2, 4, 1, 1, 2);
+        let u = s.update(cp(0, ceiling + 50, 0), flat);
+        assert!(!u.to_load.is_empty());
+        for p in &u.to_load {
+            assert!(
+                (-1..=1).contains(&p.y),
+                "requested {p:?} for a camera outside the world"
+            );
+        }
+    }
+
+    /// `wants` is the streamer's own load set, stated per chunk. Callers use
+    /// it to decide whether an absent neighbour is still coming, so it must
+    /// agree with `update` exactly — any drift is the M09 first-mesh deadlock
+    /// or a black chunk.
+    #[test]
+    fn wants_agrees_with_update_exactly() {
+        let s_cfg = || Streamer::surface_following(3, 5, 1, 2, 2);
+        for center in [cp(0, 0, 0), cp(2, -12, -1), cp(-1, 9, 3)] {
+            let mut s = s_cfg();
+            let requested: HashSet<ChunkPos> = s.update(center, ramp).to_load.into_iter().collect();
+            for x in center.x - 6..=center.x + 6 {
+                for z in center.z - 6..=center.z + 6 {
+                    for y in center.y - 20..=center.y + 20 {
+                        let p = cp(x, y, z);
+                        assert_eq!(
+                            s.wants(p, center, ramp(x, z)),
+                            requested.contains(&p),
+                            "wants and update disagree about {p:?} (camera {center:?})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn column_window_merges_overlapping_and_adjacent_ranges() {
+        let w = ColumnWindow::union((0, 5), (3, 9));
+        assert_eq!(w.ranges(), &[(0, 9)]);
+        let w = ColumnWindow::union((6, 9), (0, 5)); // adjacent, either order
+        assert_eq!(w.ranges(), &[(0, 9)]);
+        let w = ColumnWindow::union((2, 4), (0, 9)); // contained
+        assert_eq!(w.ranges(), &[(0, 9)]);
+    }
+
+    #[test]
+    fn column_window_keeps_disjoint_ranges_apart_in_order() {
+        let w = ColumnWindow::union((10, 12), (-5, -3));
+        assert_eq!(w.ranges(), &[(-5, -3), (10, 12)]);
+        assert!(w.contains(-4) && w.contains(11));
+        assert!(!w.contains(0), "the gap between the windows is not in it");
+        let up: Vec<i64> = w.layers().collect();
+        assert_eq!(up, vec![-5, -4, -3, 10, 11, 12]);
+        let down: Vec<i64> = w.layers().rev().collect();
+        assert_eq!(down, vec![12, 11, 10, -3, -4, -5]);
+    }
+
+    #[test]
+    fn column_window_with_an_empty_camera_window_is_the_surface_window() {
+        let w = ColumnWindow::union((1, 4), (7, 6));
+        assert_eq!(w.ranges(), &[(1, 4)]);
+        assert_eq!(w.layers().count(), 4);
     }
 
     // ---- M09 task 1: nearest-first batch selection ----

@@ -232,11 +232,13 @@ beyond what the invariants above already require.
   (`docs/milestones/10-terrain-and-deep-vertical.md`). **The exact state and the
   ordered list of remaining work is in that spec's "Status and remaining work —
   START HERE" section; begin at its first unchecked item.** As of 2026-09-24:
-  tasks 1–4, A2 (the torus) and one A3 fix are done and pushed; next is A3 item
-  1, `f64` world positions with camera-following streaming.
+  tasks 1–4, A2 (the torus) and two A3 items (LOD suppression waits for drawn
+  chunks; `f64` world positions with camera-following streaming) are done;
+  next is "no faces toward chunks that will never load".
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 218, vox-mesh 37, vox-worldgen 26 passing as of `249644e`), then
+  vox-core 227, vox-mesh 37, vox-worldgen 26 passing as of the `f64` /
+  camera-streaming commit), then
   start the first unchecked item.
 - **Roadmap after M10:** 11 — The Horizon
   (`docs/milestones/11-the-horizon.md`: 32–64 km view via per-level LOD ring

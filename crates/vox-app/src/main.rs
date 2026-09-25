@@ -6,7 +6,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::Instant;
 
-use glam::{Mat4, Vec3};
+use glam::{DVec3, Mat4, Vec3};
 use rayon::prelude::*;
 use vox_core::{
     cell_overlaps_aabb, BlockId, BlockRegistry, Chunk, ChunkPos, EditedColumns, LocalPos,
@@ -108,9 +108,18 @@ const LOD_SPAWN_BUDGET: usize = 48;
 /// at that scale is ~80x more chunks than the engine can carry. Below covers
 /// standing on and digging into the ground; above covers building and the
 /// near-ground flight envelope. Fly far higher than `ABOVE` and the terrain
-/// below you stays loaded — the window follows the GROUND, not the camera.
+/// below you stays loaded — this window follows the GROUND.
 const LOAD_BELOW_CHUNKS: i64 = 3;
 const LOAD_ABOVE_CHUNKS: i64 = 3;
+/// Chunk layers kept loaded above and below the CAMERA's layer, across the
+/// whole load disc (M10 A3).
+///
+/// The surface window alone strands a player who leaves it: dig more than
+/// `LOAD_BELOW_CHUNKS` down or build more than `LOAD_ABOVE_CHUNKS` up and you
+/// walk out of the loaded world. Near the ground this window overlaps the
+/// surface one and costs nothing; underground it is ~100 blocks of view each
+/// way, the same reach the surface window gives the ground.
+const LOAD_AROUND_CAMERA_CHUNKS: i64 = 3;
 
 /// Spacing and reach of the spawn search, in blocks and rings (M10 task 1).
 ///
@@ -122,7 +131,7 @@ const LOAD_ABOVE_CHUNKS: i64 = 3;
 const SPAWN_SEARCH_STRIDE: i64 = 256;
 const SPAWN_SEARCH_RINGS: i64 = 512;
 /// How far above the ground the camera starts.
-const SPAWN_EYE_HEIGHT: f32 = 12.0;
+const SPAWN_EYE_HEIGHT: f64 = 12.0;
 
 /// How many `lod_tick`s a retired LOD node keeps drawing while its replacement
 /// builds, before being dropped anyway.
@@ -332,63 +341,96 @@ enum MoveMode {
     Survival,
 }
 
+/// The player's eye and body.
+///
+/// Everything here is `f64` (CLAUDE.md, ADR-0002): the camera can be hundreds
+/// of kilometres from the origin in the unwrapped frame, where an `f32`
+/// resolves only ~0.01 blocks and a high-frame-rate step rounds away to
+/// nothing. Narrowing to `f32` happens in exactly one place —
+/// [`FlyCamera::render_relative`], after subtracting the render origin.
 struct FlyCamera {
-    /// Eye position in world blocks. In survival the player AABB hangs below
-    /// this by `EYE_HEIGHT`.
-    position: Vec3,
+    /// Eye position in world blocks, in the unwrapped frame (ADR-0012 §4):
+    /// never canonicalised. In survival the player AABB hangs below this by
+    /// `EYE_HEIGHT`.
+    position: DVec3,
     /// Radians. 0 looks along +X; positive turns toward +Z.
-    yaw: f32,
+    yaw: f64,
     /// Radians, clamped to ±~89° so the view never flips.
-    pitch: f32,
+    pitch: f64,
     /// World-space velocity (m/s). Used by survival physics; spectator ignores
     /// it (moves position directly).
-    velocity: Vec3,
+    velocity: DVec3,
     /// Whether the player is standing on solid ground (survival).
     on_ground: bool,
     mode: MoveMode,
 }
 
 impl FlyCamera {
-    const SPEED: f32 = 30.0; // m/s (spectator)
-    const SPRINT_MULTIPLIER: f32 = 4.0; // hold Ctrl (spectator)
-    const SENSITIVITY: f32 = 0.0022; // radians per mouse count
-    const PITCH_LIMIT: f32 = 1.55; // just under PI/2
+    const SPEED: f64 = 30.0; // m/s (spectator)
+    const SPRINT_MULTIPLIER: f64 = 4.0; // hold Ctrl (spectator)
+    const SENSITIVITY: f64 = 0.0022; // radians per mouse count
+    const PITCH_LIMIT: f64 = 1.55; // just under PI/2
 
     // --- Survival tuning (Minecraft-like) ---
     /// Player collision box: 0.6 × 1.8 × 0.6 blocks.
-    const HALF_WIDTH: f32 = 0.3;
-    const HEIGHT: f32 = 1.8;
+    const HALF_WIDTH: f64 = 0.3;
+    const HEIGHT: f64 = 1.8;
     /// Eye sits near the top of the box (MC eye height ~1.62).
-    const EYE_HEIGHT: f32 = 1.62;
-    const WALK_SPEED: f32 = 4.317; // m/s, MC walking
-    const SPRINT_SPEED: f32 = 5.612; // m/s, MC sprinting
-    const GRAVITY: f32 = 28.0; // m/s² (tuned for snappy MC-ish fall)
-    const JUMP_SPEED: f32 = 9.0; // m/s initial (clears ~1.25 blocks)
-    const STEP_HEIGHT: f32 = 0.6; // auto-step over single blocks
-    const TERMINAL_FALL: f32 = 78.0; // m/s clamp
+    const EYE_HEIGHT: f64 = 1.62;
+    const WALK_SPEED: f64 = 4.317; // m/s, MC walking
+    const SPRINT_SPEED: f64 = 5.612; // m/s, MC sprinting
+    const GRAVITY: f64 = 28.0; // m/s² (tuned for snappy MC-ish fall)
+    const JUMP_SPEED: f64 = 9.0; // m/s initial (clears ~1.25 blocks)
+    const STEP_HEIGHT: f64 = 0.6; // auto-step over single blocks
+    const TERMINAL_FALL: f64 = 78.0; // m/s clamp
 
-    fn forward(&self) -> Vec3 {
-        Vec3::new(
+    fn forward(&self) -> DVec3 {
+        DVec3::new(
             self.pitch.cos() * self.yaw.cos(),
             self.pitch.sin(),
             self.pitch.cos() * self.yaw.sin(),
         )
     }
 
+    /// The block containing the eye. Streaming, the render origin and the
+    /// debug tools all key off this; floor, not truncation, so negative
+    /// coordinates land in the right block.
+    fn block_pos(&self) -> WorldPos {
+        WorldPos::new(
+            self.position.x.floor() as i64,
+            self.position.y.floor() as i64,
+            self.position.z.floor() as i64,
+        )
+    }
+
+    /// The eye relative to `render_origin`, narrowed to `f32` for the GPU.
+    ///
+    /// The ONLY place the camera becomes `f32` (ADR-0002): the subtraction
+    /// happens in `f64`, so the result is a small number that `f32` holds
+    /// exactly enough, however far out the camera is.
+    fn render_relative(&self, render_origin: WorldPos) -> Vec3 {
+        let origin = DVec3::new(
+            render_origin.x as f64,
+            render_origin.y as f64,
+            render_origin.z as f64,
+        );
+        (self.position - origin).as_vec3()
+    }
+
     fn mouse_look(&mut self, dx: f64, dy: f64) {
-        self.yaw += dx as f32 * Self::SENSITIVITY;
-        self.pitch = (self.pitch - dy as f32 * Self::SENSITIVITY)
-            .clamp(-Self::PITCH_LIMIT, Self::PITCH_LIMIT);
+        self.yaw += dx * Self::SENSITIVITY;
+        self.pitch =
+            (self.pitch - dy * Self::SENSITIVITY).clamp(-Self::PITCH_LIMIT, Self::PITCH_LIMIT);
     }
 
     /// Spectator free-fly: move the eye directly, no collision.
-    fn update_spectator(&mut self, keys: &HashSet<KeyCode>, dt: f32) {
+    fn update_spectator(&mut self, keys: &HashSet<KeyCode>, dt: f64) {
         // Horizontal movement follows yaw only (classic fly-cam feel);
         // Space/Shift move straight up/down in world space.
-        let flat_forward = Vec3::new(self.yaw.cos(), 0.0, self.yaw.sin());
-        let right = Vec3::new(-self.yaw.sin(), 0.0, self.yaw.cos());
+        let flat_forward = DVec3::new(self.yaw.cos(), 0.0, self.yaw.sin());
+        let right = DVec3::new(-self.yaw.sin(), 0.0, self.yaw.cos());
 
-        let mut dir = Vec3::ZERO;
+        let mut dir = DVec3::ZERO;
         if keys.contains(&KeyCode::KeyW) {
             dir += flat_forward;
         }
@@ -402,13 +444,13 @@ impl FlyCamera {
             dir -= right;
         }
         if keys.contains(&KeyCode::Space) {
-            dir += Vec3::Y;
+            dir += DVec3::Y;
         }
         if keys.contains(&KeyCode::ShiftLeft) {
-            dir -= Vec3::Y;
+            dir -= DVec3::Y;
         }
 
-        if dir != Vec3::ZERO {
+        if dir != DVec3::ZERO {
             let speed = if keys.contains(&KeyCode::ControlLeft) {
                 Self::SPEED * Self::SPRINT_MULTIPLIER
             } else {
@@ -422,36 +464,30 @@ impl FlyCamera {
     fn aabb(&self) -> ([f64; 3], [f64; 3]) {
         let feet_y = self.position.y - Self::EYE_HEIGHT;
         let min = [
-            (self.position.x - Self::HALF_WIDTH) as f64,
-            feet_y as f64,
-            (self.position.z - Self::HALF_WIDTH) as f64,
+            self.position.x - Self::HALF_WIDTH,
+            feet_y,
+            self.position.z - Self::HALF_WIDTH,
         ];
         let max = [
-            (self.position.x + Self::HALF_WIDTH) as f64,
-            (feet_y + Self::HEIGHT) as f64,
-            (self.position.z + Self::HALF_WIDTH) as f64,
+            self.position.x + Self::HALF_WIDTH,
+            feet_y + Self::HEIGHT,
+            self.position.z + Self::HALF_WIDTH,
         ];
         (min, max)
     }
 
     /// View-projection matrix built with the camera positioned **relative to
-    /// the render origin** (ADR-0002). `render_origin_blocks` is the world
-    /// position of the render origin; subtracting it keeps the numbers fed
+    /// the render origin** (ADR-0002). `render_origin` is the world position
+    /// of the render origin; subtracting it (in `f64`) keeps the numbers fed
     /// to the matrix small regardless of absolute distance.
     /// `fov_degrees` and `far` come from settings: the far plane MUST cover the
     /// LOD horizon, or distant terrain is generated, meshed, uploaded — and
     /// then clipped away by the projection, which reads as the world ending at
     /// a hard line and as a "render distance" slider that does nothing.
-    fn view_proj(
-        &self,
-        aspect: f32,
-        render_origin_blocks: Vec3,
-        fov_degrees: f32,
-        far: f32,
-    ) -> Mat4 {
+    fn view_proj(&self, aspect: f32, render_origin: WorldPos, fov_degrees: f32, far: f32) -> Mat4 {
         let proj = Mat4::perspective_rh(fov_degrees.to_radians(), aspect, 0.1, far);
-        let rel_pos = self.position - render_origin_blocks;
-        let view = Mat4::look_to_rh(rel_pos, self.forward(), Vec3::Y);
+        let rel_pos = self.render_relative(render_origin);
+        let view = Mat4::look_to_rh(rel_pos, self.forward().as_vec3(), Vec3::Y);
         proj * view
     }
 }
@@ -621,7 +657,7 @@ impl Default for App {
             |x, z| generator.surface_height(x, z) > vox_core::SEA_LEVEL_BLOCKS + 4,
         )
         .unwrap_or((0, 0));
-        let spawn_y = generator.surface_height(spawn_x, spawn_z) as f32 + SPAWN_EYE_HEIGHT;
+        let spawn_y = generator.surface_height(spawn_x, spawn_z) as f64 + SPAWN_EYE_HEIGHT;
         // The search returns the unwrapped position near the origin, which is
         // where the camera goes; the log shows the canonical one, since that is
         // the address a player would recognise and return to.
@@ -639,10 +675,10 @@ impl Default for App {
             world: World::new(),
             // On the ground at the resolved spawn, looking out across it.
             camera: FlyCamera {
-                position: Vec3::new(spawn_x as f32, spawn_y, spawn_z as f32),
-                yaw: std::f32::consts::FRAC_PI_4,
+                position: DVec3::new(spawn_x as f64, spawn_y, spawn_z as f64),
+                yaw: std::f64::consts::FRAC_PI_4,
                 pitch: -0.45,
-                velocity: Vec3::ZERO,
+                velocity: DVec3::ZERO,
                 on_ground: false,
                 mode: MoveMode::Spectator,
             },
@@ -657,6 +693,7 @@ impl Default for App {
                 UNLOAD_RADIUS,
                 LOAD_BELOW_CHUNKS,
                 LOAD_ABOVE_CHUNKS,
+                LOAD_AROUND_CAMERA_CHUNKS,
             ),
             lod_ring: LodRing::new(
                 LOD_INNER_CHUNKS,
@@ -738,7 +775,7 @@ impl App {
     /// Move the player's eye by `delta` along one axis with AABB collision: if
     /// the moved box hits a solid, cancel the motion on that axis. Returns
     /// whether a collision blocked it.
-    fn move_axis(&self, cam: &mut FlyCamera, axis: usize, delta: f32) -> bool {
+    fn move_axis(&self, cam: &mut FlyCamera, axis: usize, delta: f64) -> bool {
         if delta == 0.0 {
             return false;
         }
@@ -755,7 +792,7 @@ impl App {
 
     /// Survival physics step: gravity, jump, WASD (yaw-relative), per-axis AABB
     /// collision, and Minecraft-style auto-step over single-block ledges.
-    fn physics_update(&mut self, dt: f32) {
+    fn physics_update(&mut self, dt: f64) {
         let mut cam = FlyCamera {
             position: self.camera.position,
             yaw: self.camera.yaw,
@@ -766,9 +803,9 @@ impl App {
         };
 
         // Horizontal velocity from input (yaw-relative).
-        let flat_forward = Vec3::new(cam.yaw.cos(), 0.0, cam.yaw.sin());
-        let right = Vec3::new(-cam.yaw.sin(), 0.0, cam.yaw.cos());
-        let mut wish = Vec3::ZERO;
+        let flat_forward = DVec3::new(cam.yaw.cos(), 0.0, cam.yaw.sin());
+        let right = DVec3::new(-cam.yaw.sin(), 0.0, cam.yaw.cos());
+        let mut wish = DVec3::ZERO;
         if self.keys.contains(&KeyCode::KeyW) {
             wish += flat_forward;
         }
@@ -786,10 +823,10 @@ impl App {
         } else {
             FlyCamera::WALK_SPEED
         };
-        let horiz = if wish != Vec3::ZERO {
+        let horiz = if wish != DVec3::ZERO {
             wish.normalize() * speed
         } else {
-            Vec3::ZERO
+            DVec3::ZERO
         };
         cam.velocity.x = horiz.x;
         cam.velocity.z = horiz.z;
@@ -829,7 +866,7 @@ impl App {
     /// Horizontal motion on X and Z; if an axis is blocked while grounded,
     /// retry after stepping up (auto-step over 1-block ledges), then drop back
     /// down onto the ledge.
-    fn move_horizontal_with_step(&self, cam: &mut FlyCamera, dx: f32, dz: f32) {
+    fn move_horizontal_with_step(&self, cam: &mut FlyCamera, dx: f64, dz: f64) {
         for (axis, d) in [(0usize, dx), (2usize, dz)] {
             if d == 0.0 {
                 continue;
@@ -1038,14 +1075,25 @@ impl App {
         (lo.div_euclid(CHUNK_SIZE_I), hi.div_euclid(CHUNK_SIZE_I))
     }
 
-    /// The chunk-Y range that will EVER be resident for a column.
-    ///
-    /// One source of truth, deferring to the streamer. Anything judging "will
-    /// this chunk arrive?" independently gets it wrong the moment the margins
-    /// or the clamping change — and both the first-mesh gate and LOD coverage
-    /// suppression ask exactly that question.
+    /// The chunk-Y range resident around a column's terrain surface,
+    /// whatever the camera does. LOD coverage asks this: whether the ground
+    /// under a node is drawn. Deferring to the streamer keeps one source of
+    /// truth — anything judging it independently gets it wrong the moment the
+    /// margins or the clamping change.
     fn surface_window_chunks(&self, cx: i64, cz: i64) -> (i64, i64) {
-        self.streamer.window_for(self.surface_span_chunks(cx, cz))
+        self.streamer
+            .surface_window(self.surface_span_chunks(cx, cz))
+    }
+
+    /// Every chunk layer resident for a column right now: the surface window
+    /// plus the camera's own neighbourhood (M10 A3). A scan for "what is in
+    /// this column" must cover both, or it misses what the player built
+    /// above the terrain window.
+    fn column_window_chunks(&self, cx: i64, cz: i64) -> vox_core::ColumnWindow {
+        self.streamer.column_window(
+            self.camera.block_pos().chunk(),
+            self.surface_span_chunks(cx, cz),
+        )
     }
 
     fn stream_tick(&mut self, camera_chunk: ChunkPos) {
@@ -1338,33 +1386,28 @@ impl App {
     /// that then persists until a neighbor's arrival happens to re-dirty it.
     ///
     /// So a chunk's first mesh waits for every face neighbor that is still
-    /// *coming*. A neighbor outside the load radius is never coming, so it is
-    /// not waited on — otherwise the outermost shell would never mesh at all
-    /// and the full-res region would end in a permanent hole. Re-meshes of an
-    /// already-meshed chunk are never gated (an edit must show immediately).
+    /// *coming*. A neighbor the streamer does not want is never coming, so it
+    /// is not waited on — otherwise the outermost shell would never mesh at
+    /// all and the full-res region would end in a permanent hole. Re-meshes of
+    /// an already-meshed chunk are never gated (an edit must show immediately).
     fn ready_for_first_mesh(&self, p: ChunkPos, camera_chunk: ChunkPos) -> bool {
         if self.meshed_once.contains(&p) {
             return true;
         }
-        let r2 = self.settings.load_radius * self.settings.load_radius;
         NEIGHBOR_OFFSETS.iter().all(|(dx, dy, dz)| {
             let n = ChunkPos::new(p.x + dx, p.y + dy, p.z + dz);
             if self.world.chunk(n).is_some() {
                 return true; // present
             }
-            // Absent: only wait if it is still COMING. Streaming is a cylinder
-            // horizontally and follows the SURFACE vertically, so a neighbour
-            // outside its own column's window never arrives no matter how close
-            // it is horizontally. Judging that against the world band instead
-            // would wait forever on chunks 10 000 blocks underground, and every
-            // chunk gated on one would stay dark — the M09 black-chunk defect,
-            // reintroduced by a taller world.
-            let (band_lo, band_hi) = self.surface_window_chunks(n.x, n.z);
-            if n.y < band_lo || n.y > band_hi {
-                return true;
-            }
-            let (ex, ez) = (n.x - camera_chunk.x, n.z - camera_chunk.z);
-            ex * ex + ez * ez > r2
+            // Absent: only wait if it is still COMING, which is the streamer's
+            // own load set — a cylinder horizontally, the surface window plus
+            // the camera window vertically. Judging it any other way waits
+            // forever on a chunk that never arrives, and every chunk gated on
+            // it stays dark: the M09 black-chunk defect, reintroduced once by a
+            // taller world.
+            !self
+                .streamer
+                .wants(n, camera_chunk, self.surface_span_chunks(n.x, n.z))
         })
     }
 
@@ -1382,18 +1425,22 @@ impl App {
     /// the pre-edit surface, and anything derived from it — LOD nodes, skylight
     /// — rebuilds the terrain the player just removed: a "ghost block".
     fn recompute_column_height(&mut self, x: i64, z: i64) {
-        // Scan only what can be resident for this column. Against the world
-        // band this would be a 20 000-block walk on every block break; blocks
-        // outside the window are not loaded, so scanning them would find
-        // nothing anyway.
-        let (wlo, whi) =
-            self.surface_window_chunks(x.div_euclid(CHUNK_SIZE_I), z.div_euclid(CHUNK_SIZE_I));
-        let (lo, hi) = (wlo * CHUNK_SIZE_I, (whi + 1) * CHUNK_SIZE_I);
+        // Scan only what can be resident for this column: its surface window
+        // and the camera's neighbourhood, top down, skipping the gap between
+        // them. Against the world band this would be a 20 000-block walk on
+        // every block break; blocks outside the window are not loaded, so
+        // scanning them would find nothing anyway. The camera part matters: a
+        // block placed above the surface window is only visible to this scan
+        // through it.
+        let window =
+            self.column_window_chunks(x.div_euclid(CHUNK_SIZE_I), z.div_euclid(CHUNK_SIZE_I));
         let mut top = i64::MIN;
-        for y in (lo..hi).rev() {
-            if !self.world.get_block(WorldPos::new(x, y, z)).is_air() {
-                top = y;
-                break;
+        'scan: for cy in window.layers().rev() {
+            for y in (cy * CHUNK_SIZE_I..(cy + 1) * CHUNK_SIZE_I).rev() {
+                if !self.world.get_block(WorldPos::new(x, y, z)).is_air() {
+                    top = y;
+                    break 'scan;
+                }
             }
         }
         self.column_heights.insert((x, z), top);
@@ -1557,6 +1604,7 @@ impl App {
             s.load_radius + 2,
             LOAD_BELOW_CHUNKS,
             LOAD_ABOVE_CHUNKS,
+            LOAD_AROUND_CAMERA_CHUNKS,
         );
         // Extend view distance by APPENDING coarser levels, each doubling both
         // stride and radius. That keeps per-level node count roughly constant,
@@ -1869,8 +1917,8 @@ impl App {
         const HALF: f64 = 0.3;
         let p = self.camera.position;
         (
-            [p.x as f64 - HALF, p.y as f64 - HALF, p.z as f64 - HALF],
-            [p.x as f64 + HALF, p.y as f64 + HALF, p.z as f64 + HALF],
+            [p.x - HALF, p.y - HALF, p.z - HALF],
+            [p.x + HALF, p.y + HALF, p.z + HALF],
         )
     }
 
@@ -1912,11 +1960,7 @@ impl App {
     /// Block-editing UI proper is Milestone 03; this exercises re-meshing.
     fn debug_punch_hole(&mut self) {
         const RADIUS: i64 = 6;
-        let center = WorldPos::new(
-            self.camera.position.x.floor() as i64,
-            self.camera.position.y.floor() as i64,
-            self.camera.position.z.floor() as i64,
-        );
+        let center = self.camera.block_pos();
 
         let mut touched: HashSet<ChunkPos> = HashSet::new();
         for dy in -RADIUS..=RADIUS {
@@ -2043,7 +2087,7 @@ impl ApplicationHandler for App {
                                     MoveMode::Spectator => MoveMode::Survival,
                                     MoveMode::Survival => MoveMode::Spectator,
                                 };
-                                self.camera.velocity = Vec3::ZERO;
+                                self.camera.velocity = DVec3::ZERO;
                                 self.camera.on_ground = false;
                                 log::info!(
                                     "move mode: {}",
@@ -2204,19 +2248,16 @@ impl ApplicationHandler for App {
                     self.world_time = vox_core::WorldTime::from_ticks(self.time_accum as u64);
                 }
 
+                // Motion integrates in f64: an f32 frame time is exact enough,
+                // an f32 POSITION is what loses the step far from the origin.
                 match self.camera.mode {
-                    MoveMode::Spectator => self.camera.update_spectator(&self.keys, dt),
-                    MoveMode::Survival => self.physics_update(dt),
+                    MoveMode::Spectator => self.camera.update_spectator(&self.keys, f64::from(dt)),
+                    MoveMode::Survival => self.physics_update(f64::from(dt)),
                 }
 
                 // Camera's current chunk drives both streaming and the
                 // floating-origin render origin.
-                let cam = WorldPos::new(
-                    self.camera.position.x.floor() as i64,
-                    self.camera.position.y.floor() as i64,
-                    self.camera.position.z.floor() as i64,
-                );
-                let origin_chunk = cam.chunk();
+                let origin_chunk = self.camera.block_pos().chunk();
 
                 // Stream chunks in/out around the camera (borrows all of
                 // self), before the render borrow below.
@@ -2231,13 +2272,8 @@ impl ApplicationHandler for App {
                 let hit = {
                     let world = &self.world;
                     let registry = &self.registry;
-                    let eye = [
-                        self.camera.position.x as f64,
-                        self.camera.position.y as f64,
-                        self.camera.position.z as f64,
-                    ];
-                    let fwd = self.camera.forward();
-                    let dir = [fwd.x as f64, fwd.y as f64, fwd.z as f64];
+                    let eye = self.camera.position.to_array();
+                    let dir = self.camera.forward().to_array();
                     vox_core::raycast_voxels(eye, dir, REACH, |p| {
                         registry.is_solid(world.get_block(p))
                     })
@@ -2318,15 +2354,10 @@ impl ApplicationHandler for App {
                     // render origin, set just above).
                     renderer.set_highlight(self.targeted.map(|h| h.block_pos));
 
-                    let origin_blocks = origin_chunk.origin();
-                    let render_origin_blocks = Vec3::new(
-                        origin_blocks.x as f32,
-                        origin_blocks.y as f32,
-                        origin_blocks.z as f32,
-                    );
+                    let render_origin = origin_chunk.origin();
                     let view_proj = self.camera.view_proj(
                         renderer.aspect(),
-                        render_origin_blocks,
+                        render_origin,
                         self.settings.fov_degrees,
                         far,
                     );
@@ -2352,7 +2383,7 @@ impl ApplicationHandler for App {
                         start: fog_start,
                         end: fog_end,
                     };
-                    let cam_rel = self.camera.position - render_origin_blocks;
+                    let cam_rel = self.camera.render_relative(render_origin);
                     let morph = vox_render::MorphParams {
                         band: self.settings.lod_morph_band,
                     };
