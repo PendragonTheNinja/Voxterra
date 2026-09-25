@@ -303,16 +303,25 @@ fn relight_chunks_parallel(
         .collect()
 }
 
+/// `jobs` pairs each chunk with its SEALED faces: a bit per entry of
+/// `NEIGHBOR_OFFSETS`, set where that face neighbour is absent and never
+/// coming (M10 A3), so the mesher emits no face into the void there. The
+/// judgement needs the streamer, so the caller makes it on the main thread;
+/// the workers only read it.
 fn mesh_chunks_parallel(
     world: &World,
     registry: &BlockRegistry,
-    positions: &[ChunkPos],
+    jobs: &[(ChunkPos, u8)],
 ) -> Vec<(ChunkPos, MeshData)> {
-    positions
-        .par_iter()
-        .filter_map(|&pos| {
+    jobs.par_iter()
+        .filter_map(|&(pos, sealed)| {
             let chunk = world.chunk(pos)?;
-            let neighbors = ChunkNeighbors::of(world, pos);
+            let mut neighbors = ChunkNeighbors::of(world, pos);
+            for (bit, &(dx, dy, dz)) in NEIGHBOR_OFFSETS.iter().enumerate() {
+                if sealed & (1 << bit) != 0 {
+                    neighbors = neighbors.with_sealed(dx, dy, dz);
+                }
+            }
             // Texture array (ADR-0003): resolve each face's layer via the
             // registry. The closure borrows the registry (Sync), shared
             // across the rayon workers.
@@ -1349,7 +1358,11 @@ impl App {
                     self.meshed_once.insert(*p);
                 }
 
-                let meshes = mesh_chunks_parallel(&self.world, &self.registry, &batch);
+                let jobs: Vec<(ChunkPos, u8)> = batch
+                    .iter()
+                    .map(|&p| (p, self.sealed_faces(p, camera_chunk)))
+                    .collect();
+                let meshes = mesh_chunks_parallel(&self.world, &self.registry, &jobs);
                 if let Some(renderer) = self.renderer.as_mut() {
                     let produced: HashSet<ChunkPos> = meshes.iter().map(|(p, _)| *p).collect();
                     // A batch chunk that produced no mesh (all air, or fully
@@ -1394,21 +1407,45 @@ impl App {
         if self.meshed_once.contains(&p) {
             return true;
         }
+        // Wait only on neighbours that are absent AND still coming. Waiting on
+        // one that never arrives leaves every chunk gated on it dark: the M09
+        // black-chunk defect, reintroduced once by a taller world.
         NEIGHBOR_OFFSETS.iter().all(|(dx, dy, dz)| {
             let n = ChunkPos::new(p.x + dx, p.y + dy, p.z + dz);
-            if self.world.chunk(n).is_some() {
-                return true; // present
-            }
-            // Absent: only wait if it is still COMING, which is the streamer's
-            // own load set — a cylinder horizontally, the surface window plus
-            // the camera window vertically. Judging it any other way waits
-            // forever on a chunk that never arrives, and every chunk gated on
-            // it stays dark: the M09 black-chunk defect, reintroduced once by a
-            // taller world.
-            !self
-                .streamer
-                .wants(n, camera_chunk, self.surface_span_chunks(n.x, n.z))
+            self.world.chunk(n).is_some() || !self.neighbor_coming(n, camera_chunk)
         })
+    }
+
+    /// Will this ABSENT chunk arrive while the camera stays where it is?
+    ///
+    /// The streamer's own load set — a cylinder horizontally, the surface
+    /// window plus the camera window vertically. The first-mesh gate (don't
+    /// wait on it if not) and face sealing (no faces toward it if not) both
+    /// ask exactly this, so both ask here: two independent answers drifting
+    /// apart is how a gate deadlocks or a face opens onto the void.
+    fn neighbor_coming(&self, n: ChunkPos, camera_chunk: ChunkPos) -> bool {
+        self.streamer
+            .wants(n, camera_chunk, self.surface_span_chunks(n.x, n.z))
+    }
+
+    /// The faces of `p` to seal for meshing: a bit per `NEIGHBOR_OFFSETS`
+    /// entry, set where that neighbour is absent and not coming (M10 A3).
+    ///
+    /// The seal is re-judged at every mesh, and every change of a neighbour's
+    /// residency re-meshes this chunk (arrival and unload both dirty their
+    /// neighbours), so a seal never outlives the absence it describes. The one
+    /// gap: a neighbour that was coming and stops being so without ever
+    /// loading (the camera left first) keeps its open face until something
+    /// else re-meshes the chunk — the pre-A3 behaviour, and harmless.
+    fn sealed_faces(&self, p: ChunkPos, camera_chunk: ChunkPos) -> u8 {
+        let mut sealed = 0u8;
+        for (bit, (dx, dy, dz)) in NEIGHBOR_OFFSETS.iter().enumerate() {
+            let n = ChunkPos::new(p.x + dx, p.y + dy, p.z + dz);
+            if self.world.chunk(n).is_none() && !self.neighbor_coming(n, camera_chunk) {
+                sealed |= 1 << bit;
+            }
+        }
+        sealed
     }
 
     /// Outermost LOD radius in blocks, for sizing the camera's far plane and

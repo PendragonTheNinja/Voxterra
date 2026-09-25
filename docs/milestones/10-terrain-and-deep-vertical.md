@@ -212,9 +212,9 @@ ground were ever loaded.
   coastline so land fraction no longer depends on the seed.
 - **A3 — Audit fixes (2026-09).** Found in a whole-codebase audit, each either a
   live bug or a cost that grows with the world:
-  - **World positions become `f64`.** At the world's edge an `f32` camera can't
-    move at 2 000 fps and walks 81% fast at 1 000; walking is already 10% slow
-    at the default spawn.
+  - **World positions become `f64`.** (Done.) At the world's edge an `f32`
+    camera can't move at 2 000 fps and walks 81% fast at 1 000; walking is
+    already 10% slow at the default spawn.
   - **`column_heights` is pruned when a chunk column unloads.** It was never
     freed — ~0.26 GB per 10 km flown. The level-0 LOD real-height gather that
     also read it is removed: seed heights plus `EditedColumns` are identical,
@@ -231,14 +231,14 @@ ground were ever loaded.
     (Done.) Suppressing a node over chunks whose first mesh was still queued
     showed sky through the gap: a flash at the edge of the full-res region at
     radius 8, a band hundreds of blocks wide at radius 24.
-  - **Streaming follows the camera as well as the ground.** Surface-following
-    loads only a few chunk layers below the surface, so a player who digs more
-    than ~100 blocks down walks out of the loaded world. The vertical window
+  - **Streaming follows the camera as well as the ground.** (Done.)
+    Surface-following loads only a few chunk layers below the surface, so a
+    player who digs more than ~100 blocks down walks out of the loaded world. The vertical window
     must also cover the camera's own neighbourhood. Done with the `f64`
     rework, which is the same question — where the player actually is.
-  - **No faces toward chunks that will never load.** The mesher reads an
-    unloaded neighbour as air, so every column's lowest loaded chunk draws a
-    black floor into the void beneath it — invisible from above, but real
+  - **No faces toward chunks that will never load.** (Done.) The mesher reads
+    an unloaded neighbour as air, so every column's lowest loaded chunk draws
+    a black floor into the void beneath it — invisible from above, but real
     geometry, and plainly visible from underground in spectator.
   - Cleanup: delete the orphaned `vox-core/src/downsample.rs` (no `mod`
     declaration anywhere) and the stray `docs/decisions/voxterra.code-workspace`;
@@ -260,29 +260,44 @@ the remote matches it, and starts at the first unchecked item.*
 - [x] **A3 — LOD suppression waits for chunks to be drawn.** Removed the sky
   flash at the edge of the full-res region and the wide band at large radii.
   Commit `249644e`; confirmed in play 2026-09-24.
+- [x] **A3 — `f64` world positions, and streaming that follows the camera.**
+  `FlyCamera` (position, velocity, yaw, pitch) and all physics are `f64`;
+  `FlyCamera::render_relative` is the one narrowing to `f32`, after subtracting
+  the render origin. Every column of the load disc now also keeps
+  `LOAD_AROUND_CAMERA_CHUNKS` (3) layers either side of the camera's layer, with
+  one layer of vertical hysteresis; a column's resident layers are a
+  `ColumnWindow` (surface ∪ camera, up to two disjoint ranges). The first-mesh
+  gate asks `Streamer::wants` instead of re-deriving residency, and the edit
+  overlay's column scan walks the column window, so a build above the surface
+  window is seen; LOD suppression still checks the surface window only.
+  `Streamer::window_for` is renamed `surface_window`. Committed with this
+  checklist update; to confirm in play: walk at the default spawn and far out
+  on a later lap (speed should match), and dig or build more than ~100 blocks
+  away from the surface in survival.
+
+- [x] **A3 — no faces toward chunks that will never load.**
+  `ChunkNeighbors::with_sealed` marks an absent face neighbour as never coming;
+  both meshers go through one rule, `MeshInput::face_open`, so no face is
+  emitted into it. Sealing changes face emission only — AO and smooth light
+  still read the shell as air, or every drawn top along a sealed edge would
+  gain a dark seam. vox-app judges the seal on the main thread with
+  `neighbor_coming`, the same call the first-mesh gate now uses (one answer
+  to "is it coming?"), and passes it to the workers as a 6-bit mask. Faces this
+  culls at the horizontal disc edge are always back-facing (the camera is
+  inside the disc), so the visible change is underground: no black floor under
+  the surface window, and no lids on the camera window. Committed with this
+  checklist update; to confirm in play: in spectator, fly down below the
+  terrain and look up and around.
 
 ### Remaining, in order
 
-1. **A3 — `f64` world positions, and streaming that follows the camera.** One
-   batch: both are "where is the player actually standing". Camera, player
-   physics, collision and the raycast origin move to `f64`, converting to
-   render-relative `f32` only at the GPU (ADR-0002). The streamer's vertical
-   window becomes the surface window *plus* a window around the camera's own
-   height, so a player who digs deep stays in the loaded world. The camera
-   stays in the unwrapped frame (ADR-0012 §4) — it must never be canonicalised.
-   Streaming changes are headless-testable in `vox-core`; the rest is
-   review-only in `vox-app`.
-2. **A3 — no faces toward chunks that will never load.** The mesher needs to
-   know which absent neighbours are *never coming* (below/above the column's
-   window) and treat those as solid rather than air. The first-mesh gate
-   already answers "is this neighbour coming?" — reuse it, don't re-derive it.
-3. **A3 — `column_heights` pruning** on chunk-column unload, and removal of the
+1. **A3 — `column_heights` pruning** on chunk-column unload, and removal of the
    redundant level-0 LOD real-height gather.
-4. **A3 — sparse LOD sampler** beyond level 0, with an ADR-0008 amendment
+2. **A3 — sparse LOD sampler** beyond level 0, with an ADR-0008 amendment
    narrowing the never-exceed contract to where LOD overlaps full-resolution
    terrain. This is what removes the `lod +N` burst frames (13–26 fps in every
    2026-09 log) and it is M11's prerequisite.
-5. **A3 — LOD grid lines. Diagnose before fixing.** Faint straight lines run
+3. **A3 — LOD grid lines. Diagnose before fixing.** Faint straight lines run
    across distant terrain; the owner confirmed with the L toggle (2026-09-24)
    that they belong to the LOD, not full-resolution chunks. First establish
    whether they sit on node borders — 64, 128 and 256-block spacing for levels
@@ -291,16 +306,16 @@ the remote matches it, and starts at the first unchecked item.*
    z-fighting between a node's skirt and its neighbour's top. If the cause is
    tied to the shared ring centre or cell layout, which M11 replaces, record it
    and defer rather than fix it twice.
-6. **A3 — cleanup.** Delete the orphaned `vox-core/src/downsample.rs` and the
+4. **A3 — cleanup.** Delete the orphaned `vox-core/src/downsample.rs` and the
    stray `docs/decisions/voxterra.code-workspace`; deduplicate the surface-span
    sampler in `vox-app`; replace `LOD_WORLD_Y_BLOCKS` with the planet constants.
-7. **A1 — transparency and water** (ADR-0011, Accepted, all decisions taken:
+5. **A1 — transparency and water** (ADR-0011, Accepted, all decisions taken:
    distant water opaque with a pre-blended colour, no light attenuation in M10,
    no swimming). An earlier sandbox implementation of the registry split and
    the mesher rule was never handed off and is lost; build from the ADR. Water
    goes after the A3 items so the performance numbers below are taken with
    oceans meshed.
-8. **Tuning and retro.** Criterion-8 numbers at radius 8, on foot and flying,
+6. **Tuning and retro.** Criterion-8 numbers at radius 8, on foot and flying,
    against M09's (stationary 851–967 fps; sprint-fly median ~180). Append the
    retrospective here, update CLAUDE.md status, then **commit before tagging**
    `v0.10.0-m10`.

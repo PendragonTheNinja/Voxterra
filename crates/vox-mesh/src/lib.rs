@@ -131,7 +131,10 @@ impl LodMeshData {
 
 /// Read-only views of a chunk's six face-neighbors, used for cross-chunk
 /// face culling. A `None` neighbor (unloaded / nonexistent chunk) is
-/// treated as air, so faces on the edge of the loaded world are emitted.
+/// treated as air, so faces on the edge of the loaded world are emitted —
+/// unless the caller marks it SEALED (M10 A3): absent and never coming, so a
+/// face toward it would be geometry into the void. See
+/// [`ChunkNeighbors::with_sealed`].
 ///
 /// This type — rather than `&World` — is the mesher input so that meshing
 /// stays trivially parallelizable: a meshing job borrows exactly seven
@@ -146,6 +149,9 @@ impl LodMeshData {
 pub struct ChunkNeighbors<'a> {
     /// Indexed by `neighbor_slot(dx,dy,dz)`; `None` = unloaded/absent (air).
     slots: [Option<&'a Chunk>; 27],
+    /// Same indexing. `true` on an absent FACE slot = never coming: faces
+    /// toward it are not emitted. Ignored where the slot holds a chunk.
+    sealed: [bool; 27],
 }
 
 impl Default for ChunkNeighbors<'_> {
@@ -163,7 +169,10 @@ fn neighbor_slot(dx: i64, dy: i64, dz: i64) -> usize {
 
 impl<'a> ChunkNeighbors<'a> {
     /// No neighbors: standalone-chunk behavior (all border faces emitted).
-    pub const NONE: ChunkNeighbors<'static> = ChunkNeighbors { slots: [None; 27] };
+    pub const NONE: ChunkNeighbors<'static> = ChunkNeighbors {
+        slots: [None; 27],
+        sealed: [false; 27],
+    };
 
     /// Gather all 26 neighbors of `pos` from a world.
     pub fn of(world: &'a World, pos: ChunkPos) -> Self {
@@ -179,7 +188,10 @@ impl<'a> ChunkNeighbors<'a> {
                 }
             }
         }
-        Self { slots }
+        Self {
+            slots,
+            sealed: [false; 27],
+        }
     }
 
     /// The neighbor chunk at offset `(dx,dy,dz)` (each in -1..=1).
@@ -192,6 +204,32 @@ impl<'a> ChunkNeighbors<'a> {
     /// tests that supply a specific neighbor against `NONE`.
     pub fn with(mut self, dx: i64, dy: i64, dz: i64, chunk: &'a Chunk) -> Self {
         self.slots[neighbor_slot(dx, dy, dz)] = Some(chunk);
+        self
+    }
+
+    /// Mark the FACE neighbour at `(dx,dy,dz)` as sealed: absent and never
+    /// coming, so no face is emitted toward it (M10 A3).
+    ///
+    /// Without this an absent neighbour reads as air and every column's lowest
+    /// loaded chunk draws a floor into the void beneath it — invisible from
+    /// above, plainly visible from underground. Whether a neighbour is coming
+    /// is a streaming question the mesher cannot answer, so the caller decides.
+    ///
+    /// Sealing changes face emission ONLY. Smooth light and AO still read the
+    /// sealed shell as air with no light, exactly as an unsealed absent
+    /// neighbour: treating it as solid there would darken the edges of faces
+    /// that ARE drawn — every terrain top along the edge of the loaded disc.
+    ///
+    /// A present chunk in the slot takes precedence; the flag is then ignored.
+    /// Only the six face offsets can be sealed: a face's neighbour cell always
+    /// lies in a face-adjacent chunk, so an edge or corner flag would mean
+    /// nothing.
+    pub fn with_sealed(mut self, dx: i64, dy: i64, dz: i64) -> Self {
+        assert!(
+            dx.abs() + dy.abs() + dz.abs() == 1,
+            "only face neighbours can be sealed (got {dx}, {dy}, {dz})"
+        );
+        self.sealed[neighbor_slot(dx, dy, dz)] = true;
         self
     }
 
@@ -237,6 +275,10 @@ pub struct MeshInput {
     sky: Vec<u8>,
     /// 34³ block light levels (0..=15); shell defaults to 0.
     block_light: Vec<u8>,
+    /// Per neighbour slot: absent AND sealed (never coming). Consulted only by
+    /// face emission ([`MeshInput::face_open`]); the shell cells themselves
+    /// stay air, so light and AO are unaffected.
+    sealed: [bool; 27],
     all_air: bool,
 }
 
@@ -258,6 +300,32 @@ impl MeshInput {
     #[inline]
     pub fn is_air(&self, x: i32, y: i32, z: i32) -> bool {
         self.block[Self::cidx(x, y, z)].is_air()
+    }
+
+    /// Does a solid cell show its face toward the cell at chunk-relative
+    /// `(x,y,z)`? Yes when that cell is air — unless it lies in a sealed
+    /// neighbour, whose air is not real space but the edge of what will ever
+    /// load. The ONE face-visibility rule; both meshers must use it, or the
+    /// greedy/naive differential test catches the drift.
+    #[inline]
+    pub fn face_open(&self, x: i32, y: i32, z: i32) -> bool {
+        self.is_air(x, y, z) && !self.in_sealed_neighbor(x, y, z)
+    }
+
+    /// Is the chunk-relative cell in the shell of a sealed neighbour?
+    #[inline]
+    fn in_sealed_neighbor(&self, x: i32, y: i32, z: i32) -> bool {
+        let off = |c: i32| -> i64 {
+            if c < 0 {
+                -1
+            } else if c >= CHUNK_SIZE as i32 {
+                1
+            } else {
+                0
+            }
+        };
+        let (dx, dy, dz) = (off(x), off(y), off(z));
+        (dx, dy, dz) != (0, 0, 0) && self.sealed[neighbor_slot(dx, dy, dz)]
     }
 
     /// Block id at chunk-relative coords.
@@ -351,10 +419,15 @@ impl MeshInput {
             }
         }
 
+        // A present chunk overrides a seal: the flag only describes absence.
+        let sealed: [bool; 27] =
+            std::array::from_fn(|slot| neighbors.sealed[slot] && neighbors.slots[slot].is_none());
+
         Self {
             block,
             sky,
             block_light,
+            sealed,
             all_air: chunk.is_all_air(),
         }
     }
@@ -676,7 +749,7 @@ pub fn mesh_chunk_naive(
         for (face_index, &(axis, positive, u_axis, v_axis)) in FACE_DIRS.iter().enumerate() {
             let mut neighbor = coords;
             neighbor[axis] += if positive { 1 } else { -1 };
-            if !input.is_air(neighbor[0], neighbor[1], neighbor[2]) {
+            if !input.face_open(neighbor[0], neighbor[1], neighbor[2]) {
                 continue;
             }
 
@@ -791,7 +864,7 @@ pub fn mesh_chunk(
 
                     let mut n = coords;
                     n[axis] += if positive { 1 } else { -1 };
-                    if input.is_air(n[0], n[1], n[2]) {
+                    if input.face_open(n[0], n[1], n[2]) {
                         let (sky15, block15) =
                             corner_lights_2ch(&input, coords, axis, positive, u_axis, v_axis);
                         let ao = corner_ao(&input, coords, axis, positive, u_axis, v_axis);
@@ -985,6 +1058,112 @@ mod tests {
         let neighbors = ChunkNeighbors::NONE.with_pos_x(&neighbor);
         let mesh = mesh_chunk_naive(&chunk, &neighbors, WHITE);
         assert_eq!(mesh.quad_count(), 5);
+    }
+
+    // -----------------------------------------------------------------
+    // Sealed neighbours (M10 A3): no faces toward chunks that never load.
+    // -----------------------------------------------------------------
+
+    /// THE bug: the lowest loaded chunk of every column drew a floor into the
+    /// void beneath it, because an absent neighbour reads as air.
+    #[test]
+    fn sealed_neighbor_gets_no_faces() {
+        let chunk = Chunk::filled(STONE);
+        let open = mesh_chunk_naive(&chunk, &ChunkNeighbors::NONE, WHITE);
+        let sealed = ChunkNeighbors::NONE.with_sealed(0, -1, 0);
+        let naive = mesh_chunk_naive(&chunk, &sealed, WHITE);
+        let greedy = mesh_chunk(&chunk, &sealed, WHITE);
+        assert_eq!(open.quad_count(), 6 * N * N);
+        assert_eq!(naive.quad_count(), 5 * N * N, "naive drew the void floor");
+        assert_eq!(greedy.quad_count(), 5, "greedy drew the void floor");
+        let floor_face = naive.indices.chunks_exact(6).any(|q| {
+            let b = q[0] as usize;
+            naive.vertices[b..b + 4]
+                .iter()
+                .all(|v| v.position[1] == 0.0)
+        });
+        assert!(!floor_face, "a face remains on the sealed -Y side");
+    }
+
+    /// Every face can be sealed; a chunk sealed on all six sides draws
+    /// nothing, as if buried.
+    #[test]
+    fn sealed_on_every_side_draws_nothing() {
+        let mut all = ChunkNeighbors::NONE;
+        for (dx, dy, dz) in [
+            (1, 0, 0),
+            (-1, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1),
+        ] {
+            all = all.with_sealed(dx, dy, dz);
+        }
+        assert!(mesh_chunk_naive(&Chunk::filled(STONE), &all, WHITE).is_empty());
+        assert!(mesh_chunk(&Chunk::filled(STONE), &all, WHITE).is_empty());
+    }
+
+    /// A seal describes ABSENCE. If the neighbour is present, its real cells
+    /// decide — a stale seal must never hide a face toward real air.
+    #[test]
+    fn a_present_neighbor_overrides_a_seal() {
+        let chunk = Chunk::filled(STONE);
+        let air = Chunk::new_air();
+        let neighbors = ChunkNeighbors::NONE.with_pos_x(&air).with_sealed(1, 0, 0);
+        let mesh = mesh_chunk_naive(&chunk, &neighbors, WHITE);
+        assert_eq!(mesh.quad_count(), 6 * N * N);
+    }
+
+    /// Sealing removes faces and changes NOTHING else. Light and AO near the
+    /// seal must match the unsealed mesh exactly, or every terrain top along a
+    /// sealed edge — the whole rim of the loaded disc — gains a dark seam.
+    #[test]
+    fn sealing_only_removes_faces_toward_the_seal() {
+        // A floor with a step on it, touching the -X edge, so +Y faces and
+        // their AO/light samples reach into the sealed shell.
+        let mut chunk = Chunk::new_air();
+        for z in 0..N as u8 {
+            for x in 0..N as u8 {
+                chunk.set(LocalPos::new(x, 0, z), STONE);
+            }
+            chunk.set(LocalPos::new(0, 1, z), STONE);
+            chunk.set(LocalPos::new(1, 1, z), STONE);
+        }
+        let quads = |m: &MeshData| -> Vec<String> {
+            m.indices
+                .chunks_exact(6)
+                .map(|q| {
+                    let b = q[0] as usize;
+                    format!("{:?}", &m.vertices[b..b + 4])
+                })
+                .collect()
+        };
+        let open = mesh_chunk_naive(&chunk, &ChunkNeighbors::NONE, WHITE);
+        let sealed_mesh =
+            mesh_chunk_naive(&chunk, &ChunkNeighbors::NONE.with_sealed(-1, 0, 0), WHITE);
+        let open_q = quads(&open);
+        let sealed_q = quads(&sealed_mesh);
+        for q in &sealed_q {
+            assert!(open_q.contains(q), "sealing altered a kept face: {q}");
+        }
+        // What was removed: exactly the -X faces on the x = 0 plane, one per
+        // cell of the floor edge and one per cell of the step.
+        assert_eq!(open.quad_count() - sealed_mesh.quad_count(), 2 * N);
+        let on_seal = |m: &MeshData| {
+            m.indices.chunks_exact(6).any(|q| {
+                let b = q[0] as usize;
+                m.vertices[b..b + 4].iter().all(|v| v.position[0] == 0.0)
+            })
+        };
+        assert!(on_seal(&open), "the test setup has no face on the seal");
+        assert!(!on_seal(&sealed_mesh), "a face on the sealed side survived");
+    }
+
+    #[test]
+    #[should_panic]
+    fn only_face_neighbors_can_be_sealed() {
+        ChunkNeighbors::NONE.with_sealed(1, 1, 0);
     }
 
     #[test]
@@ -1248,6 +1427,14 @@ mod tests {
             }
             if seed % 3 == 0 {
                 neighbors = neighbors.with_pos_y(&py);
+            }
+            // Sealed faces (M10 A3) go through the same rule in both meshers.
+            // -X is sometimes present and sealed at once, where presence wins.
+            if seed % 4 == 1 {
+                neighbors = neighbors.with_sealed(0, 0, 1);
+            }
+            if seed % 3 != 1 {
+                neighbors = neighbors.with_sealed(-1, 0, 0);
             }
 
             let naive = mesh_chunk_naive(&chunk, &neighbors, layered);
