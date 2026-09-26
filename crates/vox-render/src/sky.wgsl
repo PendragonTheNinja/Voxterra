@@ -1,9 +1,9 @@
 // Voxterra procedural sky, Milestone 07 task 3b (ADR-0007).
 //
 // A fullscreen pass drawn BEFORE the terrain: it fills every pixel with sky,
-// then terrain draws over it (terrain writes depth and tests Less against the
-// cleared 1.0; this pass writes no depth and always passes, so it never
-// occludes geometry). No textures — gradient, sun disc, phase-correct moon, and
+// then terrain draws over it (terrain writes depth and tests nearer-than
+// against the cleared far value; this pass writes no depth and always passes,
+// so it never occludes geometry). No textures — gradient, sun disc, phase-correct moon, and
 // a starfield are all procedural.
 //
 // Everything is computed from a per-pixel WORLD-SPACE ray direction,
@@ -146,8 +146,13 @@ fn star_face(dir: vec3<f32>) -> vec3<f32> {
 fn fs_sky(in: VsOut) -> @location(0) vec4<f32> {
     // Reconstruct a world-space ray direction (origin-independent, so floating
     // origin doesn't matter for the sky).
-    let near = sky.inv_view_proj * vec4<f32>(in.ndc, 0.0, 1.0);
-    let far = sky.inv_view_proj * vec4<f32>(in.ndc, 1.0, 1.0);
+    //
+    // Depth is REVERSED-Z (see vox-render's depth convention): the near plane
+    // is depth 1 and the far plane depth 0. Read them the other way round and
+    // every ray points backwards — the sky renders mirrored through the camera.
+    // The far plane is finite, so unprojecting depth 0 is safe (w != 0).
+    let near = sky.inv_view_proj * vec4<f32>(in.ndc, 1.0, 1.0);
+    let far = sky.inv_view_proj * vec4<f32>(in.ndc, 0.0, 1.0);
     let dir = normalize(far.xyz / far.w - near.xyz / near.w);
 
     let sun_dir = normalize(sky.sun.xyz);

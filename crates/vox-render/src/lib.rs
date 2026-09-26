@@ -12,7 +12,42 @@ use vox_mesh::{LodMeshData, MeshData};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
+// ---------------------------------------------------------------------------
+// Depth convention: REVERSED-Z (M10 A3).
+//
+// Near maps to depth 1, far to 0, the buffer clears to 0, and "nearer" is
+// GREATER. With a float depth buffer this spends the float's precision where
+// perspective needs it: a surface is resolved to ~0.0001 blocks at 2 km and
+// ~0.0003 at 8 km. Standard-Z, where both sit bunched up against 1.0, resolved
+// ~2.7 blocks at 2 km and ~20 at 4 km — enough that every LOD node's border
+// skirt tied with its neighbour's top face and drew as a grid of lines across
+// distant terrain. M11's horizon only makes the distances larger.
+//
+// Everything that encodes the convention lives here, so it cannot be half
+// changed: the projection, the clear value, and the two compares. The sky
+// pass and the frustum culler read depth too and are written for it.
+// ---------------------------------------------------------------------------
+
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+/// Depth the buffer clears to: the FAR end under reversed-Z.
+const DEPTH_CLEAR: f32 = 0.0;
+
+/// "Nearer than what is there" under reversed-Z.
+const DEPTH_NEARER: wgpu::CompareFunction = wgpu::CompareFunction::Greater;
+
+/// "Nearer than, or exactly at, what is there" under reversed-Z.
+const DEPTH_NEARER_OR_EQUAL: wgpu::CompareFunction = wgpu::CompareFunction::GreaterEqual;
+
+/// The perspective projection for this renderer's depth convention.
+///
+/// Every view-projection the renderer is given MUST be built from this: a
+/// standard projection against these compares draws the world inside out.
+/// Right-handed, depth 0..1, with `near` mapped to 1 and `far` to 0 — glam's
+/// `perspective_rh` with the planes swapped.
+pub fn perspective(fov_y_radians: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
+    Mat4::perspective_rh(fov_y_radians, aspect, far, near)
+}
 
 /// A view frustum as six inward-facing planes, extracted from a
 /// view-projection matrix (Gribb–Hartmann). Used to skip drawing chunks
@@ -32,8 +67,12 @@ impl Frustum {
             r3 - r0, // right
             r3 + r1, // bottom
             r3 - r1, // top
-            r3 + r2, // near
-            r3 - r2, // far
+            // Depth: wgpu's clip range is 0 <= z <= w (not OpenGL's -w..w,
+            // which the old `r3 + r2` assumed and which merely culled too
+            // little). Under reversed-Z `z <= w` is the near plane and
+            // `z >= 0` the far one; the pair bounds the frustum either way.
+            r2,      // z >= 0
+            r3 - r2, // z <= w
         ];
         let mut planes = [Vec4::ZERO; 6];
         for (i, p) in raw.iter().enumerate() {
@@ -457,7 +496,7 @@ impl Renderer {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
                 depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_compare: DEPTH_NEARER,
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
@@ -516,12 +555,21 @@ impl Renderer {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
                 depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_compare: DEPTH_NEARER,
                 stencil: Default::default(),
                 // Push LOD back so full-res occludes it in the overlap band.
+                //
+                // NEGATIVE under reversed-Z: back is toward 0. For a float
+                // buffer the constant term scales with the depth's own
+                // exponent, so 16 units is a push of ~2e-6 of the distance —
+                // 0.0005 blocks at the full-res edge. That is all it has to
+                // be: LOD never rises above real terrain, so the only contest
+                // is an exact tie where the two surfaces coincide, and 2e-6 is
+                // ~30x the float noise of computing the same point twice.
+                // (Under standard-Z the same 16 pushed ~0.6 blocks at 256.)
                 bias: wgpu::DepthBiasState {
-                    constant: 16,
-                    slope_scale: 1.0,
+                    constant: -16,
+                    slope_scale: -1.0,
                     clamp: 0.0,
                 },
             }),
@@ -559,7 +607,7 @@ impl Renderer {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
                 depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                depth_compare: DEPTH_NEARER_OR_EQUAL,
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
@@ -1110,7 +1158,7 @@ impl Renderer {
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth_view,
                     depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
+                        load: wgpu::LoadOp::Clear(DEPTH_CLEAR),
                         store: wgpu::StoreOp::Discard,
                     }),
                     stencil_ops: None,
@@ -1431,4 +1479,103 @@ fn create_depth_view(
         view_formats: &[],
     });
     texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FOV: f32 = 1.2;
+    const ASPECT: f32 = 16.0 / 9.0;
+    const NEAR: f32 = 0.1;
+    const FAR: f32 = 9000.0;
+
+    /// Depth of a point `d` blocks straight ahead (camera at origin, looking
+    /// down -Z, the right-handed convention).
+    fn depth_at(d: f32) -> f32 {
+        let c = perspective(FOV, ASPECT, NEAR, FAR) * Vec4::new(0.0, 0.0, -d, 1.0);
+        c.z / c.w
+    }
+
+    #[test]
+    fn projection_is_reversed_z() {
+        assert!(
+            (depth_at(NEAR) - 1.0).abs() < 1e-6,
+            "near {}",
+            depth_at(NEAR)
+        );
+        assert!(depth_at(FAR).abs() < 1e-6, "far {}", depth_at(FAR));
+        // Nearer is GREATER, all the way out — what DEPTH_NEARER assumes.
+        let mut previous = depth_at(NEAR);
+        for d in [1.0, 10.0, 100.0, 1_000.0, 5_000.0, FAR] {
+            let z = depth_at(d);
+            assert!(z < previous, "depth not decreasing at {d}");
+            previous = z;
+        }
+    }
+
+    /// THE bug: standard-Z could not tell apart surfaces several blocks apart
+    /// at the distances LOD draws, so skirts tied with the terrain beside them.
+    /// Reversed-Z must separate a hundredth of a block at 8 km, and order it.
+    #[test]
+    fn distant_surfaces_are_resolved() {
+        for d in [256.0f32, 1_000.0, 2_000.0, 4_000.0, 8_000.0] {
+            let (a, b) = (depth_at(d), depth_at(d + 0.01));
+            assert!(
+                a > b,
+                "at {d} blocks, 0.01 blocks of depth is lost ({a} vs {b})"
+            );
+        }
+    }
+
+    /// The same check against the old projection, to show what was lost —
+    /// and that the test above would have caught it.
+    #[test]
+    fn standard_z_could_not_resolve_them() {
+        let standard = Mat4::perspective_rh(FOV, ASPECT, NEAR, FAR);
+        let z = |d: f32| {
+            let c = standard * Vec4::new(0.0, 0.0, -d, 1.0);
+            c.z / c.w
+        };
+        assert_eq!(
+            z(4_000.0),
+            z(4_001.0),
+            "standard-Z separated 1 block at 4 km"
+        );
+    }
+
+    fn frustum() -> Frustum {
+        let view = Mat4::look_to_rh(Vec3::ZERO, Vec3::NEG_Z, Vec3::Y);
+        Frustum::from_view_proj(perspective(FOV, ASPECT, NEAR, FAR) * view)
+    }
+
+    fn cube(center: Vec3) -> (Vec3, Vec3) {
+        (center - Vec3::splat(0.5), center + Vec3::splat(0.5))
+    }
+
+    #[test]
+    fn frustum_keeps_what_is_in_front() {
+        let f = frustum();
+        for d in [1.0, 100.0, 5_000.0, FAR - 10.0] {
+            let (lo, hi) = cube(Vec3::new(0.0, 0.0, -d));
+            assert!(f.intersects_aabb(lo, hi), "culled a box {d} ahead");
+        }
+    }
+
+    /// Both depth planes bound the frustum. The old extraction used OpenGL's
+    /// -w..w range, so its "near" plane sat behind the camera and culled too
+    /// little; under reversed-Z it would also have lost the far plane.
+    #[test]
+    fn frustum_culls_behind_and_beyond() {
+        let f = frustum();
+        let (lo, hi) = cube(Vec3::new(0.0, 0.0, 5.0));
+        assert!(!f.intersects_aabb(lo, hi), "kept a box behind the camera");
+        let (lo, hi) = cube(Vec3::new(0.0, 0.0, -(FAR + 100.0)));
+        assert!(
+            !f.intersects_aabb(lo, hi),
+            "kept a box beyond the far plane"
+        );
+        let (lo, hi) = cube(Vec3::new(5_000.0, 0.0, -10.0));
+        assert!(!f.intersects_aabb(lo, hi), "kept a box far off to the side");
+    }
 }

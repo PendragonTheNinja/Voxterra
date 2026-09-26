@@ -342,27 +342,37 @@ the remote matches it, and starts at the first unchecked item.*
   change radius or LOD levels and watch `dirty`/`relight` stay near zero
   instead of jumping to ~2 000.
 
+- [x] **A3 — LOD grid lines: skirts losing the depth test; fixed with
+  reversed-Z (ADR-0013).** Diagnosed from the code, then confirmed by the
+  owner with the new `K` debug toggle (LOD rebuilt without skirts): the lines
+  vanished, and sky showed through wherever a terrace step crossed a node
+  border — the gap skirts exist to cover. A skirt's top edge lies on the seam
+  between two nodes' top faces, and standard-Z `Depth32Float` resolved only
+  ~2.7 blocks of depth at 2 km and ~20 at 4 km, so skirts tied with the
+  neighbouring surface. Depth is now reversed-Z (~0.0001–0.0003 blocks out to
+  8 km): `vox_render::perspective`, clear 0, `Greater`/`GreaterEqual`; the LOD
+  bias flips sign; the sky reads near at depth 1; the frustum culler's depth
+  planes now match wgpu's 0..w range (the old OpenGL form would have lost the
+  far plane). `K` stays as a debug tool. Ruled out along the way: shallow
+  skirts (slits on steep ground, not lines) and level-boundary morph mismatch
+  (squares, not a grid); nodes of one level are watertight (integer
+  positions). Committed with this checklist update; to confirm in play: the
+  lines are gone with skirts on, the sky looks as before in every direction,
+  and full-res still wins where it overlaps LOD near the edge of the loaded
+  area.
+
 ### Remaining, in order
 
-1. **A3 — LOD grid lines. Diagnose before fixing.** Faint straight lines run
-   across distant terrain; the owner confirmed with the L toggle (2026-09-24)
-   that they belong to the LOD, not full-resolution chunks. First establish
-   whether they sit on node borders — 64, 128 and 256-block spacing for levels
-   0, 1 and 2. Leads, unverified: skirt faces showing where neighbouring nodes'
-   edge cells differ; a morph-target mismatch where levels meet; depth-bias
-   z-fighting between a node's skirt and its neighbour's top. If the cause is
-   tied to the shared ring centre or cell layout, which M11 replaces, record it
-   and defer rather than fix it twice.
-2. **A3 — cleanup.** Delete the orphaned `vox-core/src/downsample.rs` and the
+1. **A3 — cleanup.** Delete the orphaned `vox-core/src/downsample.rs` and the
    stray `docs/decisions/voxterra.code-workspace`; deduplicate the surface-span
    sampler in `vox-app`; replace `LOD_WORLD_Y_BLOCKS` with the planet constants.
-3. **A1 — transparency and water** (ADR-0011, Accepted, all decisions taken:
+2. **A1 — transparency and water** (ADR-0011, Accepted, all decisions taken:
    distant water opaque with a pre-blended colour, no light attenuation in M10,
    no swimming). An earlier sandbox implementation of the registry split and
    the mesher rule was never handed off and is lost; build from the ADR. Water
    goes after the A3 items so the performance numbers below are taken with
    oceans meshed.
-4. **Tuning and retro.** Criterion-8 numbers at radius 8, on foot and flying,
+3. **Tuning and retro.** Criterion-8 numbers at radius 8, on foot and flying,
    against M09's (stationary 851–967 fps; sprint-fly median ~180). Append the
    retrospective here, update CLAUDE.md status, then **commit before tagging**
    `v0.10.0-m10`.

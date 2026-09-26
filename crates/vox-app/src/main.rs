@@ -495,7 +495,9 @@ impl FlyCamera {
     /// then clipped away by the projection, which reads as the world ending at
     /// a hard line and as a "render distance" slider that does nothing.
     fn view_proj(&self, aspect: f32, render_origin: WorldPos, fov_degrees: f32, far: f32) -> Mat4 {
-        let proj = Mat4::perspective_rh(fov_degrees.to_radians(), aspect, 0.1, far);
+        // The renderer's projection, not glam's directly: depth is reversed-Z
+        // and its compares expect exactly this mapping.
+        let proj = vox_render::perspective(fov_degrees.to_radians(), aspect, 0.1, far);
         let rel_pos = self.render_relative(render_origin);
         let view = Mat4::look_to_rh(rel_pos, self.forward().as_vec3(), Vec3::Y);
         proj * view
@@ -597,6 +599,11 @@ struct App {
     lod_retired: HashSet<LodNodeId>,
     /// Ticks since the last retirement flush, against `LOD_RETIRE_MAX_TICKS`.
     lod_retire_age: u32,
+    /// Debug (K): build LOD nodes with or without border skirts. A diagnostic
+    /// for the faint grid lines on distant terrain (M10 A3): if they vanish
+    /// with skirts off, they are skirts losing the depth test to their
+    /// neighbour's top face. Not a setting; always starts on.
+    lod_skirts: bool,
     /// Nodes wanted but not yet spawned (the ring is requested all at once but
     /// generated a few per frame). Drained nearest-camera-first, so this is a
     /// set rather than a queue — insertion order carries no meaning.
@@ -748,6 +755,7 @@ impl Default for App {
             lod_in_flight: HashSet::new(),
             lod_retired: HashSet::new(),
             lod_retire_age: 0,
+            lod_skirts: true,
             lod_pending_set: HashSet::new(),
 
             telemetry_accum: 0.0,
@@ -1496,6 +1504,20 @@ impl App {
         (self.lod_far_chunks * CHUNK_SIZE_I) as f32
     }
 
+    /// Drop every LOD node, queued, in-flight or drawn. The next `lod_tick`
+    /// re-requests the whole ring if LOD is enabled. One teardown for every
+    /// caller, so none of them forgets a queue.
+    fn reset_lod(&mut self) {
+        self.lod_ring.clear();
+        self.lod_in_flight.clear();
+        self.lod_pending_set.clear();
+        self.lod_retired.clear();
+        self.lod_retire_age = 0;
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.clear_lod();
+        }
+    }
+
     /// How densely to sample a node of `level` (ADR-0008, M10 amendment).
     ///
     /// Exact where the level can meet full-resolution terrain — LOD underlaps
@@ -1895,7 +1917,11 @@ impl App {
                 let generator = self.generator;
                 let tx = self.lod_tx.clone();
                 let origin_y = origin.y as i32;
-                let skirt = LOD_SKIRT_DEPTH_CELLS * stride as i32;
+                let skirt = if self.lod_skirts {
+                    LOD_SKIRT_DEPTH_CELLS * stride as i32
+                } else {
+                    0 // no border walls at all (see `lod_skirts`)
+                };
                 let edits = Arc::clone(&self.edited_columns);
                 rayon::spawn(move || {
                     let mut heights =
@@ -2225,14 +2251,7 @@ impl ApplicationHandler for App {
                                 // dead until the camera crossed a node border.
                                 self.settings.lod_enabled = !self.settings.lod_enabled;
                                 if !self.settings.lod_enabled {
-                                    self.lod_ring.clear();
-                                    self.lod_in_flight.clear();
-                                    self.lod_pending_set.clear();
-                                    self.lod_retired.clear();
-                                    self.lod_retire_age = 0;
-                                    if let Some(renderer) = self.renderer.as_mut() {
-                                        renderer.clear_lod();
-                                    }
+                                    self.reset_lod();
                                 }
                                 log::info!(
                                     "LOD {}",
@@ -2241,6 +2260,15 @@ impl ApplicationHandler for App {
                                     } else {
                                         "off"
                                     }
+                                );
+                            } else if code == KeyCode::KeyK {
+                                // Debug: rebuild LOD with or without skirts, to
+                                // diagnose the grid lines (see `lod_skirts`).
+                                self.lod_skirts = !self.lod_skirts;
+                                self.reset_lod();
+                                log::info!(
+                                    "LOD skirts {} (rebuilding LOD)",
+                                    if self.lod_skirts { "ON" } else { "off" }
                                 );
                             } else if let Some(slot) = digit_slot(code) {
                                 self.select_block_slot(slot);

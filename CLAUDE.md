@@ -99,6 +99,11 @@ crates: `vox-sim`, `vox-net`, `vox-client`, `vox-server`.
 - **Latitude loops** and is equal-area: one lap of Z passes equator, north pole,
   equator, south pole. Query it through `WorldShape::latitude_sine` (for
   generation) or `latitude_degrees` (for display), never derive it locally.
+- **Depth is reversed-Z (ADR-0013).** Near is depth 1, far is 0, the buffer
+  clears to 0, nearer is `Greater`. Build every projection with
+  `vox_render::perspective` and every depth state from `vox-render`'s
+  `DEPTH_*` constants — never glam's `perspective_rh` directly, never a literal
+  `Less`. Anything that unprojects depth (the sky) reads near at 1, far at 0.
 - **Terrain output is versioned.** Any change to what the generator produces
   for a given seed and size must bump `vox_worldgen::GENERATOR_VERSION` and
   re-pin `terrain_fingerprint_is_pinned` in the same commit; worlds made by
@@ -236,12 +241,12 @@ beyond what the invariants above already require.
   chunks; `f64` world positions with camera-following streaming; no faces
   toward chunks that will never load; `column_heights` pruning; the LOD edit
   overlay saved with the world and the level-0 gather removed; the sparse LOD
-  sampler with its ADR-0008 amendment) are done; next is diagnosing the LOD
-  grid lines.
+  sampler with its ADR-0008 amendment; the LOD grid lines, fixed with
+  reversed-Z depth, ADR-0013) are done; next is the A3 cleanup.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 251, vox-mesh 42, vox-worldgen 27 passing as of the streamer
-  reconfigure commit), then
+  vox-core 251, vox-mesh 42, vox-worldgen 27 passing as of the reversed-Z
+  commit; vox-render's 5 tests need wgpu and run natively only), then
   start the first unchecked item.
 - **Roadmap after M10:** 11 — The Horizon
   (`docs/milestones/11-the-horizon.md`: 32–64 km view via per-level LOD ring
