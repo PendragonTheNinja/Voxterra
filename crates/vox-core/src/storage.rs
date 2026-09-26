@@ -6,6 +6,7 @@
 //! <world>/
 //!   world.meta            versioned metadata (magic, version, seed, world size,
 //!                         generator version)
+//!   lod_edits.bin         the LOD's edit overlay (versioned; absent = none)
 //!   chunks/
 //!     c.<x>.<y>.<z>.vxc    one file per modified chunk
 //! ```
@@ -36,6 +37,15 @@
 //! algorithm loads its edited chunks back as islands of the old landscape in
 //! the middle of the new one — which is what happened to every world saved
 //! before M10.
+//!
+//! ## The LOD edit overlay is saved too (M10 A3)
+//!
+//! Distant terrain is drawn from the seed, lowered wherever the player dug
+//! ([`EditedColumns`]). The chunks on disk hold the edits themselves, but the
+//! LOD never reads chunks — so without the overlay, every earlier session's
+//! digs come back as ghost terrain at distance. It is saved alongside the
+//! chunks, whenever they are, and a world with no overlay file simply has no
+//! recorded edits.
 
 use std::fs;
 use std::io;
@@ -43,6 +53,7 @@ use std::path::{Path, PathBuf};
 
 use crate::chunk::{Chunk, ChunkDecodeError};
 use crate::coords::ChunkPos;
+use crate::lod::{EditedColumns, EditsDecodeError};
 use crate::planet::{WorldShape, WorldShapeError};
 
 const META_MAGIC: [u8; 4] = *b"VXTW";
@@ -98,6 +109,8 @@ pub enum StoreError {
     BadShape(WorldShapeError),
     /// A chunk file failed to decode.
     Chunk(ChunkDecodeError),
+    /// The LOD edit overlay failed to decode.
+    Edits(EditsDecodeError),
 }
 
 impl std::fmt::Display for StoreError {
@@ -120,6 +133,7 @@ impl std::fmt::Display for StoreError {
             ),
             Self::BadShape(e) => write!(f, "corrupt world metadata: {e}"),
             Self::Chunk(e) => write!(f, "chunk decode error: {e}"),
+            Self::Edits(e) => write!(f, "LOD edit overlay: {e}"),
         }
     }
 }
@@ -229,6 +243,44 @@ impl WorldStore {
     /// Whether a saved chunk file exists for `pos` (without reading it).
     pub fn has_chunk(&self, pos: ChunkPos) -> bool {
         self.chunk_path(pos).exists()
+    }
+
+    fn edits_path(&self) -> PathBuf {
+        self.root.join("lod_edits.bin")
+    }
+
+    /// Persist the LOD edit overlay, replacing any saved one. Written via a
+    /// temp file and rename, like chunks, so a crash mid-write leaves the
+    /// previous overlay intact rather than a truncated one.
+    ///
+    /// Panics if the overlay was built for a different world size: that is a
+    /// programming error, and saving it would misplace every edit.
+    pub fn save_edited_columns(&self, edits: &EditedColumns) -> Result<(), StoreError> {
+        assert_eq!(
+            edits.shape(),
+            self.meta.shape,
+            "edit overlay built for a different world size"
+        );
+        let final_path = self.edits_path();
+        let tmp_path = final_path.with_extension("bin.tmp");
+        fs::write(&tmp_path, edits.serialize())?;
+        fs::rename(&tmp_path, &final_path)?;
+        Ok(())
+    }
+
+    /// Load the LOD edit overlay. A world with no overlay file has no recorded
+    /// edits and gets an empty one — true of every new world, and of worlds
+    /// saved before the overlay was persisted.
+    pub fn load_edited_columns(&self) -> Result<EditedColumns, StoreError> {
+        match fs::read(self.edits_path()) {
+            Ok(bytes) => {
+                EditedColumns::deserialize(&bytes, self.meta.shape).map_err(StoreError::Edits)
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                Ok(EditedColumns::new(self.meta.shape))
+            }
+            Err(e) => Err(StoreError::Io(e)),
+        }
     }
 }
 
@@ -453,6 +505,65 @@ mod tests {
         store.save_chunk(pos, &chunk).unwrap();
         let loaded = store.load_chunk(pos).unwrap().unwrap();
         assert_eq!(loaded.get(LocalPos::new(7, 7, 7)), BlockId(3));
+    }
+
+    // ---- M10 A3: the LOD edit overlay persists with the world ----
+
+    /// THE bug: the overlay lived only in memory, so reopening a world forgot
+    /// every earlier session's digs and the LOD rebuilt ghost terrain over
+    /// them. It must come back exactly as saved.
+    #[test]
+    fn edit_overlay_survives_reopening_the_world() {
+        let dir = TempDir::new("edits_reopen");
+        let store = WorldStore::open(&dir.0, new_world(7)).unwrap();
+        let mut edits = EditedColumns::new(store.shape());
+        edits.record(12, -30, -5);
+        edits.record(700, 4, 18);
+        store.save_edited_columns(&edits).unwrap();
+        drop(store);
+
+        let reopened = WorldStore::open(&dir.0, new_world(7)).unwrap();
+        let back = reopened.load_edited_columns().unwrap();
+        assert_eq!(back.len(), 2);
+        assert_eq!(back.get(12, -30), Some(-5));
+        assert_eq!(back.get(700, 4), Some(18));
+    }
+
+    /// New worlds, and worlds saved before the overlay existed, have no file:
+    /// that is "no recorded edits", not an error.
+    #[test]
+    fn a_world_without_an_overlay_file_has_no_edits() {
+        let dir = TempDir::new("edits_missing");
+        let store = WorldStore::open(&dir.0, new_world(7)).unwrap();
+        let edits = store.load_edited_columns().unwrap();
+        assert!(edits.is_empty());
+        assert_eq!(edits.shape(), store.shape());
+    }
+
+    #[test]
+    fn saving_the_overlay_replaces_the_previous_one() {
+        let dir = TempDir::new("edits_replace");
+        let store = WorldStore::open(&dir.0, new_world(7)).unwrap();
+        let mut edits = EditedColumns::new(store.shape());
+        edits.record(1, 1, 10);
+        store.save_edited_columns(&edits).unwrap();
+        edits.record(1, 1, 3);
+        edits.record(2, 2, 4);
+        store.save_edited_columns(&edits).unwrap();
+        let back = store.load_edited_columns().unwrap();
+        assert_eq!(back.get(1, 1), Some(3));
+        assert_eq!(back.len(), 2);
+    }
+
+    #[test]
+    fn a_corrupt_overlay_is_reported_not_ignored() {
+        let dir = TempDir::new("edits_corrupt");
+        let store = WorldStore::open(&dir.0, new_world(7)).unwrap();
+        fs::write(dir.0.join("lod_edits.bin"), b"junk").unwrap();
+        assert!(matches!(
+            store.load_edited_columns(),
+            Err(StoreError::Edits(EditsDecodeError::Truncated))
+        ));
     }
 
     #[test]

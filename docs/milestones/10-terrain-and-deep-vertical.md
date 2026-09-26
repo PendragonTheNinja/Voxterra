@@ -215,13 +215,15 @@ ground were ever loaded.
   - **World positions become `f64`.** (Done.) At the world's edge an `f32`
     camera can't move at 2 000 fps and walks 81% fast at 1 000; walking is
     already 10% slow at the default spawn.
-  - **`column_heights` is pruned when a chunk column unloads.** It was never
-    freed — ~0.26 GB per 10 km flown. The level-0 LOD real-height gather that
-    also read it is removed: seed heights plus `EditedColumns` are identical,
-    and it cost ~4 000 main-thread lookups per level-0 node.
+  - **`column_heights` is pruned when a chunk column unloads.** (Done.) It was
+    never freed — ~0.26 GB per 10 km flown. The level-0 LOD real-height gather
+    that also read it was to be removed on the premise that seed heights plus
+    `EditedColumns` are identical, costing ~4 000 main-thread lookups per
+    level-0 node. That premise held only within a session, because the overlay
+    lived in memory; it is now saved with the world, and the gather is gone.
   - **`world.meta` records the generator version and world size.** This is
     criterion 9, widened: a world is meaningless without its period.
-  - **The LOD sampler goes sparse beyond level 0.** Exact minimum over every
+  - **The LOD sampler goes sparse beyond level 0.** (Done.) Exact minimum over every
     block is needed only where LOD overlaps full-resolution terrain; elsewhere
     a 4×4 sample per cell costs ~3 ms per node at any stride. This is the cause
     of the ~60 ms spikes that currently fail criterion 8, and the enabling
@@ -289,15 +291,60 @@ the remote matches it, and starts at the first unchecked item.*
   checklist update; to confirm in play: in spectator, fly down below the
   terrain and look up and around.
 
+- [x] **A3 — `column_heights` pruning.** The heightmap is now
+  `vox_core::ColumnHeights`: the map plus a resident-chunk count per chunk
+  column, fed by the world's single insert and single remove site. A chunk
+  column's 1 024 heights are dropped with its last resident chunk, restoring
+  "unknown" (= covered, so a reloaded column starts dark and brightens).
+  Writes to a non-resident column are ignored, so it cannot leak by
+  construction. Telemetry gained `hmap Nk` (heightmap columns, thousands),
+  bounded by the resident chunk columns. Committed with this checklist update;
+  to confirm in play: fly a long straight line and watch `hmap` stay flat.
+
+- [x] **A3 — the LOD edit overlay is saved with the world; the level-0
+  gather is removed.** The audit called the gather redundant with seed heights
+  plus `EditedColumns`, but the overlay was in-memory only, so the gather was
+  the one thing showing earlier sessions' digs at distance. The owner chose to
+  persist the overlay: `EditedColumns::serialize`/`deserialize` (magic `VXTE`,
+  version 1, entries strictly ascending and canonical; decoding rejects
+  anything else) and `WorldStore::save_edited_columns`/`load_edited_columns`
+  (`<world>/lod_edits.bin`, temp-and-rename; no file = no edits). vox-app loads
+  it at startup and flushes it wherever chunks are saved (unload and exit), so
+  it is never behind the chunks. Every LOD level is now seed plus overlay. A
+  world saved before this has no overlay file, so its existing edits do not
+  show at distance until re-edited; new edits persist. Committed with this
+  checklist update; to confirm in play: dig a pit, quit, relaunch, fly away and
+  look back — no ghost terrain over it.
+
+- [x] **A3 — sparse LOD sampler, with the ADR-0008 amendment.**
+  `LodSampling::{Exact, Sparse}` in vox-worldgen: exact reads every column,
+  sparse a 4x4 grid per cell (16 samples at any stride; a quarter of the old
+  cost from stride 8 up). Chosen per level in vox-app: exact when
+  `LodRing::closest_approach_chunks(level)` is within the streamer's unload
+  radius plus one coarsest stride, else sparse. The old sampler's 8-probe cap
+  had already broken the never-exceed contract beyond stride 8 (the extended
+  test fails by a block at 16). Cost recorded in the amendment: between two
+  sparse levels geomorph's coarse = min-of-four becomes coarse ≥ min-of-four,
+  so a handover can lift distant terrain by a few blocks; ADR-0009 carries a
+  pointer. The "settings applied" log now reports how many levels are exact.
+  Committed with this checklist update; to confirm in play: switch to 5 LOD
+  levels as in the 2026-09-25 log (then 219 → 30 fps, worst 47 ms, `lod
+  816+1600`) and compare the burst frames; the log should read "3 exact, 2
+  sparse" at radius 8.
+
+- [x] **Fix, found in play: applying view settings rebuilt the streamer.** A
+  fresh streamer knew nothing was resident, so every chunk was re-requested,
+  regenerated or reloaded from disk, and swapped in over the one in memory —
+  losing any edit not yet saved, flooding relight and meshing (2 097 dirty in
+  the 2026-09-26 log), and never unloading what a smaller radius no longer
+  wanted. `Streamer::reconfigure` now changes radii and margins while keeping
+  the resident set. Committed with this checklist update; to confirm in play:
+  change radius or LOD levels and watch `dirty`/`relight` stay near zero
+  instead of jumping to ~2 000.
+
 ### Remaining, in order
 
-1. **A3 — `column_heights` pruning** on chunk-column unload, and removal of the
-   redundant level-0 LOD real-height gather.
-2. **A3 — sparse LOD sampler** beyond level 0, with an ADR-0008 amendment
-   narrowing the never-exceed contract to where LOD overlaps full-resolution
-   terrain. This is what removes the `lod +N` burst frames (13–26 fps in every
-   2026-09 log) and it is M11's prerequisite.
-3. **A3 — LOD grid lines. Diagnose before fixing.** Faint straight lines run
+1. **A3 — LOD grid lines. Diagnose before fixing.** Faint straight lines run
    across distant terrain; the owner confirmed with the L toggle (2026-09-24)
    that they belong to the LOD, not full-resolution chunks. First establish
    whether they sit on node borders — 64, 128 and 256-block spacing for levels
@@ -306,16 +353,16 @@ the remote matches it, and starts at the first unchecked item.*
    z-fighting between a node's skirt and its neighbour's top. If the cause is
    tied to the shared ring centre or cell layout, which M11 replaces, record it
    and defer rather than fix it twice.
-4. **A3 — cleanup.** Delete the orphaned `vox-core/src/downsample.rs` and the
+2. **A3 — cleanup.** Delete the orphaned `vox-core/src/downsample.rs` and the
    stray `docs/decisions/voxterra.code-workspace`; deduplicate the surface-span
    sampler in `vox-app`; replace `LOD_WORLD_Y_BLOCKS` with the planet constants.
-5. **A1 — transparency and water** (ADR-0011, Accepted, all decisions taken:
+3. **A1 — transparency and water** (ADR-0011, Accepted, all decisions taken:
    distant water opaque with a pre-blended colour, no light attenuation in M10,
    no swimming). An earlier sandbox implementation of the registry split and
    the mesher rule was never handed off and is lost; build from the ADR. Water
    goes after the A3 items so the performance numbers below are taken with
    oceans meshed.
-6. **Tuning and retro.** Criterion-8 numbers at radius 8, on foot and flying,
+4. **Tuning and retro.** Criterion-8 numbers at radius 8, on foot and flying,
    against M09's (stationary 851–967 fps; sprint-fly median ~180). Append the
    retrospective here, update CLAUDE.md status, then **commit before tagging**
    `v0.10.0-m10`.

@@ -1,7 +1,7 @@
 //! vox-app: the game binary. Window, event loop, fly camera, and the
 //! Milestone 00 test scene: one sine-wave chunk.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::Instant;
@@ -9,15 +9,16 @@ use std::time::Instant;
 use glam::{DVec3, Mat4, Vec3};
 use rayon::prelude::*;
 use vox_core::{
-    cell_overlaps_aabb, BlockId, BlockRegistry, Chunk, ChunkPos, EditedColumns, LocalPos,
-    LodNodeId, LodRing, RayHit, Streamer, World, WorldMeta, WorldPos, WorldShape, WorldStore,
+    cell_overlaps_aabb, BlockId, BlockRegistry, Chunk, ChunkPos, ColumnHeights, EditedColumns,
+    LocalPos, LodNodeId, LodRing, RayHit, Streamer, World, WorldMeta, WorldPos, WorldShape,
+    WorldStore,
 };
 use vox_mesh::{mesh_chunk, ChunkNeighbors, LodMeshData, MeshData};
 
 mod settings_ui;
 use settings_ui::SettingsUi;
 use vox_render::Renderer;
-use vox_worldgen::Generator;
+use vox_worldgen::{Generator, LodSampling};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -203,7 +204,7 @@ fn digit_slot(code: KeyCode) -> Option<usize> {
 /// entering each column from directly above: 15 open, 0 occluded). Free fn so
 /// it can run inside the parallel relight workers rather than serially on the
 /// main thread (the serial version was ~12 ms/frame at full budget).
-fn top_sky_from_heightmap(heights: &HashMap<(i64, i64), i64>, pos: ChunkPos) -> Vec<u8> {
+fn top_sky_from_heightmap(heights: &ColumnHeights, pos: ChunkPos) -> Vec<u8> {
     let origin = pos.origin();
     let mut top = vec![0u8; (CHUNK_SIZE_I * CHUNK_SIZE_I) as usize];
     for lz in 0..CHUNK_SIZE_I {
@@ -218,7 +219,7 @@ fn top_sky_from_heightmap(heights: &HashMap<(i64, i64), i64>, pos: ChunkPos) -> 
             // gets frozen into already-lit chunks (the sealed-hole leak). It is
             // always safe to start an unknown column dark and let it brighten
             // honestly once the real terrain loads and relights it.
-            let known_h = heights.get(&(origin.x + lx, origin.z + lz)).copied();
+            let known_h = heights.get(origin.x + lx, origin.z + lz);
 
             // Inject full daylight at the chunk's TOP FACE only when the column
             // is KNOWN and open through this ENTIRE chunk — i.e. the highest
@@ -253,7 +254,7 @@ fn top_sky_from_heightmap(heights: &HashMap<(i64, i64), i64>, pos: ChunkPos) -> 
 fn relight_chunks_parallel(
     world: &World,
     registry: &BlockRegistry,
-    heights: &HashMap<(i64, i64), i64>,
+    heights: &ColumnHeights,
     positions: &[ChunkPos],
 ) -> Vec<(ChunkPos, Vec<u8>, bool, u8)> {
     const OPPOSITE: [usize; 6] = [1, 0, 3, 2, 5, 4];
@@ -553,9 +554,11 @@ struct App {
     /// Per-column heightmap: world `(x, z)` → highest solid block world-Y
     /// among loaded chunks. Drives the skylight top boundary directly, so each
     /// chunk computes its daylight in one pass without waiting on its vertical
-    /// neighbors to be relit (avoids the skylight cascade; ADR-0005). Absent
-    /// key = no solid known in that column = fully open to sky.
-    column_heights: HashMap<(i64, i64), i64>,
+    /// neighbors to be relit (avoids the skylight cascade; ADR-0005). Unknown
+    /// column = COVERED. Bounded by residency: a chunk column's heights are
+    /// dropped with its last resident chunk (M10 A3), so every insert into and
+    /// removal from `world` must be reported to it.
+    column_heights: ColumnHeights,
     /// Columns the player has dug or built, as a sparse overlay on the seed
     /// heights every LOD node starts from (M09 ghost-block fix).
     ///
@@ -563,8 +566,13 @@ struct App {
     /// have loaded, and consulting it per column would cost 32x32xstride^2
     /// lookups per node (65 536 at stride 8), nearly all misses. Shared into
     /// the rayon build jobs behind an `Arc` — edits are rare, node builds are
-    /// constant, so copy-on-write is the cheap direction.
+    /// constant, so copy-on-write is the cheap direction. Loaded from and saved
+    /// with the world, so earlier sessions' edits reach the LOD too.
     edited_columns: Arc<EditedColumns>,
+    /// `edited_columns` has changed since it was last saved. Flushed wherever
+    /// chunks are saved, so the overlay on disk is never behind the chunks it
+    /// describes.
+    edits_unsaved: bool,
     /// Block currently under the crosshair (raycast result), or none.
     targeted: Option<RayHit>,
     /// Block type placed on right-click (M03 task 4). Cycled with number
@@ -641,6 +649,14 @@ impl Default for App {
             .unwrap_or_else(|e| panic!("cannot open the world at \"world\": {e}"));
         let seed = store.seed();
         let shape = store.shape();
+        // The LOD's record of every edit ever made in this world. A corrupt
+        // overlay costs only the distant display of old edits — the chunks
+        // hold the edits themselves — so it is reported and replaced, not
+        // fatal. It is rewritten from scratch at the next save.
+        let edited_columns = store.load_edited_columns().unwrap_or_else(|e| {
+            log::error!("{e}; distant terrain will not show earlier edits");
+            EditedColumns::new(shape)
+        });
         log::info!(
             "world at {:?}, seed {:#x}, {} x {} km",
             store.root(),
@@ -720,8 +736,9 @@ impl Default for App {
             dirty: HashSet::new(),
             relight: HashSet::new(),
             meshed_once: HashSet::new(),
-            column_heights: HashMap::new(),
-            edited_columns: Arc::new(EditedColumns::new(shape)),
+            column_heights: ColumnHeights::new(),
+            edited_columns: Arc::new(edited_columns),
+            edits_unsaved: false,
             targeted: None,
             selected_block: vox_core::registry::STONE,
             gen_tx,
@@ -926,10 +943,10 @@ impl App {
                 let local_top = heights[(lx + lz * CHUNK_SIZE_I) as usize];
                 let Some(ly) = local_top else { continue };
                 let world_y = origin.y + ly as i64;
-                let key = (origin.x + lx, origin.z + lz);
-                let e = self.column_heights.entry(key).or_insert(i64::MIN);
-                if world_y > *e {
-                    *e = world_y;
+                if self
+                    .column_heights
+                    .raise(origin.x + lx, origin.z + lz, world_y)
+                {
                     any_raised = true;
                 }
             }
@@ -989,7 +1006,6 @@ impl App {
     /// the chunk above (the +Y sky plane), so a dug shaft stays correctly lit
     /// while sealed/side regions go dark — no heightmap lowering required.
     fn recompute_height_column(&mut self, wx: i64, wz: i64) {
-        let key = (wx, wz);
         let lx = wx.rem_euclid(CHUNK_SIZE_I) as u8;
         let lz = wz.rem_euclid(CHUNK_SIZE_I) as u8;
         let cx = wx.div_euclid(CHUNK_SIZE_I);
@@ -1015,10 +1031,7 @@ impl App {
         // Raise-only: a placed block above the surface extends it; a break can
         // only lower the physical top, which we deliberately ignore here.
         if let Some(h) = highest {
-            let e = self.column_heights.entry(key).or_insert(i64::MIN);
-            if h > *e {
-                *e = h;
-            }
+            self.column_heights.raise(wx, wz, h);
         }
 
         // Relight the edited column's chunks plus their horizontal neighbors so
@@ -1038,9 +1051,10 @@ impl App {
         }
     }
 
-    /// Save every loaded chunk that's been modified — called on exit so
-    /// edits to chunks still resident (not yet unloaded) aren't lost.
-    fn save_all_modified(&self) {
+    /// Save every loaded chunk that's been modified, and the LOD edit overlay —
+    /// called on exit so edits to chunks still resident (not yet unloaded)
+    /// aren't lost.
+    fn save_all_modified(&mut self) {
         let mut saved = 0;
         for (pos, chunk) in self.world.chunks() {
             if chunk.is_modified() {
@@ -1053,6 +1067,23 @@ impl App {
         }
         if saved > 0 {
             log::info!("saved {saved} modified chunks on exit");
+        }
+        self.save_edit_overlay();
+    }
+
+    /// Write the LOD edit overlay if it changed since it was last written.
+    ///
+    /// Called wherever chunks are saved, never per edit: the whole overlay is
+    /// rewritten each time, which is cheap at the rate chunks save and would
+    /// not be at the rate blocks break. On failure it stays marked unsaved, so
+    /// the next save retries.
+    fn save_edit_overlay(&mut self) {
+        if !self.edits_unsaved {
+            return;
+        }
+        match self.store.save_edited_columns(&self.edited_columns) {
+            Ok(()) => self.edits_unsaved = false,
+            Err(e) => log::error!("failed to save the LOD edit overlay: {e}"),
         }
     }
 
@@ -1129,20 +1160,27 @@ impl App {
         // 2. Unloads: save the chunk if it was modified, then drop its data
         //    + GPU mesh; neighbors may now expose a border face, so they're
         //    marked dirty below.
+        let mut saved_any = false;
         for pos in &update.to_unload {
             if let Some(chunk) = self.world.chunk(*pos) {
                 if chunk.is_modified() {
+                    saved_any = true;
                     if let Err(e) = self.store.save_chunk(*pos, chunk) {
                         log::error!("failed to save chunk {:?}: {e}", (pos.x, pos.y, pos.z));
                     }
                 }
             }
-            self.world.remove_chunk(*pos);
+            if self.world.remove_chunk(*pos).is_some() {
+                self.column_heights.chunk_unloaded(*pos);
+            }
             self.streamer.mark_unloaded(*pos);
             self.dirty.remove(pos);
             if let Some(renderer) = self.renderer.as_mut() {
                 renderer.set_chunk_mesh(*pos, &MeshData::default());
             }
+        }
+        if saved_any {
+            self.save_edit_overlay();
         }
         // Separate pass so neighbor marking isn't undone by the removal loop.
         for pos in &update.to_unload {
@@ -1193,7 +1231,11 @@ impl App {
         let mut newly_generated = Vec::new();
         while let Ok((pos, chunk)) = self.gen_rx.try_recv() {
             self.gen_in_flight.remove(&pos);
-            self.world.insert_chunk(pos, chunk);
+            // Count residency only for a chunk that was not already there, so
+            // the heightmap's per-column counts stay exact.
+            if self.world.insert_chunk(pos, chunk).is_none() {
+                self.column_heights.chunk_loaded(pos);
+            }
             self.streamer.mark_loaded(pos);
             newly_generated.push(pos);
         }
@@ -1454,6 +1496,27 @@ impl App {
         (self.lod_far_chunks * CHUNK_SIZE_I) as f32
     }
 
+    /// How densely to sample a node of `level` (ADR-0008, M10 amendment).
+    ///
+    /// Exact where the level can meet full-resolution terrain — LOD underlaps
+    /// it, and an overshoot there pokes through real ground. Sparse everywhere
+    /// else, which is what keeps a node's cost flat at any stride.
+    ///
+    /// "Can meet" is the level's closest approach against the full-res
+    /// region's reach (the unload radius — chunks linger until then), plus
+    /// one coarsest stride: a node the ring has retired stays drawn until its
+    /// replacement lands, by which time the camera may be one snap step
+    /// nearer. Decided per level, never per node, so no node ever needs a
+    /// rebuild because the camera moved.
+    fn lod_sampling(&self, level: u32) -> LodSampling {
+        let reach = self.streamer.unload_radius() + self.lod_ring.coarsest_stride();
+        if self.lod_ring.closest_approach_chunks(level) <= reach {
+            LodSampling::Exact
+        } else {
+            LodSampling::Sparse
+        }
+    }
+
     /// Recompute one column's surface height from the world.
     ///
     /// `update_heightmap_for` only ever RAISES a column (correct for
@@ -1480,12 +1543,13 @@ impl App {
                 }
             }
         }
-        self.column_heights.insert((x, z), top);
-        // Same value, but sparse and never pruned, so coarse LOD levels can see
-        // the edit without walking the whole heightmap. Clamped into the LOD
+        self.column_heights.set(x, z, top);
+        // Same value, but sparse, never pruned and saved with the world, so
+        // every LOD level sees the edit, this session and every later one. Clamped into the LOD
         // band: a fully mined column reports the i64::MIN sentinel, which is a
         // "no terrain" marker, not a height.
         Arc::make_mut(&mut self.edited_columns).record(x, z, top.max(LOD_WORLD_Y_BLOCKS.0) as i32);
+        self.edits_unsaved = true;
     }
 
     /// LOD nodes whose ground is fully covered by resident full-resolution
@@ -1636,7 +1700,9 @@ impl App {
     /// current sets dropped; the next tick re-requests everything.
     fn apply_view_settings(&mut self) {
         let s = self.settings;
-        self.streamer = Streamer::surface_following(
+        // Reconfigure, never replace: a fresh streamer would re-request every
+        // resident chunk and overwrite unsaved edits with the disk copy.
+        self.streamer.reconfigure(
             s.load_radius,
             s.load_radius + 2,
             LOAD_BELOW_CHUNKS,
@@ -1689,10 +1755,15 @@ impl App {
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.clear_lod();
         }
+        let exact = (0..levels.len() as u32)
+            .filter(|&l| self.lod_sampling(l) == LodSampling::Exact)
+            .count();
         log::info!(
-            "settings applied: radius {}, {} LOD levels, horizon {} blocks",
+            "settings applied: radius {}, {} LOD levels ({} exact, {} sparse), horizon {} blocks",
             s.load_radius,
             levels.len(),
+            exact,
+            levels.len() - exact,
             self.lod_far_blocks() as i64
         );
     }
@@ -1812,65 +1883,26 @@ impl App {
                 // terrain read as stacked terraces of tall slabs; a heightfield
                 // keeps vertical detail exact and only quantizes horizontally.
                 //
-                // The innermost ring takes its heights from the world's own
-                // column heightmap when available — so the boundary matches the
-                // real terrain it abuts, and player edits show up at distance,
-                // neither of which seed sampling can do. Only the height gather
-                // touches app state; building and meshing run on rayon.
-                // Build the node as a HEIGHTFIELD. For the innermost ring,
-                // take each column's height from the world where it is known
-                // and from the seed where it is not.
+                // Every level, level 0 included, is built from the seed with
+                // the player's edits folded in. Level 0 used to gather real
+                // heights from the heightmap on the main thread (~4 000 lookups
+                // a node); at stride 2 the seed sampler already reads every
+                // column, and the edit overlay is saved with the world, so the
+                // gather added nothing but the cost (M10 A3).
                 //
-                // This used to be all-or-nothing: one unknown column anywhere
-                // in the node fell back to seed generation for the WHOLE node.
-                // A node's footprint reaches past the loaded chunk radius, so
-                // that happened constantly — and seed heights cannot see player
-                // edits, so mined terrain reappeared as coarse "ghost" patches
-                // the size of a node. Per-column fallback keeps the edited
-                // columns real and only approximates the ones off the edge.
-                let cells = CHUNK_SIZE_I as usize;
-                let mut real_heights: Option<Vec<i32>> = None;
-                if n.level == 0 {
-                    let gen = self.generator;
-                    let mut hs = vec![0i32; cells * cells];
-                    for cz in 0..cells {
-                        for cx in 0..cells {
-                            let bx = origin.x + cx as i64 * stride;
-                            let bz = origin.z + cz as i64 * stride;
-                            let mut m = i64::MAX;
-                            for dz in 0..stride {
-                                for dx in 0..stride {
-                                    let (wx, wz) = (bx + dx, bz + dz);
-                                    // i64::MIN is the heightmap's "no terrain
-                                    // here yet" sentinel, not a height.
-                                    let h = match self.column_heights.get(&(wx, wz)) {
-                                        Some(&h) if h != i64::MIN => h,
-                                        _ => gen.surface_height(wx, wz),
-                                    };
-                                    m = m.min(h);
-                                }
-                            }
-                            hs[cz * cells + cx] = m as i32;
-                        }
-                    }
-                    real_heights = Some(hs);
-                }
-
-                // Copied into the rayon job for the seed-generated levels
-                // (Generator is Copy, so this is free).
+                // Copied into the rayon job (Generator is Copy, so this is free).
+                let sampling = self.lod_sampling(n.level);
                 let generator = self.generator;
                 let tx = self.lod_tx.clone();
                 let origin_y = origin.y as i32;
                 let skirt = LOD_SKIRT_DEPTH_CELLS * stride as i32;
                 let edits = Arc::clone(&self.edited_columns);
                 rayon::spawn(move || {
-                    let mut heights = real_heights
-                        .unwrap_or_else(|| generator.lod_heightfield(origin.x, origin.z, stride));
-                    // Fold in player edits at EVERY level. The gather above runs
-                    // for level 0 only, so without this strides 4 and 8 were
-                    // built from the seed forever — and the seed always reads
-                    // higher than dug ground, so the coarse surface floated
-                    // above the hole and showed through it (the "ghost block").
+                    let mut heights =
+                        generator.lod_heightfield(origin.x, origin.z, stride, sampling);
+                    // Fold in player edits. The seed always reads higher than
+                    // dug ground, so without this the coarse surface floats
+                    // above the hole and shows through it (the "ghost block").
                     edits.apply_to_node(&mut heights, origin.x, origin.z, stride, origin_y);
                     let mesh = vox_mesh::mesh_lod_heightfield(
                         &heights,
@@ -2450,7 +2482,7 @@ impl ApplicationHandler for App {
                         let fps = self.telemetry_frames as f32 / self.telemetry_accum;
                         let lod_backlog = self.lod_pending_set.len() + self.lod_in_flight.len();
                         log::info!(
-                            "{:.0} fps (worst {:.1}ms) | drawn {}/{} | {:.2}M tris | {:.0}MB gpu | lod {}+{} | loaded {} | gen {} | dirty {} | relight {} | lt {:.0}ms msh {:.0}ms",
+                            "{:.0} fps (worst {:.1}ms) | drawn {}/{} | {:.2}M tris | {:.0}MB gpu | lod {}+{} | loaded {} | hmap {}k | gen {} | dirty {} | relight {} | lt {:.0}ms msh {:.0}ms",
                             fps,
                             self.worst_frame_ms,
                             renderer.drawn_last_frame(),
@@ -2460,6 +2492,10 @@ impl ApplicationHandler for App {
                             renderer.lod_count(),
                             lod_backlog,
                             loaded,
+                            // Heightmap columns, thousands. Bounded by the
+                            // resident chunk columns (1 024 each); it used to
+                            // grow with every column ever visited.
+                            self.column_heights.len() / 1000,
                             in_flight,
                             dirty,
                             relight,

@@ -234,12 +234,14 @@ beyond what the invariants above already require.
   START HERE" section; begin at its first unchecked item.** As of 2026-09-24:
   tasks 1–4, A2 (the torus) and three A3 items (LOD suppression waits for drawn
   chunks; `f64` world positions with camera-following streaming; no faces
-  toward chunks that will never load) are done; next is `column_heights`
-  pruning.
+  toward chunks that will never load; `column_heights` pruning; the LOD edit
+  overlay saved with the world and the level-0 gather removed; the sparse LOD
+  sampler with its ADR-0008 amendment) are done; next is diagnosing the LOD
+  grid lines.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 227, vox-mesh 42, vox-worldgen 26 passing as of the sealed-faces
-  commit), then
+  vox-core 251, vox-mesh 42, vox-worldgen 27 passing as of the streamer
+  reconfigure commit), then
   start the first unchecked item.
 - **Roadmap after M10:** 11 — The Horizon
   (`docs/milestones/11-the-horizon.md`: 32–64 km view via per-level LOD ring
@@ -301,6 +303,11 @@ was a real shipped bug. Regression tests exist for all of them (vox-core).
   chunk stack** (same chunk x,z) — chunks lit during the unknown window hold
   stale light that only a recompute clears. Keep this O(loaded) with cheap
   integer compares; never scan per-column against all loaded chunks.
+- **The heightmap lives exactly as long as its chunk column is resident.**
+  `ColumnHeights` drops a column's heights with its last resident chunk and
+  ignores writes to non-resident columns. Every insert into and removal from
+  the `World` must be reported to it (`chunk_loaded` / `chunk_unloaded`);
+  a missed report either leaks or drops heights still in use.
 - **Never mesh a chunk that is still queued for relight.** Light first, mesh
   once. Meshing before lighting bakes zero light (dark chunk checkerboard)
   and forces a second mesh — the single biggest streaming-burst cost found.

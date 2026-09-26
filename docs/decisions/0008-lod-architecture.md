@@ -195,3 +195,73 @@ looked right in play — tuned by inspection, not by measurement.
 
 Geomorph transitions, listed here as an M09 item, are specified separately in
 ADR-0009.
+
+---
+
+## Amendment (M10 A3, 2026-09-26): exact only where LOD can meet full resolution
+
+**The contract as it stood.** Every LOD cell takes the minimum real surface over
+its footprint, so coarse terrain never rises above real ground. It exists for
+one reason: LOD underlaps the full-resolution region, and a coarse cell above
+the real surface pokes up through real ground there.
+
+**What it cost.** Honouring it exactly means reading every column of every cell:
+`1024 × stride²` surface samples per node. The sampler capped this at 8 probes
+per axis, which still meant 65 536 samples per node at stride 8 and beyond —
+the `lod +N` burst frames and the ~60 ms spikes that fail M10 criterion 8.
+
+**And the cap had already broken it.** Beyond stride 8, 8 probes per axis is no
+longer every column. The contract test only ever checked stride 8; extended to
+stride 16 it fails by a block. Levels 3 and up had never honoured it.
+
+### Decision
+
+Two samplings (`vox_worldgen::LodSampling`), chosen per level:
+
+- **Exact** — every column. For a level that can come within reach of
+  full-resolution terrain.
+- **Sparse** — a 4×4 grid per cell, 16 samples at any stride, a quarter of the
+  old cost at stride 8 and beyond. For every other level. At strides of 4 or
+  less the grid is every column, so sparse and exact agree there.
+
+**"Can come within reach"** is `LodRing::closest_approach_chunks(level)` — the
+nearest any node of the level can be to the camera, `inner − S + 1` chunks for
+coarsest stride `S` (0 for the innermost level) — against the full-resolution
+region's reach: the streamer's unload radius plus one coarsest stride. The extra
+stride covers retired nodes, which stay drawn until their replacements land
+(ADR-0009), by which time the camera may be one snap step nearer. The bound is
+proven tight by a property test sweeping every camera position over two snap
+periods.
+
+The choice is **per level, never per node**. A node's geometry stays a function
+of its id and the terrain alone, so camera motion never forces a rebuild. A
+settings change rebuilds the ring, and the choice with it.
+
+**Why nothing is lost.** Where full resolution is absent, a coarse cell a block
+above a dip it did not sample is simply the terrain's shape at distance — there
+is no real ground for it to poke through. The harm the contract prevents needs
+real ground present.
+
+### Consequences
+
+- **Geomorph (ADR-0009).** Its enabling property — a coarse cell is exactly the
+  minimum of the four finer cells under it — relied on both levels being exact.
+  A sparse level's samples are a subset of its finer neighbour's (the lattices
+  nest), so the coarse cell is at least that minimum rather than equal to it. At
+  full morph a finer node can therefore sit below the coarser node by whatever
+  dip the coarse lattice missed, and the handover lifts the surface by that
+  much: a few blocks, at the kilometre ranges where sparse levels live. Levels
+  that meet full resolution are exact on both sides of every boundary they
+  share with each other, so the near field is unchanged.
+- **Retiree overlap (ADR-0009).** "The finer node wins the depth test wherever
+  they differ" now holds only between exact levels. Between sparse levels the
+  coarse surface can sit a block or two above the finer one in places, for the
+  frames both are drawn.
+- **Tests.** `exact_lod_heightfield_never_exceeds_real_terrain` (strides 8 and
+  16; fails on the old sampler at 16),
+  `sparse_is_exact_at_fine_strides_and_never_below_it_beyond`, and the two
+  `closest_approach_is_a_tight_bound_*` tests in `vox-core::lod`.
+- **Forward constraint for M11.** The horizon adds coarser levels, all sparse,
+  at a flat per-node cost — that is the point. If M11's curvature or a new ring
+  layout changes how close a level can come, `closest_approach_chunks` is the
+  one place that must change with it.

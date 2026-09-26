@@ -33,6 +33,24 @@ pub mod blocks {
 /// Number of dirt blocks below the surface grass layer.
 const DIRT_DEPTH: i64 = 4;
 
+/// How densely [`Generator::lod_heightfield`] samples each coarse cell.
+///
+/// The choice is the caller's, because it depends on where the node sits
+/// relative to full-resolution terrain, which the generator cannot know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LodSampling {
+    /// Every column: the cell never rises above the real surface. For levels
+    /// that can overlap full-resolution terrain.
+    Exact,
+    /// A 4x4 grid per cell: cheap at any stride, may sit slightly above a
+    /// narrow dip. For levels that never meet full-resolution terrain.
+    Sparse,
+}
+
+/// Samples per axis of a sparse LOD cell. Chosen so a node costs ~16 000
+/// `surface_height` calls at any stride — the M10 audit measured ~3 ms.
+const LOD_SPARSE_PROBES: i64 = 4;
+
 /// Terrain generator for one world seed.
 #[derive(Clone, Copy, Debug)]
 pub struct Generator {
@@ -145,20 +163,37 @@ impl Generator {
     /// height of each coarse column, sampled straight from the seed without
     /// generating any full-resolution chunks.
     ///
-    /// Each cell takes the MINIMUM surface over its footprint, so coarse
-    /// terrain never rises above the real surface — LOD underlaps the
-    /// full-resolution region, and anything that overshoots pokes through real
-    /// ground and is solid to walk into. Probing is exact up to 8 columns per
-    /// axis, which covers every level fine enough to abut full-res.
+    /// Each cell takes the MINIMUM of the surface heights it samples, so it
+    /// errs downward. How many it samples is `sampling`:
+    ///
+    /// - [`LodSampling::Exact`] reads every column of the cell, so the cell
+    ///   never rises above the real surface anywhere in it. Required where LOD
+    ///   can overlap full-resolution terrain, which it underlaps: an overshoot
+    ///   there pokes up through real ground (ADR-0008's never-exceed contract).
+    /// - [`LodSampling::Sparse`] reads a 4x4 grid, 16 columns per cell at any
+    ///   stride, so a node costs the same at stride 32 as at stride 4. It can
+    ///   sit a little above a narrow dip it missed — invisible from a level
+    ///   that never meets full-res, and the reason distant levels are cheap
+    ///   (ADR-0008, M10 amendment). At strides of 4 or less it reads every
+    ///   column anyway and equals `Exact`.
     ///
     /// Feed the result to `vox_mesh::mesh_lod_heightfield`. Unlike the voxel
     /// path this preserves EXACT vertical detail — the reason distant terrain
     /// reads as terrain rather than stacked terraces.
-    pub fn lod_heightfield(&self, origin_x: i64, origin_z: i64, h_stride: i64) -> Vec<i32> {
+    pub fn lod_heightfield(
+        &self,
+        origin_x: i64,
+        origin_z: i64,
+        h_stride: i64,
+        sampling: LodSampling,
+    ) -> Vec<i32> {
         debug_assert!(h_stride >= 1);
         let n = CHUNK_SIZE as i64;
-        let probes = h_stride.min(8);
-        let step = (h_stride / probes).max(1);
+        let probes = match sampling {
+            LodSampling::Exact => h_stride,
+            LodSampling::Sparse => h_stride.min(LOD_SPARSE_PROBES),
+        };
+        let step = h_stride / probes;
         let mut out = vec![0i32; (n * n) as usize];
         for cz in 0..n {
             for cx in 0..n {
@@ -359,29 +394,58 @@ mod tests {
     fn lod_heightfield_is_deterministic() {
         let g = Generator::new(0x0007_E22A_C0DE, WorldShape::DEFAULT);
         assert_eq!(
-            g.lod_heightfield(-256, 256, S),
-            g.lod_heightfield(-256, 256, S)
+            g.lod_heightfield(-256, 256, S, LodSampling::Sparse),
+            g.lod_heightfield(-256, 256, S, LodSampling::Sparse)
         );
     }
 
-    /// THE safety contract: the coarse height never exceeds the real surface
-    /// anywhere in the cell. LOD underlaps full-res, so an overshoot pokes
-    /// through real ground and is solid to walk into. Checks every real column.
+    /// THE safety contract, where it applies: an EXACT heightfield never
+    /// exceeds the real surface anywhere in the cell. LOD underlaps full-res,
+    /// so an overshoot pokes through real ground. Checks every real column, at
+    /// a stride the old sampler (8 probes per axis) got wrong.
     #[test]
-    fn lod_heightfield_never_exceeds_real_terrain() {
+    fn exact_lod_heightfield_never_exceeds_real_terrain() {
         let g = Generator::new(42, WorldShape::DEFAULT);
-        let (ox, oz) = (0i64, 0i64);
-        let hf = g.lod_heightfield(ox, oz, S);
         let n = CHUNK_SIZE as i64;
-        for cz in 0..n {
-            for cx in 0..n {
-                let coarse = hf[(cz * n + cx) as usize] as i64;
-                for pz in 0..S {
-                    for px in 0..S {
-                        let real = g.surface_height(ox + cx * S + px, oz + cz * S + pz);
-                        assert!(coarse <= real, "coarse {coarse} above real {real}");
+        for stride in [S, 16] {
+            let (ox, oz) = (-(n * stride) / 2, 4096i64);
+            let hf = g.lod_heightfield(ox, oz, stride, LodSampling::Exact);
+            for cz in 0..n {
+                for cx in 0..n {
+                    let coarse = hf[(cz * n + cx) as usize] as i64;
+                    for pz in 0..stride {
+                        for px in 0..stride {
+                            let real =
+                                g.surface_height(ox + cx * stride + px, oz + cz * stride + pz);
+                            assert!(
+                                coarse <= real,
+                                "stride {stride}: coarse {coarse} above real {real}"
+                            );
+                        }
                     }
                 }
+            }
+        }
+    }
+
+    /// Sparse samples a subset of what exact does, so its minimum can only be
+    /// equal or higher — never lower. And at strides of 4 or less the subset
+    /// is everything, so the two agree exactly.
+    #[test]
+    fn sparse_is_exact_at_fine_strides_and_never_below_it_beyond() {
+        let g = Generator::new(9, WorldShape::DEFAULT);
+        for stride in [1, 2, 4] {
+            assert_eq!(
+                g.lod_heightfield(640, -320, stride, LodSampling::Sparse),
+                g.lod_heightfield(640, -320, stride, LodSampling::Exact),
+                "stride {stride}"
+            );
+        }
+        for stride in [8, 16, 32] {
+            let sparse = g.lod_heightfield(640, -320, stride, LodSampling::Sparse);
+            let exact = g.lod_heightfield(640, -320, stride, LodSampling::Exact);
+            for (s, e) in sparse.iter().zip(&exact) {
+                assert!(s >= e, "stride {stride}: sparse {s} below exact {e}");
             }
         }
     }
@@ -391,7 +455,7 @@ mod tests {
     #[test]
     fn lod_heightfield_tracks_the_surface() {
         let g = Generator::new(7, WorldShape::DEFAULT);
-        let hf = g.lod_heightfield(0, 0, 1); // stride 1: exact
+        let hf = g.lod_heightfield(0, 0, 1, LodSampling::Sparse); // stride 1: every column
         let n = CHUNK_SIZE as i64;
         for cz in 0..n {
             for cx in 0..n {
@@ -403,7 +467,10 @@ mod tests {
     #[test]
     fn lod_heightfield_has_one_entry_per_cell() {
         let g = Generator::new(1, WorldShape::DEFAULT);
-        assert_eq!(g.lod_heightfield(0, 0, 4).len(), CHUNK_SIZE * CHUNK_SIZE);
+        assert_eq!(
+            g.lod_heightfield(0, 0, 4, LodSampling::Sparse).len(),
+            CHUNK_SIZE * CHUNK_SIZE
+        );
     }
 }
 

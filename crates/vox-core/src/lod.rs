@@ -328,6 +328,34 @@ impl LodRing {
         &self.loaded
     }
 
+    /// The coarsest stride, in chunks: the grid the shared center snaps to.
+    pub fn coarsest_stride(&self) -> i64 {
+        self.coarsest_stride
+    }
+
+    /// The closest any node of `level` can come to the camera while that level
+    /// owns it: the Chebyshev distance, in chunks, from the camera's chunk to
+    /// the node's nearest chunk (0 = the camera stands in it).
+    ///
+    /// The camera sits in `[c, c + S - 1]` of the snapped center `c` on each
+    /// axis (`S` = coarsest stride), and a node must clear the inner square
+    /// `[c - inner, c + inner)` entirely. The near side of that square is the
+    /// binding one: `inner - S + 1`. A level with no inner square (inner 0)
+    /// reaches the camera.
+    ///
+    /// This is what decides how carefully a level must be built. Only a level
+    /// that can reach the full-resolution region has to honour the
+    /// never-exceed contract exactly (ADR-0008, M10 amendment); one that
+    /// cannot is always seen from further away than full-res reaches.
+    pub fn closest_approach_chunks(&self, level: u32) -> i64 {
+        let inner = self.levels[level as usize].inner_chunks;
+        if inner == 0 {
+            0
+        } else {
+            inner - self.coarsest_stride + 1
+        }
+    }
+
     /// The shared center all annuli are measured from: the camera's chunk
     /// floored to the coarsest grid. See the module docs on why this must be
     /// shared rather than per-level.
@@ -430,10 +458,11 @@ impl LodRing {
 ///
 /// ## Why this exists
 ///
-/// A coarse cell's height is the MINIMUM real surface over the cell — the
-/// safety contract enforced by `lod_heightfield_never_exceeds_real_terrain`:
-/// coarse may sit below real ground (harmless, it is hidden) but never above
-/// it (it pokes through). Seed sampling honours that for untouched terrain,
+/// Where LOD can meet full-resolution terrain, a coarse cell's height is the
+/// MINIMUM real surface over the cell — the safety contract enforced by
+/// `exact_lod_heightfield_never_exceeds_real_terrain` (ADR-0008, M10
+/// amendment): coarse may sit below real ground (harmless, it is hidden) but
+/// never above it (it pokes through). Seed sampling honours that for untouched terrain,
 /// and untouched terrain is nearly all of it. A mined column is exactly where
 /// seed and reality diverge, and the seed always reads *higher* — so the
 /// coarse surface floats where the player dug, visible through the hole
@@ -448,6 +477,16 @@ impl LodRing {
 ///
 /// Bucketed by chunk column so a node visits only the edits inside its own
 /// footprint, never the whole map.
+///
+/// ## Persisted with the world (M10 A3)
+///
+/// The overlay is the LOD's ONLY source of edits, at every level, so it must
+/// outlive the session: an in-memory overlay forgets every earlier session's
+/// digs, and the seed brings the ghost terrain straight back over them. It is
+/// saved beside the chunks ([`WorldStore::save_edited_columns`]) in the format
+/// of [`EditedColumns::serialize`].
+///
+/// [`WorldStore::save_edited_columns`]: crate::storage::WorldStore::save_edited_columns
 #[derive(Debug, Clone)]
 pub struct EditedColumns {
     /// Canonical chunk (x, z) -> canonical world (x, z) -> surface height.
@@ -473,6 +512,11 @@ impl EditedColumns {
 
     pub fn is_empty(&self) -> bool {
         self.by_chunk.is_empty()
+    }
+
+    /// The world shape this overlay was built for.
+    pub fn shape(&self) -> WorldShape {
+        self.shape
     }
 
     /// Number of recorded columns.
@@ -563,6 +607,130 @@ impl EditedColumns {
                 }
             }
         }
+    }
+}
+
+/// Magic at the start of a saved edit overlay.
+const EDITS_MAGIC: [u8; 4] = *b"VXTE";
+
+/// On-disk format version of the edit overlay. Independent of the chunk and
+/// world-metadata versions.
+pub const EDITS_FORMAT_VERSION: u8 = 1;
+
+/// Header: magic, version, entry count (`u64`).
+const EDITS_HEADER_LEN: usize = 4 + 1 + 8;
+
+/// One entry: canonical x (`i64`), canonical z (`i64`), height (`i32`).
+const EDITS_ENTRY_LEN: usize = 8 + 8 + 4;
+
+/// Why a saved edit overlay failed to decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditsDecodeError {
+    /// Not an edit overlay.
+    BadMagic,
+    /// Written by a format this build does not understand.
+    UnsupportedVersion(u8),
+    /// Shorter than its header or its entry count says.
+    Truncated,
+    /// Longer than its entry count says.
+    TrailingBytes,
+    /// Entries out of order or repeated. The encoder writes them strictly
+    /// ascending, so anything else is corruption.
+    Unordered,
+    /// A column outside the canonical range — from a world of another size,
+    /// or corruption. Accepting it would misplace an edit across the seam.
+    NotCanonical { x: i64, z: i64 },
+}
+
+impl std::fmt::Display for EditsDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BadMagic => write!(f, "not an edit overlay (bad magic)"),
+            Self::UnsupportedVersion(v) => write!(f, "unsupported edit overlay version {v}"),
+            Self::Truncated => write!(f, "edit overlay is truncated"),
+            Self::TrailingBytes => write!(f, "edit overlay has trailing bytes"),
+            Self::Unordered => write!(f, "edit overlay entries are out of order"),
+            Self::NotCanonical { x, z } => {
+                write!(f, "edit overlay column ({x}, {z}) is outside the world")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EditsDecodeError {}
+
+impl EditedColumns {
+    /// Encode for saving.
+    ///
+    /// Layout (little-endian): magic `VXTE`, version `u8`, entry count `u64`,
+    /// then per entry canonical x `i64`, canonical z `i64`, height `i32`, in
+    /// strictly ascending `(x, z)` order. The order makes the encoding
+    /// deterministic (identical overlays, identical bytes) and lets the
+    /// decoder reject repeated or shuffled entries as corruption.
+    ///
+    /// The world size is not stored: the overlay lives inside a world whose
+    /// `world.meta` records it, and every entry is checked against that shape
+    /// on the way back in.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut entries: Vec<(i64, i64, i32)> = self
+            .by_chunk
+            .values()
+            .flat_map(|bucket| bucket.iter().map(|(&(x, z), &h)| (x, z, h)))
+            .collect();
+        entries.sort_unstable_by_key(|&(x, z, _)| (x, z));
+        let mut bytes = Vec::with_capacity(EDITS_HEADER_LEN + entries.len() * EDITS_ENTRY_LEN);
+        bytes.extend_from_slice(&EDITS_MAGIC);
+        bytes.push(EDITS_FORMAT_VERSION);
+        bytes.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        for (x, z, h) in entries {
+            bytes.extend_from_slice(&x.to_le_bytes());
+            bytes.extend_from_slice(&z.to_le_bytes());
+            bytes.extend_from_slice(&h.to_le_bytes());
+        }
+        bytes
+    }
+
+    /// Decode a saved overlay for a world of the given shape. Strict: any
+    /// deviation from what [`EditedColumns::serialize`] writes is an error.
+    pub fn deserialize(bytes: &[u8], shape: WorldShape) -> Result<Self, EditsDecodeError> {
+        if bytes.len() < EDITS_HEADER_LEN {
+            return Err(EditsDecodeError::Truncated);
+        }
+        if bytes[0..4] != EDITS_MAGIC {
+            return Err(EditsDecodeError::BadMagic);
+        }
+        if bytes[4] != EDITS_FORMAT_VERSION {
+            return Err(EditsDecodeError::UnsupportedVersion(bytes[4]));
+        }
+        let count = u64::from_le_bytes(bytes[5..13].try_into().expect("8 bytes"));
+        // Checked: a corrupt count must not overflow into a plausible length.
+        let body_len = usize::try_from(count)
+            .ok()
+            .and_then(|n| n.checked_mul(EDITS_ENTRY_LEN))
+            .ok_or(EditsDecodeError::Truncated)?;
+        let body = &bytes[EDITS_HEADER_LEN..];
+        match body.len().cmp(&body_len) {
+            std::cmp::Ordering::Less => return Err(EditsDecodeError::Truncated),
+            std::cmp::Ordering::Greater => return Err(EditsDecodeError::TrailingBytes),
+            std::cmp::Ordering::Equal => {}
+        }
+
+        let mut edits = Self::new(shape);
+        let mut previous: Option<(i64, i64)> = None;
+        for entry in body.chunks_exact(EDITS_ENTRY_LEN) {
+            let x = i64::from_le_bytes(entry[0..8].try_into().expect("8 bytes"));
+            let z = i64::from_le_bytes(entry[8..16].try_into().expect("8 bytes"));
+            let h = i32::from_le_bytes(entry[16..20].try_into().expect("4 bytes"));
+            if shape.canonical_x(x) != x || shape.canonical_z(z) != z {
+                return Err(EditsDecodeError::NotCanonical { x, z });
+            }
+            if previous.is_some_and(|p| p >= (x, z)) {
+                return Err(EditsDecodeError::Unordered);
+            }
+            previous = Some((x, z));
+            edits.record(x, z, h);
+        }
+        Ok(edits)
     }
 }
 
@@ -1153,5 +1321,229 @@ mod tests {
         edits.record(5, 5, 30);
         assert_eq!(edits.get(5, 5), Some(30));
         assert_eq!(edits.len(), 1);
+    }
+
+    // ---- M10 A3: how close each level can come (drives LOD sampling) ----
+
+    /// The bound must hold for EVERY camera position: a node closer than
+    /// `closest_approach_chunks` would be one built sparsely where full-res
+    /// could meet it. Sweeps cameras over two full coarsest periods, negative
+    /// coordinates included, and checks every node each update requests.
+    fn assert_closest_approach_holds(ring: &mut LodRing) {
+        let s = ring.coarsest_stride();
+        let mut attained = vec![i64::MAX; ring.level_count()];
+        for cz in -s..s {
+            for cx in -s..s {
+                ring.clear();
+                let cam = ChunkPos::new(cx, 0, cz);
+                for id in ring.update(cam).to_load {
+                    let d = nearest_chunk_dist(ring, id, cam);
+                    let bound = ring.closest_approach_chunks(id.level);
+                    assert!(
+                        d >= bound,
+                        "level {} node {id:?} is {d} chunks from camera {cam:?}, \
+                         closer than the bound {bound}",
+                        id.level
+                    );
+                    let a = &mut attained[id.level as usize];
+                    *a = (*a).min(d);
+                }
+            }
+        }
+        // And it is tight: some camera position reaches it. A loose bound
+        // would build levels exactly that never needed it.
+        for (level, &a) in attained.iter().enumerate() {
+            assert_eq!(
+                a,
+                ring.closest_approach_chunks(level as u32),
+                "level {level}: bound is not attained"
+            );
+        }
+    }
+
+    #[test]
+    fn closest_approach_is_a_tight_bound_for_three_levels() {
+        let mut ring = three_levels();
+        assert_closest_approach_holds(&mut ring);
+    }
+
+    /// Extra levels grow the coarsest stride, which loosens the snapping — the
+    /// case where getting the bound wrong would matter most.
+    #[test]
+    fn closest_approach_is_a_tight_bound_with_a_coarse_snap() {
+        let mut ring = LodRing::new(
+            0,
+            &[
+                LodLevel {
+                    stride: 2,
+                    outer_chunks: 32,
+                },
+                LodLevel {
+                    stride: 4,
+                    outer_chunks: 64,
+                },
+                LodLevel {
+                    stride: 8,
+                    outer_chunks: 96,
+                },
+                LodLevel {
+                    stride: 16,
+                    outer_chunks: 128,
+                },
+                LodLevel {
+                    stride: 32,
+                    outer_chunks: 256,
+                },
+            ],
+            32,
+            TEST_Y,
+        );
+        assert_eq!(ring.closest_approach_chunks(0), 0);
+        assert_eq!(ring.closest_approach_chunks(2), 64 - 32 + 1);
+        assert_closest_approach_holds(&mut ring);
+    }
+
+    // ---- M10 A3: the overlay is saved with the world ----
+
+    fn sample_edits() -> EditedColumns {
+        let mut edits = EditedColumns::new(WorldShape::DEFAULT);
+        edits.record(5, 5, 20);
+        edits.record(-3, 7, -40); // canonicalised on record
+        edits.record(40, -2, i32::MIN / 2);
+        edits.record(1000, 64, 3);
+        edits
+    }
+
+    fn all_entries(e: &EditedColumns) -> Vec<((i64, i64), i32)> {
+        let mut v: Vec<_> = e
+            .by_chunk
+            .values()
+            .flat_map(|b| b.iter().map(|(&k, &h)| (k, h)))
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn edits_roundtrip_exactly() {
+        let edits = sample_edits();
+        let back =
+            EditedColumns::deserialize(&edits.serialize(), WorldShape::DEFAULT).expect("decodes");
+        assert_eq!(all_entries(&back), all_entries(&edits));
+        assert_eq!(back.len(), 4);
+    }
+
+    /// Identical overlays encode to identical bytes, whatever order the edits
+    /// were made in — hash-map iteration order must not leak into the file.
+    #[test]
+    fn edits_encode_deterministically() {
+        let mut a = EditedColumns::new(WorldShape::DEFAULT);
+        let mut b = EditedColumns::new(WorldShape::DEFAULT);
+        let cols = [(9, 1, 5), (-4, 2, 6), (300, -70, 7), (0, 0, 8)];
+        for &(x, z, h) in &cols {
+            a.record(x, z, h);
+        }
+        for &(x, z, h) in cols.iter().rev() {
+            b.record(x, z, h);
+        }
+        assert_eq!(a.serialize(), b.serialize());
+    }
+
+    #[test]
+    fn an_empty_overlay_roundtrips() {
+        let empty = EditedColumns::new(WorldShape::DEFAULT);
+        let back =
+            EditedColumns::deserialize(&empty.serialize(), WorldShape::DEFAULT).expect("decodes");
+        assert!(back.is_empty());
+    }
+
+    /// The seam, through the save: an edit decoded from disk must reach a node
+    /// on another lap of the world, exactly as a live one does.
+    #[test]
+    fn a_saved_edit_reaches_every_lap() {
+        let cells = CHUNK_SIZE as i64;
+        let shape = WorldShape::DEFAULT;
+        let mut edits = EditedColumns::new(shape);
+        edits.record(5, 5, -10);
+        let back = EditedColumns::deserialize(&edits.serialize(), shape).expect("decodes");
+        let mut heights = vec![40i32; (cells * cells) as usize];
+        // Stride 1: cell (5, 5) of a node one full world width east.
+        back.apply_to_node(&mut heights, shape.size_x(), 0, 1, -128);
+        assert_eq!(heights[(5 * cells + 5) as usize], -10);
+    }
+
+    #[test]
+    fn edits_reject_corruption() {
+        let good = sample_edits().serialize();
+        let decode = |b: &[u8]| EditedColumns::deserialize(b, WorldShape::DEFAULT);
+
+        assert_eq!(decode(&good[..3]).unwrap_err(), EditsDecodeError::Truncated);
+
+        let mut bad = good.clone();
+        bad[0] = b'X';
+        assert_eq!(decode(&bad).unwrap_err(), EditsDecodeError::BadMagic);
+
+        let mut bad = good.clone();
+        bad[4] = 99;
+        assert_eq!(
+            decode(&bad).unwrap_err(),
+            EditsDecodeError::UnsupportedVersion(99)
+        );
+
+        assert_eq!(
+            decode(&good[..good.len() - 1]).unwrap_err(),
+            EditsDecodeError::Truncated
+        );
+
+        let mut bad = good.clone();
+        bad.push(0);
+        assert_eq!(decode(&bad).unwrap_err(), EditsDecodeError::TrailingBytes);
+
+        // A count so large it would overflow the length arithmetic.
+        let mut bad = good.clone();
+        bad[5..13].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(decode(&bad).unwrap_err(), EditsDecodeError::Truncated);
+    }
+
+    #[test]
+    fn edits_reject_unordered_or_repeated_entries() {
+        let mut edits = EditedColumns::new(WorldShape::DEFAULT);
+        edits.record(1, 1, 5);
+        edits.record(2, 2, 6);
+        let mut bytes = edits.serialize();
+        let first = EDITS_HEADER_LEN..EDITS_HEADER_LEN + EDITS_ENTRY_LEN;
+        let second = EDITS_HEADER_LEN + EDITS_ENTRY_LEN..EDITS_HEADER_LEN + 2 * EDITS_ENTRY_LEN;
+        let (a, b) = (
+            bytes[first.clone()].to_vec(),
+            bytes[second.clone()].to_vec(),
+        );
+        bytes[first.clone()].copy_from_slice(&b);
+        bytes[second.clone()].copy_from_slice(&a);
+        assert_eq!(
+            EditedColumns::deserialize(&bytes, WorldShape::DEFAULT).unwrap_err(),
+            EditsDecodeError::Unordered
+        );
+        // Repeated: the first entry twice.
+        bytes[second].copy_from_slice(&a);
+        bytes[first].copy_from_slice(&a);
+        assert_eq!(
+            EditedColumns::deserialize(&bytes, WorldShape::DEFAULT).unwrap_err(),
+            EditsDecodeError::Unordered
+        );
+    }
+
+    /// An overlay from a larger world has columns outside this one. Accepting
+    /// them would fold each edit onto the wrong column across the seam.
+    #[test]
+    fn edits_from_a_larger_world_are_refused() {
+        let small = WorldShape::DEFAULT;
+        let big = WorldShape::new(small.size_x() * 2, small.size_z()).expect("legal size");
+        let mut edits = EditedColumns::new(big);
+        let x = small.size_x() + 10;
+        edits.record(x, 3, 1);
+        assert_eq!(
+            EditedColumns::deserialize(&edits.serialize(), small).unwrap_err(),
+            EditsDecodeError::NotCanonical { x, z: 3 }
+        );
     }
 }

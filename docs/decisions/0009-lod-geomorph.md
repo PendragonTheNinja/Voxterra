@@ -19,11 +19,16 @@
 ## The enabling property
 
 The strides nest 2:1 and every level takes the **minimum** real surface over
-its cell (`lod_heightfield_never_exceeds_real_terrain`). Minimum is
+its cell (`exact_lod_heightfield_never_exceeds_real_terrain`). Minimum is
 associative, so:
 
 > A level-*N+1* cell's height is exactly the minimum of the four level-*N*
 > cells inside it.
+
+(Amended, M10 A3: levels that cannot reach full-resolution terrain now sample
+sparsely, and between two such levels the coarse cell is *at least* this
+minimum rather than exactly it. See ADR-0008's M10 amendment for the bound and
+its visible cost.)
 
 That is the whole trick. A level-*N* node can compute, locally and with no
 extra sampling, no neighbour data and no second generation pass, precisely

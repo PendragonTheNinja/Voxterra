@@ -212,6 +212,38 @@ impl Streamer {
         }
     }
 
+    /// Change the radii and margins, KEEPING the resident set.
+    ///
+    /// A view-settings change must go through this, never through a new
+    /// streamer. A fresh one knows nothing is resident while the world still
+    /// holds every chunk, so it re-requests them all: each is regenerated or
+    /// reloaded from disk and replaces the one in memory — discarding any
+    /// edit not yet saved — and a shrunken radius never unloads the chunks
+    /// the new one no longer wants, because it never loaded them.
+    ///
+    /// Kept, the next [`update`](Streamer::update) diffs the new window
+    /// against what is really resident: it unloads what no longer fits and
+    /// loads only what is new. Same panics as
+    /// [`surface_following`](Streamer::surface_following).
+    pub fn reconfigure(
+        &mut self,
+        load_radius: i64,
+        unload_radius: i64,
+        below_chunks: i64,
+        above_chunks: i64,
+        camera_chunks: i64,
+    ) {
+        let loaded = std::mem::take(&mut self.loaded);
+        *self = Self::surface_following(
+            load_radius,
+            unload_radius,
+            below_chunks,
+            above_chunks,
+            camera_chunks,
+        );
+        self.loaded = loaded;
+    }
+
     /// Chunk layers kept below and above each column's surface span.
     pub fn vertical_margins(&self) -> (i64, i64) {
         (self.below_chunks, self.above_chunks)
@@ -793,6 +825,58 @@ mod tests {
                 b.to_unload.is_empty(),
                 "oscillating camera unloaded chunks: {:?}",
                 b.to_unload
+            );
+        }
+    }
+
+    // ---- View-settings changes keep the resident set ----
+
+    /// THE bug: applying view settings built a fresh streamer, which
+    /// re-requested every resident chunk — each came back regenerated or
+    /// reloaded from disk and replaced the one in memory, losing unsaved
+    /// edits. Reconfiguring to the SAME settings must request nothing.
+    #[test]
+    fn reconfiguring_does_not_re_request_resident_chunks() {
+        let mut s = Streamer::surface_following(4, 6, 1, 1, 1);
+        let first = s.update(cp(0, 0, 0), flat);
+        s.apply(&first);
+        s.reconfigure(4, 6, 1, 1, 1);
+        let again = s.update(cp(0, 0, 0), flat);
+        assert!(again.is_empty(), "re-requested resident chunks: {again:?}");
+    }
+
+    /// Growing the radius loads only the new ring.
+    #[test]
+    fn a_larger_radius_loads_only_what_is_new() {
+        let mut s = Streamer::surface_following(3, 5, 1, 1, 1);
+        let first = s.update(cp(0, 0, 0), flat);
+        s.apply(&first);
+        let before: HashSet<ChunkPos> = s.loaded().collect();
+        s.reconfigure(6, 8, 1, 1, 1);
+        let grow = s.update(cp(0, 0, 0), flat);
+        assert!(grow.to_unload.is_empty());
+        assert!(!grow.to_load.is_empty());
+        for p in &grow.to_load {
+            assert!(!before.contains(p), "re-requested resident {p:?}");
+        }
+    }
+
+    /// Shrinking the radius unloads what the new window no longer wants. A
+    /// fresh streamer never did: it had not loaded those chunks, so it never
+    /// released them.
+    #[test]
+    fn a_smaller_radius_unloads_the_excess() {
+        let mut s = Streamer::surface_following(8, 10, 1, 1, 1);
+        let first = s.update(cp(0, 0, 0), flat);
+        s.apply(&first);
+        s.reconfigure(3, 5, 1, 1, 1);
+        let shrink = s.update(cp(0, 0, 0), flat);
+        assert!(shrink.to_load.is_empty());
+        s.apply(&shrink);
+        for p in s.loaded() {
+            assert!(
+                horiz_dist_sq(p, cp(0, 0, 0)) <= 25,
+                "{p:?} still resident beyond the new unload radius"
             );
         }
     }

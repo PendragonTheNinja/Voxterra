@@ -6,6 +6,7 @@
 pub mod block;
 pub mod chunk;
 pub mod coords;
+pub mod heightmap;
 pub mod light;
 pub mod lod;
 pub mod planet;
@@ -20,6 +21,7 @@ pub mod world;
 pub use block::BlockId;
 pub use chunk::{CHUNK_FORMAT_VERSION, Chunk, ChunkDecodeError};
 pub use coords::{CHUNK_BITS, CHUNK_SIZE, CHUNK_VOLUME, ChunkPos, LocalPos, WorldPos};
+pub use heightmap::ColumnHeights;
 pub use light::{
     ColumnMap, LightVolume, MAX_LIGHT, NeighborLight, NeighborSky, apply_chunk_light,
     chunk_column_heights, chunk_column_occludes, chunk_light_plane, chunk_sky_plane, column_index,
@@ -27,7 +29,9 @@ pub use light::{
     propagate_block_light, propagate_sky_light, relight_chunk, relight_chunk_2ch,
     remove_block_light,
 };
-pub use lod::{EditedColumns, LodLevel, LodNodeId, LodRing, LodUpdate};
+pub use lod::{
+    EDITS_FORMAT_VERSION, EditedColumns, EditsDecodeError, LodLevel, LodNodeId, LodRing, LodUpdate,
+};
 pub use planet::{
     DEFAULT_WORLD_SIZE_BLOCKS, MAX_WORLD_SIZE_BLOCKS, MIN_WORLD_SIZE_BLOCKS, SEA_LEVEL_BLOCKS,
     WORLD_SIZE_QUANTUM_BLOCKS, WORLD_Y_MAX_BLOCKS, WORLD_Y_MIN_BLOCKS, WorldShape, WorldShapeError,
