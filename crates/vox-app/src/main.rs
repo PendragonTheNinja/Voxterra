@@ -306,7 +306,9 @@ fn relight_chunks_parallel(
 
 /// `jobs` pairs each chunk with its SEALED faces: a bit per entry of
 /// `NEIGHBOR_OFFSETS`, set where that face neighbour is absent and never
-/// coming (M10 A3), so the mesher emits no face into the void there. The
+/// coming (M10 A3). The mesher continues the chunk's own edge there: no face
+/// into the void, and edge light and AO match the interior instead of fading
+/// toward an unlit nothing (the dark line around the loaded disc). The
 /// judgement needs the streamer, so the caller makes it on the main thread;
 /// the workers only read it.
 fn mesh_chunks_parallel(
@@ -1470,9 +1472,9 @@ impl App {
     ///
     /// The streamer's own load set — a cylinder horizontally, the surface
     /// window plus the camera window vertically. The first-mesh gate (don't
-    /// wait on it if not) and face sealing (no faces toward it if not) both
-    /// ask exactly this, so both ask here: two independent answers drifting
-    /// apart is how a gate deadlocks or a face opens onto the void.
+    /// wait on it if not) and sealing (mesh the chunk's edge as continuing if
+    /// not) both ask exactly this, so both ask here: two independent answers
+    /// drifting apart is how a gate deadlocks or an edge opens onto the void.
     fn neighbor_coming(&self, n: ChunkPos, camera_chunk: ChunkPos) -> bool {
         self.streamer
             .wants(n, camera_chunk, self.surface_span_chunks(n.x, n.z))
@@ -1485,8 +1487,8 @@ impl App {
     /// residency re-meshes this chunk (arrival and unload both dirty their
     /// neighbours), so a seal never outlives the absence it describes. The one
     /// gap: a neighbour that was coming and stops being so without ever
-    /// loading (the camera left first) keeps its open face until something
-    /// else re-meshes the chunk — the pre-A3 behaviour, and harmless.
+    /// loading (the camera left first) keeps its open, dimmed edge until
+    /// something else re-meshes the chunk — the pre-A3 behaviour, and rare.
     fn sealed_faces(&self, p: ChunkPos, camera_chunk: ChunkPos) -> u8 {
         let mut sealed = 0u8;
         for (bit, (dx, dy, dz)) in NEIGHBOR_OFFSETS.iter().enumerate() {

@@ -342,24 +342,37 @@ the remote matches it, and starts at the first unchecked item.*
   change radius or LOD levels and watch `dirty`/`relight` stay near zero
   instead of jumping to ~2 000.
 
-- [x] **A3 — LOD grid lines: skirts losing the depth test; fixed with
-  reversed-Z (ADR-0013).** Diagnosed from the code, then confirmed by the
-  owner with the new `K` debug toggle (LOD rebuilt without skirts): the lines
-  vanished, and sky showed through wherever a terrace step crossed a node
-  border — the gap skirts exist to cover. A skirt's top edge lies on the seam
-  between two nodes' top faces, and standard-Z `Depth32Float` resolved only
-  ~2.7 blocks of depth at 2 km and ~20 at 4 km, so skirts tied with the
-  neighbouring surface. Depth is now reversed-Z (~0.0001–0.0003 blocks out to
-  8 km): `vox_render::perspective`, clear 0, `Greater`/`GreaterEqual`; the LOD
-  bias flips sign; the sky reads near at depth 1; the frustum culler's depth
-  planes now match wgpu's 0..w range (the old OpenGL form would have lost the
-  far plane). `K` stays as a debug tool. Ruled out along the way: shallow
-  skirts (slits on steep ground, not lines) and level-boundary morph mismatch
-  (squares, not a grid); nodes of one level are watertight (integer
-  positions). Committed with this checklist update; to confirm in play: the
-  lines are gone with skirts on, the sky looks as before in every direction,
-  and full-res still wins where it overlaps LOD near the edge of the loaded
-  area.
+- [x] **A3 — LOD grid lines: the slope-scaled LOD depth bias; plus reversed-Z
+  depth (ADR-0013).** Diagnosed with the new `K` debug toggle (LOD rebuilt
+  without skirts): the lines vanished, and sky showed through wherever a
+  terrace step crossed a node border — the gap skirts exist to cover. First
+  attributed to depth precision; reversed-Z was adopted and the lines stayed,
+  which ruled that out. The cause was the LOD pipeline's slope-scaled bias: a
+  grazing top face was pushed back ~1 pixel of depth, the skirt hidden behind
+  it barely at all, so the skirt's top row showed along every node border.
+  Slope term now 0; the constant term alone separates LOD from the coplanar
+  full-res surfaces. Reversed-Z is kept on its own evidence: standard-Z
+  resolved ~20 blocks of depth at 4 km, reversed ~0.0002 (ADR-0013 records
+  both, including the wrong first attribution). Also corrected on the way:
+  the frustum culler's depth planes now match wgpu's 0..w range; the sky reads
+  near at depth 1. Ruled out: shallow skirts (slits on steep ground, not
+  lines), level-boundary morph mismatch (squares, not a grid), gaps between
+  nodes (integer positions). Committed with this checklist update; to confirm
+  in play: the lines are gone with skirts on, and full-res still wins, without
+  flicker, where it overlaps LOD near the edge of the loaded area.
+
+- [x] **Fix, found in play: the dark jagged line around the loaded disc.**
+  Every chunk on the rim of full resolution drew its edge row dark, tracing
+  the chunk staircase across even flat ground. A face's smooth light and AO
+  average the cells beyond it, and an absent neighbour's shell read as air
+  with light 0, so edge vertices sat at half light. A sealed neighbour (absent
+  and never coming) is now meshed as the chunk's own edge continued outward:
+  its shell copies the nearest cell of the chunk, blocks and light alike. That
+  also closes every face toward it — the cell across a face is a copy of the
+  cell itself — so the separate face-sealing rule is gone. Committed with this
+  checklist update; to confirm in play: no dark line where full-res meets LOD
+  on flat ground. Any line left there is the real height step, or the look of
+  LOD against full-res — a separate question.
 
 ### Remaining, in order
 

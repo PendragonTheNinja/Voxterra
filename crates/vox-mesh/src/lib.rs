@@ -132,8 +132,8 @@ impl LodMeshData {
 /// Read-only views of a chunk's six face-neighbors, used for cross-chunk
 /// face culling. A `None` neighbor (unloaded / nonexistent chunk) is
 /// treated as air, so faces on the edge of the loaded world are emitted —
-/// unless the caller marks it SEALED (M10 A3): absent and never coming, so a
-/// face toward it would be geometry into the void. See
+/// unless the caller marks it SEALED (M10 A3): absent and never coming, and
+/// meshed as the chunk's own edge continued outward. See
 /// [`ChunkNeighbors::with_sealed`].
 ///
 /// This type — rather than `&World` — is the mesher input so that meshing
@@ -149,8 +149,9 @@ impl LodMeshData {
 pub struct ChunkNeighbors<'a> {
     /// Indexed by `neighbor_slot(dx,dy,dz)`; `None` = unloaded/absent (air).
     slots: [Option<&'a Chunk>; 27],
-    /// Same indexing. `true` on an absent FACE slot = never coming: faces
-    /// toward it are not emitted. Ignored where the slot holds a chunk.
+    /// Same indexing. `true` on an absent FACE slot = never coming: the shell
+    /// there continues the chunk's own edge. Ignored where the slot holds a
+    /// chunk.
     sealed: [bool; 27],
 }
 
@@ -208,22 +209,24 @@ impl<'a> ChunkNeighbors<'a> {
     }
 
     /// Mark the FACE neighbour at `(dx,dy,dz)` as sealed: absent and never
-    /// coming, so no face is emitted toward it (M10 A3).
+    /// coming (M10 A3). The mesher treats it as **the chunk's own edge
+    /// continued outward**: each shell cell on that side copies the nearest
+    /// cell of the chunk — block, sky light and block light alike.
     ///
-    /// Without this an absent neighbour reads as air and every column's lowest
-    /// loaded chunk draws a floor into the void beneath it — invisible from
-    /// above, plainly visible from underground. Whether a neighbour is coming
-    /// is a streaming question the mesher cannot answer, so the caller decides.
+    /// Both halves of that matter. As plain air with no light, an absent
+    /// neighbour (a) drew a floor into the void under every column's lowest
+    /// loaded chunk, plainly visible from underground, and (b) dragged the
+    /// smooth light and AO of every face on the chunk's edge toward zero, so
+    /// the rim of the loaded disc drew as a dark jagged line — the chunk
+    /// staircase — right across flat ground. Continuing the edge fixes both at
+    /// once: the shell cell across any face is a copy of the cell itself, so
+    /// no face toward the seal is ever open, and edge vertices average the
+    /// same light and occlusion as interior ones.
     ///
-    /// Sealing changes face emission ONLY. Smooth light and AO still read the
-    /// sealed shell as air with no light, exactly as an unsealed absent
-    /// neighbour: treating it as solid there would darken the edges of faces
-    /// that ARE drawn — every terrain top along the edge of the loaded disc.
-    ///
-    /// A present chunk in the slot takes precedence; the flag is then ignored.
-    /// Only the six face offsets can be sealed: a face's neighbour cell always
-    /// lies in a face-adjacent chunk, so an edge or corner flag would mean
-    /// nothing.
+    /// Whether a neighbour is coming is a streaming question the mesher cannot
+    /// answer, so the caller decides. A present chunk in the slot takes
+    /// precedence; the flag is then ignored. Only the six face offsets can be
+    /// sealed; edge and corner shell cells follow the faces they lie beyond.
     pub fn with_sealed(mut self, dx: i64, dy: i64, dz: i64) -> Self {
         assert!(
             dx.abs() + dy.abs() + dz.abs() == 1,
@@ -275,10 +278,6 @@ pub struct MeshInput {
     sky: Vec<u8>,
     /// 34³ block light levels (0..=15); shell defaults to 0.
     block_light: Vec<u8>,
-    /// Per neighbour slot: absent AND sealed (never coming). Consulted only by
-    /// face emission ([`MeshInput::face_open`]); the shell cells themselves
-    /// stay air, so light and AO are unaffected.
-    sealed: [bool; 27],
     all_air: bool,
 }
 
@@ -300,32 +299,6 @@ impl MeshInput {
     #[inline]
     pub fn is_air(&self, x: i32, y: i32, z: i32) -> bool {
         self.block[Self::cidx(x, y, z)].is_air()
-    }
-
-    /// Does a solid cell show its face toward the cell at chunk-relative
-    /// `(x,y,z)`? Yes when that cell is air — unless it lies in a sealed
-    /// neighbour, whose air is not real space but the edge of what will ever
-    /// load. The ONE face-visibility rule; both meshers must use it, or the
-    /// greedy/naive differential test catches the drift.
-    #[inline]
-    pub fn face_open(&self, x: i32, y: i32, z: i32) -> bool {
-        self.is_air(x, y, z) && !self.in_sealed_neighbor(x, y, z)
-    }
-
-    /// Is the chunk-relative cell in the shell of a sealed neighbour?
-    #[inline]
-    fn in_sealed_neighbor(&self, x: i32, y: i32, z: i32) -> bool {
-        let off = |c: i32| -> i64 {
-            if c < 0 {
-                -1
-            } else if c >= CHUNK_SIZE as i32 {
-                1
-            } else {
-                0
-            }
-        };
-        let (dx, dy, dz) = (off(x), off(y), off(z));
-        (dx, dy, dz) != (0, 0, 0) && self.sealed[neighbor_slot(dx, dy, dz)]
     }
 
     /// Block id at chunk-relative coords.
@@ -419,15 +392,60 @@ impl MeshInput {
             }
         }
 
-        // A present chunk overrides a seal: the flag only describes absence.
-        let sealed: [bool; 27] =
-            std::array::from_fn(|slot| neighbors.sealed[slot] && neighbors.slots[slot].is_none());
+        // Sealed neighbours: continue the chunk's own edge outward (see
+        // `ChunkNeighbors::with_sealed`). Each shell cell in an ABSENT slot
+        // with a sealed axis copies the cell reached by clamping its sealed
+        // axes back into the chunk. That source never has a sealed axis
+        // itself, so nothing this pass writes is read by it again, and the
+        // order of the walk does not matter.
+        if neighbors.sealed.iter().any(|&s| s) {
+            let off = |c: i32| -> i64 {
+                if c < 0 {
+                    -1
+                } else if c >= sz {
+                    1
+                } else {
+                    0
+                }
+            };
+            for z in -1..=sz {
+                for y in -1..=sz {
+                    for x in -1..=sz {
+                        let (dx, dy, dz) = (off(x), off(y), off(z));
+                        if (dx, dy, dz) == (0, 0, 0)
+                            || neighbors.slots[neighbor_slot(dx, dy, dz)].is_some()
+                        {
+                            continue; // interior, or a present neighbour's real cells
+                        }
+                        let sealed_axis = |d: i64, slot: usize| d != 0 && neighbors.sealed[slot];
+                        let clamp_if = |c: i32, d: i64, slot: usize| {
+                            if sealed_axis(d, slot) {
+                                c.clamp(0, sz - 1)
+                            } else {
+                                c
+                            }
+                        };
+                        let from = (
+                            clamp_if(x, dx, neighbor_slot(dx, 0, 0)),
+                            clamp_if(y, dy, neighbor_slot(0, dy, 0)),
+                            clamp_if(z, dz, neighbor_slot(0, 0, dz)),
+                        );
+                        if from == (x, y, z) {
+                            continue; // no sealed axis: stays air, light 0
+                        }
+                        let (src, dst) = (Self::cidx(from.0, from.1, from.2), Self::cidx(x, y, z));
+                        block[dst] = block[src];
+                        sky[dst] = sky[src];
+                        block_light[dst] = block_light[src];
+                    }
+                }
+            }
+        }
 
         Self {
             block,
             sky,
             block_light,
-            sealed,
             all_air: chunk.is_all_air(),
         }
     }
@@ -749,7 +767,7 @@ pub fn mesh_chunk_naive(
         for (face_index, &(axis, positive, u_axis, v_axis)) in FACE_DIRS.iter().enumerate() {
             let mut neighbor = coords;
             neighbor[axis] += if positive { 1 } else { -1 };
-            if !input.face_open(neighbor[0], neighbor[1], neighbor[2]) {
+            if !input.is_air(neighbor[0], neighbor[1], neighbor[2]) {
                 continue;
             }
 
@@ -864,7 +882,7 @@ pub fn mesh_chunk(
 
                     let mut n = coords;
                     n[axis] += if positive { 1 } else { -1 };
-                    if input.face_open(n[0], n[1], n[2]) {
+                    if input.is_air(n[0], n[1], n[2]) {
                         let (sky15, block15) =
                             corner_lights_2ch(&input, coords, axis, positive, u_axis, v_axis);
                         let ao = corner_ao(&input, coords, axis, positive, u_axis, v_axis);
@@ -1115,13 +1133,72 @@ mod tests {
         assert_eq!(mesh.quad_count(), 6 * N * N);
     }
 
-    /// Sealing removes faces and changes NOTHING else. Light and AO near the
-    /// seal must match the unsealed mesh exactly, or every terrain top along a
-    /// sealed edge — the whole rim of the loaded disc — gains a dark seam.
+    /// A floor at y = 10 across the whole chunk, with full sky light above.
+    fn floor_with_sky() -> Chunk {
+        let mut chunk = Chunk::new_air();
+        for z in 0..N as u8 {
+            for x in 0..N as u8 {
+                chunk.set(LocalPos::new(x, 10, z), STONE);
+                for y in 11..N as u8 {
+                    chunk.set_sky_light(LocalPos::new(x, y, z), 15);
+                }
+            }
+        }
+        chunk
+    }
+
+    /// THE bug: the rim of the loaded disc drew as a dark jagged line across
+    /// flat ground. An edge face's smooth light averaged in the absent
+    /// neighbour's shell as light 0. Sealed, the shell continues the chunk,
+    /// so a top face on the edge is lit exactly like one in the middle.
     #[test]
-    fn sealing_only_removes_faces_toward_the_seal() {
-        // A floor with a step on it, touching the -X edge, so +Y faces and
-        // their AO/light samples reach into the sealed shell.
+    fn a_sealed_edge_is_lit_like_the_interior() {
+        let chunk = floor_with_sky();
+        let interior = MeshInput::build(&chunk, &ChunkNeighbors::NONE);
+        let (mid, _) = corner_lights_2ch(&interior, [15, 10, 15], 1, true, 2, 0);
+        assert_eq!(mid, [15.0; 4], "setup: interior top face is fully lit");
+
+        // Unsealed, the east edge is dragged dark — the reported line.
+        let (dark, _) = corner_lights_2ch(&interior, [31, 10, 15], 1, true, 2, 0);
+        assert!(
+            dark.iter().any(|&c| c < 15.0),
+            "setup: an unsealed edge should darken, got {dark:?}"
+        );
+
+        let sealed = MeshInput::build(&chunk, &ChunkNeighbors::NONE.with_sealed(1, 0, 0));
+        let (edge, _) = corner_lights_2ch(&sealed, [31, 10, 15], 1, true, 2, 0);
+        assert_eq!(edge, mid, "a sealed edge must be lit like the interior");
+        // The corner cell, which is also beyond a sealed face along Z.
+        let corner = MeshInput::build(
+            &chunk,
+            &ChunkNeighbors::NONE
+                .with_sealed(1, 0, 0)
+                .with_sealed(0, 0, 1),
+        );
+        let (c, _) = corner_lights_2ch(&corner, [31, 10, 31], 1, true, 2, 0);
+        assert_eq!(c, mid, "a sealed corner must be lit like the interior");
+    }
+
+    /// Occlusion continues too: an edge corner sees the same occluders it
+    /// would if the chunk carried on, not open air.
+    #[test]
+    fn a_sealed_edge_is_occluded_like_the_interior() {
+        let mut chunk = floor_with_sky();
+        // A wall along the whole east edge at y = 11: a top face beside it
+        // is occluded on that side, in the middle of the chunk and at its edge.
+        for z in 0..N as u8 {
+            chunk.set(LocalPos::new(31, 11, z), STONE);
+        }
+        let sealed = MeshInput::build(&chunk, &ChunkNeighbors::NONE.with_sealed(0, 0, 1));
+        let mid = corner_ao(&sealed, [30, 10, 15], 1, true, 2, 0);
+        let edge = corner_ao(&sealed, [30, 10, 31], 1, true, 2, 0);
+        assert_eq!(edge, mid, "the wall's occlusion stopped at the sealed edge");
+    }
+
+    /// Continuing the edge closes every face toward the seal — the cell
+    /// across a face is a copy of the cell itself — and only those faces.
+    #[test]
+    fn sealing_removes_exactly_the_faces_toward_the_seal() {
         let mut chunk = Chunk::new_air();
         for z in 0..N as u8 {
             for x in 0..N as u8 {
@@ -1130,25 +1207,10 @@ mod tests {
             chunk.set(LocalPos::new(0, 1, z), STONE);
             chunk.set(LocalPos::new(1, 1, z), STONE);
         }
-        let quads = |m: &MeshData| -> Vec<String> {
-            m.indices
-                .chunks_exact(6)
-                .map(|q| {
-                    let b = q[0] as usize;
-                    format!("{:?}", &m.vertices[b..b + 4])
-                })
-                .collect()
-        };
         let open = mesh_chunk_naive(&chunk, &ChunkNeighbors::NONE, WHITE);
         let sealed_mesh =
             mesh_chunk_naive(&chunk, &ChunkNeighbors::NONE.with_sealed(-1, 0, 0), WHITE);
-        let open_q = quads(&open);
-        let sealed_q = quads(&sealed_mesh);
-        for q in &sealed_q {
-            assert!(open_q.contains(q), "sealing altered a kept face: {q}");
-        }
-        // What was removed: exactly the -X faces on the x = 0 plane, one per
-        // cell of the floor edge and one per cell of the step.
+        // One -X face per cell of the floor edge and one per cell of the step.
         assert_eq!(open.quad_count() - sealed_mesh.quad_count(), 2 * N);
         let on_seal = |m: &MeshData| {
             m.indices.chunks_exact(6).any(|q| {

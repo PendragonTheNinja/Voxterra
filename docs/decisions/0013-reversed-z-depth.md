@@ -7,17 +7,13 @@
 
 ## Context
 
-Distant terrain carried a regular grid of faint lines. The owner confirmed with
-the `L` toggle that they belong to LOD, and with the `K` debug toggle (LOD built
-without border skirts) that they are the skirts: with skirts off the lines
-vanished and sky showed through wherever a terrace step crossed a node border,
-which is the gap the skirts exist to cover.
+This came out of diagnosing the faint grid lines across distant LOD terrain,
+and it was first adopted as their fix. **It was not their fix** — see "What the
+lines actually were" below. It stands on its own evidence.
 
-A skirt's top edge lies exactly on the seam between two nodes' top faces, so
-every skirt pixel near that edge competes in depth with the neighbour's top
-face. The depth buffer was standard-Z `Depth32Float` (near 0, far 1, near plane
-0.1). Standard-Z maps distant depths into a sliver just below 1.0, where a float
-has its coarsest spacing. Measured with the engine's own projection:
+The depth buffer was standard-Z `Depth32Float` (near 0, far 1, near plane 0.1).
+Standard-Z maps distant depths into a sliver just below 1.0, where a float has
+its coarsest spacing. Measured with the engine's own projection:
 
 | distance | standard-Z resolves | reversed-Z resolves |
 |---|---|---|
@@ -25,9 +21,9 @@ has its coarsest spacing. Measured with the engine's own projection:
 | 2 km | 2.7 blocks | 0.0001 blocks |
 | 4 km | ~20 blocks | 0.0002 blocks |
 
-At those resolutions a skirt ties with the surface beside it and wins about half
-the time. The LOD depth bias could not help: it shifts all LOD geometry equally,
-so it separates LOD from full resolution, never LOD from LOD.
+Twenty blocks of depth ambiguity at 4 km is unusable for M11's multi-kilometre
+horizon: any two surfaces that close in depth at that range — a ridge and the
+slope behind it, a node and its neighbour — resolve by draw order.
 
 ## Decision
 
@@ -43,9 +39,9 @@ The convention lives in one place in `vox-render`: `perspective()` (glam's
 
 Everything else that encoded the old convention changed with it:
 
-- **LOD depth bias** flips sign (`-16`, slope `-1.0`). Under reversed-Z a
-  float buffer's constant bias scales with the depth's own exponent, so 16
-  units is a push of ~2e-6 of the distance. That suffices: LOD never rises
+- **LOD depth bias** flips sign (`-16`) and loses its slope term (see below).
+  Under reversed-Z a float buffer's constant bias scales with the depth's own
+  exponent, so 16 units is a push of ~2e-6 of the distance. That suffices: LOD never rises
   above real terrain (ADR-0008), so the only contest is an exact tie where the
   surfaces coincide. Under standard-Z the same 16 pushed ~0.6 blocks at the
   full-resolution edge.
@@ -57,10 +53,29 @@ Everything else that encoded the old convention changed with it:
   under reversed-Z it drops the far plane entirely. It now uses `z >= 0` and
   `z <= w`, correct for either direction.
 
+## What the lines actually were
+
+The owner confirmed with `L` that the lines belong to LOD, and with the `K`
+debug toggle (LOD rebuilt without border skirts) that they are the skirts: with
+skirts off they vanished, and sky showed through wherever a terrace step crossed
+a node border — the gap skirts exist to cover. A skirt lies hidden behind its
+neighbour's top face, sharing its top edge with the seam, so a depth tie there
+seemed the obvious cause. Reversed-Z removed any possible tie; the lines stayed.
+
+The cause was the LOD pipeline's **slope-scaled** depth bias. It pushes each
+triangle back by its own screen-space depth slope. A top face seen at a grazing
+angle has a steep slope and was pushed back about one pixel's worth of depth; a
+skirt facing the camera has almost none and barely moved. Along every node
+border that brought the top face level with the skirt behind it, and the
+skirt's top pixel row showed through. Interior walls never showed it because
+they are never hidden — they end exactly at their neighbour's height. The slope
+term is now 0: the surfaces the bias separates from full resolution are coplanar
+with it, where the constant term is exact. The depth format was never involved,
+which is why changing it changed nothing.
+
 ## Consequences
 
-- The skirt lines are gone without touching the skirts, which still cover the
-  slits `K` exposed.
+- The skirts stay; they still cover the slits `K` exposed.
 - M11's horizon (multi-kilometre view) inherits usable depth precision. Under
   standard-Z it would have been ~80 blocks at 8 km.
 - The far plane stays finite (settings-driven), so the sky's unprojection of

@@ -241,11 +241,12 @@ beyond what the invariants above already require.
   chunks; `f64` world positions with camera-following streaming; no faces
   toward chunks that will never load; `column_heights` pruning; the LOD edit
   overlay saved with the world and the level-0 gather removed; the sparse LOD
-  sampler with its ADR-0008 amendment; the LOD grid lines, fixed with
-  reversed-Z depth, ADR-0013) are done; next is the A3 cleanup.
+  sampler with its ADR-0008 amendment; the LOD grid lines, which were the
+  slope-scaled LOD depth bias, plus reversed-Z depth, ADR-0013; the dark line
+  around the loaded disc) are done; next is the A3 cleanup.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 251, vox-mesh 42, vox-worldgen 27 passing as of the reversed-Z
+  vox-core 251, vox-mesh 44, vox-worldgen 27 passing as of the sealed-edge
   commit; vox-render's 5 tests need wgpu and run natively only), then
   start the first unchecked item.
 - **Roadmap after M10:** 11 — The Horizon

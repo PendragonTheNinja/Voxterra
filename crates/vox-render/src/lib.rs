@@ -566,10 +566,19 @@ impl Renderer {
                 // be: LOD never rises above real terrain, so the only contest
                 // is an exact tie where the two surfaces coincide, and 2e-6 is
                 // ~30x the float noise of computing the same point twice.
-                // (Under standard-Z the same 16 pushed ~0.6 blocks at 256.)
+                //
+                // NO slope-scaled term. It pushes each triangle back by its own
+                // screen-space depth slope, which is not uniform: a top face
+                // seen at a grazing angle is pushed about one pixel's worth of
+                // depth, a skirt facing the camera almost not at all. So along
+                // every node border the top face was pushed level with the
+                // skirt hidden behind it, and the skirt's top pixel row showed
+                // through — a line on every border (M10 A3, the "grid lines").
+                // The surfaces it exists to separate from full-res are
+                // coplanar with it, where the constant term is exact.
                 bias: wgpu::DepthBiasState {
                     constant: -16,
-                    slope_scale: -1.0,
+                    slope_scale: 0.0,
                     clamp: 0.0,
                 },
             }),
