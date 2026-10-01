@@ -190,6 +190,14 @@ The division of labour:
   sprint-flight is 120 m/s, **21× faster**. One minute of flight is twenty-one
   minutes on foot. Every walking-time figure in the docs is ground sprint.
 
+**Cloud sessions (Claude Code on the web, from 2026-10).** The container
+has Rust 1.97 with clippy and rustfmt, and the whole workspace — vox-render and
+vox-app included — compiles, so `cargo test` on the headless crates,
+`cargo clippy --workspace --all-targets -- -D warnings` and
+`cargo fmt --all -- --check` run as they do natively, and the `fixcheck` and
+clippy workarounds below are unnecessary there. Running the game, the GPU and
+every visual check are still Nathan's alone.
+
 **Headless test setup (`fixcheck`).** The sandbox's stock toolchain is older
 than the project's Rust 1.96 / edition 2024, so to run `vox-core`/`vox-mesh`
 tests Claude builds a throwaway `fixcheck/` workspace: copy those two crates,
@@ -243,57 +251,48 @@ mechanics (hunger, temperature), the full LOD octree, real worldgen, and all
 skill systems (mining cave-ins, tree felling). They are on the roadmap; their
 absence is deliberate, not an oversight. Do not add speculative hooks for them
 beyond what the invariants above already require.
+The owner's ideas for all of them, and a proposed order, are recorded in
+`docs/vision.md`; that file is a record of intent, not permission to build.
 
 ## Current status
 
-- **Active milestone:** 10 — Terrain & the Deep Vertical
-  (`docs/milestones/10-terrain-and-deep-vertical.md`). **The exact state and the
-  ordered list of remaining work is in that spec's "Status and remaining work —
-  START HERE" section; begin at its first unchecked item.** As of 2026-09-24:
-  tasks 1–4, A2 (the torus) and three A3 items (LOD suppression waits for drawn
-  chunks; `f64` world positions with camera-following streaming; no faces
-  toward chunks that will never load; `column_heights` pruning; the LOD edit
-  overlay saved with the world and the level-0 gather removed; the sparse LOD
-  sampler with its ADR-0008 amendment; the LOD grid lines, which were the
-  slope-scaled LOD depth bias, plus reversed-Z depth, ADR-0013; the dark line
-  around the loaded disc; the cleanup) are done — A3 is complete. A1 (transparency and water,
-  ADR-0011) is done: the solid/opaque/renders split, then water. Next is M10's
-  tuning and retro.
+- **Active milestone:** 11 — The Horizon
+  (`docs/milestones/11-the-horizon.md`). Not started. Read its "Changes at M10
+  close" section first: reverse-Z is already done (ADR-0013), distant water
+  changed shape (ADR-0011 1c), and **task 0 — find out why relighting doubled
+  in M10 — comes before everything else**. Give the spec a "Status and
+  remaining work — START HERE" checklist as the first task lands.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 265, vox-mesh 53, vox-worldgen 31 passing as of LOD water 1c;
+  vox-core 265, vox-mesh 53, vox-worldgen 31 passing as of M10's close;
   vox-render's 10 tests need wgpu and run natively only), then start the first
   unchecked item.
-- **Roadmap after M10:** 11 — The Horizon
-  (`docs/milestones/11-the-horizon.md`: 32–64 km view via per-level LOD ring
-  centring, Earth-radius curvature, flat-cell merging, reverse-Z depth); then
-  12 — Climate & Biomes (spec not yet written). Climate was originally M11 and
-  was deliberately moved behind the horizon and topology work, which it depends
-  on.
+- **Roadmap after M11:** 12 — Climate & Biomes (spec not yet written). The
+  longer-range order, and the owner's ideas for the whole game, are in
+  `docs/vision.md` — ideas and a proposed order, not decisions; each becomes a
+  milestone spec and ADRs before anything is built.
 - **Numbering:** milestones (`M10`, `M11`…) and ADRs (`ADR-0010`, `ADR-0011`…)
   are separate counters. ADRs number decisions in the order they are made;
   milestones number work in the order it is built. Matching numbers are
   coincidence — ADR-0011 (transparency) belongs to milestone M10.
-- **Last completed milestone:** 09 — LOD Levels & Streaming Quality
-  (2026-08-25); retrospective with numbers at the end of
-  `docs/milestones/09-lod-octree-streaming.md`. Shipped: nearest-camera-first
-  draining of every streaming queue plus a first-light gate (black chunks
-  fixed; relight ~390 ms/s → ~100 ms/s; dirty backlog no longer plateaus at
-  ~2000, now peaks ~410 and drains); multi-level `LodRing` (strides 2/4/8,
-  exact inter-level partition, per-level hysteresis); heightfield LOD
-  (`mesh_lod_heightfield`) replacing voxel-grid nodes; distance fog; an ESC
-  settings menu with live sliders; geomorph (ADR-0009, `LodVertex` +
-  `lod.wgsl`); `EditedColumns` so player edits reach every LOD level; LOD node
-  *retirement* instead of immediate unload; a crosshair. ADR-0009 accepted;
-  ADR-0008's "LOD node = scaled chunk" claim superseded.
-- **Prior milestone:** 08 — Single-Level LOD (2026-07-09);
-  retrospective with numbers at the end of
-  `docs/milestones/08-lod-single-level.md`. Shipped: seed-driven coarse nodes
-  (`generate_lod_node`, round-down classification, baked skylight),
-  `mesh_lod_node` (skirts, scale+UV baking), `vox-core::lod::LodRing`
-  (disjoint partition + hysteresis), depth-biased LOD render path, budgeted
-  async node streaming. Placeholder terrain gained mountains (~[-59, +108]).
-  ADR-0008 accepted.
+- **Last completed milestone:** 10 — Terrain & the Deep Vertical
+  (2026-10-01); retrospective with numbers at the end of
+  `docs/milestones/10-terrain-and-deep-vertical.md`. Shipped: the elevation
+  field tuned to walking time (ADR-0010); surface- and camera-following
+  streaming over a ~20 000-block vertical; the torus with per-world size and
+  generator version in `world.meta` (ADR-0012); transparency and water with
+  LOD seabed under a translucent sea (ADR-0011); `f64` world positions;
+  heightmap pruning; the saved LOD edit overlay; the sparse LOD sampler;
+  reversed-Z (ADR-0013). Criterion 8 **partly met**: backlog peaks 410 and
+  drains as in M09, but sprint-fly median fell ~180 → ~130 fps with relight
+  ~2× M09's — carried into M11 as task 0.
+- **Prior milestone:** 09 — LOD Levels & Streaming Quality (2026-08-25);
+  retrospective at the end of `docs/milestones/09-lod-octree-streaming.md`.
+  Nearest-first streaming queues and the first-light gate; multi-level
+  `LodRing`; heightfield LOD; fog; the ESC settings menu; geomorph (ADR-0009);
+  `EditedColumns`; LOD node retirement.
+- Milestone 08 — Single-Level LOD (2026-07-09); retrospective at the end of
+  `docs/milestones/08-lod-single-level.md`.
 - Milestone 07 — Day/Night Cycle (2026-07-06); retrospective at the end of
   `docs/milestones/07-day-night.md`.
 - Completed milestones have retrospectives in `docs/milestones/`.

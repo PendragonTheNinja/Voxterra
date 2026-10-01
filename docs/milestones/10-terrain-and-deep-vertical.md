@@ -461,12 +461,15 @@ the remote matches it, and starts at the first unchecked item.*
   slivers or pale strip, and the seabed is visible through distant water as
   through near.
 
+- [x] **Tuning and retro.** Criterion-8 numbers at radius 8 from the
+  2026-10-01 logs, against M09's; retrospective appended below; CLAUDE.md
+  status updated. The A3 cleanup's three file deletions had never reached the
+  repository (deleted on disk, never staged) and are made in this commit.
+
 ### Remaining, in order
 
-1. **Tuning and retro.** Criterion-8 numbers at radius 8, on foot and flying,
-   against M09's (stationary 851–967 fps; sprint-fly median ~180). Append the
-   retrospective here, update CLAUDE.md status, then **commit before tagging**
-   `v0.10.0-m10`.
+None. M10 is closed; tag `v0.10.0-m10` from the commit carrying the
+retrospective.
 
 ### Known performance state (2026-09-24 logs)
 
@@ -508,3 +511,134 @@ they produce moved.
   classification and surface materials moved to M12. The vertical range
   decision turned out to require a streaming rework, which is a milestone's
   work on its own, and climate depends on elevation existing first.
+
+# Retrospective (2026-10-01)
+
+## What shipped
+
+**A world with a shape (tasks 1–4, ADR-0010).** Continents, shelves, basins
+and coherent mountain ranges with an explicit relief control, so plains are
+genuinely flat and mountains mean something. The first pass used literal Earth
+relief and was unplayable; the second was tuned from spectator flight and was
+still wrong. The field that shipped is tuned to **ground walking time**, which
+is now a standing rule (CLAUDE.md: judge terrain at ground speed).
+
+**The deep vertical (tasks 2–3).** Streaming follows the surface instead of
+loading a full-height cylinder, so the world's height costs nothing; it also
+follows the camera within a small window (A3), so digging deep or flying high
+keeps the player inside the loaded world without streaming the sky.
+
+**A torus instead of a box (A2, ADR-0012).** Superseded criteria 1–2. Both
+horizontal axes wrap, latitude loops and is equal-area, and world size is a
+per-world value recorded in `world.meta` with the generator version
+(criterion 9). The seam lives only in generation, saves and the edit overlay;
+the player's frame never wraps, so streaming, LOD, rendering and physics have
+no seam code at all.
+
+**Transparency and water (A1, ADR-0011).** `solid` / `opaque` / `renders`
+split, audited site by site; a transparent pass; static oceans to sea level;
+the seabed lit through unloaded water via the heightmap. Distant water ended at
+ADR-0011 decision 1(c): the LOD draws its real seabed under the same
+translucent surface, so near and far water are one surface at two resolutions.
+One set, `fullres_columns`, decides everywhere LOD and full resolution meet.
+
+**The audit (A3).** `f64` world positions; `column_heights` pruned with its
+chunk column (it leaked ~0.26 GB per 10 km flown); the LOD edit overlay saved
+with the world; the sparse LOD sampler (ADR-0008 amendment); LOD suppression
+waiting for chunks to be drawn; sealed neighbours meshed as the chunk's edge
+continued; reversed-Z depth (ADR-0013).
+
+## Criteria
+
+| # | Criterion | Result |
+|---|---|---|
+| 1–2 | Bounded world, spawn resolver | Superseded by A2 (torus); spawn resolver kept |
+| 3 | Latitude axis | Met — loops, equal-area, one query function |
+| 4 | Surface-following streaming | Met, plus the camera window (A3) |
+| 5 | Deep vertical | Met |
+| 6 | Elevation field | Met after two scale corrections (ADR-0010) |
+| 7 | Water | Met via A1 / ADR-0011 |
+| 8 | Performance | **Partly met** — backlog yes, fps no (below) |
+| 9 | Worldgen version stamp | Met, widened to world size (A2) |
+| 10 | Bookkeeping | ADR-0010 to 0013; this retro; CLAUDE.md |
+
+## Numbers (owner's machine, radius 8, 3 LOD levels — the M09 configuration)
+
+| | M09 | M10 |
+|---|---|---|
+| Stationary, drained | 851–967 fps, worst 3.3 ms | **733–817 fps**, worst 1.8–2.8 ms |
+| Walking (survival), settled | — | 782–852 fps |
+| Walking, chunk-boundary second | — | 518–726 fps, worst 14–20 ms, dirty ≤ 295 |
+| Fly over land, normal speed | — | 514–801, median ~640, worst 12–22 ms, dirty ≤ 277 |
+| Fly over ocean, normal speed | — | 316–604, median ~490, worst 14–24 ms, dirty ≤ **440** |
+| **Sprint-fly over land** | median ~180, min 127 | **median ~130, min 98**, worst 16–27 ms |
+| Sprint-fly dirty backlog | 0–410, drains | **0–410**, drains mid-flight and on stopping |
+| Relight (sprint) | 95–130 ms/s | **192–253 ms/s (~2×)** |
+| Mesh (sprint) | 500–590 ms/s | 471–531 ms/s (unchanged) |
+| Settled over ocean | — | 590–653 fps, 0.94 M tris, `loaded` ~2 100 (land ~1 780) |
+
+Changing view settings (the `Streamer::reconfigure` fix, the sparse sampler):
+
+| Setting | Settled fps | GPU | LOD nodes | Switch cost |
+|---|---|---|---|---|
+| 3 levels (2 exact, 1 sparse) | 702–705 | 193 MB | 640 | one second at 614 fps |
+| 4 levels (3 exact, 1 sparse) | 642–674 | 272 MB | 832 | one second at ~470–596 fps |
+| 5 levels (3 exact, 2 sparse) | 453–494 | 726 MB, 2.47 M tris | 2 416 | one second at 366 fps, worst 23 ms |
+
+Before the sparse sampler (2026-09-25), switching to 5 levels fell to 30 fps,
+worst 47 ms, with 1 600 nodes queued; it is now **0 queued** after the switch.
+Every settings change left `dirty`/`relight` at 0, where rebuilding the
+streamer used to put ~2 000 chunks back through the pipeline.
+
+**Criterion 8, honestly.** The backlog half is met: the deep world produces no
+spiral; sprint over land peaks at exactly 410 and drains, as in M09. Ocean runs
+higher (440 at normal speed), and one unlabelled five-second stretch
+(02:13:12–17, `loaded` ~2 000, relight ~300 ms/s, 79–92 fps, dirty 579) is most
+likely sprint flight over water — the owner did not record what it was. The
+fps half is **not met**: stationary ~15% below M09 (about 0.15 ms per frame,
+with worst frames better), sprint-fly median 28% below. The sprint result is
+still above M08's ~92 and M09's own floor of 90.
+
+The cause visible in the telemetry is **relighting at about twice M09's cost**
+while meshing is unchanged. Why is not yet measured. Candidates: the
+sea-surface layer and seabed as separate windows (more chunks and more borders
+per ocean column), the camera window, and border relights now that a sealed
+neighbour's shell copies the chunk's edge. Ocean also holds 15–20% more chunks
+than land. Carried into M11 as its first task — finding out, with a
+measurement, before the horizon work spends the same budget.
+
+- Headless tests at close: vox-core 265, vox-mesh 53, vox-worldgen 31 (run in
+  this session on Rust 1.97, edition 2024, together with clippy `-D warnings`
+  on the whole workspace and `cargo fmt --check`).
+
+## Bugs found in play
+
+Each was found by playing the build; none by a test that existed beforehand.
+
+1. **Applying view settings rebuilt the streamer** — every resident chunk
+   re-requested, unsaved edits overwritten, chunks leaked on shrink.
+2. **The camera window streamed the sky** — ~1 400 empty chunks kept in flight
+   above a spectator; 90 fps with nothing drawn.
+3. **LOD grid lines.** First blamed on depth precision; reversed-Z was adopted
+   and the lines stayed, which ruled it out. The real cause was the
+   slope-scaled LOD depth bias. Reversed-Z was kept on its own evidence
+   (ADR-0013 records the wrong first attribution).
+4. **A dark jagged line around the loaded disc** — an absent neighbour's shell
+   read as air at light 0.
+5. **LOD through the near sea** — overlap that opaque ground had always hidden
+   and translucent water did not; then a pale strip where opaque LOD water had
+   nothing under it.
+
+## Lessons
+
+- **Judge the world at the speed the player moves.** The elevation field was
+  wrong twice because it was judged from the air.
+- **A first attribution is a hypothesis.** The grid lines survived the fix for
+  the cause first named; the fix stayed, because it was right for a different
+  reason, and the record says so.
+- **A checklist is not the repository.** The A3 cleanup was ticked off while
+  its three deletions were never staged; they were found only at close. When a
+  task deletes files, check `git ls-files`, not the working tree.
+- **Every place two renderers meet needs one owner.** Near and far water only
+  stopped disagreeing when a single set decided suppression, discard and the
+  transparent pass together.

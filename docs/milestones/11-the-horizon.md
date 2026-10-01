@@ -9,6 +9,29 @@ Depends on M10 (the torus, `f64` world positions, and the sparse LOD sampler).
 Climate & Biomes (M12) comes after, and benefits: a biome you can see from
 30 km away is a destination.
 
+## Changes at M10 close (2026-10-01)
+
+This spec was written before M10 finished, and M10 took on part of it:
+
+- **Criterion 8 (reverse-Z) is done** — ADR-0013, in M10. What remains is to
+  confirm it holds at 32 and 64 km.
+- **Criterion 7 (distant water) changed shape.** ADR-0011 decision 1 moved to
+  (c): LOD draws its real seabed and a translucent sea surface, not a flat
+  opaque top. Flat-cell merging (criterion 6) still applies to the sea surface;
+  the seabed under it merges by its own heights.
+- **New task 0 — why relighting doubled.** M10 closed with criterion 8 partly
+  met: sprint-fly median ~130 fps against M09's ~180, with relight at
+  192–253 ms/s against M09's 95–130 and meshing unchanged (M10 retrospective).
+  Before the horizon spends the same budget, measure whether each relight got
+  slower or more relights happen per chunk (per-chunk timing at the
+  `v0.9.0-m09` tag against now; relights per loaded chunk in telemetry), and fix
+  what the measurement names. Optimize from measurements, not vibes.
+- **Criterion 9 (atmosphere) is wavelength-dependent.** Distant terrain should
+  turn blue-violet with distance, as real mountains do through air, not fade to
+  white: per-channel extinction (blue scattered most) with in-scattering toward
+  the sky colour. The owner raised this independently on 2026-10-01; see
+  `docs/vision.md`.
+
 ## Why this milestone exists
 
 Measured in the September 2026 audit: from random points on land, how often is a
