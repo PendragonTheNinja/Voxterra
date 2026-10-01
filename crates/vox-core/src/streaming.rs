@@ -232,6 +232,10 @@ pub struct Streamer {
     /// Camera chunk used for the last `update`; `update` is a no-op (returns
     /// empty) when the camera hasn't changed chunks and nothing else has.
     last_center: Option<ChunkPos>,
+    /// The last `update` found nothing to do, and the resident set has not
+    /// changed since. With `last_center` this is the whole of `update`'s
+    /// input, so the next call at the same centre would find nothing again.
+    settled: bool,
 }
 
 impl Streamer {
@@ -242,6 +246,7 @@ impl Streamer {
             loaded: HashSet::new(),
             config,
             last_center: None,
+            settled: false,
         }
     }
 
@@ -261,6 +266,7 @@ impl Streamer {
         config.validate();
         self.config = config;
         self.last_center = None;
+        self.settled = false;
     }
 
     /// The current configuration.
@@ -416,11 +422,21 @@ impl Streamer {
     /// The query is called at most once per column per update (results are
     /// memoized), so a caller backing it with real worldgen pays per column,
     /// not per chunk.
+    ///
+    /// When the previous call found nothing to do and nothing has changed
+    /// since — same `center`, no load or unload confirmed, no reconfigure —
+    /// this returns empty without scanning: a still camera over a settled world
+    /// is most frames, and the scan cost ~0.3 ms each (M11 task 0). That
+    /// relies on `surface_span` being the same function from call to call,
+    /// which the resident set already assumes.
     pub fn update(
         &mut self,
         center: ChunkPos,
-        surface_span: impl Fn(i64, i64) -> (i64, i64),
+        mut surface_span: impl FnMut(i64, i64) -> (i64, i64),
     ) -> StreamUpdate {
+        if self.settled && self.last_center == Some(center) {
+            return StreamUpdate::default();
+        }
         self.last_center = Some(center);
 
         let load_sq = self.config.load_radius * self.config.load_radius;
@@ -480,17 +496,22 @@ impl Streamer {
         // before distant ones.
         to_load.sort_by_key(|&p| dist_sq(p, center));
 
+        self.settled = to_load.is_empty() && to_unload.is_empty();
         StreamUpdate { to_load, to_unload }
     }
 
     /// Confirm a chunk has been loaded (data is resident). Idempotent.
     pub fn mark_loaded(&mut self, pos: ChunkPos) {
-        self.loaded.insert(pos);
+        if self.loaded.insert(pos) {
+            self.settled = false;
+        }
     }
 
     /// Confirm a chunk has been unloaded (data released). Idempotent.
     pub fn mark_unloaded(&mut self, pos: ChunkPos) {
-        self.loaded.remove(&pos);
+        if self.loaded.remove(&pos) {
+            self.settled = false;
+        }
     }
 
     /// Convenience: apply an update's loads and unloads immediately, as a
@@ -499,10 +520,10 @@ impl Streamer {
     /// completes.
     pub fn apply(&mut self, update: &StreamUpdate) {
         for &p in &update.to_load {
-            self.loaded.insert(p);
+            self.mark_loaded(p);
         }
         for &p in &update.to_unload {
-            self.loaded.remove(&p);
+            self.mark_unloaded(p);
         }
     }
 }
@@ -595,6 +616,68 @@ pub fn nearest_first(
     out.into_iter()
         .map(|(_, x, y, z)| ChunkPos::new(x, y, z))
         .collect()
+}
+
+/// Surface spans remembered from frame to frame (M11 task 0).
+///
+/// A column's span is a pure function of the world and the column, yet every
+/// scanning [`Streamer::update`] asks again for every column of its disc —
+/// ~245 columns of five elevation samples, ~0.2 ms a frame in flight. With
+/// this between the streamer and the generator, a column is sampled once
+/// while it stays near the camera. [`prune`](SpanCache::prune) keeps it
+/// bounded to the neighbourhood, like everything else that follows the
+/// camera.
+#[derive(Debug, Default)]
+pub struct SpanCache {
+    spans: HashMap<(i64, i64), (i64, i64)>,
+    /// Chunk column of the camera at the last prune, so a still camera costs
+    /// nothing.
+    pruned_at: Option<(i64, i64)>,
+}
+
+impl SpanCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The span of column `(cx, cz)`, computed by `compute` only the first
+    /// time it is asked for. `compute` must give the same answer for a column
+    /// every time — which the generator does.
+    pub fn get(
+        &mut self,
+        cx: i64,
+        cz: i64,
+        compute: impl FnOnce(i64, i64) -> (i64, i64),
+    ) -> (i64, i64) {
+        *self
+            .spans
+            .entry((cx, cz))
+            .or_insert_with(|| compute(cx, cz))
+    }
+
+    /// Forget columns more than `radius` chunks from `center` horizontally.
+    /// Scans only when the camera has changed chunk column.
+    pub fn prune(&mut self, center: ChunkPos, radius: i64) {
+        let here = (center.x, center.z);
+        if self.pruned_at == Some(here) {
+            return;
+        }
+        self.pruned_at = Some(here);
+        let r_sq = radius * radius;
+        self.spans.retain(|&(cx, cz), _| {
+            let (dx, dz) = (cx - center.x, cz - center.z);
+            dx * dx + dz * dz <= r_sq
+        });
+    }
+
+    /// Columns remembered.
+    pub fn len(&self) -> usize {
+        self.spans.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -1355,5 +1438,99 @@ mod tests {
         ];
         let got = nearest_first(set.iter().copied(), cam, 1);
         assert_eq!(got, vec![cp(2_000_000_001, 0, -2_000_000_000)]);
+    }
+
+    /// Load everything the streamer asks for, until it asks for nothing.
+    fn settle(s: &mut Streamer, center: ChunkPos) {
+        loop {
+            let u = s.update(center, flat);
+            if u.is_empty() {
+                return;
+            }
+            s.apply(&u);
+        }
+    }
+
+    /// A still camera over a settled world is most frames; the streamer must
+    /// answer it without scanning — and without asking for a single span.
+    #[test]
+    fn a_settled_streamer_does_not_rescan() {
+        let mut s = streamer(4, 6, 1, 1, 1);
+        settle(&mut s, cp(0, 0, 0));
+        let mut asked = 0;
+        let u = s.update(cp(0, 0, 0), |cx, cz| {
+            asked += 1;
+            flat(cx, cz)
+        });
+        assert!(u.is_empty());
+        assert_eq!(asked, 0, "a settled update sampled the terrain");
+    }
+
+    /// The shortcut must end the moment any input changes: the camera moving,
+    /// the resident set changing behind the streamer's back, a reconfigure.
+    #[test]
+    fn a_settled_streamer_wakes_on_any_change() {
+        let mut s = streamer(4, 6, 1, 1, 1);
+        settle(&mut s, cp(0, 0, 0));
+        // Camera moves a chunk: new columns enter the disc.
+        assert!(!s.update(cp(1, 0, 0), flat).to_load.is_empty());
+        settle(&mut s, cp(1, 0, 0));
+        // A chunk unloaded by the caller is asked for again.
+        s.mark_unloaded(cp(1, 0, 0));
+        assert_eq!(s.update(cp(1, 0, 0), flat).to_load, vec![cp(1, 0, 0)]);
+        settle(&mut s, cp(1, 0, 0));
+        // A wider radius loads more, from the same centre.
+        s.reconfigure(config(5, 7, 1, 1, 1));
+        assert!(!s.update(cp(1, 0, 0), flat).to_load.is_empty());
+    }
+
+    /// Re-confirming a chunk already resident changes nothing, so it must not
+    /// cost a rescan either.
+    #[test]
+    fn redundant_confirmations_keep_the_streamer_settled() {
+        let mut s = streamer(4, 6, 1, 1, 1);
+        settle(&mut s, cp(0, 0, 0));
+        s.mark_loaded(cp(0, 0, 0));
+        s.mark_unloaded(cp(50, 0, 50));
+        let mut asked = 0;
+        s.update(cp(0, 0, 0), |cx, cz| {
+            asked += 1;
+            flat(cx, cz)
+        });
+        assert_eq!(asked, 0);
+    }
+
+    #[test]
+    fn span_cache_computes_each_column_once() {
+        let mut c = SpanCache::new();
+        let mut computed = 0;
+        for _ in 0..3 {
+            for cx in -2..=2 {
+                c.get(cx, 7, |x, z| {
+                    computed += 1;
+                    ramp(x, z)
+                });
+            }
+        }
+        assert_eq!(computed, 5);
+        assert_eq!(c.get(2, 7, |_, _| unreachable!()), ramp(2, 7));
+    }
+
+    /// Bounded with the camera's neighbourhood, including across negative
+    /// columns; a still camera's prune is free.
+    #[test]
+    fn span_cache_prunes_far_columns() {
+        let mut c = SpanCache::new();
+        for cx in -20..=20 {
+            c.get(cx, 0, flat);
+        }
+        c.prune(cp(-10, 0, 0), 3);
+        assert_eq!(c.len(), 7, "columns -13..=-7 remain");
+        assert_eq!(c.get(-13, 0, |_, _| (9, 9)), flat(-13, 0));
+        assert_eq!(c.get(-14, 0, |_, _| (9, 9)), (9, 9), "-14 was pruned");
+        // Same column again: nothing is scanned, so the far column stays.
+        c.get(40, 0, flat);
+        c.prune(cp(-10, 5, 0), 3);
+        assert!(c.len() > 8, "a still camera's prune dropped something");
     }
 }

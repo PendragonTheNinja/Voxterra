@@ -32,6 +32,59 @@ This spec was written before M10 finished, and M10 took on part of it:
   the sky colour. The owner raised this independently on 2026-10-01; see
   `docs/vision.md`.
 
+## Status and remaining work — START HERE
+
+*Kept current at every task boundary. A new session reads this list, verifies
+the remote matches it, and starts at the first unchecked item.*
+
+### Done
+
+- [x] **Task 0 — why relighting doubled (measured, three fixes).** A headless
+  model of `stream_tick`'s relight loop (the real generator, streamer,
+  heightmap and `compute_chunk_light_2ch`, with vox-app's triggers copied)
+  reproduced the sprint log: ~880 ms/s of single-thread relight work, which
+  over the worker pool is the ~220 ms/s `lt`. Where it went, at 120 m/s and
+  radius 8 (~470 chunks loaded per second, ~1 800 relights per second):
+  - **Uniform air under open sky missed the fast path** — 985 relights/s at
+    ~425 us each, ~70% of the lighting function's time. The fast path refused
+    any uniform chunk whose side neighbours carried sky light, which is every
+    air chunk above the ground. Where 15 enters every column from above, side
+    planes cannot change a cell; an all-solid chunk likewise. Both now take
+    the fast path, checked against the full path in tests (418 → 31 ms/s).
+  - **`top_sky` cost ~80 us per relight**: 1 024 hash-map lookups, one per
+    block column. `ColumnHeights` now stores each chunk column's heights as
+    one array, and `ColumnHeights::sky_top` reads a chunk's whole footprint
+    with one lookup (141 → 2.5 ms/s). Semantics unchanged, unknown included.
+  - **`Streamer::update` re-sampled the terrain every frame**, standing still
+    included: ~245 columns × 5 elevation samples, ~0.3 ms a frame on the main
+    thread, in neither `lt` nor `msh`. It now returns early when nothing has
+    changed (its own field comment already promised this), and vox-app keeps
+    spans in a `SpanCache` (0.32 → ~0.001 ms per still frame; 51 → 3 ms/s in
+    flight). The likeliest cause of M10's ~15% lower standing fps.
+
+  Overall: relight work 879 → 292 ms/s in the model, with every relight's
+  result identical (same count, same causes). Not all of this was new in M10 —
+  the fast-path miss and the per-column map predate it — but M10 streams more
+  air (the surface band's upper layers and the camera window), so it paid
+  them more often. No exact M09 comparison exists: the `v0.9.0-m09` tag is an
+  in-progress commit and M09's completion landed together with M10's tasks
+  1–4. Still open in the model, for later: 83% of relights change nothing
+  (most queued as a new chunk's six neighbours), and non-uniform chunks are
+  now most of the cost. To confirm in play: the M10 retro's sprint-fly and
+  standing runs at radius 8, 3 levels — compare `lt`, fps and worst frame;
+  and that lighting looks unchanged (caves dark, no bright or black chunks
+  while flying).
+
+### Remaining, in order
+
+1. **Lighting asks `solid` where CLAUDE.md requires `opaque`.** Found during
+   task 0: `light.rs` (relight, `chunk_column_heights`, the fast path) still
+   calls `registry.is_solid`, though the M10 checklist recorded ADR-0011's
+   step 1 as converting it. Invisible today — every block has
+   `solid == opaque` — but wrong the first time a block is solid and
+   transparent (glass). Fix with a test whose registry has such a block.
+2. **Tasks 1–6 below**, in order.
+
 ## Why this milestone exists
 
 Measured in the September 2026 audit: from random points on land, how often is a

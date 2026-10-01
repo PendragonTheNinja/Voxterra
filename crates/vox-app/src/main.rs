@@ -186,47 +186,22 @@ fn digit_slot(code: KeyCode) -> Option<usize> {
     }
 }
 
-/// Build a chunk's heightmap-derived `top_sky` (CHUNK_SIZE², daylight
-/// entering each column from directly above: 15 open, 0 occluded). Free fn so
-/// it can run inside the parallel relight workers rather than serially on the
-/// main thread (the serial version was ~12 ms/frame at full budget).
+/// A chunk's heightmap-derived `top_sky` (CHUNK_SIZE², daylight entering each
+/// column from directly above: 15 open, 0 occluded). Free fn so it runs inside
+/// the parallel relight workers rather than serially on the main thread.
+///
+/// Full daylight enters a column at the chunk's TOP FACE only when the column
+/// is KNOWN and open through the entire chunk — its highest solid lies below
+/// the chunk's floor. When the surface lies INSIDE this chunk the top stays 0:
+/// daylight then enters from the chunk ABOVE via its -Y sky plane and floods
+/// down only through actual air, so a sealed shaft below the surface stays
+/// dark (the cave-lit bug). And an UNKNOWN column — its solid chunks not yet
+/// streamed in — is COVERED, never open: assuming "open" injects daylight that
+/// the uniform-air fast path commits and nothing corrects (the sealed-hole
+/// leak). Dark-then-brighten is always safe. `ColumnHeights::sky_top` applies
+/// exactly that rule.
 fn top_sky_from_heightmap(heights: &ColumnHeights, pos: ChunkPos) -> Vec<u8> {
-    let origin = pos.origin();
-    let mut top = vec![0u8; (CHUNK_SIZE_I * CHUNK_SIZE_I) as usize];
-    for lz in 0..CHUNK_SIZE_I {
-        for lx in 0..CHUNK_SIZE_I {
-            // Distinguish a KNOWN column height from an UNKNOWN one. A column is
-            // unknown when its solid chunks have not streamed in yet (no entry
-            // in the heightmap). An unknown column must be treated as COVERED
-            // (top_sky = 0), never as open: assuming "open" here injects full
-            // daylight that the uniform-air fast path then commits straight down
-            // a column that may actually be sealed/underground, and because the
-            // heightmap is raise-only and relight is local, that bogus daylight
-            // gets frozen into already-lit chunks (the sealed-hole leak). It is
-            // always safe to start an unknown column dark and let it brighten
-            // honestly once the real terrain loads and relights it.
-            let known_h = heights.get(origin.x + lx, origin.z + lz);
-
-            // Inject full daylight at the chunk's TOP FACE only when the column
-            // is KNOWN and open through this ENTIRE chunk — i.e. the highest
-            // solid is below the chunk's floor. Then 15 legitimately fills the
-            // column top-to-bottom (it's all air to the surface, which lies
-            // below).
-            //
-            // When the surface lies INSIDE this chunk (origin.y <= h), we must
-            // NOT blanket the ceiling with 15 — that would flood daylight down
-            // past the surface into sealed air below it (the cave-lit bug).
-            // Instead leave the top face at 0 here; the real daylight enters
-            // from the chunk ABOVE via its -Y sky plane (the +Y neighbor border)
-            // and BFS-floods down only through actual air, stopping at the
-            // surface solid. Sealed shafts below the surface stay dark.
-            top[(lx + lz * CHUNK_SIZE_I) as usize] = match known_h {
-                Some(h) if h < origin.y => vox_core::MAX_LIGHT,
-                _ => 0,
-            };
-        }
-    }
-    top
+    heights.sky_top(pos)
 }
 
 /// Compute both light channels for many chunks in parallel (rayon),
@@ -522,6 +497,10 @@ struct App {
     // --- Streaming (M02 task 3) ---
     generator: Generator,
     streamer: Streamer,
+    /// Surface spans the streamer has asked for, kept from frame to frame:
+    /// re-sampling every column of the disc each frame was ~0.2 ms in flight
+    /// (M11 task 0).
+    spans: vox_core::SpanCache,
     /// Coarse LOD ring policy (M08): which distant LOD nodes are loaded.
     lod_ring: LodRing,
 
@@ -725,6 +704,7 @@ impl Default for App {
             streamer: Streamer::new(Self::stream_config(
                 vox_core::Settings::default().load_radius,
             )),
+            spans: vox_core::SpanCache::new(),
             lod_ring: LodRing::new(
                 LOD_INNER_CHUNKS,
                 &LOD_LEVELS,
@@ -1146,12 +1126,16 @@ impl App {
     /// "runs on the rayon pool, bounded, no stall" without needing to clone
     /// chunk data into mesh jobs or share the World across threads.
     fn stream_tick(&mut self, camera_chunk: ChunkPos) {
-        // 1. Ask the streamer what should change. It memoizes one surface
-        //    span per column per update.
+        // 1. Ask the streamer what should change. A still camera over a
+        //    settled world costs nothing; otherwise spans come from the cache,
+        //    so only columns new to the neighbourhood sample the terrain.
         let generator = self.generator;
-        let update = self
-            .streamer
-            .update(camera_chunk, |cx, cz| generator.surface_span_chunks(cx, cz));
+        self.spans
+            .prune(camera_chunk, self.streamer.unload_radius() + 1);
+        let spans = &mut self.spans;
+        let update = self.streamer.update(camera_chunk, |cx, cz| {
+            spans.get(cx, cz, |x, z| generator.surface_span_chunks(x, z))
+        });
 
         // 2. Unloads: save the chunk if it was modified, then drop its data
         //    + GPU mesh; neighbors may now expose a border face, so they're

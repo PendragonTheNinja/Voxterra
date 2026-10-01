@@ -257,14 +257,15 @@ The owner's ideas for all of them, and a proposed order, are recorded in
 ## Current status
 
 - **Active milestone:** 11 — The Horizon
-  (`docs/milestones/11-the-horizon.md`). Not started. Read its "Changes at M10
-  close" section first: reverse-Z is already done (ADR-0013), distant water
-  changed shape (ADR-0011 1c), and **task 0 — find out why relighting doubled
-  in M10 — comes before everything else**. Give the spec a "Status and
-  remaining work — START HERE" checklist as the first task lands.
+  (`docs/milestones/11-the-horizon.md`). **The exact state and the ordered
+  list of remaining work is in that spec's "Status and remaining work — START
+  HERE" section.** Read its "Changes at M10 close" too: reverse-Z is already
+  done (ADR-0013) and distant water changed shape (ADR-0011 1c). As of
+  2026-10-01, task 0 (why relighting doubled) is done and awaiting in-play
+  numbers; next is making `light.rs` ask `opaque`, then task 1.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 265, vox-mesh 53, vox-worldgen 31 passing as of M10's close;
+  vox-core 275, vox-mesh 53, vox-worldgen 31 passing as of M11 task 0;
   vox-render's 10 tests need wgpu and run natively only), then start the first
   unchecked item.
 - **Roadmap after M11:** 12 — Climate & Biomes (spec not yet written). The

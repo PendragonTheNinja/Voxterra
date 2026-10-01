@@ -42,8 +42,8 @@ pub use registry::{BlockRegistry, BlockType};
 pub use settings::Settings;
 pub use storage::{StoreError, WORLD_META_VERSION, WorldMeta, WorldStore};
 pub use streaming::{
-    ColumnWindow, MAX_RESIDENT_RADIUS, StreamConfig, StreamUpdate, Streamer, UNLOAD_MARGIN_CHUNKS,
-    nearest_first,
+    ColumnWindow, MAX_RESIDENT_RADIUS, SpanCache, StreamConfig, StreamUpdate, Streamer,
+    UNLOAD_MARGIN_CHUNKS, nearest_first,
 };
 pub use time::{
     DEFAULT_DAY_LENGTH_SECS, LUNATION_DAYS, NIGHT_SKY_FULL_MOON, NIGHT_SKY_MIN, TICKS_PER_DAY,

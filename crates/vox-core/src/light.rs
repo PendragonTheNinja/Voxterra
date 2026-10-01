@@ -667,18 +667,32 @@ pub fn compute_chunk_light_2ch(
     // spill is resolved by the neighbor that actually needs it.
     if chunk.is_uniform() {
         let b = chunk.get(LocalPos::new(0, 0, 0));
-        // Only safe to skip the block-light BFS when no block light can flood
-        // in from a neighbor (e.g. an adjacent lamp lighting this air). If any
-        // block border carries light, fall through to the full computation.
-        let no_block_inflow = block_borders
-            .iter()
-            .all(|p| p.as_ref().is_none_or(|plane| plane.iter().all(|&v| v == 0)));
-        // Only safe to skip the sky BFS when no neighbor sky plane brings in
-        // MORE light than the heightmap's top_sky already accounts for. Below
-        // the surface, real daylight flows down a shaft via the overhead (+Y)
-        // plane and sideways via the horizontal planes; if any such inflow
-        // exceeds top_sky, this air must propagate it — use the full path.
-        let no_extra_sky_inflow = !do_sky
+        // Two cases are settled whatever the neighbours hold, because nothing
+        // they bring can change a cell. Light never enters a solid cell, so an
+        // all-solid chunk is dark. And where 15 enters every column from
+        // above, an all-clear chunk is 15 throughout — a side plane can only
+        // offer less. The second is most of what streams in flight (air above
+        // the ground, beside lit air), and the side-plane test below sent it
+        // all to the full flood: ~70% of relight time (M11 task 0).
+        let solid = registry.is_solid(b);
+        let open_above = top_sky.iter().all(|&v| v == MAX_LIGHT);
+        // Otherwise it is only safe to skip the block-light BFS when no block
+        // light can flood in from a neighbor (e.g. an adjacent lamp lighting
+        // this air). If any block border carries light, fall through to the
+        // full computation.
+        let block_settled = solid
+            || block_borders
+                .iter()
+                .all(|p| p.as_ref().is_none_or(|plane| plane.iter().all(|&v| v == 0)));
+        // And only safe to skip the sky BFS when no neighbor sky plane brings
+        // in MORE light than the heightmap's top_sky already accounts for.
+        // Below the surface, real daylight flows down a shaft via the overhead
+        // (+Y) plane and sideways via the horizontal planes; if any such
+        // inflow exceeds top_sky, this air must propagate it — use the full
+        // path.
+        let sky_settled = !do_sky
+            || solid
+            || open_above
             || sky_borders.iter().enumerate().all(|(face, plane)| {
                 // -Y (face 3) never brings sky up; ignore it.
                 face == 3
@@ -692,7 +706,7 @@ pub fn compute_chunk_light_2ch(
                         })
                     })
             });
-        if registry.emission(b) == 0 && no_block_inflow && no_extra_sky_inflow {
+        if registry.emission(b) == 0 && block_settled && sky_settled {
             let mut out = vec![0u8; CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE];
             if do_sky && !registry.is_solid(b) {
                 // All-air: each column carries its top_sky straight down (the
@@ -1772,6 +1786,113 @@ mod tests {
             compute_chunk_light_2ch(&chunk, &reg, &block_borders, &no_sky(), &dark_top, true);
         // Block light floods in from the -X border.
         assert_eq!(light[LocalPos::new(0, 16, 16).index()] & 0x0F, 14);
+    }
+
+    /// A chunk of `block` everywhere that is NOT stored uniform, so
+    /// `compute_chunk_light_2ch` takes the full path for it: the reference
+    /// every fast-path answer is checked against.
+    fn full_path_chunk(block: BlockId) -> Chunk {
+        let mut chunk = Chunk::filled(block);
+        let p = LocalPos::new(0, 0, 0);
+        let other = if block == BlockId::AIR {
+            BlockId(1)
+        } else {
+            BlockId::AIR
+        };
+        chunk.set(p, other);
+        chunk.set(p, block);
+        assert!(
+            !chunk.is_uniform(),
+            "reference chunk must take the full path"
+        );
+        chunk
+    }
+
+    /// Deterministic 0..=15 planes, so a failure reproduces.
+    fn noisy_plane(seed: u32) -> Vec<u8> {
+        let mut s = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+        (0..CHUNK_SIZE * CHUNK_SIZE)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                (s % 16) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn uniform_open_sky_ignores_lit_side_planes() {
+        // Air and water chunks above the ground under open sky are most of
+        // what streams in flight, and every one has lit air beside it. With
+        // 15 entering every column from above, nothing from the sides can
+        // raise a cell, so the answer is all 15 — the fast path must give
+        // exactly what the full flood gives (M11 task 0: these chunks were
+        // ~70% of relight time while falling through to the full path).
+        use crate::registry::WATER;
+        let reg = BlockRegistry::default_set();
+        for (i, block) in [BlockId::AIR, WATER].into_iter().enumerate() {
+            let seed = i as u32 * 10;
+            let sky: NeighborSky = [
+                Some(noisy_plane(seed + 1)),
+                Some(noisy_plane(seed + 2)),
+                Some(noisy_plane(seed + 3)),
+                None,
+                Some(noisy_plane(seed + 4)),
+                Some(noisy_plane(seed + 5)),
+            ];
+            let top = open_sky_top();
+            let fast = compute_chunk_light_2ch(
+                &Chunk::filled(block),
+                &reg,
+                &no_borders(),
+                &sky,
+                &top,
+                true,
+            );
+            let full = compute_chunk_light_2ch(
+                &full_path_chunk(block),
+                &reg,
+                &no_borders(),
+                &sky,
+                &top,
+                true,
+            );
+            assert_eq!(fast, full, "block {block:?}");
+            assert!(
+                fast.0.iter().all(|&v| v == MAX_LIGHT << 4),
+                "block {block:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn uniform_solid_ignores_lit_neighbours() {
+        // Light never enters a solid cell, so an all-solid non-emitter is
+        // dark whatever its neighbours hold — block light and sky alike.
+        let reg = BlockRegistry::default_set();
+        let block: NeighborLight = [
+            Some(noisy_plane(21)),
+            Some(noisy_plane(22)),
+            Some(noisy_plane(23)),
+            Some(noisy_plane(24)),
+            Some(noisy_plane(25)),
+            Some(noisy_plane(26)),
+        ];
+        let sky: NeighborSky = [
+            Some(noisy_plane(31)),
+            Some(noisy_plane(32)),
+            Some(noisy_plane(33)),
+            None,
+            Some(noisy_plane(34)),
+            Some(noisy_plane(35)),
+        ];
+        let top = open_sky_top();
+        let stone = BlockId(1);
+        let fast = compute_chunk_light_2ch(&Chunk::filled(stone), &reg, &block, &sky, &top, true);
+        let full = compute_chunk_light_2ch(&full_path_chunk(stone), &reg, &block, &sky, &top, true);
+        assert_eq!(fast, full);
+        assert!(fast.0.iter().all(|&v| v == 0));
     }
 
     #[test]
