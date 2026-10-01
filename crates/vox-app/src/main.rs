@@ -40,14 +40,6 @@ const NEIGHBOR_OFFSETS: [(i64, i64, i64); 6] = [
     (0, 0, -1),
 ];
 
-/// Streaming radii, in chunks (ADR-0002 / M02). Chunks within `LOAD_RADIUS`
-/// of the camera's chunk are generated/loaded; chunks beyond `UNLOAD_RADIUS`
-/// are dropped. The gap between them is hysteresis to prevent boundary
-/// thrash. With 32-block chunks, radius 8 ≈ 256 blocks of full-res world in
-/// every direction (~2,000 chunks resident).
-const LOAD_RADIUS: i64 = 8;
-const UNLOAD_RADIUS: i64 = 10;
-
 // --- LOD (M09). LOD is configured as a list of levels (finest to coarsest). Radii are in
 // CHUNKS from the camera and must be multiples of the coarsest stride (the ring
 // asserts this). LOD starts at 0 — it underlaps the full-res region, which
@@ -80,18 +72,6 @@ const LOD_LEVELS: [vox_core::LodLevel; 3] = [
     },
 ];
 const LOD_UNLOAD_MARGIN_CHUNKS: i64 = 8; // multiple of the coarsest stride
-                                         // World vertical band LOD must cover. ONE node spans it at every level: cells
-                                         // are `stride` blocks wide but `band/32` blocks tall, so horizontal detail and
-                                         // vertical resolution are independent. Widen if worldgen's range grows (the
-                                         // terrain currently spans about -59..108).
-/// The world's vertical extent, and therefore the LOD nodes' (M10 task 3).
-///
-/// Opened from 256 blocks to ~20 000 so Everest (+8 848) and Challenger Deep
-/// (−10 935) both fit at one block per metre. This is affordable ONLY because
-/// streaming follows the surface (task 2): nothing loads a full column, so the
-/// world's height costs nothing. Anything that still walks this whole band per
-/// column is a bug — see `surface_window_chunks`.
-const LOD_WORLD_Y_BLOCKS: (i64, i64) = (vox_core::WORLD_Y_MIN_BLOCKS, vox_core::WORLD_Y_MAX_BLOCKS);
 
 // Fog (M09 amendment A2) is tuned live from the settings menu; its defaults
 // live in `vox_core::Settings`.
@@ -112,15 +92,21 @@ const LOD_SPAWN_BUDGET: usize = 48;
 /// below you stays loaded — this window follows the GROUND.
 const LOAD_BELOW_CHUNKS: i64 = 3;
 const LOAD_ABOVE_CHUNKS: i64 = 3;
-/// Chunk layers kept loaded above and below the CAMERA's layer, across the
-/// whole load disc (M10 A3).
+/// The camera window (M10 A3): chunk layers kept above and below the
+/// CAMERA's layer, in columns within `CAMERA_WINDOW_RADIUS` of it.
 ///
 /// The surface window alone strands a player who leaves it: dig more than
 /// `LOAD_BELOW_CHUNKS` down or build more than `LOAD_ABOVE_CHUNKS` up and you
 /// walk out of the loaded world. Near the ground this window overlaps the
-/// surface one and costs nothing; underground it is ~100 blocks of view each
-/// way, the same reach the surface window gives the ground.
-const LOAD_AROUND_CAMERA_CHUNKS: i64 = 3;
+/// surface one and costs nothing; underground it is ~100 blocks each way.
+///
+/// The radius is the player's working neighbourhood, not a view distance.
+/// Spanning the whole load disc, the window streamed ~1 400 empty chunks
+/// through generation, lighting and meshing for a spectator in the sky; at 3
+/// chunks it is ~200. A build above the terrain window is visible while the
+/// player is near it — the same as before the window existed, from further.
+const CAMERA_WINDOW_LAYERS: i64 = 3;
+const CAMERA_WINDOW_RADIUS: i64 = 3;
 
 /// Spacing and reach of the spawn search, in blocks and rings (M10 task 1).
 ///
@@ -250,17 +236,23 @@ fn top_sky_from_heightmap(heights: &ColumnHeights, pos: ChunkPos) -> Vec<u8> {
 /// `border_changed` (→ neighbors need a relight check). Skylight's vertical
 /// fill comes from `top_sky`, so there's no dependence on the +Y neighbor
 /// being relit first — no vertical cascade (ADR-0005).
+///
+/// `jobs` pairs each chunk with its SEALED faces, the same mask the mesher
+/// gets (`sealed_faces`). A sealed +Y neighbour — absent and never coming —
+/// supplies its sky plane from the heightmap instead of nothing: over deep
+/// ocean only the seabed and the sea surface are resident, and the seabed
+/// would otherwise be dark under water that passes light (M10 A1).
 #[allow(clippy::type_complexity)]
 fn relight_chunks_parallel(
     world: &World,
     registry: &BlockRegistry,
     heights: &ColumnHeights,
-    positions: &[ChunkPos],
+    jobs: &[(ChunkPos, u8)],
 ) -> Vec<(ChunkPos, Vec<u8>, bool, u8)> {
     const OPPOSITE: [usize; 6] = [1, 0, 3, 2, 5, 4];
-    positions
-        .par_iter()
-        .filter_map(|&pos| {
+    const POS_Y: usize = 2; // NEIGHBOR_OFFSETS[2] == (0, 1, 0)
+    jobs.par_iter()
+        .filter_map(|&(pos, sealed)| {
             let chunk = world.chunk(pos)?;
             let top_sky = top_sky_from_heightmap(heights, pos);
             let mut block_borders: vox_core::NeighborLight = [None, None, None, None, None, None];
@@ -276,6 +268,8 @@ fn relight_chunks_parallel(
                     if face != 3 {
                         sky_borders[face] = Some(vox_core::chunk_sky_plane(n, OPPOSITE[face]));
                     }
+                } else if face == POS_Y && sealed & (1 << POS_Y) != 0 {
+                    sky_borders[face] = Some(heights.sky_plane_above(pos));
                 }
             }
             let (light, border_changed) = vox_core::compute_chunk_light_2ch(
@@ -328,7 +322,13 @@ fn mesh_chunks_parallel(
             // Texture array (ADR-0003): resolve each face's layer via the
             // registry. The closure borrows the registry (Sync), shared
             // across the rayon workers.
-            let mesh = mesh_chunk(chunk, &neighbors, |b, face| registry.face_layer(b, face));
+            // VISUAL: faces cull against OPAQUE neighbours (ADR-0011).
+            let mesh = mesh_chunk(
+                chunk,
+                &neighbors,
+                |b, face| registry.face_layer(b, face),
+                |b| registry.is_opaque(b),
+            );
             if mesh.is_empty() {
                 None
             } else {
@@ -722,18 +722,14 @@ impl Default for App {
 
             generator,
             // Cylindrical horizontally, surface-following vertically.
-            streamer: Streamer::surface_following(
-                LOAD_RADIUS,
-                UNLOAD_RADIUS,
-                LOAD_BELOW_CHUNKS,
-                LOAD_ABOVE_CHUNKS,
-                LOAD_AROUND_CAMERA_CHUNKS,
-            ),
+            streamer: Streamer::new(Self::stream_config(
+                vox_core::Settings::default().load_radius,
+            )),
             lod_ring: LodRing::new(
                 LOD_INNER_CHUNKS,
                 &LOD_LEVELS,
                 LOD_UNLOAD_MARGIN_CHUNKS,
-                LOD_WORLD_Y_BLOCKS,
+                (vox_core::WORLD_Y_MIN_BLOCKS, vox_core::WORLD_Y_MAX_BLOCKS),
             ),
             settings: vox_core::Settings::default(),
             settings_applied: vox_core::Settings::default(),
@@ -797,6 +793,7 @@ impl App {
             for by in lo[1]..=hi[1] {
                 for bz in lo[2]..=hi[2] {
                     let wp = WorldPos::new(bx, by, bz);
+                    // PHYSICAL (ADR-0011): only solid blocks stop the player.
                     if self.registry.is_solid(self.world.get_block(wp))
                         && cell_overlaps_aabb(wp, min, max)
                     {
@@ -1030,7 +1027,9 @@ impl App {
             column_chunks.push(cpos);
             for ly in (0..CHUNK_SIZE_I as u8).rev() {
                 let p = LocalPos::new(lx, ly, lz);
-                if self.registry.is_solid(chunk.get(p)) {
+                // The skylight heightmap: where light stops, so OPAQUE
+                // (ADR-0011), not solid.
+                if self.registry.is_opaque(chunk.get(p)) {
                     let wy = cpos.origin().y + ly as i64;
                     highest = Some(highest.map_or(wy, |h| h.max(wy)));
                     break;
@@ -1097,6 +1096,45 @@ impl App {
         }
     }
 
+    /// The chunk-Y range resident around a column's terrain surface,
+    /// whatever the camera does. LOD coverage asks this: whether the ground
+    /// under a node is drawn. Deferring to the streamer keeps one source of
+    /// truth — anything judging it independently gets it wrong the moment the
+    /// margins or the clamping change.
+    fn surface_window_chunks(&self, cx: i64, cz: i64) -> vox_core::ColumnWindow {
+        self.streamer
+            .surface_window(self.generator.surface_span_chunks(cx, cz))
+    }
+
+    /// The streaming configuration for a load radius. The one place it is
+    /// built, so startup and a settings change cannot disagree.
+    fn stream_config(load_radius: i64) -> vox_core::StreamConfig {
+        vox_core::StreamConfig {
+            load_radius,
+            unload_radius: load_radius + vox_core::UNLOAD_MARGIN_CHUNKS,
+            below_surface: LOAD_BELOW_CHUNKS,
+            above_surface: LOAD_ABOVE_CHUNKS,
+            camera_layers: CAMERA_WINDOW_LAYERS,
+            // A radius setting below the window's would otherwise be refused.
+            camera_radius: CAMERA_WINDOW_RADIUS.min(load_radius),
+            // Keep the sea surface over deep water, not the water under it.
+            sea_layer: Some(vox_core::SEA_SURFACE_CHUNK_Y),
+        }
+    }
+
+    /// Every chunk layer resident for a column right now: the surface window
+    /// plus the camera's own neighbourhood (M10 A3). A scan for "what is in
+    /// this column" must cover both, or it misses what the player built
+    /// above the terrain window.
+    fn column_window_chunks(&self, cx: i64, cz: i64) -> vox_core::ColumnWindow {
+        self.streamer.column_window(
+            self.camera.block_pos().chunk(),
+            cx,
+            cz,
+            self.generator.surface_span_chunks(cx, cz),
+        )
+    }
+
     /// One streaming step, run every frame. Keeps the resident chunk set
     /// centered on the camera and the GPU meshes in sync, within per-frame
     /// budgets so the frame never stalls.
@@ -1107,65 +1145,13 @@ impl App {
     /// chunks/frame so the cost stays well under a millisecond. This honors
     /// "runs on the rayon pool, bounded, no stall" without needing to clone
     /// chunk data into mesh jobs or share the World across threads.
-    /// The inclusive chunk-Y span of terrain surface within a chunk column.
-    ///
-    /// Sampled at the column's four corners and its centre rather than one
-    /// point: a 32-block-wide column can hold a cliff, and a single sample
-    /// would report the top and miss the face.
-    fn surface_span_chunks(&self, cx: i64, cz: i64) -> (i64, i64) {
-        let (bx, bz) = (cx * CHUNK_SIZE_I, cz * CHUNK_SIZE_I);
-        let e = CHUNK_SIZE_I - 1;
-        let mut lo = i64::MAX;
-        let mut hi = i64::MIN;
-        for (ox, oz) in [(0, 0), (e, 0), (0, e), (e, e), (e / 2, e / 2)] {
-            let h = self.generator.surface_height(bx + ox, bz + oz);
-            lo = lo.min(h);
-            hi = hi.max(h);
-        }
-        (lo.div_euclid(CHUNK_SIZE_I), hi.div_euclid(CHUNK_SIZE_I))
-    }
-
-    /// The chunk-Y range resident around a column's terrain surface,
-    /// whatever the camera does. LOD coverage asks this: whether the ground
-    /// under a node is drawn. Deferring to the streamer keeps one source of
-    /// truth — anything judging it independently gets it wrong the moment the
-    /// margins or the clamping change.
-    fn surface_window_chunks(&self, cx: i64, cz: i64) -> (i64, i64) {
-        self.streamer
-            .surface_window(self.surface_span_chunks(cx, cz))
-    }
-
-    /// Every chunk layer resident for a column right now: the surface window
-    /// plus the camera's own neighbourhood (M10 A3). A scan for "what is in
-    /// this column" must cover both, or it misses what the player built
-    /// above the terrain window.
-    fn column_window_chunks(&self, cx: i64, cz: i64) -> vox_core::ColumnWindow {
-        self.streamer.column_window(
-            self.camera.block_pos().chunk(),
-            self.surface_span_chunks(cx, cz),
-        )
-    }
-
     fn stream_tick(&mut self, camera_chunk: ChunkPos) {
-        // 1. Ask the streamer what should change.
-        //
-        // The surface span is sampled at the chunk column's four corners and
-        // its centre rather than one point: a 32-block-wide column can hold a
-        // cliff, and a single sample would load its top and leave a hole down
-        // the face. Cheap — the streamer memoizes one call per column.
+        // 1. Ask the streamer what should change. It memoizes one surface
+        //    span per column per update.
         let generator = self.generator;
-        let update = self.streamer.update(camera_chunk, |cx, cz| {
-            let (bx, bz) = (cx * CHUNK_SIZE_I, cz * CHUNK_SIZE_I);
-            let e = CHUNK_SIZE_I - 1;
-            let mut lo = i64::MAX;
-            let mut hi = i64::MIN;
-            for (ox, oz) in [(0, 0), (e, 0), (0, e), (e, e), (e / 2, e / 2)] {
-                let h = generator.surface_height(bx + ox, bz + oz);
-                lo = lo.min(h);
-                hi = hi.max(h);
-            }
-            (lo.div_euclid(CHUNK_SIZE_I), hi.div_euclid(CHUNK_SIZE_I))
-        });
+        let update = self
+            .streamer
+            .update(camera_chunk, |cx, cz| generator.surface_span_chunks(cx, cz));
 
         // 2. Unloads: save the chunk if it was modified, then drop its data
         //    + GPU mesh; neighbors may now expose a border face, so they're
@@ -1305,11 +1291,15 @@ impl App {
                 for p in &sub {
                     self.relight.remove(p);
                 }
+                let jobs: Vec<(ChunkPos, u8)> = sub
+                    .iter()
+                    .map(|&p| (p, self.sealed_faces(p, camera_chunk)))
+                    .collect();
                 let lit = relight_chunks_parallel(
                     &self.world,
                     &self.registry,
                     &self.column_heights,
-                    &sub,
+                    &jobs,
                 );
                 for (pos, light, interior_changed, border_faces) in lit {
                     if interior_changed {
@@ -1476,8 +1466,11 @@ impl App {
     /// not) both ask exactly this, so both ask here: two independent answers
     /// drifting apart is how a gate deadlocks or an edge opens onto the void.
     fn neighbor_coming(&self, n: ChunkPos, camera_chunk: ChunkPos) -> bool {
-        self.streamer
-            .wants(n, camera_chunk, self.surface_span_chunks(n.x, n.z))
+        self.streamer.wants(
+            n,
+            camera_chunk,
+            self.generator.surface_span_chunks(n.x, n.z),
+        )
     }
 
     /// The faces of `p` to seal for meshing: a bit per `NEIGHBOR_OFFSETS`
@@ -1556,95 +1549,111 @@ impl App {
         // scanning them would find nothing anyway. The camera part matters: a
         // block placed above the surface window is only visible to this scan
         // through it.
+        //
+        // TWO tops, because they answer different questions (ADR-0011): the
+        // skylight heightmap wants the highest OPAQUE block (where light
+        // stops), the LOD's terrain the highest SOLID one (the ground, which
+        // under an ocean is the seabed). Identical for every block today.
         let window =
             self.column_window_chunks(x.div_euclid(CHUNK_SIZE_I), z.div_euclid(CHUNK_SIZE_I));
-        let mut top = i64::MIN;
+        let (mut opaque_top, mut solid_top) = (None, None);
         'scan: for cy in window.layers().rev() {
             for y in (cy * CHUNK_SIZE_I..(cy + 1) * CHUNK_SIZE_I).rev() {
-                if !self.world.get_block(WorldPos::new(x, y, z)).is_air() {
-                    top = y;
+                let b = self.world.get_block(WorldPos::new(x, y, z));
+                if opaque_top.is_none() && self.registry.is_opaque(b) {
+                    opaque_top = Some(y);
+                }
+                if solid_top.is_none() && self.registry.is_solid(b) {
+                    solid_top = Some(y);
+                }
+                if opaque_top.is_some() && solid_top.is_some() {
                     break 'scan;
                 }
             }
         }
-        self.column_heights.set(x, z, top);
-        // Same value, but sparse, never pruned and saved with the world, so
-        // every LOD level sees the edit, this session and every later one. Clamped into the LOD
-        // band: a fully mined column reports the i64::MIN sentinel, which is a
-        // "no terrain" marker, not a height.
-        Arc::make_mut(&mut self.edited_columns).record(x, z, top.max(LOD_WORLD_Y_BLOCKS.0) as i32);
+        // i64::MIN: known, and nothing there — a column mined out entirely.
+        self.column_heights
+            .set(x, z, opaque_top.unwrap_or(i64::MIN));
+        // Sparse, never pruned and saved with the world, so every LOD level
+        // sees the edit, this session and every later one. Clamped to the
+        // world floor: a fully mined column has no top at all.
+        Arc::make_mut(&mut self.edited_columns).record(
+            x,
+            z,
+            solid_top
+                .unwrap_or(i64::MIN)
+                .max(vox_core::WORLD_Y_MIN_BLOCKS) as i32,
+        );
         self.edits_unsaved = true;
     }
 
-    /// LOD nodes whose ground is fully covered by resident full-resolution
-    /// chunks, and which therefore must NOT be drawn.
+    /// Chunk columns whose full-resolution terrain is DRAWN: every layer of
+    /// the column's surface window — its ground, and over deep water the sea
+    /// surface — resident AND meshed at least once. Searched out to the
+    /// UNLOAD radius: the hysteresis band holds drawn chunks too, and leaving
+    /// it out left LOD under their water (M10 A1).
     ///
-    /// LOD underlaps the full-res region by design (that is what guarantees no
-    /// gaps). The cost is that any hole the player digs shows coarse terrain
-    /// behind it — the neighbouring coarse cells' walls seen through the gap,
-    /// which reads as a "ghost block" left where terrain was removed. A coarse
-    /// node cannot represent a hole; the only correct answer is to stop drawing
-    /// it wherever the real chunks already cover the ground.
+    /// Complete columns only. A column with its sea surface but not yet its
+    /// seabed (or the reverse) is not full resolution's to draw: the renderer
+    /// draws near water only in these columns and LOD everywhere else, so the
+    /// two never overlap in either direction.
     ///
-    /// Cheap geometry pre-filter (is the whole footprint inside the streaming
-    /// radius?) before the actual residency check, so only a handful of nodes
-    /// pay for the lookups.
-    fn covered_lod_nodes(&mut self, camera_chunk: ChunkPos) -> HashSet<(ChunkPos, u32)> {
+    /// Residency alone is not enough: a chunk's first mesh is deliberately
+    /// held back until its neighbours arrive (so it never bakes dark), and
+    /// sits behind a meshing queue. Counting it earlier hides the coarse
+    /// terrain while the real chunk draws nothing, and the sky shows through —
+    /// a flash at the edge of the full-res region at radius 8, a band hundreds
+    /// of blocks wide at radius 24.
+    ///
+    /// The one answer to "does full resolution draw here?", for both of its
+    /// consumers: whole LOD nodes skipped when every column under them is in
+    /// it (`covered_lod_nodes`), and per-column discarding in the LOD shader
+    /// for the nodes that straddle the edge (ADR-0011 notes).
+    fn fullres_columns(&self, camera_chunk: ChunkPos) -> HashSet<(i64, i64)> {
+        // The streamer's own reach: everything it can hold resident.
+        let r = self.streamer.unload_radius();
         let mut out = HashSet::new();
-        let r = self.settings.load_radius;
-        // Snapshot the ids so the loop can borrow `self.world` freely.
-        //
-        // Retired nodes are still DRAWN but are no longer in `loaded()`, so
-        // they must be considered here too — otherwise a node lingering over
-        // ground the player has dug shows its coarse surface through the hole
-        // for the few frames before it is flushed.
-        let ids: Vec<LodNodeId> = self
-            .lod_ring
-            .loaded()
-            .iter()
-            .chain(self.lod_retired.iter())
-            .copied()
-            .collect();
-        for id in &ids {
-            let s = self.lod_ring.stride(id.level);
-            let (ox, oz) = self.lod_ring.node_origin_chunk_xz(*id);
-            // Pre-filter: every corner of the footprint inside the radius.
-            let far_x = (ox - camera_chunk.x)
-                .abs()
-                .max((ox + s - 1 - camera_chunk.x).abs());
-            let far_z = (oz - camera_chunk.z)
-                .abs()
-                .max((oz + s - 1 - camera_chunk.z).abs());
-            if far_x * far_x + far_z * far_z > r * r {
-                continue;
-            }
-            // Confirm every chunk in the footprint is actually DRAWN — resident
-            // AND meshed at least once. Residency alone is not enough: a
-            // chunk's first mesh is deliberately held back until its neighbors
-            // arrive (so it never bakes dark), and behind a meshing queue. A
-            // node suppressed in that window hides the coarse terrain while the
-            // real chunk draws nothing, and the sky shows through — a brief
-            // flash at the edge of the full-res region at radius 8, and a
-            // band hundreds of blocks wide at radius 24, where the mesh
-            // backlog runs to thousands of chunks.
-            let mut missing = false;
-            'cols: for cz in oz..oz + s {
-                for cx in ox..ox + s {
-                    // Only the layers that will ever be resident for THIS
-                    // column. Walking the world band would be ~640 layers per
-                    // column and would never succeed, because streaming does
-                    // not load them.
-                    let (band_lo, band_hi) = self.surface_window_chunks(cx, cz);
-                    for cy in band_lo..=band_hi {
-                        let c = ChunkPos::new(cx, cy, cz);
-                        if self.world.chunk(c).is_none() || !self.meshed_once.contains(&c) {
-                            missing = true;
-                            break 'cols;
-                        }
-                    }
+        for dz in -r..=r {
+            for dx in -r..=r {
+                if dx * dx + dz * dz > r * r {
+                    continue;
+                }
+                let (cx, cz) = (camera_chunk.x + dx, camera_chunk.z + dz);
+                // Only the layers that will ever be resident for THIS column.
+                // Walking the world band would be ~640 layers and would never
+                // succeed, because streaming does not load them.
+                let drawn = self.surface_window_chunks(cx, cz).layers().all(|cy| {
+                    let c = ChunkPos::new(cx, cy, cz);
+                    self.world.chunk(c).is_some() && self.meshed_once.contains(&c)
+                });
+                if drawn {
+                    out.insert((cx, cz));
                 }
             }
-            if !missing {
+        }
+        out
+    }
+
+    /// LOD nodes every column of which full resolution draws, and which
+    /// therefore need not be drawn at all.
+    ///
+    /// LOD underlaps the full-res region by design (that is what guarantees no
+    /// gaps). A coarse node cannot represent a hole the player dug, and under
+    /// translucent water it cannot hide behind the real terrain at all — so it
+    /// must not be drawn wherever the real chunks already are. Whole nodes are
+    /// skipped here; the LOD shader discards per column for the rest.
+    ///
+    /// Retired nodes are still DRAWN but are no longer in `loaded()`, so they
+    /// are considered too — otherwise a node lingering over ground the player
+    /// has dug shows its coarse surface through the hole for the few frames
+    /// before it is flushed.
+    fn covered_lod_nodes(&self, fullres: &HashSet<(i64, i64)>) -> HashSet<(ChunkPos, u32)> {
+        let mut out = HashSet::new();
+        for id in self.lod_ring.loaded().iter().chain(self.lod_retired.iter()) {
+            let s = self.lod_ring.stride(id.level);
+            let (ox, oz) = self.lod_ring.node_origin_chunk_xz(*id);
+            let covered = (oz..oz + s).all(|cz| (ox..ox + s).all(|cx| fullres.contains(&(cx, cz))));
+            if covered {
                 out.insert((Self::lod_node_origin_chunk(&self.lod_ring, *id), id.level));
             }
         }
@@ -1726,13 +1735,8 @@ impl App {
         let s = self.settings;
         // Reconfigure, never replace: a fresh streamer would re-request every
         // resident chunk and overwrite unsaved edits with the disk copy.
-        self.streamer.reconfigure(
-            s.load_radius,
-            s.load_radius + 2,
-            LOAD_BELOW_CHUNKS,
-            LOAD_ABOVE_CHUNKS,
-            LOAD_AROUND_CAMERA_CHUNKS,
-        );
+        self.streamer
+            .reconfigure(Self::stream_config(s.load_radius));
         // Extend view distance by APPENDING coarser levels, each doubling both
         // stride and radius. That keeps per-level node count roughly constant,
         // so distance costs linearly in levels — where scaling the radii alone
@@ -1767,7 +1771,11 @@ impl App {
         // levels. Round it up rather than passing the base constant, or adding
         // a level trips the ring's assertion.
         let margin = ((LOD_UNLOAD_MARGIN_CHUNKS + coarsest - 1) / coarsest) * coarsest;
-        self.lod_ring = LodRing::new(LOD_INNER_CHUNKS, &levels, margin, LOD_WORLD_Y_BLOCKS);
+        // The whole world's height: one node spans it at every level (cells
+        // are `stride` wide but band/32 tall), affordable because streaming
+        // follows the surface and nothing loads a full column.
+        let band = (vox_core::WORLD_Y_MIN_BLOCKS, vox_core::WORLD_Y_MAX_BLOCKS);
+        self.lod_ring = LodRing::new(LOD_INNER_CHUNKS, &levels, margin, band);
 
         self.lod_pending_set.clear();
         self.lod_in_flight.clear();
@@ -1874,6 +1882,10 @@ impl App {
         let stone = vox_core::registry::STONE;
         let grass_layers: [u32; 6] = std::array::from_fn(|f| self.registry.face_layer(grass, f));
         let stone_layers: [u32; 6] = std::array::from_fn(|f| self.registry.face_layer(stone, f));
+        // The LOD's sea surface is the same translucent water as up close
+        // (ADR-0011 decision 1c).
+        let water = vox_core::registry::WATER;
+        let water_layers: [u32; 6] = std::array::from_fn(|f| self.registry.face_layer(water, f));
 
         let mut spawned = 0;
         if !self.lod_pending_set.is_empty() {
@@ -1939,6 +1951,8 @@ impl App {
                         |b, face| {
                             if b == grass {
                                 grass_layers[face]
+                            } else if b == water {
+                                water_layers[face]
                             } else {
                                 stone_layers[face]
                             }
@@ -1975,7 +1989,8 @@ impl App {
     fn break_block(&mut self) {
         let Some(hit) = self.targeted else { return };
         let pos = hit.block_pos;
-        if self.world.get_block(pos).is_air() {
+        // PHYSICAL (ADR-0011): only solid blocks can be broken.
+        if !self.registry.is_solid(self.world.get_block(pos)) {
             return;
         }
         self.world.set_block(pos, BlockId::AIR);
@@ -1991,7 +2006,9 @@ impl App {
     fn place_block(&mut self) {
         let Some(hit) = self.targeted else { return };
         let Some(pos) = hit.place_pos else { return };
-        if !self.world.get_block(pos).is_air() {
+        // PHYSICAL (ADR-0011): a cell is occupied only by a solid block, so
+        // placing into water replaces it.
+        if self.registry.is_solid(self.world.get_block(pos)) {
             return; // target cell occupied
         }
         // Reject if the cell would overlap the player's box.
@@ -2067,6 +2084,8 @@ impl App {
                         continue;
                     }
                     let pos = WorldPos::new(center.x + dx, center.y + dy, center.z + dz);
+                    // Deliberately `is_air`, not a registry property: the
+                    // debug hole clears everything, water included.
                     if !self.world.get_block(pos).is_air() {
                         self.world.set_block(pos, BlockId::AIR);
                         touched.insert(pos.chunk());
@@ -2120,8 +2139,8 @@ impl ApplicationHandler for App {
         // progressively, bounded by GEN_SPAWN_BUDGET and the per-frame mesh time budget.
         log::info!(
             "streaming: load radius {} / unload {} chunks",
-            LOAD_RADIUS,
-            UNLOAD_RADIUS
+            self.streamer.load_radius(),
+            self.streamer.unload_radius()
         );
 
         self.ui = Some(SettingsUi::new(&window));
@@ -2373,6 +2392,7 @@ impl ApplicationHandler for App {
                     let registry = &self.registry;
                     let eye = self.camera.position.to_array();
                     let dir = self.camera.forward().to_array();
+                    // PHYSICAL (ADR-0011): only solid blocks can be targeted.
                     vox_core::raycast_voxels(eye, dir, REACH, |p| {
                         registry.is_solid(world.get_block(p))
                     })
@@ -2438,7 +2458,8 @@ impl ApplicationHandler for App {
                 let far = (self.lod_far_blocks() * 1.6).max(1000.0);
                 // Nodes whose ground full-res already covers must not draw, or
                 // every dug hole shows coarse terrain behind it.
-                let covered = self.covered_lod_nodes(origin_chunk);
+                let fullres = self.fullres_columns(origin_chunk);
+                let covered = self.covered_lod_nodes(&fullres);
 
                 if let Some(renderer) = self.renderer.as_mut() {
                     // Floating origin (ADR-0002): keep the render origin at
@@ -2502,6 +2523,8 @@ impl ApplicationHandler for App {
                         pixels_per_point: o.pixels_per_point,
                     });
                     renderer.set_suppressed_lod(covered);
+                    renderer
+                        .set_fullres_columns(origin_chunk, |cx, cz| fullres.contains(&(cx, cz)));
                     renderer.render(view_proj.to_cols_array_2d(), ui_frame);
 
                     // Telemetry once per second: FPS, frustum-culling ratio,

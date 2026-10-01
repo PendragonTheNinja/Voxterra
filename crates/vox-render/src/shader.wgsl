@@ -41,11 +41,15 @@ var block_sampler: sampler;
 //   fog_color : rgb = colour terrain fades toward, w = strength (0 = off)
 //   fog_range : x = fog start, y = fog end (blocks), zw reserved
 //   morph     : x = geomorph band width in blocks — lod.wgsl only (ADR-0009)
+//   fullres   : where the full-resolution column mask sits — xy = its corner
+//               (render-relative blocks), z = column size, w = side in
+//               columns (0 = no mask yet) — lod.wgsl only (M10 A1)
 struct SkyChunk {
     cam_scale: vec4<f32>,
     fog_color: vec4<f32>,
     fog_range: vec4<f32>,
     morph: vec4<f32>,
+    fullres: vec4<f32>,
 };
 @group(3) @binding(0)
 var<uniform> sky: SkyChunk;
@@ -101,10 +105,37 @@ fn light_curve(level: f32) -> f32 {
     return ambient + (1.0 - ambient) * pow(t, 1.8);
 }
 
+// Opaque pass. The texture's alpha is ignored: opaque blocks are opaque.
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let tex = textureSample(block_tex, block_sampler, in.uv, in.layer);
+    return vec4<f32>(lit(in, tex.rgb), 1.0);
+}
 
+// Transparent pass (ADR-0011): identical lighting and fog, blended over the
+// finished opaque scene. Unsorted — see the ADR for why that is enough for one
+// near-planar water surface.
+//
+// Opacity rises toward 1 at grazing angles (Schlick's Fresnel term). Real
+// water does the same: looked at across the sea it shows the sky, not what
+// is under it. Without it, a low view through the surface near the edge of
+// the loaded area looked straight into the empty space under the LOD sea,
+// and read as white slivers (M10 A1). Looking down, it changes almost
+// nothing: at 45 degrees the term is 0.002.
+@fragment
+fn fs_transparent(in: VsOut) -> @location(0) vec4<f32> {
+    let tex = textureSample(block_tex, block_sampler, in.uv, in.layer);
+    // The face's normal from screen-space derivatives: flat per face, and
+    // needs nothing from the vertex format.
+    let normal = normalize(cross(dpdx(in.world_rel), dpdy(in.world_rel)));
+    let to_eye = normalize(sky.cam_scale.xyz - in.world_rel);
+    let grazing = pow(1.0 - abs(dot(normal, to_eye)), 5.0);
+    return vec4<f32>(lit(in, tex.rgb), mix(tex.a, 1.0, grazing));
+}
+
+// Lighting and fog for a surface of colour `albedo`, shared by both passes so
+// water is lit exactly like the ground beside it.
+fn lit(in: VsOut, albedo: vec3<f32>) -> vec3<f32> {
     // Day/night: dim the SKY channel by sky_scale, leaving block light (torches)
     // untouched. sky_scale is driven per-frame by vox_core::WorldTime.
     let sky_scale = sky.cam_scale.w;
@@ -119,7 +150,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let sky_lit = light_curve(in.sky) * sky_scale;
     let block_lit = light_curve(in.block);
     let brightness = in.shade * max(sky_lit, block_lit);
-    var color = tex.rgb * brightness;
+    var color = albedo * brightness;
 
     // Distance fog (M09 amendment A2). Terrain fades toward the sky as it
     // recedes, which is what makes the LOD detail transitions unreadable:
@@ -135,5 +166,5 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         );
         color = mix(color, sky.fog_color.rgb, t * t * fog_strength);
     }
-    return vec4<f32>(color, 1.0);
+    return color;
 }

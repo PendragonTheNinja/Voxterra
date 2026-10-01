@@ -1,8 +1,8 @@
 //! Block registry (Milestone 03 task 1).
 //!
 //! The single source of truth for what each [`BlockId`] *is*: its name,
-//! whether it's solid, and which texture-array layer each of its six faces
-//! uses. Replaces the placeholder hardcoded block constants that were
+//! its physical and visual properties, and which texture-array layer each of
+//! its six faces uses. Replaces the placeholder hardcoded block constants that were
 //! scattered across vox-worldgen and vox-app.
 //!
 //! Headless: no graphics dependency. The renderer consumes only the
@@ -21,6 +21,21 @@
 //! `faces[i]` is indexed the same way vox-mesh's `FACE_DIRS` orders faces:
 //! `0:+X (east) 1:-X (west) 2:+Y (top) 3:-Y (bottom) 4:+Z (south) 5:-Z (north)`.
 //! Keep these in lockstep — the mesher uses this index to pick the layer.
+//!
+//! ## Three properties, not one (ADR-0011)
+//!
+//! `solid` once meant five different things at its call sites. It is now
+//! three independent properties, and every caller asks the one it means:
+//!
+//! | property | question | asked by |
+//! |---|---|---|
+//! | `solid` | does it stop the player / can it be targeted? | collision, raycast, break/place, the terrain top the LOD draws |
+//! | `opaque` | does it block light / hide the face behind it? | lighting, the skylight heightmap, meshing, AO |
+//! | `renders` | does it have geometry at all? | meshing |
+//!
+//! Every block is either air (none of the three), an opaque cube (all three),
+//! or water — rendered, but neither solid nor opaque. A new call site that picks the wrong property compiles, passes most
+//! tests, and shows up in play — choose by the question being asked.
 
 use crate::block::BlockId;
 
@@ -39,10 +54,13 @@ pub mod face {
 pub struct BlockType {
     /// Human-readable name (debug/UI/logging).
     pub name: &'static str,
-    /// Whether this block occludes neighbor faces / can be targeted by the
-    /// raycast. All current blocks are opaque cubes; transparency is a later
-    /// milestone. Air is the only non-solid block this milestone.
+    /// PHYSICAL: stops the player, can be targeted and broken, and counts as
+    /// the terrain top. See the module docs for which property to ask.
     pub solid: bool,
+    /// VISUAL: blocks light and hides the neighbouring face behind it.
+    pub opaque: bool,
+    /// VISUAL: has geometry. Only air does not.
+    pub renders: bool,
     /// Texture-array layer index for each of the six faces (see module docs
     /// for face order). Used by meshing/rendering from task 2 onward.
     pub faces: [u32; 6],
@@ -61,6 +79,8 @@ impl BlockType {
         Self {
             name,
             solid: true,
+            opaque: true,
+            renders: true,
             faces: [layer; 6],
             color,
             light_emission: 0,
@@ -73,6 +93,8 @@ impl BlockType {
         Self {
             name,
             solid: true,
+            opaque: true,
+            renders: true,
             faces: [side, side, top, bottom, side, side],
             color,
             light_emission: 0,
@@ -84,9 +106,25 @@ impl BlockType {
         Self {
             name,
             solid: true,
+            opaque: true,
+            renders: true,
             faces: [layer; 6],
             color,
             light_emission: emission,
+        }
+    }
+
+    /// Water (ADR-0011): drawn in the transparent pass, passes light
+    /// undimmed (M10), and stops nobody — the player falls to the seabed.
+    fn water() -> Self {
+        Self {
+            name: "water",
+            solid: false,
+            opaque: false,
+            renders: true,
+            faces: [L_WATER; 6],
+            color: [0.20, 0.38, 0.62],
+            light_emission: 0,
         }
     }
 
@@ -94,6 +132,8 @@ impl BlockType {
         Self {
             name: "air",
             solid: false,
+            opaque: false,
+            renders: false,
             faces: [0; 6],
             color: [0.0, 0.0, 0.0],
             light_emission: 0,
@@ -111,6 +151,8 @@ pub const COBBLESTONE: BlockId = BlockId(5);
 pub const PLANKS: BlockId = BlockId(6);
 /// A light-emitting block (Milestone 04). Solid, glows at near-max level.
 pub const LAMP: BlockId = BlockId(7);
+/// Sea water (M10 A1, ADR-0011). Rendered, not solid, not opaque.
+pub const WATER: BlockId = BlockId(8);
 
 // --- Texture-array layer assignment (one layer per distinct tile). Used by
 // the texture pipeline in task 2; declared here so the registry is the
@@ -123,9 +165,13 @@ const L_SAND: u32 = 4;
 const L_COBBLE: u32 = 5;
 const L_PLANKS: u32 = 6;
 const L_LAMP: u32 = 7;
+/// Water: translucent (the tile carries alpha), near and far alike — the LOD
+/// draws the same surface over its own seabed (ADR-0011 decision 1c).
+pub const L_WATER: u32 = 8;
 /// Number of texture-array layers the default registry references. The
-/// texture array built in M03 task 2 must have at least this many layers.
-pub const DEFAULT_LAYER_COUNT: u32 = 8;
+/// renderer builds exactly this many, so a new layer is one change here and
+/// one tile in `vox-render`'s `tile_pixels`.
+pub const DEFAULT_LAYER_COUNT: u32 = 9;
 
 /// Block-light level emitted by the lamp block.
 pub const LAMP_EMISSION: u8 = 14;
@@ -139,7 +185,7 @@ impl BlockRegistry {
     /// Build the default starter registry. Indices are dense and match the
     /// `BlockId` numeric values, so lookup is O(1) indexing.
     pub fn default_set() -> Self {
-        // Order MUST match the BlockId values (0..=6).
+        // Order MUST match the BlockId values (0..=8).
         let types = vec![
             BlockType::air(),                                         // 0 AIR
             BlockType::uniform("stone", L_STONE, [0.55, 0.55, 0.58]), // 1
@@ -155,6 +201,7 @@ impl BlockRegistry {
             BlockType::uniform("cobblestone", L_COBBLE, [0.50, 0.50, 0.52]), // 5
             BlockType::uniform("planks", L_PLANKS, [0.62, 0.46, 0.28]), // 6
             BlockType::emitter("lamp", L_LAMP, [1.0, 0.93, 0.70], LAMP_EMISSION), // 7
+            BlockType::water(),                                       // 8
         ];
         Self { types }
     }
@@ -166,10 +213,23 @@ impl BlockRegistry {
         self.types.get(id.0 as usize).unwrap_or(&self.types[0])
     }
 
-    /// Whether a block occludes / is targetable. Air is not solid.
+    /// PHYSICAL: stops the player, can be targeted and broken, counts as the
+    /// terrain top. Not "blocks light" — that is [`is_opaque`](Self::is_opaque).
     #[inline]
     pub fn is_solid(&self, id: BlockId) -> bool {
         self.get(id).solid
+    }
+
+    /// VISUAL: blocks light and hides the neighbouring face behind it.
+    #[inline]
+    pub fn is_opaque(&self, id: BlockId) -> bool {
+        self.get(id).opaque
+    }
+
+    /// VISUAL: has geometry at all.
+    #[inline]
+    pub fn renders(&self, id: BlockId) -> bool {
+        self.get(id).renders
     }
 
     /// Block-light this block emits (0..=15), 0 for non-emitters.
@@ -243,6 +303,41 @@ mod tests {
         assert!(!reg.is_solid(AIR));
         assert!(reg.is_solid(STONE));
         assert!(reg.is_solid(GRASS));
+    }
+
+    /// The three properties are what they claim for every block, and the
+    /// shortcut the mesher relies on holds: air is the only block that does
+    /// not render, so `is_air` answers "renders nothing".
+    #[test]
+    fn properties_are_consistent() {
+        let reg = BlockRegistry::default_set();
+        assert!(!reg.is_opaque(AIR) && !reg.renders(AIR));
+        for i in 0..reg.len() {
+            let id = BlockId(i as u16);
+            assert_eq!(reg.renders(id), !id.is_air(), "{}", reg.get(id).name);
+            // Opaque implies renders: nothing hides a face while drawing none.
+            assert!(
+                !reg.is_opaque(id) || reg.renders(id),
+                "{}",
+                reg.get(id).name
+            );
+        }
+        for id in [STONE, DIRT, GRASS, SAND, COBBLESTONE, PLANKS, LAMP] {
+            assert!(reg.is_solid(id) && reg.is_opaque(id) && reg.renders(id));
+        }
+    }
+
+    /// Water is the block the split exists for: drawn, but it stops nobody
+    /// and blocks no light — and it is not something to place from the
+    /// hotbar.
+    #[test]
+    fn water_renders_but_is_neither_solid_nor_opaque() {
+        let reg = BlockRegistry::default_set();
+        assert_eq!(reg.get(WATER).name, "water");
+        assert!(reg.renders(WATER));
+        assert!(!reg.is_solid(WATER), "the player would stand on the sea");
+        assert!(!reg.is_opaque(WATER), "the seabed would be dark and hidden");
+        assert!(!reg.placeable().any(|b| b == WATER));
     }
 
     #[test]

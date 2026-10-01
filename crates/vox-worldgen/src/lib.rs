@@ -21,13 +21,13 @@
 pub mod elevation;
 
 use elevation::Elevation;
-use vox_core::{BlockId, CHUNK_SIZE, Chunk, ChunkPos, LocalPos, WorldShape};
+use vox_core::{BlockId, CHUNK_SIZE, Chunk, ChunkPos, LocalPos, SEA_LEVEL_BLOCKS, WorldShape};
 
 /// Block ids used by the placeholder generator. These now come from the
 /// canonical block registry in vox-core (Milestone 03); re-exported here so
 /// existing call sites (`blocks::STONE`, etc.) keep working unchanged.
 pub mod blocks {
-    pub use vox_core::registry::{AIR, DIRT, GRASS, STONE};
+    pub use vox_core::registry::{AIR, DIRT, GRASS, STONE, WATER};
 }
 
 /// Number of dirt blocks below the surface grass layer.
@@ -69,7 +69,10 @@ pub struct Generator {
 /// a decision to bump this and re-pin the fingerprint in the same commit.
 ///
 /// History: 1 — the M10 torus (ADR-0012), the first version recorded.
-pub const GENERATOR_VERSION: u32 = 1;
+/// 2 — sea water fills every block above the ground up to sea level (M10 A1,
+/// ADR-0011). Surface heights are unchanged; chunk contents are not, which is
+/// why the fingerprint now covers chunks as well as heights.
+pub const GENERATOR_VERSION: u32 = 2;
 
 impl Generator {
     /// A generator for one world: its seed and its size. The size is part of
@@ -110,6 +113,31 @@ impl Generator {
         self.elevation.height(wx, wz)
     }
 
+    /// The inclusive chunk-Y span of the terrain surface across one chunk
+    /// column `(cx, cz)` — the layers that streaming keeps around the ground.
+    ///
+    /// Sampled at the column's four corners and its centre rather than one
+    /// point: a 32-block-wide column can hold a cliff, and a single sample
+    /// would load its top and leave a hole down the face. Five samples, not
+    /// 1 024, because the streamer calls this for every column in its disc
+    /// every frame; the margins around the span absorb what they miss.
+    ///
+    /// The one sampler: the streamer, the first-mesh gate and LOD coverage
+    /// all judge residency from it, and they must agree to the layer.
+    pub fn surface_span_chunks(&self, cx: i64, cz: i64) -> (i64, i64) {
+        let s = CHUNK_SIZE as i64;
+        let (bx, bz) = (cx * s, cz * s);
+        let e = s - 1;
+        let mut lo = i64::MAX;
+        let mut hi = i64::MIN;
+        for (ox, oz) in [(0, 0), (e, 0), (0, e), (e, e), (e / 2, e / 2)] {
+            let h = self.surface_height(bx + ox, bz + oz);
+            lo = lo.min(h);
+            hi = hi.max(h);
+        }
+        (lo.div_euclid(s), hi.div_euclid(s))
+    }
+
     /// Generate the chunk at `pos` independently. Empty (all-air) chunks —
     /// the common case far above the surface — return a uniform chunk for
     /// free (no per-voxel work, O(1) storage).
@@ -131,8 +159,16 @@ impl Generator {
             }
         }
 
+        // Wholly above the ground: sky, sea, or the sea surface between them.
         if chunk_min_y > max_surface {
-            return Chunk::filled(blocks::AIR);
+            if chunk_min_y > SEA_LEVEL_BLOCKS {
+                return Chunk::filled(blocks::AIR);
+            }
+            if chunk_max_y <= SEA_LEVEL_BLOCKS {
+                // Open ocean between the seabed and the surface — most of an
+                // ocean's volume, generated without a single height query more.
+                return Chunk::filled(blocks::WATER);
+            }
         }
         if chunk_max_y < min_surface - DIRT_DEPTH {
             return Chunk::filled(blocks::STONE);
@@ -216,7 +252,12 @@ impl Generator {
     /// by both the per-column fill and any future queries.
     fn block_at(&self, wy: i64, height: i64) -> BlockId {
         if wy > height {
-            blocks::AIR
+            // Above the ground: the sea fills up to sea level (ADR-0011).
+            if wy <= SEA_LEVEL_BLOCKS {
+                blocks::WATER
+            } else {
+                blocks::AIR
+            }
         } else if wy == height {
             blocks::GRASS
         } else if wy >= height - DIRT_DEPTH {
@@ -271,23 +312,17 @@ mod tests {
         let lower = worldgen.generate_chunk(ChunkPos::new(0, 0, 0));
         let upper = worldgen.generate_chunk(ChunkPos::new(0, 1, 0));
 
-        // For a few columns, walk world Y across the seam and confirm the
-        // surface/dirt/stone profile is continuous.
+        // For a few columns, walk world Y across the seam and confirm both
+        // chunks follow the one vertical profile, `block_at` — compared
+        // against it rather than a second copy of it, which is what went stale
+        // when the sea arrived.
         for &(lx, lz) in &[(0u8, 0u8), (7, 19), (31, 31), (15, 3)] {
             let wx = lx as i64;
             let wz = lz as i64;
             let height = worldgen.surface_height(wx, wz);
             // Lower chunk covers wy 0..32, upper covers 32..64.
             for wy in 0..(2 * CHUNK_SIZE as i64) {
-                let expected = if wy > height {
-                    blocks::AIR
-                } else if wy == height {
-                    blocks::GRASS
-                } else if wy >= height - DIRT_DEPTH {
-                    blocks::DIRT
-                } else {
-                    blocks::STONE
-                };
+                let expected = worldgen.block_at(wy, height);
                 let from_world = WorldPos::new(wx, wy, wz);
                 let (chunk_pos, local) = from_world.split();
                 let chunk = if chunk_pos.y == 0 { &lower } else { &upper };
@@ -295,6 +330,99 @@ mod tests {
                     chunk.get(local),
                     expected,
                     "seam mismatch at column ({wx},{wz}) wy={wy}"
+                );
+            }
+        }
+    }
+
+    /// A column whose ground is at least `depth` below sea level, found by
+    /// walking a line — oceans cover most of the world, so this is short.
+    fn ocean_column(g: &Generator, depth: i64) -> (i64, i64) {
+        (0..200_000i64)
+            .step_by(97)
+            .map(|x| (x, 5_000))
+            .find(|&(x, z)| g.surface_height(x, z) < SEA_LEVEL_BLOCKS - depth)
+            .expect("no ocean that deep along the search line")
+    }
+
+    /// THE point of version 2: the sea fills every block above the ground up
+    /// to sea level, and not one block higher.
+    #[test]
+    fn the_sea_fills_to_sea_level_and_no_higher() {
+        let g = Generator::new(42, WorldShape::DEFAULT);
+        let (x, z) = ocean_column(&g, 100);
+        let ground = g.surface_height(x, z);
+        let block = |y: i64| {
+            let (chunk, local) = vox_core::WorldPos::new(x, y, z).split();
+            g.generate_chunk(chunk).get(local)
+        };
+        assert_ne!(block(ground), blocks::WATER, "the seabed itself is water");
+        for y in [
+            ground + 1,
+            ground + 40,
+            SEA_LEVEL_BLOCKS - 1,
+            SEA_LEVEL_BLOCKS,
+        ] {
+            assert_eq!(block(y), blocks::WATER, "no water at {y} (ground {ground})");
+        }
+        assert_eq!(
+            block(SEA_LEVEL_BLOCKS + 1),
+            blocks::AIR,
+            "the sea overflows"
+        );
+    }
+
+    /// Dry land keeps no water: the fill is above the GROUND, below sea level
+    /// — a column above sea level has none, even in the chunk holding the sea
+    /// surface elsewhere.
+    #[test]
+    fn land_above_sea_level_stays_dry() {
+        let g = Generator::new(42, WorldShape::DEFAULT);
+        let (x, z) = (0..200_000i64)
+            .step_by(97)
+            .map(|x| (x, 5_000))
+            .find(|&(x, z)| g.surface_height(x, z) > SEA_LEVEL_BLOCKS + 10)
+            .expect("no land along the search line");
+        let ground = g.surface_height(x, z);
+        for y in ground - 30..=ground + 30 {
+            assert_ne!(
+                g.block_at(y, ground),
+                blocks::WATER,
+                "water at {y} on dry land"
+            );
+        }
+    }
+
+    /// Every fast path agrees with the per-block profile: an all-water chunk
+    /// of open ocean, the sea-surface chunk above it, and the air above that.
+    #[test]
+    fn ocean_chunks_match_the_profile_through_every_fast_path() {
+        let g = Generator::new(42, WorldShape::DEFAULT);
+        let s = CHUNK_SIZE as i64;
+        let (x, z) = ocean_column(&g, 150);
+        let (cx, cz) = (x.div_euclid(s), z.div_euclid(s));
+        let open_ocean = ChunkPos::new(cx, vox_core::SEA_SURFACE_CHUNK_Y - 2, cz);
+        assert!(
+            g.generate_chunk(open_ocean).is_uniform(),
+            "setup: expected the all-water fast path"
+        );
+        for cy in [
+            vox_core::SEA_SURFACE_CHUNK_Y - 2,
+            vox_core::SEA_SURFACE_CHUNK_Y,
+            vox_core::SEA_SURFACE_CHUNK_Y + 1,
+        ] {
+            let pos = ChunkPos::new(cx, cy, cz);
+            let chunk = g.generate_chunk(pos);
+            for local in LocalPos::iter() {
+                let (wx, wy, wz) = (
+                    pos.x * s + local.x() as i64,
+                    pos.y * s + local.y() as i64,
+                    pos.z * s + local.z() as i64,
+                );
+                assert_eq!(
+                    chunk.get(local),
+                    g.block_at(wy, g.surface_height(wx, wz)),
+                    "chunk {pos:?} disagrees with the profile at ({wx}, {wy}, {wz})"
                 );
             }
         }
@@ -353,10 +481,29 @@ mod tests {
     fn terrain_fingerprint() -> u64 {
         let g = Generator::new(0x0007_E22A_C0DE, WorldShape::DEFAULT);
         let mut h = 0xCBF2_9CE4_8422_2325u64; // FNV-1a
+        let mut eat = |bytes: &[u8]| {
+            for &b in bytes {
+                h = (h ^ b as u64).wrapping_mul(0x0100_0000_01B3);
+            }
+        };
         for i in 0..512i64 {
             let (x, z) = (i * 7_919 - 1_000_000, i * 104_729 + 3);
-            for b in g.surface_height(x, z).to_le_bytes() {
-                h = (h ^ b as u64).wrapping_mul(0x0100_0000_01B3);
+            eat(&g.surface_height(x, z).to_le_bytes());
+        }
+        // Chunk contents too: what fills the space around the surface can
+        // change without moving a single height — the sea did (version 2).
+        // Several layers around the surface of scattered columns, land and
+        // ocean alike, catch the fill rules and every fast path.
+        let s = CHUNK_SIZE as i64;
+        for i in 0..24i64 {
+            let (cx, cz) = (i * 1_987 - 20_000, i * 3_571 + 11);
+            let surface = g.surface_height(cx * s, cz * s).div_euclid(s);
+            let top = surface.max(vox_core::SEA_SURFACE_CHUNK_Y);
+            for cy in surface - 1..=top + 1 {
+                let chunk = g.generate_chunk(ChunkPos::new(cx, cy, cz));
+                for pos in LocalPos::iter() {
+                    eat(&chunk.get(pos).0.to_le_bytes());
+                }
             }
         }
         h
@@ -374,7 +521,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (1, 0x3808_a5be_8a75_2e0e);
+        const PINNED: (u32, u64) = (2, 0x14c7_a1a5_93b3_debf);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),
@@ -471,6 +618,27 @@ mod tests {
             g.lod_heightfield(0, 0, 4, LodSampling::Sparse).len(),
             CHUNK_SIZE * CHUNK_SIZE
         );
+    }
+
+    /// The span covers the surface wherever it samples it — every corner and
+    /// the centre of the column — in negative columns too, where the chunk
+    /// layer of a height needs floor division.
+    #[test]
+    fn surface_span_covers_the_sampled_surface() {
+        let g = Generator::new(11, WorldShape::DEFAULT);
+        let s = CHUNK_SIZE as i64;
+        for (cx, cz) in [(0, 0), (-1, -1), (37, -12), (-400, 250), (5_000, 3)] {
+            let (lo, hi) = g.surface_span_chunks(cx, cz);
+            assert!(lo <= hi);
+            let e = s - 1;
+            for (ox, oz) in [(0, 0), (e, 0), (0, e), (e, e), (e / 2, e / 2)] {
+                let layer = g.surface_height(cx * s + ox, cz * s + oz).div_euclid(s);
+                assert!(
+                    (lo..=hi).contains(&layer),
+                    "column ({cx}, {cz}): surface layer {layer} outside span ({lo}, {hi})"
+                );
+            }
+        }
     }
 }
 

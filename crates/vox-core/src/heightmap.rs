@@ -110,6 +110,36 @@ impl ColumnHeights {
         }
     }
 
+    /// The skylight entering `pos` from above when the chunk above is ABSENT
+    /// AND NEVER COMING (sealed), as a 32x32 plane indexed `x + z * 32` — the
+    /// layout of a +Y neighbour's sky plane.
+    ///
+    /// Why it exists (M10 A1): over deep ocean only the seabed and the sea
+    /// surface are resident; the water column between is not. With no chunk
+    /// above, the seabed chunk received no daylight at all, although nothing
+    /// but water — which passes light — lies between it and the sky.
+    ///
+    /// The rule is the heightmap's own, one chunk up: a column whose highest
+    /// opaque block is below the chunk above has open sky there, so 15; any
+    /// other column, and every UNKNOWN one, 0 — unknown is covered (CLAUDE.md
+    /// lighting invariants). Only for a sealed neighbour: one still coming
+    /// supplies its real plane when it arrives, and guessing before then would
+    /// light a cave under a surface chunk that has not streamed in yet.
+    pub fn sky_plane_above(&self, pos: ChunkPos) -> Vec<u8> {
+        let s = CHUNK_SIZE as i64;
+        let (x0, z0) = (pos.x * s, pos.z * s);
+        let above = (pos.y + 1) * s;
+        let mut plane = vec![0u8; (s * s) as usize];
+        for z in 0..s {
+            for x in 0..s {
+                if self.get(x0 + x, z0 + z).is_some_and(|h| h < above) {
+                    plane[(x + z * s) as usize] = crate::MAX_LIGHT;
+                }
+            }
+        }
+        plane
+    }
+
     /// Number of columns with a known height.
     pub fn len(&self) -> usize {
         self.heights.len()
@@ -260,6 +290,38 @@ mod tests {
         assert_eq!(h.get(-S, -S), None);
         assert_eq!(h.get(0, 0), Some(4), "pruned the neighbouring column");
         assert_eq!(h.len(), (S * S) as usize);
+    }
+
+    /// The seabed under unloaded water gets daylight where the heightmap
+    /// shows open sky above it — and only there.
+    #[test]
+    fn the_plane_above_follows_the_heightmap() {
+        let mut h = ColumnHeights::new();
+        let seabed = cp(0, -9, 0);
+        h.chunk_loaded(seabed);
+        let top_of_chunk = -9 * S + S - 1;
+        h.raise(3, 4, top_of_chunk - 5); // seabed inside the chunk: open above
+        h.raise(5, 6, top_of_chunk); // opaque in the chunk's top layer: still open above
+        h.raise(7, 8, top_of_chunk + 40); // something opaque above: covered
+        h.set(9, 9, i64::MIN); // known, nothing opaque: open
+        let plane = h.sky_plane_above(seabed);
+        let at = |x: i64, z: i64| plane[(x + z * S) as usize];
+        assert_eq!(at(3, 4), crate::MAX_LIGHT);
+        assert_eq!(at(5, 6), crate::MAX_LIGHT);
+        assert_eq!(at(7, 8), 0, "daylight under something opaque");
+        assert_eq!(at(9, 9), crate::MAX_LIGHT);
+    }
+
+    /// The lighting invariant: an unknown column is covered, never open.
+    #[test]
+    fn an_unknown_column_is_dark_above() {
+        let mut h = ColumnHeights::new();
+        h.chunk_loaded(cp(0, -9, 0));
+        let plane = h.sky_plane_above(cp(0, -9, 0));
+        assert!(
+            plane.iter().all(|&v| v == 0),
+            "an unknown column let daylight in"
+        );
     }
 
     #[test]

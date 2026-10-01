@@ -104,6 +104,19 @@ crates: `vox-sim`, `vox-net`, `vox-client`, `vox-server`.
   `vox_render::perspective` and every depth state from `vox-render`'s
   `DEPTH_*` constants — never glam's `perspective_rh` directly, never a literal
   `Less`. Anything that unprojects depth (the sky) reads near at 1, far at 0.
+- **LOD never draws where full resolution does.** It used to underlap and
+  rely on opaque ground in front; translucent water broke that (ADR-0011
+  notes). One set, vox-app's `fullres_columns` — complete columns out to the
+  unload radius — decides whole-node suppression, the per-column mask the LOD
+  shader discards against, and where the transparent pass may draw near
+  water. A second, independent judgement of "is full-res drawn here?" is how
+  they would disagree at the edge; stopping at the load radius already did.
+- **Ask the block property you mean (ADR-0011).** `solid` is physical:
+  collision, targeting, breaking, placing, the terrain top the LOD draws.
+  `opaque` is visual: blocks light, hides the face behind it, casts AO — so
+  lighting, the skylight heightmap and meshing ask it. `renders` is whether it
+  has geometry. They coincide for every block until water, which is rendered
+  but neither solid nor opaque; a site on the wrong one compiles and passes.
 - **Terrain output is versioned.** Any change to what the generator produces
   for a given seed and size must bump `vox_worldgen::GENERATOR_VERSION` and
   re-pin `terrain_fingerprint_is_pinned` in the same commit; worlds made by
@@ -243,12 +256,14 @@ beyond what the invariants above already require.
   overlay saved with the world and the level-0 gather removed; the sparse LOD
   sampler with its ADR-0008 amendment; the LOD grid lines, which were the
   slope-scaled LOD depth bias, plus reversed-Z depth, ADR-0013; the dark line
-  around the loaded disc) are done; next is the A3 cleanup.
+  around the loaded disc; the cleanup) are done — A3 is complete. A1 (transparency and water,
+  ADR-0011) is done: the solid/opaque/renders split, then water. Next is M10's
+  tuning and retro.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 251, vox-mesh 44, vox-worldgen 27 passing as of the sealed-edge
-  commit; vox-render's 5 tests need wgpu and run natively only), then
-  start the first unchecked item.
+  vox-core 265, vox-mesh 53, vox-worldgen 31 passing as of LOD water 1c;
+  vox-render's 10 tests need wgpu and run natively only), then start the first
+  unchecked item.
 - **Roadmap after M10:** 11 — The Horizon
   (`docs/milestones/11-the-horizon.md`: 32–64 km view via per-level LOD ring
   centring, Earth-radius curvature, flat-cell merging, reverse-Z depth); then
@@ -314,6 +329,13 @@ was a real shipped bug. Regression tests exist for all of them (vox-core).
   ignores writes to non-resident columns. Every insert into and removal from
   the `World` must be reported to it (`chunk_loaded` / `chunk_unloaded`);
   a missed report either leaks or drops heights still in use.
+- **A sealed +Y neighbour's skylight comes from the heightmap; an absent one
+  still coming gets none.** Over deep ocean only the seabed and the sea
+  surface are resident, and the seabed must be lit through the water between
+  (ADR-0011). `ColumnHeights::sky_plane_above` gives 15 where the column's
+  highest opaque block is below the chunk above and 0 elsewhere — unknown
+  included. Applying it to a neighbour that IS coming would light caves under
+  surface chunks that have not arrived yet: lit-then-frozen, the old bug.
 - **Never mesh a chunk that is still queued for relight.** Light first, mesh
   once. Meshing before lighting bakes zero light (dark chunk checkerboard)
   and forces a second mesh — the single biggest streaming-burst cost found.

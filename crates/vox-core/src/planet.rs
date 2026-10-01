@@ -87,9 +87,20 @@ pub const WORLD_Y_MIN_BLOCKS: i64 = -11_264;
 /// (8 848 m). A multiple of [`CHUNK_SIZE`].
 pub const WORLD_Y_MAX_BLOCKS: i64 = 9_216;
 
-/// Y at which oceans fill. Land elevations and ocean depths are both quoted
-/// relative to this.
+/// The highest block that holds sea water. Land elevations and ocean depths
+/// are both quoted relative to it.
+///
+/// Water fills every block above the ground up to and including this Y, so
+/// the sea surface is the TOP face of this block: a column of height 0 is
+/// flush with the sea, lower ones are under it (ADR-0011). Chosen so the top
+/// water block and the air above it share one chunk layer,
+/// [`SEA_SURFACE_CHUNK_Y`] — the one layer streaming must add to keep the
+/// ocean's surface resident over deep water.
 pub const SEA_LEVEL_BLOCKS: i64 = 0;
+
+/// The chunk layer holding the sea surface: the top water block and the air
+/// just above it.
+pub const SEA_SURFACE_CHUNK_Y: i64 = SEA_LEVEL_BLOCKS.div_euclid(CHUNK_SIZE as i64);
 
 /// Is this Y inside the world? Horizontally every position is in the world —
 /// it wraps — so this is the only bound there is.
@@ -412,6 +423,15 @@ mod tests {
 
     /// Every bound must land on a chunk edge, and so must every world size,
     /// or chunk coordinates would not wrap exactly.
+    /// The sea surface — the top water block and the air above it — lies in
+    /// one chunk layer, which is what lets streaming keep it with one layer.
+    #[test]
+    fn the_sea_surface_fits_in_one_chunk_layer() {
+        let s = CHUNK_SIZE as i64;
+        assert_eq!(SEA_LEVEL_BLOCKS.div_euclid(s), SEA_SURFACE_CHUNK_Y);
+        assert_eq!((SEA_LEVEL_BLOCKS + 1).div_euclid(s), SEA_SURFACE_CHUNK_Y);
+    }
+
     #[test]
     fn every_bound_and_size_is_chunk_aligned() {
         let s = CHUNK_SIZE as i64;

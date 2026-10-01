@@ -1,7 +1,9 @@
 # ADR-0011: Transparency, and water
 
-- **Status:** Accepted (M10 amendment A1). All three open decisions resolved
-  below.
+- **Status:** Accepted (M10 amendment A1) and implemented (2026-09-26), in two
+  steps: the property split and mesher rule, behaviour-neutral, then water.
+  See "Implementation notes" at the end for the choices this ADR did not
+  cover.
 - **Context:** M10 generates oceans covering ~58% of the world and renders none
   of them, because the engine has no transparency at all. `BlockType` says so:
   *"All current blocks are opaque cubes; transparency is a later milestone."*
@@ -107,7 +109,7 @@ surface, where overlaps are rare and the blend is nearly idempotent. The
 limitation is recorded here so the first person to add glass knows why their
 windows look wrong through each other.
 
-### Decision 1 (taken: **a**) — distant water
+### Decision 1 (taken: **a**, then **c** after play) — distant water
 
 LOD is a heightfield of land, so oceans beyond the full-resolution radius will
 still read as empty basins unless something covers them.
@@ -139,6 +141,22 @@ Mitigation, cheap: give distant water a colour already blended toward a typical
 seabed, so the two match rather than step. If a band still shows in play, (c)
 becomes a contained upgrade, because the transparent pipeline will exist by
 then.
+
+**Revised in play (2026-09-30): (c).** A band did show, and it could not be
+masked away. The reasoning above holds for distant water seen *from above*; it
+fails for the line of sight that passes through translucent NEAR water and
+continues, underwater, past the edge of the loaded area. Opaque LOD water is a
+lid with nothing under it, so that line ended in empty space — a pale strip
+along the whole edge, as wide as the sea is deep (260 blocks over the abyssal
+plain, seen from above at 45 degrees). The owner put it exactly: the near field
+renders the water and the land under it, the LOD only the water's top face.
+Under (c) the LOD draws its real seabed in the opaque pass and the same
+translucent water surface in the transparent pass, so near and far water are
+one thing at two resolutions and every line of sight through either ends on a
+seabed. It also retired the pre-blended distant-water layer and the LOD's
+"effective height" (ground raised to sea level): the LOD ground is ground
+again. Cost: the seabed's terraces and one water quad per row of sea cells per
+node — rows merge, so an open-ocean node adds 32 quads, not 1 024.
 
 ### Decision 2 (taken: defer) — does water dim light?
 
@@ -178,3 +196,81 @@ be unpicked. Buoyancy (c) is the natural follow-up once swimming is wanted.
   will be denser than they are today, and the M10 performance numbers should be
   taken after this lands, not before.
 - Glass, ice and leaves all become possible; none are in scope here.
+
+## Implementation notes (2026-09-26)
+
+Choices the decisions above left open, and why each was taken.
+
+**Sea level is the highest water block.** Water fills every block above the
+ground up to and including `SEA_LEVEL_BLOCKS` (0), so the sea surface is that
+block's top face and a column of height 0 is flush with the sea. Chosen so
+the top water block and the air above it share one chunk layer,
+`SEA_SURFACE_CHUNK_Y` — see the next note. Worldgen fills below it, with an
+all-water fast path for open ocean; `GENERATOR_VERSION` went to 2, and the
+terrain fingerprint now hashes chunk contents as well as surface heights,
+because water changed chunks without moving a single height.
+
+**Streaming keeps the sea surface, not the water column.** Streaming follows
+the ground, which over the abyssal plain (~260 blocks down) is eight chunk
+layers below the surface — out of reach of the surface window, so the ocean
+would never be seen from above. Loading the water column would add ~8 layers of
+uniform water per ocean column, all invisible: water-water faces are culled, so
+an ocean is its surface and its seabed. `StreamConfig::sea_layer` keeps that
+one layer for columns whose ground is below it; a column's window is now up to
+three ranges (ground, sea surface, camera). LOD coverage counts the sea layer,
+or a node over deep water would be hidden before its sea arrived.
+
+**The seabed is lit through the gap.** With the water column absent, the
+seabed chunk had nothing above it and read as dark, although only water, which
+passes light (decision 2), lies between it and the sky. When a chunk's +Y
+neighbour is absent AND never coming (sealed — the same judgement the mesher
+uses), its sky plane is derived from the heightmap: 15 where the column's
+highest opaque block is below that neighbour, 0 elsewhere, and 0 for unknown
+columns, which stay covered. Not for a neighbour still coming: guessing then
+would light a cave under a surface chunk that has not streamed in yet.
+(`ColumnHeights::sky_plane_above`.)
+
+**The transparent pass does not cull faces**, so the sea surface is visible
+from beneath — looking up from the seabed in spectator, or after falling in
+(decision 3).
+
+**Distant water is the LOD's seabed under a translucent surface (decision 1c,
+revised).** See decision 1. The LOD's sea surface is drawn by its own
+pipeline in the transparent pass (`fs_lod_transparent`), with the same blend,
+depth state, culling and Fresnel as near water, and discarding in full-res
+columns as the LOD ground does.
+
+**LOD is discarded per chunk column wherever full resolution draws.** The
+first in-play test showed, at the edge of the loaded area over ocean, a dark
+jagged band, a speckled blue band beyond it and white slivers. The cause was an
+assumption translucency breaks: LOD underlaps full resolution, and whole
+nodes are hidden only when every column under them is drawn, so nodes
+straddling the edge stayed drawn *under* the full-res region. Opaque ground in
+front had always hidden that overlap. Translucent near water does not: the
+nodes' opaque sea tied in depth with the near sea surface (the speckle), and
+their ground-textured skirts showed through it as a dark wall along the
+suppression boundary. Depth bias cannot fix a surface that is meant to be seen
+through. Now `Renderer::set_fullres_columns` uploads a mask of the chunk
+columns full resolution draws — the same set node suppression uses
+(`fullres_columns` in vox-app) — and two things follow from it: the LOD
+fragment shader discards in those columns, and the transparent pass draws
+near water ONLY in them. So LOD and full resolution never overlap in either
+direction, whatever either is made of, including in a column still streaming
+in (sea surface without its seabed shows LOD water, not near water over
+nothing). The set spans every resident column, out to the unload radius: the
+first version stopped at the load radius, and the unload band's still-drawn
+water sat over unmasked LOD — the fix appeared to change nothing until that
+was found. The mask
+is group 3 binding 1 (the four-group default limit is already reached) and its
+placement is the chunk uniform's fifth vec4, written only by
+`set_fullres_columns`; `set_sky` writes the first four.
+
+**Water turns opaque at grazing angles (Fresnel).** Looking across the sea
+from low down, the line of sight passes through the near surface and on,
+underwater, past the edge of the loaded area — into the empty space beneath
+the LOD sea surface, which read as white slivers. Real water is nearly opaque
+there anyway, showing the sky rather than what lies below, so the transparent
+pass raises alpha toward 1 by Schlick's term, `(1 - |n·v|)^5`, with the face
+normal taken from screen-space derivatives. Looking down it changes almost
+nothing (0.002 at 45 degrees). It is also the first step toward decision 2's
+deferred depth tint, not a substitute for it.

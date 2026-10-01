@@ -69,14 +69,38 @@ var block_sampler: sampler;
 //   fog_color : rgb = colour terrain fades toward, w = strength (0 = off)
 //   fog_range : x = fog start, y = fog end (blocks), zw reserved
 //   morph     : x = morph band width in blocks (0 = morphing off)
+//   fullres   : where the full-resolution column mask sits — xy = its corner
+//               (render-relative blocks), z = column size, w = side in
+//               columns (0 = no mask yet) — lod.wgsl only (M10 A1)
 struct SkyChunk {
     cam_scale: vec4<f32>,
     fog_color: vec4<f32>,
     fog_range: vec4<f32>,
     morph: vec4<f32>,
+    fullres: vec4<f32>,
 };
 @group(3) @binding(0)
 var<uniform> sky: SkyChunk;
+
+// Chunk columns full resolution draws (1) around the render origin; see
+// `Renderer::set_fullres_columns`.
+@group(3) @binding(1)
+var fullres_mask: texture_2d<f32>;
+
+// Does full resolution draw the chunk column under this point? LOD must not
+// draw there at all: under translucent near water it cannot hide behind the
+// real terrain, so any overlap shows (M10 A1).
+fn under_fullres(world_rel: vec3<f32>) -> bool {
+    let side = i32(sky.fullres.w);
+    if (side <= 0) {
+        return false;
+    }
+    let column = vec2<i32>(floor((world_rel.xz - sky.fullres.xy) / sky.fullres.z));
+    if (any(column < vec2<i32>(0)) || any(column >= vec2<i32>(side))) {
+        return false;
+    }
+    return textureLoad(fullres_mask, column, 0).r > 0.5;
+}
 
 struct VsIn {
     @location(0) position: vec3<f32>,
@@ -146,8 +170,33 @@ fn light_curve(level: f32) -> f32 {
 
 @fragment
 fn fs_lod(in: VsOut) -> @location(0) vec4<f32> {
+    // Sampled before the discard, so the sample stays in uniform control flow.
     let tex = textureSample(block_tex, block_sampler, in.uv, in.layer);
+    if (under_fullres(in.world_rel)) {
+        discard;
+    }
+    return vec4<f32>(lod_lit(in, tex.rgb), 1.0);
+}
 
+// The LOD's sea surface (ADR-0011 decision 1c): the same translucent water as
+// up close, blended over the LOD's own seabed, with the same Fresnel term as
+// shader.wgsl's fs_transparent so near and far water match at the boundary.
+// Discards in full-res columns like the ground does — near water draws there.
+@fragment
+fn fs_lod_transparent(in: VsOut) -> @location(0) vec4<f32> {
+    let tex = textureSample(block_tex, block_sampler, in.uv, in.layer);
+    let normal = normalize(cross(dpdx(in.world_rel), dpdy(in.world_rel)));
+    let to_eye = normalize(sky.cam_scale.xyz - in.world_rel);
+    let grazing = pow(1.0 - abs(dot(normal, to_eye)), 5.0);
+    if (under_fullres(in.world_rel)) {
+        discard;
+    }
+    return vec4<f32>(lod_lit(in, tex.rgb), mix(tex.a, 1.0, grazing));
+}
+
+// Lighting and fog for a distant surface of colour `albedo`, shared by both
+// LOD passes so the far sea is lit exactly like the far ground.
+fn lod_lit(in: VsOut, albedo: vec3<f32>) -> vec3<f32> {
     // Skylight only — no block channel to combine, which is the whole reason
     // this shader is separate. Day/night dims it through the same sky_scale
     // the near field uses, so the two match across the boundary.
@@ -160,7 +209,7 @@ fn fs_lod(in: VsOut) -> @location(0) vec4<f32> {
     // hide. Keep the formulas identical wherever they can be.
     let sky_scale = sky.cam_scale.w;
     let brightness = in.shade * max(light_curve(in.sky_light) * sky_scale, light_curve(0.0));
-    var color = tex.rgb * brightness;
+    var color = albedo * brightness;
 
     // Distance fog (M09 amendment A2), identical to shader.wgsl.
     let fog_strength = sky.fog_color.w;
@@ -173,5 +222,5 @@ fn fs_lod(in: VsOut) -> @location(0) vec4<f32> {
         );
         color = mix(color, sky.fog_color.rgb, t * t * fog_strength);
     }
-    return vec4<f32>(color, 1.0);
+    return color;
 }

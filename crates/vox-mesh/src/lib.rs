@@ -56,12 +56,41 @@ pub struct Vertex {
 #[derive(Debug, Default)]
 pub struct MeshData {
     pub vertices: Vec<Vertex>,
+    /// Opaque faces' indices first, then transparent ones (ADR-0011), sharing
+    /// the one vertex buffer.
     pub indices: Vec<u32>,
+    /// How many of `indices` are opaque: the renderer draws
+    /// `indices[..opaque_index_count]` in the opaque pass and the rest in the
+    /// transparent pass. One `u32` rather than a second mesh per chunk.
+    pub opaque_index_count: u32,
 }
 
 impl MeshData {
     pub fn is_empty(&self) -> bool {
         self.indices.is_empty()
+    }
+
+    /// Indices of opaque faces (the opaque pass).
+    pub fn opaque_indices(&self) -> &[u32] {
+        &self.indices[..self.opaque_index_count as usize]
+    }
+
+    /// Indices of transparent faces (the transparent pass), after the opaque
+    /// ones in the same buffer.
+    pub fn transparent_indices(&self) -> &[u32] {
+        &self.indices[self.opaque_index_count as usize..]
+    }
+
+    /// Join separately built opaque and transparent faces into one mesh, in
+    /// the order the renderer relies on.
+    fn joined(mut opaque: MeshData, transparent: MeshData) -> MeshData {
+        opaque.opaque_index_count = opaque.indices.len() as u32;
+        let base = opaque.vertices.len() as u32;
+        opaque.vertices.extend(transparent.vertices);
+        opaque
+            .indices
+            .extend(transparent.indices.iter().map(|&i| i + base));
+        opaque
     }
 
     pub fn quad_count(&self) -> usize {
@@ -107,7 +136,12 @@ pub struct LodVertex {
 #[derive(Debug, Default)]
 pub struct LodMeshData {
     pub vertices: Vec<LodVertex>,
+    /// Ground first, then the sea surface (ADR-0011): the renderer draws
+    /// `indices[..opaque_index_count]` in the opaque LOD pass and the rest in
+    /// the transparent pass, exactly as for chunk meshes.
     pub indices: Vec<u32>,
+    /// How many of `indices` are opaque.
+    pub opaque_index_count: u32,
     /// Node-local Y bounds of everything this mesh can occupy, morph targets
     /// and skirts included.
     ///
@@ -122,6 +156,16 @@ pub struct LodMeshData {
 impl LodMeshData {
     pub fn is_empty(&self) -> bool {
         self.indices.is_empty()
+    }
+
+    /// Indices of the ground (the opaque pass).
+    pub fn opaque_indices(&self) -> &[u32] {
+        &self.indices[..self.opaque_index_count as usize]
+    }
+
+    /// Indices of the sea surface (the transparent pass).
+    pub fn transparent_indices(&self) -> &[u32] {
+        &self.indices[self.opaque_index_count as usize..]
     }
 
     pub fn quad_count(&self) -> usize {
@@ -278,6 +322,10 @@ pub struct MeshInput {
     sky: Vec<u8>,
     /// 34³ block light levels (0..=15); shell defaults to 0.
     block_light: Vec<u8>,
+    /// 34³: does the cell's block occlude (hide the face behind it, cast AO)?
+    /// Evaluated once per cell from the caller's `occludes`, so the hot loops
+    /// index a map instead of calling back (ADR-0011).
+    opaque: Vec<bool>,
     all_air: bool,
 }
 
@@ -296,9 +344,32 @@ impl MeshInput {
     }
 
     /// Is the cell at chunk-relative coords air? (Absent neighbors are air.)
+    /// Air is the only block that renders nothing, so this is also "has no
+    /// geometry" — the registry asserts the equivalence.
     #[inline]
     pub fn is_air(&self, x: i32, y: i32, z: i32) -> bool {
         self.block[Self::cidx(x, y, z)].is_air()
+    }
+
+    /// Does the cell's block occlude — hide the face behind it, cast AO?
+    #[inline]
+    pub fn is_opaque(&self, x: i32, y: i32, z: i32) -> bool {
+        self.opaque[Self::cidx(x, y, z)]
+    }
+
+    /// THE face rule (ADR-0011), for a face of `block` toward the cell at
+    /// chunk-relative `n`:
+    ///
+    /// - the neighbour renders nothing (air): emit;
+    /// - the neighbour is opaque: cull;
+    /// - the neighbour renders but is not opaque: cull if it is the same block.
+    ///
+    /// The last clause is what makes an ocean cost a surface instead of a
+    /// volume: water-water faces vanish. Both meshers use this, or the
+    /// differential test catches the drift.
+    #[inline]
+    fn shows_face(&self, block: BlockId, n: [i32; 3]) -> bool {
+        !self.is_opaque(n[0], n[1], n[2]) && self.block(n[0], n[1], n[2]) != block
     }
 
     /// Block id at chunk-relative coords.
@@ -321,8 +392,13 @@ impl MeshInput {
         self.block_light[Self::cidx(x, y, z)]
     }
 
-    /// Build the snapshot from a chunk and its face neighbors.
-    pub fn build(chunk: &Chunk, neighbors: &ChunkNeighbors) -> Self {
+    /// Build the snapshot from a chunk and its face neighbors. `occludes`
+    /// answers the registry's `is_opaque` for a block id.
+    pub fn build(
+        chunk: &Chunk,
+        neighbors: &ChunkNeighbors,
+        mut occludes: impl FnMut(BlockId) -> bool,
+    ) -> Self {
         let n = CHUNK_SIZE;
         let mut block = vec![BlockId::AIR; PAD * PAD * PAD];
         let mut sky = vec![0u8; PAD * PAD * PAD];
@@ -442,10 +518,30 @@ impl MeshInput {
             }
         }
 
+        // After the shell (sealed extension included), so every cell's
+        // opacity follows the block it finally holds. Memoised per block id:
+        // a chunk and its neighbours hold a handful of distinct blocks.
+        let mut memo: Vec<(BlockId, bool)> = Vec::new();
+        let opaque = block
+            .iter()
+            .map(|&b| {
+                if b.is_air() {
+                    return false;
+                }
+                if let Some(&(_, o)) = memo.iter().find(|&&(id, _)| id == b) {
+                    return o;
+                }
+                let o = occludes(b);
+                memo.push((b, o));
+                o
+            })
+            .collect();
+
         Self {
             block,
             sky,
             block_light,
+            opaque,
             all_air: chunk.is_all_air(),
         }
     }
@@ -593,7 +689,9 @@ fn corner_ao(
         let mut c = front;
         c[u_axis] += du;
         c[v_axis] += dv;
-        u8::from(!input.is_air(c[0], c[1], c[2]))
+        // Occluders are OPAQUE cells (ADR-0011): water beside the seabed must
+        // not darken it.
+        u8::from(input.is_opaque(c[0], c[1], c[2]))
     };
 
     let mut out = [3u8; 4];
@@ -750,9 +848,11 @@ pub fn mesh_chunk_naive(
     chunk: &Chunk,
     neighbors: &ChunkNeighbors,
     mut layer_of: impl FnMut(BlockId, usize) -> u32,
+    occludes: impl FnMut(BlockId) -> bool,
 ) -> MeshData {
     let mut mesh = MeshData::default();
-    let input = MeshInput::build(chunk, neighbors);
+    let mut transparent = MeshData::default();
+    let input = MeshInput::build(chunk, neighbors, occludes);
     if input.all_air {
         return mesh;
     }
@@ -767,7 +867,7 @@ pub fn mesh_chunk_naive(
         for (face_index, &(axis, positive, u_axis, v_axis)) in FACE_DIRS.iter().enumerate() {
             let mut neighbor = coords;
             neighbor[axis] += if positive { 1 } else { -1 };
-            if !input.is_air(neighbor[0], neighbor[1], neighbor[2]) {
+            if !input.shows_face(block, neighbor) {
                 continue;
             }
 
@@ -802,8 +902,14 @@ pub fn mesh_chunk_naive(
                 dir_shade * ao_factor(ao[3]),
             ];
             let flip = choose_flip(daytime_brightness(c_sky, c_block, c_shade));
+            // A face belongs to the pass of the block it is ON.
+            let target = if input.is_opaque(coords[0], coords[1], coords[2]) {
+                &mut mesh
+            } else {
+                &mut transparent
+            };
             emit_rect(
-                &mut mesh,
+                target,
                 base,
                 axis_unit(u_axis),
                 axis_unit(v_axis),
@@ -818,7 +924,7 @@ pub fn mesh_chunk_naive(
         }
     }
 
-    mesh
+    MeshData::joined(mesh, transparent)
 }
 
 // ---------------------------------------------------------------------------
@@ -836,9 +942,11 @@ pub fn mesh_chunk(
     chunk: &Chunk,
     neighbors: &ChunkNeighbors,
     mut layer_of: impl FnMut(BlockId, usize) -> u32,
+    occludes: impl FnMut(BlockId) -> bool,
 ) -> MeshData {
     let mut mesh = MeshData::default();
-    let input = MeshInput::build(chunk, neighbors);
+    let mut transparent = MeshData::default();
+    let input = MeshInput::build(chunk, neighbors, occludes);
     if input.all_air {
         return mesh;
     }
@@ -882,7 +990,7 @@ pub fn mesh_chunk(
 
                     let mut n = coords;
                     n[axis] += if positive { 1 } else { -1 };
-                    if input.is_air(n[0], n[1], n[2]) {
+                    if input.shows_face(block, n) {
                         let (sky15, block15) =
                             corner_lights_2ch(&input, coords, axis, positive, u_axis, v_axis);
                         let ao = corner_ao(&input, coords, axis, positive, u_axis, v_axis);
@@ -972,8 +1080,19 @@ pub fn mesh_chunk(
                         dir_shade * ao_factor(ao[3]),
                     ];
                     let flip = choose_flip(daytime_brightness(c_sky, c_block, c_shade));
+                    // Merged cells share their block, so the rectangle's pass
+                    // is the block's: a face belongs to the block it is ON.
+                    let mut on = [0i32; 3];
+                    on[axis] = slice as i32;
+                    on[u_axis] = u0 as i32;
+                    on[v_axis] = v0 as i32;
+                    let target = if input.is_opaque(on[0], on[1], on[2]) {
+                        &mut mesh
+                    } else {
+                        &mut transparent
+                    };
                     emit_rect(
-                        &mut mesh,
+                        target,
                         base,
                         u_dir,
                         v_dir,
@@ -990,7 +1109,7 @@ pub fn mesh_chunk(
         }
     }
 
-    mesh
+    MeshData::joined(mesh, transparent)
 }
 
 #[cfg(test)]
@@ -1005,6 +1124,12 @@ mod tests {
         (b.0 as u32) * 6 + face as u32
     }
     const WHITE: fn(BlockId, usize) -> u32 = layers;
+
+    /// Every non-air block is an opaque cube — the world before ADR-0011, and
+    /// what every test written before it assumes.
+    fn cubes(b: BlockId) -> bool {
+        !b.is_air()
+    }
     const STONE: BlockId = BlockId(1);
     const N: usize = CHUNK_SIZE;
 
@@ -1014,7 +1139,7 @@ mod tests {
 
     #[test]
     fn naive_empty_chunk_produces_empty_mesh() {
-        let mesh = mesh_chunk_naive(&Chunk::new_air(), &ChunkNeighbors::NONE, WHITE);
+        let mesh = mesh_chunk_naive(&Chunk::new_air(), &ChunkNeighbors::NONE, WHITE, cubes);
         assert!(mesh.is_empty());
     }
 
@@ -1022,7 +1147,7 @@ mod tests {
     fn naive_isolated_block_has_six_quads() {
         let mut chunk = Chunk::new_air();
         chunk.set(LocalPos::new(5, 5, 5), STONE);
-        let mesh = mesh_chunk_naive(&chunk, &ChunkNeighbors::NONE, WHITE);
+        let mesh = mesh_chunk_naive(&chunk, &ChunkNeighbors::NONE, WHITE, cubes);
         assert_eq!(mesh.quad_count(), 6);
         assert_eq!(mesh.vertices.len(), 24);
         assert_eq!(mesh.indices.len(), 36);
@@ -1033,13 +1158,13 @@ mod tests {
         let mut chunk = Chunk::new_air();
         chunk.set(LocalPos::new(5, 5, 5), STONE);
         chunk.set(LocalPos::new(6, 5, 5), STONE);
-        let mesh = mesh_chunk_naive(&chunk, &ChunkNeighbors::NONE, WHITE);
+        let mesh = mesh_chunk_naive(&chunk, &ChunkNeighbors::NONE, WHITE, cubes);
         assert_eq!(mesh.quad_count(), 10);
     }
 
     #[test]
     fn naive_solid_chunk_meshes_to_shell_only() {
-        let mesh = mesh_chunk_naive(&Chunk::filled(STONE), &ChunkNeighbors::NONE, WHITE);
+        let mesh = mesh_chunk_naive(&Chunk::filled(STONE), &ChunkNeighbors::NONE, WHITE, cubes);
         assert_eq!(mesh.quad_count(), 6 * N * N);
     }
 
@@ -1048,7 +1173,7 @@ mod tests {
         let chunk = Chunk::filled(STONE);
         let neighbor = Chunk::filled(STONE);
         let neighbors = ChunkNeighbors::NONE.with_pos_x(&neighbor);
-        let mesh = mesh_chunk_naive(&chunk, &neighbors, WHITE);
+        let mesh = mesh_chunk_naive(&chunk, &neighbors, WHITE, cubes);
         assert_eq!(mesh.quad_count(), 5 * N * N);
     }
 
@@ -1063,7 +1188,7 @@ mod tests {
             .with_pos_y(&solid)
             .with_neg_z(&solid)
             .with_pos_z(&solid);
-        let mesh = mesh_chunk_naive(&chunk, &neighbors, WHITE);
+        let mesh = mesh_chunk_naive(&chunk, &neighbors, WHITE, cubes);
         assert!(mesh.is_empty());
     }
 
@@ -1074,8 +1199,169 @@ mod tests {
         let mut neighbor = Chunk::new_air();
         neighbor.set(LocalPos::new(0, 5, 5), STONE);
         let neighbors = ChunkNeighbors::NONE.with_pos_x(&neighbor);
-        let mesh = mesh_chunk_naive(&chunk, &neighbors, WHITE);
+        let mesh = mesh_chunk_naive(&chunk, &neighbors, WHITE, cubes);
         assert_eq!(mesh.quad_count(), 5);
+    }
+
+    // -----------------------------------------------------------------
+    // Transparent blocks (ADR-0011). WATER here is a stand-in: any block
+    // the caller says does not occlude.
+    // -----------------------------------------------------------------
+
+    const WATER: BlockId = BlockId(9);
+
+    fn water_passes(b: BlockId) -> bool {
+        !b.is_air() && b != WATER
+    }
+
+    /// Just the opaque or just the transparent part of a mesh, as a mesh, so
+    /// the coverage helpers can inspect each pass on its own.
+    fn pass(m: &MeshData, opaque: bool) -> MeshData {
+        let indices = if opaque {
+            m.opaque_indices()
+        } else {
+            m.transparent_indices()
+        };
+        MeshData {
+            vertices: m.vertices.clone(),
+            indices: indices.to_vec(),
+            opaque_index_count: 0,
+        }
+    }
+
+    /// THE point of the same-block rule: an ocean costs a surface, not a
+    /// volume. A 4x4x4 body of water meshes its 6 x 16 outer faces and none
+    /// of the 144 faces between water cells — all in the transparent pass.
+    #[test]
+    fn a_water_body_meshes_its_surface_not_its_volume() {
+        let mut chunk = Chunk::new_air();
+        for z in 10..14 {
+            for y in 10..14 {
+                for x in 10..14 {
+                    chunk.set(LocalPos::new(x, y, z), WATER);
+                }
+            }
+        }
+        let mesh = mesh_chunk_naive(&chunk, &ChunkNeighbors::NONE, WHITE, water_passes);
+        assert_eq!(mesh.quad_count(), 6 * 16);
+        assert_eq!(mesh.opaque_index_count, 0, "water drew in the opaque pass");
+        assert_eq!(mesh.transparent_indices().len(), 6 * 16 * 6);
+    }
+
+    /// The same-block clause, and only that clause: two DIFFERENT
+    /// transparent blocks touching both show the face between them (water
+    /// against glass). Culling any non-air neighbour would hide both.
+    #[test]
+    fn different_transparent_blocks_show_the_face_between_them() {
+        const GLASS: BlockId = BlockId(10);
+        let clear = |b: BlockId| !b.is_air() && b != WATER && b != GLASS;
+        let mut chunk = Chunk::new_air();
+        chunk.set(LocalPos::new(8, 8, 8), WATER);
+        chunk.set(LocalPos::new(9, 8, 8), GLASS);
+        let mesh = mesh_chunk_naive(&chunk, &ChunkNeighbors::NONE, WHITE, clear);
+        // Each cube shows all six faces: five to air, one to the other block.
+        assert_eq!(mesh.quad_count(), 12);
+        assert_eq!(mesh.opaque_index_count, 0);
+    }
+
+    /// Water over stone: the seabed is drawn (in the opaque pass) because
+    /// water does not hide it; water's own face against the stone is not,
+    /// because stone does.
+    #[test]
+    fn the_seabed_shows_through_water() {
+        let mut chunk = Chunk::new_air();
+        for z in 0..N as u8 {
+            for x in 0..N as u8 {
+                chunk.set(LocalPos::new(x, 5, z), STONE);
+                for y in 6..10 {
+                    chunk.set(LocalPos::new(x, y, z), WATER);
+                }
+            }
+        }
+        let mesh = mesh_chunk_naive(&chunk, &ChunkNeighbors::NONE, WHITE, water_passes);
+        let faces_at = |m: &MeshData, y: f32, up: bool| -> usize {
+            m.indices
+                .chunks_exact(6)
+                .filter(|q| {
+                    let b = q[0] as usize;
+                    let quad = &m.vertices[b..b + 4];
+                    let e1 = sub(quad[1].position, quad[0].position);
+                    let e2 = sub(quad[2].position, quad[0].position);
+                    let normal_up = cross(e1, e2)[1] > 0.0;
+                    quad.iter().all(|v| v.position[1] == y) && normal_up == up
+                })
+                .count()
+        };
+        let (opaque, transparent) = (pass(&mesh, true), pass(&mesh, false));
+        assert_eq!(faces_at(&opaque, 6.0, true), N * N, "the seabed is missing");
+        assert_eq!(
+            faces_at(&transparent, 6.0, false),
+            0,
+            "water drew a face on the stone"
+        );
+        assert_eq!(
+            faces_at(&transparent, 10.0, true),
+            N * N,
+            "the water surface is missing"
+        );
+        for &i in mesh.transparent_indices() {
+            let layer = mesh.vertices[i as usize].layer;
+            assert_eq!(
+                layer / 6,
+                WATER.0 as u32,
+                "a non-water face in the transparent pass"
+            );
+        }
+    }
+
+    /// Water must not darken what it sits beside: occlusion comes from opaque
+    /// cells only.
+    #[test]
+    fn water_casts_no_ambient_occlusion() {
+        let floor = |beside: BlockId| {
+            let mut chunk = Chunk::new_air();
+            for z in 0..N as u8 {
+                for x in 0..N as u8 {
+                    chunk.set(LocalPos::new(x, 5, z), STONE);
+                }
+            }
+            chunk.set(LocalPos::new(9, 6, 8), beside);
+            MeshInput::build(&chunk, &ChunkNeighbors::NONE, water_passes)
+        };
+        let ao = |input: &MeshInput| corner_ao(input, [8, 5, 8], 1, true, 2, 0);
+        let open = ao(&floor(BlockId::AIR));
+        assert_eq!(ao(&floor(WATER)), open, "water cast AO");
+        assert_ne!(ao(&floor(STONE)), open, "setup: stone should cast AO here");
+    }
+
+    /// The same rule in both meshers, pass by pass, on random mixtures of
+    /// opaque blocks, water and air.
+    #[test]
+    fn greedy_equals_naive_in_both_passes() {
+        let layered = |b: BlockId, face: usize| (b.0 as u32) * 6 + face as u32;
+        for seed in 0..6u64 {
+            let mut rng = SplitMix64::new(0xA11CE + seed);
+            let mut chunk = random_chunk(&mut rng, 20 + seed * 12, 4);
+            for pos in LocalPos::iter() {
+                if rng.next() % 100 < 30 {
+                    chunk.set(pos, WATER);
+                }
+            }
+            let naive = mesh_chunk_naive(&chunk, &ChunkNeighbors::NONE, layered, water_passes);
+            let greedy = mesh_chunk(&chunk, &ChunkNeighbors::NONE, layered, water_passes);
+            for opaque in [true, false] {
+                assert_eq!(
+                    coverage(&pass(&naive, opaque)),
+                    coverage(&pass(&greedy, opaque)),
+                    "seed {seed}: meshers disagree on the {} pass",
+                    if opaque { "opaque" } else { "transparent" }
+                );
+            }
+            assert!(
+                !naive.transparent_indices().is_empty(),
+                "setup: no water faces"
+            );
+        }
     }
 
     // -----------------------------------------------------------------
@@ -1087,10 +1373,10 @@ mod tests {
     #[test]
     fn sealed_neighbor_gets_no_faces() {
         let chunk = Chunk::filled(STONE);
-        let open = mesh_chunk_naive(&chunk, &ChunkNeighbors::NONE, WHITE);
+        let open = mesh_chunk_naive(&chunk, &ChunkNeighbors::NONE, WHITE, cubes);
         let sealed = ChunkNeighbors::NONE.with_sealed(0, -1, 0);
-        let naive = mesh_chunk_naive(&chunk, &sealed, WHITE);
-        let greedy = mesh_chunk(&chunk, &sealed, WHITE);
+        let naive = mesh_chunk_naive(&chunk, &sealed, WHITE, cubes);
+        let greedy = mesh_chunk(&chunk, &sealed, WHITE, cubes);
         assert_eq!(open.quad_count(), 6 * N * N);
         assert_eq!(naive.quad_count(), 5 * N * N, "naive drew the void floor");
         assert_eq!(greedy.quad_count(), 5, "greedy drew the void floor");
@@ -1118,8 +1404,8 @@ mod tests {
         ] {
             all = all.with_sealed(dx, dy, dz);
         }
-        assert!(mesh_chunk_naive(&Chunk::filled(STONE), &all, WHITE).is_empty());
-        assert!(mesh_chunk(&Chunk::filled(STONE), &all, WHITE).is_empty());
+        assert!(mesh_chunk_naive(&Chunk::filled(STONE), &all, WHITE, cubes).is_empty());
+        assert!(mesh_chunk(&Chunk::filled(STONE), &all, WHITE, cubes).is_empty());
     }
 
     /// A seal describes ABSENCE. If the neighbour is present, its real cells
@@ -1129,7 +1415,7 @@ mod tests {
         let chunk = Chunk::filled(STONE);
         let air = Chunk::new_air();
         let neighbors = ChunkNeighbors::NONE.with_pos_x(&air).with_sealed(1, 0, 0);
-        let mesh = mesh_chunk_naive(&chunk, &neighbors, WHITE);
+        let mesh = mesh_chunk_naive(&chunk, &neighbors, WHITE, cubes);
         assert_eq!(mesh.quad_count(), 6 * N * N);
     }
 
@@ -1154,7 +1440,7 @@ mod tests {
     #[test]
     fn a_sealed_edge_is_lit_like_the_interior() {
         let chunk = floor_with_sky();
-        let interior = MeshInput::build(&chunk, &ChunkNeighbors::NONE);
+        let interior = MeshInput::build(&chunk, &ChunkNeighbors::NONE, cubes);
         let (mid, _) = corner_lights_2ch(&interior, [15, 10, 15], 1, true, 2, 0);
         assert_eq!(mid, [15.0; 4], "setup: interior top face is fully lit");
 
@@ -1165,7 +1451,7 @@ mod tests {
             "setup: an unsealed edge should darken, got {dark:?}"
         );
 
-        let sealed = MeshInput::build(&chunk, &ChunkNeighbors::NONE.with_sealed(1, 0, 0));
+        let sealed = MeshInput::build(&chunk, &ChunkNeighbors::NONE.with_sealed(1, 0, 0), cubes);
         let (edge, _) = corner_lights_2ch(&sealed, [31, 10, 15], 1, true, 2, 0);
         assert_eq!(edge, mid, "a sealed edge must be lit like the interior");
         // The corner cell, which is also beyond a sealed face along Z.
@@ -1174,6 +1460,7 @@ mod tests {
             &ChunkNeighbors::NONE
                 .with_sealed(1, 0, 0)
                 .with_sealed(0, 0, 1),
+            cubes,
         );
         let (c, _) = corner_lights_2ch(&corner, [31, 10, 31], 1, true, 2, 0);
         assert_eq!(c, mid, "a sealed corner must be lit like the interior");
@@ -1189,7 +1476,7 @@ mod tests {
         for z in 0..N as u8 {
             chunk.set(LocalPos::new(31, 11, z), STONE);
         }
-        let sealed = MeshInput::build(&chunk, &ChunkNeighbors::NONE.with_sealed(0, 0, 1));
+        let sealed = MeshInput::build(&chunk, &ChunkNeighbors::NONE.with_sealed(0, 0, 1), cubes);
         let mid = corner_ao(&sealed, [30, 10, 15], 1, true, 2, 0);
         let edge = corner_ao(&sealed, [30, 10, 31], 1, true, 2, 0);
         assert_eq!(edge, mid, "the wall's occlusion stopped at the sealed edge");
@@ -1207,9 +1494,13 @@ mod tests {
             chunk.set(LocalPos::new(0, 1, z), STONE);
             chunk.set(LocalPos::new(1, 1, z), STONE);
         }
-        let open = mesh_chunk_naive(&chunk, &ChunkNeighbors::NONE, WHITE);
-        let sealed_mesh =
-            mesh_chunk_naive(&chunk, &ChunkNeighbors::NONE.with_sealed(-1, 0, 0), WHITE);
+        let open = mesh_chunk_naive(&chunk, &ChunkNeighbors::NONE, WHITE, cubes);
+        let sealed_mesh = mesh_chunk_naive(
+            &chunk,
+            &ChunkNeighbors::NONE.with_sealed(-1, 0, 0),
+            WHITE,
+            cubes,
+        );
         // One -X face per cell of the floor edge and one per cell of the step.
         assert_eq!(open.quad_count() - sealed_mesh.quad_count(), 2 * N);
         let on_seal = |m: &MeshData| {
@@ -1232,7 +1523,12 @@ mod tests {
     fn naive_top_face_winding_points_up() {
         let mut chunk = Chunk::new_air();
         chunk.set(LocalPos::new(0, 0, 0), STONE);
-        assert_top_winding_up(&mesh_chunk_naive(&chunk, &ChunkNeighbors::NONE, WHITE));
+        assert_top_winding_up(&mesh_chunk_naive(
+            &chunk,
+            &ChunkNeighbors::NONE,
+            WHITE,
+            cubes,
+        ));
     }
 
     // -----------------------------------------------------------------
@@ -1243,7 +1539,7 @@ mod tests {
     /// — one maximal rectangle per side.
     #[test]
     fn greedy_solid_chunk_is_six_quads() {
-        let mesh = mesh_chunk(&Chunk::filled(STONE), &ChunkNeighbors::NONE, WHITE);
+        let mesh = mesh_chunk(&Chunk::filled(STONE), &ChunkNeighbors::NONE, WHITE, cubes);
         assert_eq!(mesh.quad_count(), 6);
     }
 
@@ -1254,7 +1550,7 @@ mod tests {
         let mut chunk = Chunk::new_air();
         chunk.set(LocalPos::new(5, 5, 5), STONE);
         chunk.set(LocalPos::new(6, 5, 5), STONE);
-        let mesh = mesh_chunk(&chunk, &ChunkNeighbors::NONE, WHITE);
+        let mesh = mesh_chunk(&chunk, &ChunkNeighbors::NONE, WHITE, cubes);
         assert_eq!(mesh.quad_count(), 6);
     }
 
@@ -1264,7 +1560,7 @@ mod tests {
         let mut chunk = Chunk::new_air();
         chunk.set(LocalPos::new(5, 5, 5), STONE);
         chunk.set(LocalPos::new(6, 5, 5), BlockId(2));
-        let mesh = mesh_chunk(&chunk, &ChunkNeighbors::NONE, WHITE);
+        let mesh = mesh_chunk(&chunk, &ChunkNeighbors::NONE, WHITE, cubes);
         assert_eq!(mesh.quad_count(), 10);
     }
 
@@ -1278,8 +1574,8 @@ mod tests {
                 chunk.set(pos, STONE);
             }
         }
-        let greedy = mesh_chunk(&chunk, &ChunkNeighbors::NONE, WHITE);
-        let naive = mesh_chunk_naive(&chunk, &ChunkNeighbors::NONE, WHITE);
+        let greedy = mesh_chunk(&chunk, &ChunkNeighbors::NONE, WHITE, cubes);
+        let naive = mesh_chunk_naive(&chunk, &ChunkNeighbors::NONE, WHITE, cubes);
         assert_eq!(greedy.quad_count(), naive.quad_count());
     }
 
@@ -1287,7 +1583,7 @@ mod tests {
     fn greedy_top_face_winding_points_up() {
         let mut chunk = Chunk::new_air();
         chunk.set(LocalPos::new(0, 0, 0), STONE);
-        assert_top_winding_up(&mesh_chunk(&chunk, &ChunkNeighbors::NONE, WHITE));
+        assert_top_winding_up(&mesh_chunk(&chunk, &ChunkNeighbors::NONE, WHITE, cubes));
     }
 
     // -----------------------------------------------------------------
@@ -1440,7 +1736,7 @@ mod tests {
     /// chunk, each of the 6 faces is one 32×32 quad whose UVs span 0..32.
     #[test]
     fn greedy_quad_uvs_tile_across_merge() {
-        let mesh = mesh_chunk(&Chunk::filled(STONE), &ChunkNeighbors::NONE, WHITE);
+        let mesh = mesh_chunk(&Chunk::filled(STONE), &ChunkNeighbors::NONE, WHITE, cubes);
         assert_eq!(mesh.quad_count(), 6);
         for quad in mesh.indices.chunks_exact(6) {
             let bi = quad[0] as usize;
@@ -1458,7 +1754,7 @@ mod tests {
     fn unit_quad_uvs_are_unit() {
         let mut chunk = Chunk::new_air();
         chunk.set(LocalPos::new(5, 5, 5), STONE);
-        let mesh = mesh_chunk(&chunk, &ChunkNeighbors::NONE, WHITE);
+        let mesh = mesh_chunk(&chunk, &ChunkNeighbors::NONE, WHITE, cubes);
         for quad in mesh.indices.chunks_exact(6) {
             let bi = quad[0] as usize;
             let uvs: Vec<[f32; 2]> = (0..4).map(|k| mesh.vertices[bi + k].uv).collect();
@@ -1499,8 +1795,8 @@ mod tests {
                 neighbors = neighbors.with_sealed(-1, 0, 0);
             }
 
-            let naive = mesh_chunk_naive(&chunk, &neighbors, layered);
-            let greedy = mesh_chunk(&chunk, &neighbors, layered);
+            let naive = mesh_chunk_naive(&chunk, &neighbors, layered, cubes);
+            let greedy = mesh_chunk(&chunk, &neighbors, layered, cubes);
 
             let naive_cov = coverage(&naive);
             let greedy_cov = coverage(&greedy);
@@ -1575,7 +1871,7 @@ mod tests {
         west.set(LocalPos::new(31, 7, 7), BlockId::AIR);
         west.set_block_light(LocalPos::new(31, 7, 7), 9);
         let neighbors = ChunkNeighbors::NONE.with_neg_x(&west);
-        let input = MeshInput::build(&chunk, &neighbors);
+        let input = MeshInput::build(&chunk, &neighbors, cubes);
         // Interior: sky present, block absent — the two channels stay separate.
         assert!(!input.is_air(3, 4, 5));
         assert_eq!(input.block(3, 4, 5), STONE);
@@ -1645,7 +1941,7 @@ mod tests {
         let start = std::time::Instant::now();
         let mut quads = 0usize;
         for _ in 0..iters {
-            let m = mesh_chunk(&chunk, &ChunkNeighbors::NONE, |_, _| 0);
+            let m = mesh_chunk(&chunk, &ChunkNeighbors::NONE, |_, _| 0, cubes);
             quads = m.quad_count();
         }
         let total = start.elapsed();
@@ -1669,7 +1965,7 @@ mod tests {
                 chunk.set_sky_light(LocalPos::new(x, 16, z), (x / 2).min(15));
             }
         }
-        let input = MeshInput::build(&chunk, &ChunkNeighbors::NONE);
+        let input = MeshInput::build(&chunk, &ChunkNeighbors::NONE, cubes);
         let (sky, _block) = corner_lights_2ch(&input, [4, 15, 4], 1, true, 2, 0);
         let spread = sky.iter().cloned().fold(0.0f32, f32::max)
             - sky.iter().cloned().fold(f32::MAX, f32::min);
@@ -1694,7 +1990,7 @@ mod tests {
             }
         }
         let nb = ChunkNeighbors::NONE.with_pos_x(&right);
-        let input = MeshInput::build(&left, &nb);
+        let input = MeshInput::build(&left, &nb, cubes);
         let (sky, _block) = corner_lights_2ch(&input, [31, 8, 8], 0, true, 1, 2);
         for (k, &c) in sky.iter().enumerate() {
             assert!((c - 10.0).abs() < 1e-6, "corner {k} = {c}");
@@ -1727,7 +2023,7 @@ mod tests {
             }
         }
         let nb = ChunkNeighbors::NONE.with_pos_x(&east);
-        let input = MeshInput::build(&chunk, &nb);
+        let input = MeshInput::build(&chunk, &nb, cubes);
         // Top face of the edge block (31,10,8): all four corners should be 15
         // (uniform bright), including the corner that samples into +X.
         let (sky, _block) = corner_lights_2ch(&input, [31, 10, 8], 1, true, 2, 0);
@@ -1761,7 +2057,7 @@ mod tests {
             }
         }
         let nb = ChunkNeighbors::NONE.with_pos_x(&right);
-        let input = MeshInput::build(&left, &nb);
+        let input = MeshInput::build(&left, &nb, cubes);
         let (sky, block) = corner_lights_2ch(&input, [31, 8, 8], 0, true, 1, 2);
         for (k, &s) in sky.iter().enumerate() {
             assert!((s - 10.0).abs() < 1e-6, "sky corner {k} = {s}, expected 10");
@@ -1793,7 +2089,7 @@ mod tests {
         let mut a = Chunk::new_air();
         a.set(LocalPos::new(cx, 10, cz), STONE);
         a.set(LocalPos::new(cx, 11, cz + 1), STONE);
-        let ia = MeshInput::build(&a, &ChunkNeighbors::NONE);
+        let ia = MeshInput::build(&a, &ChunkNeighbors::NONE, cubes);
         assert_eq!(
             corner_ao(&ia, cell, 1, true, 2, 0),
             [3, 2, 2, 3],
@@ -1807,7 +2103,7 @@ mod tests {
         b.set(LocalPos::new(cx, 10, cz), STONE);
         b.set(LocalPos::new(cx, 11, cz + 1), STONE);
         b.set(LocalPos::new(cx + 1, 11, cz), STONE);
-        let ib = MeshInput::build(&b, &ChunkNeighbors::NONE);
+        let ib = MeshInput::build(&b, &ChunkNeighbors::NONE, cubes);
         assert_eq!(
             corner_ao(&ib, cell, 1, true, 2, 0),
             [3, 2, 0, 2],
@@ -1827,7 +2123,7 @@ mod tests {
         chunk.set(LocalPos::new(cx, 11, cz + 1), STONE);
         chunk.set(LocalPos::new(cx + 1, 11, cz), STONE);
 
-        let input = MeshInput::build(&chunk, &ChunkNeighbors::NONE);
+        let input = MeshInput::build(&chunk, &ChunkNeighbors::NONE, cubes);
         let cell = [cx as i32, 10, cz as i32];
         let ao = corner_ao(&input, cell, 1, true, 2, 0);
         assert_eq!(ao, [3, 2, 0, 2]);
@@ -1836,7 +2132,7 @@ mod tests {
         let base = face_brightness(1, true) * light_curve_f(0.0);
         let expected: Vec<f32> = ao.iter().map(|&l| base * ao_factor(l)).collect();
 
-        let mesh = mesh_chunk_naive(&chunk, &ChunkNeighbors::NONE, WHITE);
+        let mesh = mesh_chunk_naive(&chunk, &ChunkNeighbors::NONE, WHITE, cubes);
 
         // Recover the +Y face over (cx,10,cz): all four corners at y==11,
         // spanning x in [cx,cx+1], z in [cz,cz+1].
@@ -1948,6 +2244,10 @@ pub fn mesh_lod_heightfield(
     let sky = 1.0f32;
     let top_shade = face_brightness(1, true);
 
+    // The ground, everywhere — seabed included. The sea is a separate,
+    // translucent surface added after (ADR-0011 decision 1c), so a view
+    // through near water past the edge of the loaded area, or through distant
+    // water anywhere, ends on a seabed exactly as it does up close.
     let at = |cx: i32, cz: i32| -> i32 { heights[(cz * n + cx) as usize] };
 
     // The height this cell takes at the NEXT COARSER level (ADR-0009).
@@ -2106,6 +2406,49 @@ pub fn mesh_lod_heightfield(
             }
         }
     }
+    // The sea surface (ADR-0011 decision 1c): a translucent quad at sea level
+    // over every cell whose ground is below it, after all the ground, so it
+    // lands in the transparent index range. Coplanar, so runs along a row
+    // merge into one quad — an open-ocean node is 32 quads, not 1 024. It
+    // never rises above what full resolution shows: a cell's ground is the
+    // MINIMUM of its columns, so over a column of land the sea surface is at
+    // or below that land's top.
+    mesh.opaque_index_count = mesh.indices.len() as u32;
+    let sea = vox_core::SEA_LEVEL_BLOCKS as i32;
+    let sea_top = (sea + 1 - origin_y) as f32;
+    let water_layer = layer_of(vox_core::registry::WATER, 2);
+    let w = h_stride as f32;
+    for cz in 0..n {
+        let mut cx = 0;
+        while cx < n {
+            if at(cx, cz) >= sea {
+                cx += 1;
+                continue;
+            }
+            let run_start = cx;
+            while cx < n && at(cx, cz) < sea {
+                cx += 1;
+            }
+            emit_lod_rect(
+                &mut mesh,
+                [
+                    (run_start * h_stride) as f32,
+                    sea_top,
+                    (cz * h_stride) as f32,
+                ],
+                axis_unit(2),
+                axis_unit(0),
+                w,
+                (cx - run_start) as f32 * w,
+                water_layer,
+                sky,
+                top_shade,
+                // Flat, and the same at every level: nothing to morph.
+                [sea_top; 4],
+            );
+        }
+    }
+
     // Bounds over BOTH the resting position and the morph target: a vertex
     // sits somewhere between them at any moment, so an AABB built from
     // positions alone would clip geometry mid-morph.
@@ -2133,6 +2476,98 @@ mod heightfield_tests {
         vec![h; LOD_CELLS * LOD_CELLS]
     }
 
+    // ---- Distant water (ADR-0011 decision 1c) ----
+
+    /// Distinct layers so a test can tell sea from land by texture.
+    fn sea_or_land(b: BlockId, _face: usize) -> u32 {
+        if b == vox_core::registry::WATER { 7 } else { 1 }
+    }
+
+    /// Just one range of an LOD mesh, as vertices: `(opaque, transparent)`.
+    fn lod_ranges(m: &LodMeshData) -> (Vec<LodVertex>, Vec<LodVertex>) {
+        let pick = |ix: &[u32]| ix.iter().map(|&i| m.vertices[i as usize]).collect();
+        (pick(m.opaque_indices()), pick(m.transparent_indices()))
+    }
+
+    /// THE point of 1c: over open ocean the LOD draws the real seabed AND a
+    /// translucent sea surface above it, so a view through either — or
+    /// through near water past the edge of the loaded area — ends on a
+    /// seabed instead of an empty space under an opaque lid.
+    #[test]
+    fn open_ocean_draws_its_seabed_under_a_translucent_sea() {
+        let sea = vox_core::SEA_LEVEL_BLOCKS as i32;
+        let seabed = sea - 260;
+        let mesh = mesh_lod_heightfield(&flat(seabed), 4, 0, sea_or_land, 0);
+        let (ground, water) = lod_ranges(&mesh);
+        assert!(!ground.is_empty() && !water.is_empty());
+        for v in &ground {
+            assert_eq!(
+                v.position[1],
+                (seabed + 1) as f32,
+                "the seabed is not at the seabed"
+            );
+            assert_eq!(v.layer, 1, "the seabed is textured as water");
+        }
+        for v in &water {
+            assert_eq!(
+                v.position[1],
+                (sea + 1) as f32,
+                "the sea surface is off sea level"
+            );
+            assert_eq!(v.morph_y, (sea + 1) as f32, "the sea surface morphs");
+            assert_eq!(v.layer, 7, "the sea surface is textured as ground");
+        }
+    }
+
+    /// Coplanar sea cells merge along each row: an open-ocean node costs one
+    /// quad per row of water, not one per cell.
+    #[test]
+    fn open_ocean_water_merges_by_row() {
+        let sea = vox_core::SEA_LEVEL_BLOCKS as i32;
+        let mesh = mesh_lod_heightfield(&flat(sea - 50), 4, 0, sea_or_land, 0);
+        assert_eq!(mesh.transparent_indices().len() / 6, LOD_CELLS);
+    }
+
+    /// At a coast, only the sea cells carry water, and land is untouched —
+    /// its walls drop to the real seabed like any other terrain.
+    #[test]
+    fn a_coast_has_water_only_over_the_sea() {
+        let sea = vox_core::SEA_LEVEL_BLOCKS as i32;
+        let n = LOD_CELLS as i32;
+        let stride = 4;
+        let mut heights = flat(sea - 120);
+        for cz in 0..n {
+            for cx in 0..n / 2 {
+                heights[(cz * n + cx) as usize] = sea + 6; // land to the west
+            }
+        }
+        let mesh = mesh_lod_heightfield(&heights, stride, 0, sea_or_land, 0);
+        let (ground, water) = lod_ranges(&mesh);
+        let land_edge = (n / 2 * stride) as f32;
+        for v in &water {
+            assert!(
+                v.position[0] >= land_edge,
+                "water over land at x = {}",
+                v.position[0]
+            );
+        }
+        assert!(
+            ground
+                .iter()
+                .any(|v| v.position[1] == (sea - 120 + 1) as f32),
+            "the seabed off the coast is missing"
+        );
+        assert!(ground.iter().all(|v| v.layer == 1));
+    }
+
+    /// Dry land has no transparent range at all.
+    #[test]
+    fn dry_land_has_no_sea() {
+        let mesh = mesh_lod_heightfield(&flat(40), 4, 0, sea_or_land, 0);
+        assert!(mesh.transparent_indices().is_empty());
+        assert_eq!(mesh.opaque_index_count as usize, mesh.indices.len());
+    }
+
     /// A flat field emits one top quad per cell and no interior walls — only
     /// the border skirts.
     #[test]
@@ -2148,7 +2583,10 @@ mod heightfield_tests {
     /// heightfield path exists.
     #[test]
     fn top_face_is_at_the_exact_height() {
-        for h in [0, 7, 37, -13] {
+        // Land heights. Below sea level the ground is drawn the same way, with
+        // a sea surface added above it — see
+        // `open_ocean_draws_its_seabed_under_a_translucent_sea`.
+        for h in [0, 7, 37, 413] {
             let mesh = mesh_lod_heightfield(&flat(h), 4, 0, |_, _| 0, 0);
             let top = mesh
                 .vertices
@@ -2264,8 +2702,9 @@ mod heightfield_tests {
         for cz in 0..n {
             for cx in 0..n {
                 // Deterministic, varied, and not symmetric under the 2x2
-                // grouping — so a wrong group alignment would show.
-                heights[(cz * n + cx) as usize] = (cx * 7 + cz * 13) % 23 - 5;
+                // grouping — so a wrong group alignment would show. Kept
+                // above sea level: this is about the ground's geometry.
+                heights[(cz * n + cx) as usize] = (cx * 7 + cz * 13) % 23 + 5;
             }
         }
         let mesh = mesh_lod_heightfield(&heights, 2, 0, |_, _| 0, 0);

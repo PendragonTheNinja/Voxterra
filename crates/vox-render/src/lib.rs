@@ -107,6 +107,9 @@ struct GpuMesh {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     index_count: u32,
+    /// Indices `[0, opaque_index_count)` are drawn in the opaque pass, the
+    /// rest in the transparent pass (ADR-0011). All of them for LOD nodes.
+    opaque_index_count: u32,
     /// Vertex + index bytes on the GPU, tracked so the renderer can report
     /// total buffer memory without walking every mesh each frame.
     bytes: u64,
@@ -234,6 +237,13 @@ pub struct Renderer {
     /// for the sky-pass additions (sun direction, moon) in task 3b.
     sky_buffer: wgpu::Buffer,
     sky_bind_group: wgpu::BindGroup,
+    /// Which chunk columns around the render origin full resolution draws:
+    /// 1 = drawn, so the LOD shader discards there (see `set_fullres_columns`).
+    fullres_mask: wgpu::Texture,
+    /// The same columns, CPU-side, with the centre they were laid out
+    /// around: the transparent pass draws near water only in them.
+    fullres_texels: Vec<u8>,
+    fullres_center: ChunkPos,
     /// Most recent sky_scale, also used to dim the background clear color until
     /// the procedural sky pass replaces it (task 3b).
     sky_scale: f32,
@@ -265,6 +275,11 @@ pub struct Renderer {
     /// occludes them where they overlap.
     lod_meshes: HashMap<(ChunkPos, u32), GpuMesh>,
     lod_pipeline: wgpu::RenderPipeline,
+    /// The LOD's sea surface (ADR-0011 decision 1c).
+    lod_transparent_pipeline: wgpu::RenderPipeline,
+    /// Chunk faces of non-opaque blocks (water), drawn after everything
+    /// opaque (ADR-0011).
+    transparent_pipeline: wgpu::RenderPipeline,
 }
 
 impl Renderer {
@@ -365,33 +380,72 @@ impl Renderer {
         // these flags is a pipeline-creation panic, not a compile error. ---
         let sky_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sky uniform"),
-            // 4 vec4s: camera+sky_scale, fog colour, fog range + snapped LOD
-            // centre, morph params (ADR-0009). Must match `SkyChunk` in both
-            // shader.wgsl and lod.wgsl.
-            size: std::mem::size_of::<[f32; 16]>() as u64,
+            // 5 vec4s: camera+sky_scale, fog colour, fog range, morph params
+            // (ADR-0009), full-res mask placement. Must match `SkyChunk` in
+            // both shader.wgsl and lod.wgsl. Two writers, disjoint ranges:
+            // `set_sky` owns vec4s 0-3, `set_fullres_columns` owns vec4 4.
+            size: std::mem::size_of::<[f32; 20]>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // Binding 1 is the full-resolution column mask (see
+        // `set_fullres_columns`). It lives in group 3 because the default
+        // limit is four bind groups and 0-3 are taken; the chunk shaders
+        // ignore it.
+        let fullres_mask = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("full-res column mask"),
+            size: wgpu::Extent3d {
+                width: FULLRES_MASK_SIDE,
+                height: FULLRES_MASK_SIDE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let fullres_mask_view = fullres_mask.create_view(&wgpu::TextureViewDescriptor::default());
         let sky_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("sky bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        // Read with textureLoad: exact texels, no sampler.
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
         });
         let sky_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("sky bind group"),
             layout: &sky_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: sky_buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: sky_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&fullres_mask_view),
+                },
+            ],
         });
 
         // --- Per-chunk offset uniform layout (group 1), for floating
@@ -475,7 +529,7 @@ impl Renderer {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[vertex_layout],
+                buffers: std::slice::from_ref(&vertex_layout),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -505,6 +559,53 @@ impl Renderer {
             cache: None,
         });
 
+        // --- Transparent pipeline (ADR-0011): the chunk pipeline's vertex
+        // stage and layout, drawn AFTER every opaque surface (chunks and LOD).
+        //
+        // - Alpha blended, from the texture's own alpha (`fs_transparent`).
+        // - Depth TESTED, so terrain in front hides water, but NOT WRITTEN, so
+        //   overlapping transparent surfaces do not occlude each other.
+        // - Unsorted, per the ADR: one near-planar water surface rarely
+        //   overlaps itself, and the blend is nearly idempotent where it does.
+        // - Not culled: the sea surface is seen from beneath too, looking up
+        //   from the seabed.
+        let transparent_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("transparent chunk pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[vertex_layout],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_transparent"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: DEPTH_NEARER,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
+
         // --- LOD pipeline (M08): identical to the chunk pipeline but with a
         // small depth bias that pushes coarse LOD terrain slightly back, so
         // where a near LOD ring overlaps full-res chunks the full-res surface
@@ -517,6 +618,17 @@ impl Renderer {
             label: Some("lod shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("lod.wgsl").into()),
         });
+        // Matches vox_mesh::LodVertex: position, uv, layer, sky, morph_y,
+        // shade. Slot 4 is the MORPH TARGET here, where the full-res layout
+        // has block light. Shared by both LOD pipelines.
+        let lod_vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<vox_mesh::LodVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![
+                0 => Float32x3, 1 => Float32x2, 2 => Uint32,
+                3 => Float32, 4 => Float32, 5 => Float32
+            ],
+        };
         let lod_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("lod pipeline"),
             layout: Some(&pipeline_layout),
@@ -524,17 +636,7 @@ impl Renderer {
                 module: &lod_shader,
                 entry_point: Some("vs_lod"),
                 compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<vox_mesh::LodVertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    // Matches vox_mesh::LodVertex: position, uv, layer, sky,
-                    // morph_y, shade. Slot 4 is the MORPH TARGET here, where
-                    // the full-res layout has block light.
-                    attributes: &wgpu::vertex_attr_array![
-                        0 => Float32x3, 1 => Float32x2, 2 => Uint32,
-                        3 => Float32, 4 => Float32, 5 => Float32
-                    ],
-                }],
+                buffers: std::slice::from_ref(&lod_vertex_layout),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &lod_shader,
@@ -586,6 +688,49 @@ impl Renderer {
             multiview: None,
             cache: None,
         });
+
+        // --- LOD sea surface (ADR-0011 decision 1c): the LOD's own
+        // translucent water over its own seabed, drawn in the transparent
+        // pass beside near water, with the same blend, depth state, culling
+        // and Fresnel. The two never overlap: near water draws only in
+        // full-res columns, and this discards in them.
+        let lod_transparent_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("lod transparent pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &lod_shader,
+                    entry_point: Some("vs_lod"),
+                    compilation_options: Default::default(),
+                    buffers: &[lod_vertex_layout],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &lod_shader,
+                    entry_point: Some("fs_lod_transparent"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: false,
+                    depth_compare: DEPTH_NEARER,
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                multiview: None,
+                cache: None,
+            });
         let highlight_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("highlight shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("highlight.wgsl").into()),
@@ -759,6 +904,9 @@ impl Renderer {
             highlight_target: None,
             sky_buffer,
             sky_bind_group,
+            fullres_mask,
+            fullres_texels: Vec::new(),
+            fullres_center: ChunkPos::new(0, 0, 0),
             sky_scale: 1.0,
             sky_pipeline,
             sky_pass_buffer,
@@ -766,6 +914,8 @@ impl Renderer {
             lod_meshes: HashMap::new(),
             suppressed_lod: HashSet::new(),
             lod_pipeline,
+            lod_transparent_pipeline,
+            transparent_pipeline,
             egui_renderer,
         }
     }
@@ -783,13 +933,14 @@ impl Renderer {
             return;
         }
         let offset = chunk_offset(pos, self.render_origin);
-        let gpu = self.build_gpu_mesh(
+        let mut gpu = self.build_gpu_mesh(
             offset,
             Vec3::splat(CHUNK_SIZE as f32),
             0.0,
             &mesh.vertices,
             &mesh.indices,
         );
+        gpu.opaque_index_count = mesh.opaque_index_count;
         self.buffer_bytes += gpu.bytes;
         if let Some(old) = self.meshes.insert(pos, gpu) {
             self.buffer_bytes -= old.bytes;
@@ -870,6 +1021,7 @@ impl Renderer {
             vertex_buffer,
             index_buffer,
             index_count: indices.len() as u32,
+            opaque_index_count: indices.len() as u32,
             bytes,
             aabb_min: offset + aabb_offset,
             aabb_max: offset + aabb_offset + extent,
@@ -904,7 +1056,7 @@ impl Renderer {
         // Vertical extent comes from the MESH, not the world's Y band. With
         // M10's ~20 000-block world a band-height AABB would span everything
         // and vertical frustum culling would stop rejecting anything.
-        let gpu = self.build_gpu_mesh_at(
+        let mut gpu = self.build_gpu_mesh_at(
             offset,
             Vec3::new(0.0, mesh.y_min, 0.0),
             Vec3::new(span_blocks, mesh.y_max - mesh.y_min, span_blocks),
@@ -912,6 +1064,7 @@ impl Renderer {
             &mesh.vertices,
             &mesh.indices,
         );
+        gpu.opaque_index_count = mesh.opaque_index_count;
         self.buffer_bytes += gpu.bytes;
         if let Some(old) = self.lod_meshes.insert(key, gpu) {
             self.buffer_bytes -= old.bytes;
@@ -919,6 +1072,54 @@ impl Renderer {
     }
 
     /// Set the LOD nodes to skip drawing (fully covered by full-res).
+    /// Tell the renderer which chunk columns full resolution draws (M10 A1).
+    /// Two consequences, which together mean LOD and full resolution never
+    /// overlap, whatever either is made of:
+    ///
+    /// - the LOD shader discards its fragments in those columns. Whole-node
+    ///   suppression (`set_suppressed_lod`) cannot do this alone: a node
+    ///   straddling the edge of the loaded area stays drawn, and under
+    ///   TRANSLUCENT near water it cannot hide behind the real terrain — its
+    ///   opaque sea tied with the near water's surface, and its skirts showed
+    ///   through as a dark wall;
+    /// - the transparent pass draws near water ONLY in those columns. A
+    ///   column still streaming in — sea surface without its seabed — shows
+    ///   LOD water instead of near water over nothing.
+    ///
+    /// `center` must be the render origin's chunk (the camera's): the mask is
+    /// placed relative to it, and reaches as far as any chunk can be
+    /// resident.
+    pub fn set_fullres_columns(&mut self, center: ChunkPos, covered: impl Fn(i64, i64) -> bool) {
+        let texels = fullres_mask_texels(center, covered);
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.fullres_mask,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &texels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(FULLRES_MASK_SIDE),
+                rows_per_image: Some(FULLRES_MASK_SIDE),
+            },
+            wgpu::Extent3d {
+                width: FULLRES_MASK_SIDE,
+                height: FULLRES_MASK_SIDE,
+                depth_or_array_layers: 1,
+            },
+        );
+        let placement = fullres_mask_placement(center, self.render_origin);
+        self.queue.write_buffer(
+            &self.sky_buffer,
+            FULLRES_MASK_UNIFORM_OFFSET,
+            bytemuck::cast_slice(&placement),
+        );
+        self.fullres_texels = texels;
+        self.fullres_center = center;
+    }
+
     pub fn set_suppressed_lod(&mut self, set: HashSet<(ChunkPos, u32)>) {
         self.suppressed_lod = set;
     }
@@ -1041,7 +1242,8 @@ impl Renderer {
         let sky_scale = time.sky_scale().clamp(0.0, 1.0);
         self.sky_scale = sky_scale;
 
-        // Chunk-shader uniform (group 3), 4 vec4s:
+        // Chunk-shader uniform (group 3). This writes vec4s 0-3; vec4 4 (the
+        // full-res mask placement) belongs to `set_fullres_columns`:
         //   0: camera position (render-relative) + sky_scale
         //   1: fog colour rgb + strength
         //   2: fog start, fog end, reserved, reserved
@@ -1197,12 +1399,16 @@ impl Renderer {
                     if !frustum.intersects_aabb(mesh.aabb_min, mesh.aabb_max) {
                         continue;
                     }
+                    // A chunk of open water has no opaque faces at all.
+                    if mesh.opaque_index_count == 0 {
+                        continue;
+                    }
                     pass.set_bind_group(1, &mesh.offset_bind_group, &[]);
                     pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                     pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                    pass.draw_indexed(0..mesh.opaque_index_count, 0, 0..1);
                     drawn += 1;
-                    tris += (mesh.index_count / 3) as usize;
+                    tris += (mesh.opaque_index_count / 3) as usize;
                 }
 
                 // Coarse LOD nodes (M08): same camera/texture/sky bind groups,
@@ -1224,12 +1430,53 @@ impl Renderer {
                             mesh.index_buffer.slice(..),
                             wgpu::IndexFormat::Uint32,
                         );
-                        pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                        pass.draw_indexed(0..mesh.opaque_index_count, 0, 0..1);
                         drawn += 1;
-                        tris += (mesh.index_count / 3) as usize;
+                        tris += (mesh.opaque_index_count / 3) as usize;
                     }
-                    // Restore the full-res pipeline for the highlight pass below.
-                    pass.set_pipeline(&self.pipeline);
+                }
+
+                // Transparent chunk faces (ADR-0011), last of the world so they
+                // blend over everything opaque — full-res and LOD alike. Same
+                // bind-group layout, so groups 0, 2 and 3 stay bound.
+                pass.set_pipeline(&self.transparent_pipeline);
+                for (pos, mesh) in self.meshes.iter() {
+                    if mesh.index_count == mesh.opaque_index_count {
+                        continue;
+                    }
+                    // Only where full resolution draws the whole column; LOD
+                    // water stands in everywhere else (see
+                    // `set_fullres_columns`).
+                    if !fullres_mask_covers(&self.fullres_texels, self.fullres_center, pos.x, pos.z)
+                    {
+                        continue;
+                    }
+                    if !frustum.intersects_aabb(mesh.aabb_min, mesh.aabb_max) {
+                        continue;
+                    }
+                    pass.set_bind_group(1, &mesh.offset_bind_group, &[]);
+                    pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(mesh.opaque_index_count..mesh.index_count, 0, 0..1);
+                    tris += ((mesh.index_count - mesh.opaque_index_count) / 3) as usize;
+                }
+
+                // The LOD's sea surface (ADR-0011 decision 1c), over the LOD
+                // seabed drawn above. Never overlapping near water: the shader
+                // discards in full-res columns, where near water draws.
+                pass.set_pipeline(&self.lod_transparent_pipeline);
+                for (key, mesh) in self.lod_meshes.iter() {
+                    if mesh.index_count == mesh.opaque_index_count
+                        || self.suppressed_lod.contains(key)
+                        || !frustum.intersects_aabb(mesh.aabb_min, mesh.aabb_max)
+                    {
+                        continue;
+                    }
+                    pass.set_bind_group(1, &mesh.offset_bind_group, &[]);
+                    pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(mesh.opaque_index_count..mesh.index_count, 0, 0..1);
+                    tris += ((mesh.index_count - mesh.opaque_index_count) / 3) as usize;
                 }
 
                 // Targeted-block highlight (M03 task 3): wireframe cube on
@@ -1351,7 +1598,7 @@ fn cube_edge_vertices() -> [[f32; 3]; 24] {
 
 /// Build the block texture array (ADR-0003): one 16×16 RGBA layer per tile,
 /// generated procedurally so the engine ships no image assets yet. Layer
-/// indices match the block registry's assignment (L_STONE=0 .. L_PLANKS=6).
+/// indices match the block registry's assignment (`vox_core::registry::L_*`).
 /// Real PNG tiles can replace `tile_pixels` later with no format change.
 ///
 /// Returns the bind group (texture view + Repeat/nearest sampler) for group 2.
@@ -1361,7 +1608,9 @@ fn create_block_texture(
     layout: &wgpu::BindGroupLayout,
 ) -> wgpu::BindGroup {
     const TILE: u32 = 16;
-    const LAYERS: u32 = 8; // = registry DEFAULT_LAYER_COUNT
+    // The registry's count, not a copy of it: a layer the registry names but
+    // the array lacks samples out of range.
+    const LAYERS: u32 = vox_core::registry::DEFAULT_LAYER_COUNT;
 
     // Generate all layers back-to-back (the upload expects layers contiguous).
     let mut data = Vec::with_capacity((TILE * TILE * 4 * LAYERS) as usize);
@@ -1437,6 +1686,7 @@ fn create_block_texture(
 /// plus a cheap deterministic per-texel variation so surfaces read as
 /// textured rather than flat. Placeholder until real art drops in.
 fn tile_pixels(layer: u32, tile: u32) -> Vec<u8> {
+    use vox_core::registry::L_WATER;
     // Base colors keyed to the registry's layer assignment.
     let base: [u8; 3] = match layer {
         0 => [128, 128, 134], // stone
@@ -1447,8 +1697,11 @@ fn tile_pixels(layer: u32, tile: u32) -> Vec<u8> {
         5 => [120, 120, 126], // cobblestone
         6 => [156, 116, 70],  // planks
         7 => [255, 236, 170], // lamp (warm, bright)
-        _ => [255, 0, 255],   // magenta = missing
+        L_WATER => WATER_RGB,
+        _ => [255, 0, 255], // magenta = missing
     };
+    // Only water is see-through.
+    let alpha = if layer == L_WATER { WATER_ALPHA } else { 255 };
     let mut px = Vec::with_capacity((tile * tile * 4) as usize);
     for y in 0..tile {
         for x in 0..tile {
@@ -1463,10 +1716,71 @@ fn tile_pixels(layer: u32, tile: u32) -> Vec<u8> {
             px.push(shade(base[0]));
             px.push(shade(base[1]));
             px.push(shade(base[2]));
-            px.push(255);
+            px.push(alpha);
         }
     }
     px
+}
+
+/// Water's colour and opacity (ADR-0011): about 60% opaque, so the seabed
+/// shows through at every depth — one surface, one blend, near and far.
+const WATER_RGB: [u8; 3] = [52, 96, 158];
+const WATER_ALPHA: u8 = 150;
+
+/// Columns either side of the centre the full-res mask covers: as far as any
+/// chunk can be resident, unload band included — the band is exactly where a
+/// mask sized to the load radius missed overlap (M10 A1).
+const FULLRES_MASK_RADIUS: i64 = vox_core::MAX_RESIDENT_RADIUS;
+// Checked at compile time: a mask short of the largest unload radius misses
+// the band, and nothing else would notice.
+const _: () = assert!(
+    FULLRES_MASK_RADIUS
+        >= vox_core::settings::ranges::LOAD_RADIUS.1 + vox_core::UNLOAD_MARGIN_CHUNKS
+);
+const FULLRES_MASK_SIDE: u32 = (2 * FULLRES_MASK_RADIUS + 1) as u32;
+/// Byte offset of the mask placement (vec4 4) in the chunk uniform.
+const FULLRES_MASK_UNIFORM_OFFSET: wgpu::BufferAddress = 4 * 16;
+
+/// The mask's texels: 255 where `covered(cx, cz)`, row-major from the
+/// corner column `(center.x - R, center.z - R)`.
+fn fullres_mask_texels(center: ChunkPos, covered: impl Fn(i64, i64) -> bool) -> Vec<u8> {
+    let r = FULLRES_MASK_RADIUS;
+    let side = FULLRES_MASK_SIDE as usize;
+    let mut texels = vec![0u8; side * side];
+    for iz in 0..side {
+        for ix in 0..side {
+            if covered(center.x - r + ix as i64, center.z - r + iz as i64) {
+                texels[ix + iz * side] = 255;
+            }
+        }
+    }
+    texels
+}
+
+/// Whether the mask built around `center` marks column `(cx, cz)` as drawn
+/// at full resolution. False outside the mask, and before the first mask.
+fn fullres_mask_covers(texels: &[u8], center: ChunkPos, cx: i64, cz: i64) -> bool {
+    let (r, side) = (FULLRES_MASK_RADIUS, FULLRES_MASK_SIDE as i64);
+    let (ix, iz) = (cx - center.x + r, cz - center.z + r);
+    if !(0..side).contains(&ix) || !(0..side).contains(&iz) {
+        return false;
+    }
+    texels
+        .get((ix + iz * side) as usize)
+        .is_some_and(|&t| t > 127)
+}
+
+/// Vec4 4 of the chunk uniform: the mask's corner relative to the render
+/// origin, in blocks; the column size; the side in columns. Exact in f32 —
+/// the corner is a few thousand blocks from the origin at most.
+fn fullres_mask_placement(center: ChunkPos, render_origin: ChunkPos) -> [f32; 4] {
+    let (r, s) = (FULLRES_MASK_RADIUS, CHUNK_SIZE as i64);
+    [
+        ((center.x - r - render_origin.x) * s) as f32,
+        ((center.z - r - render_origin.z) * s) as f32,
+        s as f32,
+        FULLRES_MASK_SIDE as f32,
+    ]
 }
 
 fn create_depth_view(
@@ -1551,6 +1865,118 @@ mod tests {
             z(4_001.0),
             "standard-Z separated 1 block at 4 km"
         );
+    }
+
+    // ---- Texture layers (ADR-0011) ----
+
+    /// Every layer the registry names has a real tile — not the magenta
+    /// placeholder, which is what a layer missing from `tile_pixels` gets.
+    #[test]
+    fn every_registry_layer_has_a_tile() {
+        for layer in 0..vox_core::registry::DEFAULT_LAYER_COUNT {
+            let px = tile_pixels(layer, 4);
+            let magenta = px[0] > 200 && px[1] < 40 && px[2] > 200;
+            assert!(!magenta, "layer {layer} has no tile");
+        }
+    }
+
+    /// Only water is see-through: every other layer is drawn in an opaque
+    /// pass, where a translucent texel would show the clear colour.
+    #[test]
+    fn only_water_is_translucent() {
+        use vox_core::registry::{DEFAULT_LAYER_COUNT, L_WATER};
+        for layer in 0..DEFAULT_LAYER_COUNT {
+            let alpha = tile_pixels(layer, 4)[3];
+            if layer == L_WATER {
+                assert!(alpha < 255, "water is opaque");
+            } else {
+                assert_eq!(alpha, 255, "layer {layer} is translucent");
+            }
+        }
+    }
+
+    // ---- Full-resolution column mask (M10 A1) ----
+
+    /// `under_fullres` from lod.wgsl, transcribed: the column a render-relative
+    /// point falls in, looked up in the texels. The Rust side and the shader
+    /// must agree to the column, or LOD vanishes one column off from where
+    /// full resolution actually is.
+    fn shader_lookup(texels: &[u8], placement: [f32; 4], x: f32, z: f32) -> bool {
+        let side = placement[3] as i32;
+        let cx = ((x - placement[0]) / placement[2]).floor() as i32;
+        let cz = ((z - placement[1]) / placement[2]).floor() as i32;
+        if !(0..side).contains(&cx) || !(0..side).contains(&cz) {
+            return false;
+        }
+        texels[(cx + cz * side) as usize] > 127
+    }
+
+    /// Every point of a covered column is found covered, and every point of
+    /// its neighbours is not — including negative columns and a mask centre
+    /// away from the render origin.
+    #[test]
+    fn the_mask_and_the_shader_agree_on_every_column() {
+        let s = CHUNK_SIZE as i64;
+        for (center, origin) in [
+            (ChunkPos::new(0, 0, 0), ChunkPos::new(0, 0, 0)),
+            (ChunkPos::new(-7, 3, 12), ChunkPos::new(-7, 3, 12)),
+            (ChunkPos::new(5, 0, -2), ChunkPos::new(4, 0, -3)),
+        ] {
+            let target = (center.x + 2, center.z - 3);
+            let texels = fullres_mask_texels(center, |cx, cz| (cx, cz) == target);
+            let placement = fullres_mask_placement(center, origin);
+            for cz in center.z - 4..=center.z + 4 {
+                for cx in center.x - 4..=center.x + 4 {
+                    // Corners and middle of the column, render-relative.
+                    for (ox, oz) in [
+                        (0.01, 0.01),
+                        (s as f32 - 0.01, 16.0),
+                        (16.0, s as f32 - 0.01),
+                    ] {
+                        let x = ((cx - origin.x) * s) as f32 + ox;
+                        let z = ((cz - origin.z) * s) as f32 + oz;
+                        assert_eq!(
+                            shader_lookup(&texels, placement, x, z),
+                            (cx, cz) == target,
+                            "column ({cx}, {cz}), centre {center:?}, origin {origin:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The transparent pass's lookup agrees with the texels: exactly the
+    /// covered columns, nothing outside the mask, nothing before the first.
+    #[test]
+    fn the_transparent_pass_sees_exactly_the_covered_columns() {
+        let center = ChunkPos::new(-3, 0, 9);
+        let covered = |cx: i64, cz: i64| (cx + cz).rem_euclid(3) == 0;
+        let texels = fullres_mask_texels(center, covered);
+        let r = FULLRES_MASK_RADIUS;
+        for cz in center.z - r - 2..=center.z + r + 2 {
+            for cx in center.x - r - 2..=center.x + r + 2 {
+                let inside = (cx - center.x).abs() <= r && (cz - center.z).abs() <= r;
+                assert_eq!(
+                    fullres_mask_covers(&texels, center, cx, cz),
+                    inside && covered(cx, cz),
+                    "column ({cx}, {cz})"
+                );
+            }
+        }
+        assert!(!fullres_mask_covers(&[], center, center.x, center.z));
+    }
+
+    /// Outside the mask nothing is covered: the shader must not wrap or clamp
+    /// into it.
+    #[test]
+    fn beyond_the_mask_nothing_is_covered() {
+        let texels = fullres_mask_texels(ChunkPos::new(0, 0, 0), |_, _| true);
+        let placement = fullres_mask_placement(ChunkPos::new(0, 0, 0), ChunkPos::new(0, 0, 0));
+        let edge = ((FULLRES_MASK_RADIUS + 1) * CHUNK_SIZE as i64) as f32;
+        assert!(shader_lookup(&texels, placement, 0.0, 0.0));
+        assert!(!shader_lookup(&texels, placement, edge + 1.0, 0.0));
+        assert!(!shader_lookup(&texels, placement, 0.0, -edge - 1.0));
     }
 
     fn frustum() -> Frustum {

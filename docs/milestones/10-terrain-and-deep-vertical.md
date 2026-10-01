@@ -242,7 +242,7 @@ ground were ever loaded.
     an unloaded neighbour as air, so every column's lowest loaded chunk draws
     a black floor into the void beneath it — invisible from above, but real
     geometry, and plainly visible from underground in spectator.
-  - Cleanup: delete the orphaned `vox-core/src/downsample.rs` (no `mod`
+  - Cleanup (done): delete the orphaned `vox-core/src/downsample.rs` (no `mod`
     declaration anywhere) and the stray `docs/decisions/voxterra.code-workspace`;
     deduplicate the surface-span sampler in `vox-app`; replace
     `LOD_WORLD_Y_BLOCKS` with the planet constants it now duplicates.
@@ -265,9 +265,9 @@ the remote matches it, and starts at the first unchecked item.*
 - [x] **A3 — `f64` world positions, and streaming that follows the camera.**
   `FlyCamera` (position, velocity, yaw, pitch) and all physics are `f64`;
   `FlyCamera::render_relative` is the one narrowing to `f32`, after subtracting
-  the render origin. Every column of the load disc now also keeps
-  `LOAD_AROUND_CAMERA_CHUNKS` (3) layers either side of the camera's layer, with
-  one layer of vertical hysteresis; a column's resident layers are a
+  the render origin. Columns near the camera also keep 3 layers either side of
+  the camera's layer, with one chunk of hysteresis (the window was first the
+  whole load disc; see the camera-window fix below); a column's resident layers are a
   `ColumnWindow` (surface ∪ camera, up to two disjoint ranges). The first-mesh
   gate asks `Streamer::wants` instead of re-deriving residency, and the edit
   overlay's column scan walks the column window, so a build above the surface
@@ -374,18 +374,96 @@ the remote matches it, and starts at the first unchecked item.*
   on flat ground. Any line left there is the real height step, or the look of
   LOD against full-res — a separate question.
 
+- [x] **A3 — cleanup.** Deleted the orphaned `vox-core/src/downsample.rs`, the
+  stray `docs/decisions/voxterra.code-workspace`, and the stray
+  `docs/milestones/m10-spec.md` (a mis-named copy of this spec). The
+  surface-span sampler, duplicated between a vox-app method and the streaming
+  closure, is now one `Generator::surface_span_chunks` in vox-worldgen, with a
+  test that the span covers every sampled point. `LOD_WORLD_Y_BLOCKS` is gone;
+  its uses read the planet constants. `stream_tick`'s doc comment, which had
+  drifted onto the sampler, is back on `stream_tick`.
+
+- [x] **Fix, found in play: the camera window streamed the sky.** It spanned
+  the whole load disc, so a spectator high above the ground kept ~1 400 empty
+  chunks streaming through generation, lighting and meshing — the 2026-09-26
+  flight log held ~90 fps with zero chunk meshes drawn, `loaded` ~3 600 and
+  ~2 000 queued. The window now has its own radius (`CAMERA_WINDOW_RADIUS`, 3
+  chunks: ~200 chunks at altitude) with one chunk of horizontal hysteresis as
+  well as vertical. The streamer takes a named `StreamConfig` instead of six
+  positional integers, and vox-app builds it in one place from the load-radius
+  setting (the separate `LOAD_RADIUS`/`UNLOAD_RADIUS` constants are gone). A
+  build above the terrain window is visible while the player is near it — as
+  before the window existed, from further. Committed with this checklist
+  update; to confirm in play: fly high as in that log; `loaded` should sit near
+  the on-ground figure (~2 000) and `dirty`/`relight` should drain.
+
+- [x] **A1 — transparency and water** (ADR-0011, Accepted, all decisions taken:
+   distant water opaque with a pre-blended colour, no light attenuation in M10,
+   no swimming). Delivered in two steps so the risky audit is verified alone.
+
+   - [x] **Step 1 — the property split and the mesher rule, behaviour-neutral.**
+     `BlockType` has `solid` (physical), `opaque` (blocks light, hides faces)
+     and `renders`; every call site was reclassified by the question it asks,
+     none by find-and-replace: collision, targeting, break and place ask
+     `solid`; lighting (`light.rs` now says opacity throughout), the skylight
+     heightmap and meshing ask `opaque`; `recompute_column_height` tracks both
+     tops (opaque for the skylight heightmap, solid for the LOD edit overlay);
+     the debug punch-hole keeps `is_air` on purpose. `mesh_chunk` takes an
+     `occludes` closure; the face rule is "emit unless the neighbour is opaque
+     or the same block"; AO asks opacity; `MeshData` carries opaque indices
+     then transparent (`opaque_index_count`). With every block an opaque cube
+     nothing may look or behave differently — to confirm in play: nothing
+     changed (walk, collide, break, place, lighting, LOD).
+   - [x] **Step 2 — water.** `WATER` (id 8): renders, not solid, not
+     opaque, in the transparent pass. Sea level is the highest water block
+     (`SEA_LEVEL_BLOCKS` = 0), so the sea surface fits one chunk layer.
+     Worldgen fills below it (all-water fast path for open ocean);
+     `GENERATOR_VERSION` 2, and the fingerprint now covers chunk contents.
+     Streaming keeps the sea-surface layer over deep water but not the water
+     column (`StreamConfig::sea_layer`; a column window is up to three
+     ranges); LOD coverage counts the sea layer. A sealed +Y neighbour's sky
+     plane comes from the heightmap (`ColumnHeights::sky_plane_above`), so the
+     seabed is lit through the unloaded water. Renderer: a transparent
+     pipeline (alpha blend, depth test without write, no culling) after all
+     opaque geometry, drawing each chunk's transparent index range;
+     `fs_transparent` in `shader.wgsl`; layers 8 (near water, translucent) and
+     9 (distant water, opaque, pre-blended); the texture array's layer count
+     now comes from the registry. LOD: each cell's effective top is
+     max(ground, sea level), textured as distant water below it. All shaders
+     validate with naga. **Existing worlds are refused (generator v1)** — move
+     or delete `world/`. Known limit, recorded in ADR-0011: over ocean at the
+     edge of the loaded area, partly covered LOD nodes put opaque LOD sea
+     under the translucent near sea. To confirm in play: oceans are water
+     from above and from the seabed; the seabed is lit; coasts meet the sea at
+     the water line near and far; walking into the sea drops you to the
+     seabed; performance over ocean with `loaded` near the land figure.
+
+- [x] **Fix, found in play: LOD showing through the near sea at the edge of
+  the loaded area.** A dark jagged band, a speckled blue band and white
+  slivers where full resolution met LOD over ocean. LOD nodes straddling the
+  edge stayed drawn under the full-res region; opaque ground had always hidden
+  that, translucent water does not. One set, `fullres_columns` in vox-app —
+  complete columns out to the UNLOAD radius — now drives node suppression,
+  per-column discarding in the LOD shader, and which columns the transparent
+  pass may draw near water in, so the two never overlap. The first attempt
+  stopped at the load radius and changed nothing visible: the unload band
+  still drew water over LOD. Water gains a Fresnel term. The last piece, named
+  by the owner: opaque LOD water was a lid with nothing under it, so a view
+  through near water past the edge of the loaded area ended in empty space (a
+  pale strip as wide as the sea is deep). ADR-0011 decision 1 moved from (a) to
+  (c): the LOD draws its real seabed and the same translucent water, near and
+  far now one surface at two resolutions; the pre-blended distant-water layer
+  is gone. Tests
+  transcribe the shader's column lookup and the transparent pass's, and check
+  both against the mask to the column; the mask's reach is a compile-time
+  assertion. Committed with this checklist update; to confirm in play: the
+  views of 2026-09-30 — from above and from low — show no band, speckle,
+  slivers or pale strip, and the seabed is visible through distant water as
+  through near.
+
 ### Remaining, in order
 
-1. **A3 — cleanup.** Delete the orphaned `vox-core/src/downsample.rs` and the
-   stray `docs/decisions/voxterra.code-workspace`; deduplicate the surface-span
-   sampler in `vox-app`; replace `LOD_WORLD_Y_BLOCKS` with the planet constants.
-2. **A1 — transparency and water** (ADR-0011, Accepted, all decisions taken:
-   distant water opaque with a pre-blended colour, no light attenuation in M10,
-   no swimming). An earlier sandbox implementation of the registry split and
-   the mesher rule was never handed off and is lost; build from the ADR. Water
-   goes after the A3 items so the performance numbers below are taken with
-   oceans meshed.
-3. **Tuning and retro.** Criterion-8 numbers at radius 8, on foot and flying,
+1. **Tuning and retro.** Criterion-8 numbers at radius 8, on foot and flying,
    against M09's (stationary 851–967 fps; sprint-fly median ~180). Append the
    retrospective here, update CLAUDE.md status, then **commit before tagging**
    `v0.10.0-m10`.

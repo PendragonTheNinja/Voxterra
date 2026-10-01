@@ -54,6 +54,7 @@ to run the tests. Same class of thing as the pre-existing let-chain in
 | `manual_div_ceil` | `((x + n - 1) / n)` on **unsigned** ints | `x.div_ceil(n)` — but ONLY for unsigned. `div_ceil` on **signed** ints (`i64`) is still unstable (`int_roundings`), so signed code must keep the manual form. Applying clippy's suggestion blindly to an `i64` produces a compile error. |
 | `too_many_arguments` | `emit_rect` (11 args) | genuinely warranted here → explicit `#[allow(clippy::too_many_arguments)]` with a reason |
 | `manual_range_contains` (negated form) | `ix < 0 \|\| ix >= cells` — a bounds *reject*, not a bounds accept | `!(0..cells).contains(&ix)`. The lint fires on both polarities; the reject form is easy to miss when scanning for the `>= a && <= b` shape in the checklist. |
+| `cloned_ref_to_slice_refs` | `buffers: &[vertex_layout.clone()]` — cloning a value only to make a one-element slice of it, when a second pipeline also needed the layout (A1, 2026-09-26) | `std::slice::from_ref(&vertex_layout)`: borrow, don't clone. Newer than the sandbox's Rust 1.75, so found only on the native run. |
 
 ---
 
@@ -72,6 +73,8 @@ Before sending Rust files, grep the diff for:
 7. bindings introduced then unused mid-refactor → `dead_code`
 8. new multi-line doc comments → `doc_lazy_continuation`
 9. `x.div_ceil(n)` on a SIGNED integer → unstable; use `((x + n - 1) / n)`
+10. `&[x.clone()]` building a one-element slice → `cloned_ref_to_slice_refs`;
+    use `std::slice::from_ref(&x)`
 
 Also: run `cargo test` in `fixcheck` (catches real compile errors, never
 lints), and remember the sandbox cannot compile `vox-render`/`vox-app` at all —
