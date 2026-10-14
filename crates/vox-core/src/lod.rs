@@ -124,6 +124,30 @@ impl LodLevel {
     }
 }
 
+impl LodLevel {
+    /// `wanted` extra levels, or fewer if that many would show the same
+    /// terrain twice: the outermost square must be narrower than the world's
+    /// period on both axes, i.e. the horizon under half the period (ADR-0012
+    /// rule 3). Only small worlds clamp — the default (204.8 km) takes all
+    /// eight levels' 64 km; the smallest (32.8 km) stops at five.
+    pub fn extra_levels_within(
+        base: &[LodLevel],
+        wanted: u32,
+        lod_inner_chunks: i64,
+        shape: WorldShape,
+    ) -> u32 {
+        let period = shape.size_x().min(shape.size_z());
+        let fits = |extra: u32| {
+            let outer = Self::extended(base, extra, lod_inner_chunks)
+                .last()
+                .expect("at least one level")
+                .outer_chunks;
+            2 * outer * (CHUNK_SIZE as i64) < period
+        };
+        (0..=wanted).rev().find(|&e| fits(e)).unwrap_or(0)
+    }
+}
+
 /// The grid level `i`'s square snaps to: the next coarser stride, so that
 /// level's nodes never straddle the square's edge; the coarsest snaps to its
 /// own.
@@ -1282,6 +1306,39 @@ mod tests {
             // Just outside the square, nothing.
             assert_eq!(coverage(&ring, sq.x1, cam.z), 0);
             assert_eq!(coverage(&ring, cam.x, sq.z0 - 1), 0);
+        }
+    }
+
+    /// ADR-0012 rule 3: no terrain visible twice around the world. The
+    /// default world takes all eight levels; the smallest stops where the
+    /// outermost square would span the whole period.
+    #[test]
+    fn view_distance_clamps_below_half_the_period() {
+        let within = |size_x: i64, size_z: i64, wanted: u32| {
+            let shape = WorldShape::new(size_x, size_z).expect("legal size");
+            LodLevel::extra_levels_within(&base_levels(), wanted, 0, shape)
+        };
+        let default = crate::planet::DEFAULT_WORLD_SIZE_BLOCKS;
+        let min = crate::planet::MIN_WORLD_SIZE_BLOCKS;
+        assert_eq!(within(default, default, 5), 5);
+        // 32 768 blocks: 256 chunks of horizon is a 16 384-block square, 512 is
+        // the whole period.
+        assert_eq!(within(min, min, 5), 2);
+        // Never more than asked for, and the narrower axis decides.
+        assert_eq!(within(default, default, 1), 1);
+        assert_eq!(within(default, min, 5), 2);
+        // Whatever it returns honours the rule.
+        for size in [min, 2 * min, default] {
+            let shape = WorldShape::new(size, size).unwrap();
+            let e = LodLevel::extra_levels_within(&base_levels(), 5, 0, shape);
+            let outer = LodLevel::extended(&base_levels(), e, 0)
+                .last()
+                .unwrap()
+                .outer_chunks;
+            assert!(
+                2 * outer * CHUNK_SIZE as i64 <= size,
+                "size {size}: {e} extra levels"
+            );
         }
     }
 

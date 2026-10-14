@@ -1727,11 +1727,23 @@ impl App {
         // Extend view distance by APPENDING coarser levels (see
         // `LodLevel::extended`, which also puts every radius on the grid the
         // ring requires — one rule for the menu and the tests).
-        let levels = vox_core::LodLevel::extended(
+        // A small world clamps the horizon below half its width, or the same
+        // terrain would be visible twice around it (ADR-0012 rule 3). The
+        // clamped value is written back so the menu shows what is in effect.
+        let wanted = s.lod_extra_levels.max(0) as u32;
+        let extra = vox_core::LodLevel::extra_levels_within(
             &LOD_LEVELS,
-            s.lod_extra_levels.max(0) as u32,
+            wanted,
             LOD_INNER_CHUNKS,
+            self.store.shape(),
         );
+        if extra < wanted {
+            log::info!(
+                "extra LOD levels clamped {wanted} -> {extra}: the horizon must stay under half this world's width"
+            );
+            self.settings.lod_extra_levels = extra as i32;
+        }
+        let levels = vox_core::LodLevel::extended(&LOD_LEVELS, extra, LOD_INNER_CHUNKS);
         self.lod_far_chunks = levels.last().expect("at least one level").outer_chunks;
 
         // Actually install the new ring. Losing this line meant the ring kept

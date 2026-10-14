@@ -114,14 +114,14 @@ impl Default for Settings {
 /// the clamping cannot drift apart.
 pub mod ranges {
     pub const LOAD_RADIUS: (i64, i64) = (2, 24);
-    /// Capped at 2 deliberately. The LOD ring requires every boundary radius to
-    /// be a multiple of the COARSEST stride (that is what keeps the levels
-    /// exactly partitioned), so adding very coarse levels drags the FINE
-    /// levels' radii outward too — and their node count is quadratic in radius.
-    /// Measured: 0 → 640 nodes / 2 km, 1 → 832 / 4 km, 2 → 2416 / 8 km,
-    /// 3 → 9196 / 16 km (which is where memory becomes a problem). Lifting this
-    /// needs a partition that doesn't tie fine radii to the coarsest grid.
-    pub const LOD_EXTRA_LEVELS: (i32, i32) = (0, 2);
+    /// Up to five: the eight levels (strides 2..256, 64 km) M11 targets.
+    /// It was capped at 2 while the LOD ring tied every radius to the
+    /// COARSEST stride, which dragged the fine levels' radii outward with each
+    /// coarse level added (2 extra measured 2 416 nodes, 3 extra 9 196).
+    /// Per-level centring (ADR-0014) frees the fine radii, so each extra level
+    /// adds ~192 nodes: 640 at 0, ~1 600 at 5. A small world clamps lower so
+    /// no terrain shows twice (`LodLevel::extra_levels_within`).
+    pub const LOD_EXTRA_LEVELS: (i32, i32) = (0, 5);
     pub const FOV_DEGREES: (f32, f32) = (30.0, 120.0);
     pub const FOG_START: (f32, f32) = (0.0, 8000.0);
     pub const FOG_END: (f32, f32) = (16.0, 16000.0);

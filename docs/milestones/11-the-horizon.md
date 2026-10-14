@@ -102,10 +102,25 @@ the remote matches it, and starts at the first unchecked item.*
   and fly at 3 and 5 levels; no holes or doubled terrain where levels meet,
   no new popping.
 
+- [x] **Task 2 — more levels + view-distance clamp.** The extra-levels slider
+  now reaches 5 (eight levels, strides 2–256, 64 km). Its old cap of 2 existed
+  because the shared centre dragged fine radii out with every coarse level
+  (2 extra measured 2 416 nodes); with per-level centring each extra level
+  adds 192 nodes: 640 at 3 levels, 1 024 at 5, 1 600 at 8. A world too small
+  for the asked horizon clamps it under half its width (ADR-0012 rule 3,
+  `LodLevel::extra_levels_within`) — the default world takes all eight, the
+  smallest stops at five — and the menu shows the clamped value. Side effect
+  to expect at 4–5 levels: the fine levels keep their designed radii instead
+  of being rounded out to the coarsest grid, so far fewer nodes (the 5-level
+  log's `lod 2416` should read ~1 024) and less GPU memory, with fine detail
+  reaching as far as at 3 levels. Flat-cell merging (task 3) is not in yet,
+  so 8 levels draws every open-ocean cell. To confirm in play: step the
+  slider 0 → 5, logging `lod`, GPU MB, triangles and fps at each.
+
 ### Remaining, in order
 
-1. **Tasks 2–6 below**, in order (task 2: more levels + view-distance
-   clamp).
+1. **Tasks 3–6 below**, in order (task 3: flat-cell merging in
+   `mesh_lod_heightfield`).
 
 ## Why this milestone exists
 
