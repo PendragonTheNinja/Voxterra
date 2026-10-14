@@ -117,10 +117,44 @@ the remote matches it, and starts at the first unchecked item.*
   so 8 levels draws every open-ocean cell. To confirm in play: step the
   slider 0 → 5, logging `lod`, GPU MB, triangles and fps at each.
 
+- [x] **In play, 2026-10-14 (owner's log, radius 8): tasks 0–2 confirmed.**
+  Standing at 3 levels: **908–1 052 fps** (M10 733–817, M09 851–967) — the
+  per-frame terrain re-sampling was the standing-fps regression. LOD slider
+  0 → 5: `lod` 640 / 832 / 1 024 / 1 216 / 1 408 / 1 600 exactly as predicted,
+  GPU 187 / 270 / 353 / 440 / 534 / 631 MB (5 levels was 726 MB), 0.69 →
+  2.20 M triangles, standing 843 → ~680 fps at 8 levels and a 64 km horizon.
+  Flight at 8 levels: 126–161 fps with relight 126–163 ms/s (M10 sprint:
+  192–253) on 2.3 M triangles; meshing (~490 ms/s, its whole 4 ms/frame
+  budget) is now the limit. One 3-level flight (07:25–07:37) ran 215–426 fps,
+  median ~340 — sprint or not is unconfirmed. Flying at 8 levels holds
+  ~2 020 nodes rather than 1 600: each level keeps one snap step of slack
+  (ADR-0014), which for the 256-chunk levels is a wide band. No holes,
+  doubling or popping reported; "looking pretty fancy".
+
+- [x] **Task 3 — flat-cell merging.** `mesh_lod_heightfield` merges top
+  quads greedily, but ONLY across cells that do not move under morph (each
+  already equals its 2x2 group minimum) and share a height: the shader takes
+  each vertex's morph factor from its own distance, so a merged quad that
+  morphed would tilt against the walls on its edges (ADR-0009's warning).
+  Cells that morph keep their own quad; walls are unchanged. Measured on real
+  terrain around spawn (49 nodes per stride): quads per node 1 588 → 787 at
+  stride 2, 1 824 → 1 151 at 4, 1 997 → 1 410 at 8, 2 600 → 2 329 at 32,
+  3 181 → 3 135 at 256 — about a quarter fewer LOD quads over eight levels.
+  Coarse strides gain little: their cells are rarely flat, and walls are now
+  most of their geometry. A flat field or open seabed is one top quad.
+  Tests: every cell covered by exactly one top at its exact height and morph
+  target (four fields, three strides and origins); merged quads never move
+  under morph; the inversion test now includes plateaus where merged and
+  single cells meet. To confirm in play: at 8 levels, triangles below the
+  2.20 M above, and no sparkles or cracks along the edges of flat areas.
+  Left for later: merging WALLS along runs, the bigger share at coarse
+  strides, under the same morph constraint.
+
 ### Remaining, in order
 
-1. **Tasks 3–6 below**, in order (task 3: flat-cell merging in
-   `mesh_lod_heightfield`).
+1. **Tasks 4–6 below**, in order. Task 4 (reverse-Z) shipped in M10
+   (ADR-0013) — confirm it holds at 32 and 64 km — so next is task 5:
+   curvature and horizon culling.
 
 ## Why this milestone exists
 

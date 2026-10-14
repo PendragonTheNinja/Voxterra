@@ -263,11 +263,12 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   done (ADR-0013) and distant water changed shape (ADR-0011 1c). As of
   2026-10-14: task 0 (why relighting doubled), the `light.rs` `opaque` fix and
   tasks 1–2 (per-level ring centring, ADR-0014 Proposed; eight levels with
-  the half-period clamp) are done and await in-play confirmation; next is
-  task 3 (flat-cell merging).
+  the half-period clamp) are done and confirmed in play; task 3 (flat-cell
+  merging) is done; next is task 5 (curvature and horizon culling — task 4,
+  reverse-Z, shipped in M10).
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 283, vox-mesh 53, vox-worldgen 31 passing as of M11 task 2;
+  vox-core 283, vox-mesh 56, vox-worldgen 31 passing as of M11 task 3;
   vox-render's 10 tests need wgpu and run natively only), then start the first
   unchecked item.
 - **Roadmap after M11:** 12 — Climate & Biomes (spec not yet written). The

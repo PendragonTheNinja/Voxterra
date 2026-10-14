@@ -2267,27 +2267,70 @@ pub fn mesh_lod_heightfield(
             .min(at(bx + 1, bz + 1))
     };
 
+    // Top faces, each at its column's exact height (M11 task 3: flat-cell
+    // merging). A cell whose top does NOT move under morph — it already equals
+    // its 2x2 group's minimum, so its morph target is itself — merges greedily
+    // with equal-height neighbours of the same kind into one rectangle. Any
+    // other cell keeps its own quad.
+    //
+    // Merging only unmoving cells is what ADR-0009 requires. The shader picks
+    // each VERTEX's morph factor from its own distance to the camera, so a
+    // merged quad whose cells morphed would tilt as one plane while the walls
+    // along its edges follow their own corners — exactly the class of hole
+    // geomorph once opened. A quad that never moves cannot tilt, and every
+    // wall meeting it keeps its top edge where the quad is. Plains, plateaus
+    // and open seabed are unmoving almost everywhere: an open-ocean node's
+    // ground drops from 1 024 top quads to one.
+    let still = |cx: i32, cz: i32| at(cx, cz) == coarse_at(cx, cz);
+    let mut covered = vec![false; LOD_CELLS * LOD_CELLS];
+    let idx = |cx: i32, cz: i32| (cz * n + cx) as usize;
+    for cz in 0..n {
+        for cx in 0..n {
+            if covered[idx(cx, cz)] {
+                continue;
+            }
+            let h = at(cx, cz);
+            // Cells along x, then whole rows along z.
+            let (mut wx, mut wz) = (1, 1);
+            if still(cx, cz) {
+                let joins = |x: i32, z: i32| !covered[idx(x, z)] && still(x, z) && at(x, z) == h;
+                while cx + wx < n && joins(cx + wx, cz) {
+                    wx += 1;
+                }
+                while cz + wz < n && (cx..cx + wx).all(|x| joins(x, cz + wz)) {
+                    wz += 1;
+                }
+            }
+            for z in cz..cz + wz {
+                for x in cx..cx + wx {
+                    covered[idx(x, z)] = true;
+                }
+            }
+            let top = (h - origin_y + 1) as f32;
+            let coarse_top = (coarse_at(cx, cz) - origin_y + 1) as f32;
+            emit_lod_rect(
+                &mut mesh,
+                [(cx * h_stride) as f32, top, (cz * h_stride) as f32],
+                axis_unit(2),
+                axis_unit(0),
+                (wz * h_stride) as f32,
+                (wx * h_stride) as f32,
+                layer_of(grass, 2),
+                sky,
+                top_shade,
+                [coarse_top; 4],
+            );
+        }
+    }
+
     for cz in 0..n {
         for cx in 0..n {
             let h = at(cx, cz) - origin_y;
             let coarse_h = coarse_at(cx, cz) - origin_y;
             let (x0, z0) = ((cx * h_stride) as f32, (cz * h_stride) as f32);
             let w = h_stride as f32;
-            // Top face of the column, at its exact height.
             let top = (h + 1) as f32;
             let coarse_top = (coarse_h + 1) as f32;
-            emit_lod_rect(
-                &mut mesh,
-                [x0, top, z0],
-                axis_unit(2),
-                axis_unit(0),
-                w,
-                w,
-                layer_of(grass, 2),
-                sky,
-                top_shade,
-                [coarse_top; 4],
-            );
 
             // Vertical walls down to each lower neighbour. Outside the node,
             // fall back to a skirt so borders are covered.
@@ -2568,14 +2611,148 @@ mod heightfield_tests {
         assert_eq!(mesh.opaque_index_count as usize, mesh.indices.len());
     }
 
-    /// A flat field emits one top quad per cell and no interior walls — only
-    /// the border skirts.
+    /// A flat field is ONE top quad (M11 flat-cell merging) and no interior
+    /// walls — only the border skirts.
     #[test]
-    fn flat_field_is_tops_plus_border_skirts() {
+    fn flat_field_is_one_top_plus_border_skirts() {
         let mesh = mesh_lod_heightfield(&flat(20), 4, 0, |_, _| 0, 8);
-        let cells = LOD_CELLS * LOD_CELLS;
-        // 32x32 tops + 4 borders x 32 skirt walls.
-        assert_eq!(mesh.quad_count(), cells + 4 * LOD_CELLS);
+        // 1 merged top + 4 borders x 32 skirt walls.
+        assert_eq!(mesh.quad_count(), 1 + 4 * LOD_CELLS);
+    }
+
+    // ---- Flat-cell merging (M11 task 3) ----
+
+    /// Mesh with `layer_of` reporting the face index, so tops (face 2) can be
+    /// told from walls.
+    fn faces_as_layers(heights: &[i32], stride: i32, origin_y: i32) -> LodMeshData {
+        mesh_lod_heightfield(heights, stride, origin_y, |_, face| face as u32, 4)
+    }
+
+    /// Terraces whose steps fall both on and off the 2x2 grid, so merged
+    /// (unmoving) and single (moving) cells meet along every kind of edge.
+    fn plateaus() -> Vec<i32> {
+        let n = LOD_CELLS as i32;
+        let mut h = vec![0i32; LOD_CELLS * LOD_CELLS];
+        for cz in 0..n {
+            for cx in 0..n {
+                h[(cz * n + cx) as usize] = 9 * ((cx / 5 + cz / 3) % 4) - 7;
+            }
+        }
+        h
+    }
+
+    fn varied() -> Vec<i32> {
+        let n = LOD_CELLS as i32;
+        let mut h = vec![0i32; LOD_CELLS * LOD_CELLS];
+        for cz in 0..n {
+            for cx in 0..n {
+                h[(cz * n + cx) as usize] = (cx * 7 + cz * 13) % 23 - 5;
+            }
+        }
+        h
+    }
+
+    /// The opaque range's top quads (face 2), as (x0, x1, z0, z1, y, morph_y)
+    /// in node-local blocks.
+    fn top_rects(mesh: &LodMeshData) -> Vec<(f32, f32, f32, f32, f32, f32)> {
+        let opaque = mesh.opaque_index_count as usize / 6;
+        mesh.vertices
+            .chunks(4)
+            .take(opaque)
+            .filter(|q| q[0].layer == 2)
+            .map(|q| {
+                let xs = q.iter().map(|v| v.position[0]);
+                let zs = q.iter().map(|v| v.position[2]);
+                let y = q[0].position[1];
+                assert!(
+                    q.iter().all(|v| v.position[1] == y),
+                    "a top quad is not level"
+                );
+                assert!(
+                    q.iter().all(|v| v.morph_y == q[0].morph_y),
+                    "a top quad morphs unevenly"
+                );
+                (
+                    xs.clone().fold(f32::MAX, f32::min),
+                    xs.fold(f32::MIN, f32::max),
+                    zs.clone().fold(f32::MAX, f32::min),
+                    zs.fold(f32::MIN, f32::max),
+                    y,
+                    q[0].morph_y,
+                )
+            })
+            .collect()
+    }
+
+    /// Merging must change how many quads draw the tops, never what they
+    /// draw: every cell covered by exactly one top, at its exact height and
+    /// its exact morph target.
+    #[test]
+    fn merged_tops_cover_every_cell_once_at_its_height_and_morph() {
+        let n = LOD_CELLS as i32;
+        for (label, heights) in [
+            ("flat", flat(12)),
+            ("plateaus", plateaus()),
+            ("varied", varied()),
+            ("bumpy", bumpy_but_flat_when_coarse(3)),
+        ] {
+            for (stride, origin_y) in [(2, 0), (4, -40), (8, 7)] {
+                let mesh = faces_as_layers(&heights, stride, origin_y);
+                let mut count = vec![0u32; LOD_CELLS * LOD_CELLS];
+                for (x0, x1, z0, z1, y, morph_y) in top_rects(&mesh) {
+                    let s = stride as f32;
+                    for cz in (z0 / s) as i32..(z1 / s) as i32 {
+                        for cx in (x0 / s) as i32..(x1 / s) as i32 {
+                            let i = (cz * n + cx) as usize;
+                            count[i] += 1;
+                            let at = |x: i32, z: i32| heights[(z * n + x) as usize];
+                            let (bx, bz) = (cx & !1, cz & !1);
+                            let coarse = at(bx, bz)
+                                .min(at(bx + 1, bz))
+                                .min(at(bx, bz + 1))
+                                .min(at(bx + 1, bz + 1));
+                            assert_eq!(
+                                y,
+                                (at(cx, cz) - origin_y + 1) as f32,
+                                "{label} ({cx},{cz})"
+                            );
+                            assert_eq!(
+                                morph_y,
+                                (coarse - origin_y + 1) as f32,
+                                "{label} ({cx},{cz})"
+                            );
+                        }
+                    }
+                }
+                assert!(
+                    count.iter().all(|&c| c == 1),
+                    "{label}, stride {stride}: a cell is covered {:?} times",
+                    count.iter().find(|&&c| c != 1)
+                );
+            }
+        }
+    }
+
+    /// ADR-0009's condition on merging: a quad covering more than one cell
+    /// never moves under morph, so per-vertex morph factors cannot tilt it.
+    #[test]
+    fn merged_tops_never_move_under_morph() {
+        for heights in [plateaus(), varied(), flat(-30)] {
+            let mesh = faces_as_layers(&heights, 4, 0);
+            for (x0, x1, z0, z1, y, morph_y) in top_rects(&mesh) {
+                if x1 - x0 > 4.0 || z1 - z0 > 4.0 {
+                    assert_eq!(y, morph_y, "a merged top moves under morph");
+                }
+            }
+        }
+    }
+
+    /// Open seabed is where merging pays most: one ground quad for the node.
+    #[test]
+    fn open_seabed_is_one_ground_quad() {
+        let sea = vox_core::SEA_LEVEL_BLOCKS as i32;
+        let mesh = faces_as_layers(&flat(sea - 300), 8, 0);
+        assert_eq!(top_rects(&mesh).len(), 1);
     }
 
     /// **Vertical detail is exact**: the top face sits at the column's true
@@ -2819,16 +2996,9 @@ mod heightfield_tests {
                 "neighbour sinks below",
                 heights_where_the_neighbour_sinks_below(),
             ),
-            ("varied terrain", {
-                let n = LOD_CELLS as i32;
-                let mut h = vec![0i32; LOD_CELLS * LOD_CELLS];
-                for cz in 0..n {
-                    for cx in 0..n {
-                        h[(cz * n + cx) as usize] = (cx * 7 + cz * 13) % 23 - 5;
-                    }
-                }
-                h
-            }),
+            ("varied terrain", varied()),
+            // Merged (unmoving) tops beside moving single cells (M11 task 3).
+            ("plateaus", plateaus()),
         ] {
             for stride in [2, 4, 8] {
                 let mesh = mesh_lod_heightfield(&heights, stride, 0, |_, _| 0, 4);
