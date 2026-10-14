@@ -75,15 +75,19 @@ the remote matches it, and starts at the first unchecked item.*
   and that lighting looks unchanged (caves dark, no bright or black chunks
   while flying).
 
+- [x] **Lighting asks `opaque`, not `solid` (ADR-0011).** Found during task
+  0: `light.rs` still asked the physical `solid` at its five registry
+  queries (the skylight column heights, the uniform fast path, the padded
+  map the flood fills read), though the M10 checklist recorded ADR-0011's
+  step 1 as converting it. Invisible while every block has
+  `solid == opaque`; wrong the first time one doesn't. Three tests with a
+  glass block (solid, not opaque) failed on the old code — daylight under a
+  glass roof, a glass chunk, the heightmap — and pass now.
+  `BlockRegistry::from_types` (test-only) builds such registries.
+
 ### Remaining, in order
 
-1. **Lighting asks `solid` where CLAUDE.md requires `opaque`.** Found during
-   task 0: `light.rs` (relight, `chunk_column_heights`, the fast path) still
-   calls `registry.is_solid`, though the M10 checklist recorded ADR-0011's
-   step 1 as converting it. Invisible today — every block has
-   `solid == opaque` — but wrong the first time a block is solid and
-   transparent (glass). Fix with a test whose registry has such a block.
-2. **Tasks 1–6 below**, in order.
+1. **Tasks 1–6 below**, in order.
 
 ## Why this milestone exists
 

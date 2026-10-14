@@ -206,6 +206,15 @@ impl BlockRegistry {
         Self { types }
     }
 
+    /// A registry of exactly `types`, id = index. For tests that need a block
+    /// the starter set lacks — above all one whose properties differ, like
+    /// glass (solid, not opaque), which is how a site asking the wrong
+    /// property gets caught (ADR-0011).
+    #[cfg(test)]
+    pub(crate) fn from_types(types: Vec<BlockType>) -> Self {
+        Self { types }
+    }
+
     /// Look up a block type. Unknown ids resolve to air (defensive: a saved
     /// world referencing a since-removed id won't crash, it reads as empty).
     #[inline]

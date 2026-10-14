@@ -36,6 +36,10 @@ pub trait LightVolume {
     /// Dimensions `[x, y, z]` of the volume in cells.
     fn dims(&self) -> [usize; 3];
     /// Whether the cell blocks light (light does not enter solid cells).
+    ///
+    /// "Solid" throughout this module means light-blocking — the registry's
+    /// OPAQUE, never its physical `solid` (ADR-0011). Glass is physically
+    /// solid and lets light through; water is neither.
     fn is_solid(&self, x: usize, y: usize, z: usize) -> bool;
     /// Light this cell emits on its own (0 for non-emitters).
     fn emission(&self, x: usize, y: usize, z: usize) -> u8;
@@ -391,8 +395,8 @@ pub fn column_index(x: usize, z: usize) -> usize {
 }
 
 /// For each `(x, z)` column in the chunk, the local Y (0..=31) of the highest
-/// sky-occluding (solid) block, or `None` if the column is entirely
-/// non-solid within this chunk. Used both for the heightmap and to know
+/// sky-occluding (opaque) block, or `None` if the column is entirely
+/// non-opaque within this chunk. Used both for the heightmap and to know
 /// where skylight stops descending inside the chunk.
 pub fn chunk_column_heights(chunk: &Chunk, registry: &BlockRegistry) -> Vec<Option<u8>> {
     let n = CHUNK_SIZE;
@@ -401,7 +405,8 @@ pub fn chunk_column_heights(chunk: &Chunk, registry: &BlockRegistry) -> Vec<Opti
     // trivial — skip the up-to-32k-cell scan, which otherwise runs for every
     // newly loaded chunk inside the frame (a hidden streaming-burst cost).
     if chunk.is_uniform() {
-        let top = if registry.is_solid(chunk.get(LocalPos::new(0, 0, 0))) {
+        // Where light stops, so OPAQUE (ADR-0011).
+        let top = if registry.is_opaque(chunk.get(LocalPos::new(0, 0, 0))) {
             Some((n - 1) as u8) // all-solid: every column tops at the chunk top
         } else {
             None // all-air: no solid anywhere
@@ -415,7 +420,7 @@ pub fn chunk_column_heights(chunk: &Chunk, registry: &BlockRegistry) -> Vec<Opti
             // Scan from the top down; first solid is the column's height.
             for y in (0..n).rev() {
                 let pos = LocalPos::new(x as u8, y as u8, z as u8);
-                if registry.is_solid(chunk.get(pos)) {
+                if registry.is_opaque(chunk.get(pos)) {
                     top = Some(y as u8);
                     break;
                 }
@@ -674,7 +679,7 @@ pub fn compute_chunk_light_2ch(
         // offer less. The second is most of what streams in flight (air above
         // the ground, beside lit air), and the side-plane test below sent it
         // all to the full flood: ~70% of relight time (M11 task 0).
-        let solid = registry.is_solid(b);
+        let solid = registry.is_opaque(b); // light-blocking (ADR-0011)
         let open_above = top_sky.iter().all(|&v| v == MAX_LIGHT);
         // Otherwise it is only safe to skip the block-light BFS when no block
         // light can flood in from a neighbor (e.g. an adjacent lamp lighting
@@ -708,7 +713,7 @@ pub fn compute_chunk_light_2ch(
             });
         if registry.emission(b) == 0 && block_settled && sky_settled {
             let mut out = vec![0u8; CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE];
-            if do_sky && !registry.is_solid(b) {
+            if do_sky && !solid {
                 // All-air: each column carries its top_sky straight down (the
                 // no-attenuation-down rule keeps 15 at 15; 0 stays 0).
                 for pos in LocalPos::iter() {
@@ -785,7 +790,8 @@ pub fn compute_chunk_light_2ch(
 fn padded_solidity(chunk: &Chunk, registry: &BlockRegistry) -> Vec<bool> {
     let mut solid = vec![false; PAD * PAD * PAD];
     for pos in LocalPos::iter() {
-        if registry.is_solid(chunk.get(pos)) {
+        // Light-blocking: OPAQUE, not the physical `solid` (ADR-0011).
+        if registry.is_opaque(chunk.get(pos)) {
             solid[PaddedChunk::idx(
                 pos.x() as usize + 1,
                 pos.y() as usize + 1,
@@ -1546,7 +1552,7 @@ mod tests {
     // ---- Chunk relight adapter ----
 
     use crate::block::BlockId;
-    use crate::registry::{BlockRegistry, LAMP};
+    use crate::registry::{BlockRegistry, BlockType, LAMP};
 
     fn no_borders() -> NeighborLight {
         [None, None, None, None, None, None]
@@ -1786,6 +1792,71 @@ mod tests {
             compute_chunk_light_2ch(&chunk, &reg, &block_borders, &no_sky(), &dark_top, true);
         // Block light floods in from the -X border.
         assert_eq!(light[LocalPos::new(0, 16, 16).index()] & 0x0F, 14);
+    }
+
+    /// The starter set plus glass at id 9: solid (you stand on it), not
+    /// opaque (light passes). No such block ships yet, which is exactly why a
+    /// lighting site asking `solid` instead of `opaque` went unnoticed.
+    fn registry_with_glass() -> (BlockRegistry, BlockId) {
+        let d = BlockRegistry::default_set();
+        let mut types: Vec<BlockType> = (0..9).map(|i| d.get(BlockId(i)).clone()).collect();
+        let mut glass = d.get(BlockId(1)).clone();
+        glass.name = "glass";
+        glass.opaque = false;
+        types.push(glass);
+        (BlockRegistry::from_types(types), BlockId(9))
+    }
+
+    #[test]
+    fn daylight_passes_through_glass() {
+        // A glass roof across the whole chunk: everything under it must stay
+        // in full daylight, as under water. Lighting asks OPAQUE (ADR-0011).
+        let (reg, glass) = registry_with_glass();
+        let mut chunk = Chunk::new_air();
+        for z in 0..CHUNK_SIZE as u8 {
+            for x in 0..CHUNK_SIZE as u8 {
+                chunk.set(LocalPos::new(x, 20, z), glass);
+            }
+        }
+        let (light, _) = compute_chunk_light_2ch(
+            &chunk,
+            &reg,
+            &no_borders(),
+            &no_sky(),
+            &open_sky_top(),
+            true,
+        );
+        for y in [0u8, 10, 19, 20] {
+            let sky = light[LocalPos::new(16, y, 16).index()] >> 4;
+            assert_eq!(sky, MAX_LIGHT, "sky at y={y} under a glass roof");
+        }
+    }
+
+    #[test]
+    fn a_uniform_glass_chunk_is_lit() {
+        let (reg, glass) = registry_with_glass();
+        let (light, _) = compute_chunk_light_2ch(
+            &Chunk::filled(glass),
+            &reg,
+            &no_borders(),
+            &no_sky(),
+            &open_sky_top(),
+            true,
+        );
+        assert!(light.iter().all(|&v| v >> 4 == MAX_LIGHT));
+    }
+
+    #[test]
+    fn glass_does_not_raise_the_skylight_heightmap() {
+        // The skylight heightmap is where light stops: glass is not that.
+        let (reg, glass) = registry_with_glass();
+        let mut chunk = Chunk::new_air();
+        chunk.set(LocalPos::new(3, 20, 4), glass);
+        chunk.set(LocalPos::new(5, 7, 6), BlockId(1)); // stone does count
+        let h = chunk_column_heights(&chunk, &reg);
+        assert_eq!(h[column_index(3, 4)], None);
+        assert_eq!(h[column_index(5, 6)], Some(7));
+        assert_eq!(chunk_column_heights(&Chunk::filled(glass), &reg)[0], None);
     }
 
     /// A chunk of `block` everywhere that is NOT stored uniform, so
