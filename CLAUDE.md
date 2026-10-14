@@ -261,12 +261,12 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   list of remaining work is in that spec's "Status and remaining work — START
   HERE" section.** Read its "Changes at M10 close" too: reverse-Z is already
   done (ADR-0013) and distant water changed shape (ADR-0011 1c). As of
-  2026-10-14, task 0 (why relighting doubled) is done and awaiting in-play
-  numbers, and `light.rs` asks `opaque`; next is task 1 (per-level ring
-  centring).
+  2026-10-14: task 0 (why relighting doubled), the `light.rs` `opaque` fix and
+  task 1 (per-level ring centring, ADR-0014 Proposed) are done and await
+  in-play confirmation; next is task 2 (more levels + view-distance clamp).
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 278, vox-mesh 53, vox-worldgen 31 passing as of the opaque fix;
+  vox-core 282, vox-mesh 53, vox-worldgen 31 passing as of M11 task 1;
   vox-render's 10 tests need wgpu and run natively only), then start the first
   unchecked item.
 - **Roadmap after M11:** 12 — Climate & Biomes (spec not yet written). The

@@ -41,14 +41,14 @@ const NEIGHBOR_OFFSETS: [(i64, i64, i64); 6] = [
 ];
 
 // --- LOD (M09). LOD is configured as a list of levels (finest to coarsest). Radii are in
-// CHUNKS from the camera and must be multiples of the coarsest stride (the ring
-// asserts this). LOD starts at 0 — it underlaps the full-res region, which
+// CHUNKS, each level's around its own snapped centre (ADR-0014), and must lie on
+// the grids the ring asserts (`LodLevel::extended` puts them there). LOD starts at 0 — it underlaps the full-res region, which
 // simply draws on top; see the vox-core::lod docs on why a flush inner edge
 // would open a gap. Multi-level tuning lands with the octree wiring; today this
 // is the single level M08 shipped.
 const LOD_INNER_CHUNKS: i64 = 0;
-// Finest to coarsest. Radii are CHUNKS from the camera and must be multiples of
-// the coarsest stride (the ring asserts it).
+// Finest to coarsest. Each radius is CHUNKS from that level's snapped centre and
+// must be a multiple of the next level's stride (the ring asserts it).
 //
 // Sizing follows the standard screen-space-error idea: a cell should subtend
 // roughly constant pixels, so each level's switch distance scales with its cell
@@ -71,7 +71,7 @@ const LOD_LEVELS: [vox_core::LodLevel; 3] = [
         outer_chunks: 64,
     },
 ];
-const LOD_UNLOAD_MARGIN_CHUNKS: i64 = 8; // multiple of the coarsest stride
+const LOD_UNLOAD_MARGIN_CHUNKS: i64 = 8; // each level uses at least its snap step (ADR-0014)
 
 // Fog (M09 amendment A2) is tuned live from the settings menu; its defaults
 // live in `vox_core::Settings`.
@@ -1505,12 +1505,15 @@ impl App {
     ///
     /// "Can meet" is the level's closest approach against the full-res
     /// region's reach (the unload radius — chunks linger until then), plus
-    /// one coarsest stride: a node the ring has retired stays drawn until its
-    /// replacement lands, by which time the camera may be one snap step
-    /// nearer. Decided per level, never per node, so no node ever needs a
+    /// one step of the level's inner edge: a node the ring has retired stays
+    /// drawn until its replacement lands, by which time the camera may be one
+    /// snap step nearer. That step is the level's own stride since each level
+    /// snaps separately (ADR-0014); under the shared centre it was the
+    /// coarsest stride, which at eight levels would have made every level
+    /// exact. Decided per level, never per node, so no node ever needs a
     /// rebuild because the camera moved.
     fn lod_sampling(&self, level: u32) -> LodSampling {
-        let reach = self.streamer.unload_radius() + self.lod_ring.coarsest_stride();
+        let reach = self.streamer.unload_radius() + self.lod_ring.inner_snap_chunks(level);
         if self.lod_ring.closest_approach_chunks(level) <= reach {
             LodSampling::Exact
         } else {
@@ -1721,45 +1724,25 @@ impl App {
         // resident chunk and overwrite unsaved edits with the disk copy.
         self.streamer
             .reconfigure(Self::stream_config(s.load_radius));
-        // Extend view distance by APPENDING coarser levels, each doubling both
-        // stride and radius. That keeps per-level node count roughly constant,
-        // so distance costs linearly in levels — where scaling the radii alone
-        // is quadratic (x4 distance once produced 10 240 nodes and 4.3 GB).
-        let mut levels: Vec<vox_core::LodLevel> = LOD_LEVELS.to_vec();
-        for _ in 0..s.lod_extra_levels {
-            let last = *levels.last().expect("at least one base level");
-            levels.push(vox_core::LodLevel {
-                stride: last.stride * 2,
-                outer_chunks: last.outer_chunks * 2,
-            });
-        }
-        // The ring requires every radius to be a multiple of the COARSEST
-        // stride, which just grew. Round each outer edge up onto that grid and
-        // keep the sequence strictly increasing — collapsing two levels onto
-        // the same radius is what panicked ("outer 8 must exceed inner 8").
-        let coarsest = levels.last().map(|l| l.stride).unwrap_or(8);
-        let mut prev = LOD_INNER_CHUNKS;
-        for l in levels.iter_mut() {
-            let aligned = ((l.outer_chunks + coarsest - 1) / coarsest) * coarsest;
-            l.outer_chunks = aligned.max(prev + coarsest);
-            prev = l.outer_chunks;
-        }
-        self.lod_far_chunks = prev;
+        // Extend view distance by APPENDING coarser levels (see
+        // `LodLevel::extended`, which also puts every radius on the grid the
+        // ring requires — one rule for the menu and the tests).
+        let levels = vox_core::LodLevel::extended(
+            &LOD_LEVELS,
+            s.lod_extra_levels.max(0) as u32,
+            LOD_INNER_CHUNKS,
+        );
+        self.lod_far_chunks = levels.last().expect("at least one level").outer_chunks;
 
         // Actually install the new ring. Losing this line meant the ring kept
         // every node marked loaded with its centre already set, so update()
         // returned nothing and LOD never came back until the camera crossed a
         // node boundary — exactly the reported symptom.
-        // The hysteresis margin has the SAME alignment requirement as the
-        // radii: a multiple of the coarsest stride, which grows with extra
-        // levels. Round it up rather than passing the base constant, or adding
-        // a level trips the ring's assertion.
-        let margin = ((LOD_UNLOAD_MARGIN_CHUNKS + coarsest - 1) / coarsest) * coarsest;
         // The whole world's height: one node spans it at every level (cells
         // are `stride` wide but band/32 tall), affordable because streaming
         // follows the surface and nothing loads a full column.
         let band = (vox_core::WORLD_Y_MIN_BLOCKS, vox_core::WORLD_Y_MAX_BLOCKS);
-        self.lod_ring = LodRing::new(LOD_INNER_CHUNKS, &levels, margin, band);
+        self.lod_ring = LodRing::new(LOD_INNER_CHUNKS, &levels, LOD_UNLOAD_MARGIN_CHUNKS, band);
 
         self.lod_pending_set.clear();
         self.lod_in_flight.clear();

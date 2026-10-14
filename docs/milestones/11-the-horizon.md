@@ -85,9 +85,27 @@ the remote matches it, and starts at the first unchecked item.*
   glass roof, a glass chunk, the heightmap — and pass now.
   `BlockRegistry::from_types` (test-only) builds such registries.
 
+- [x] **Task 1 — per-level centring (ADR-0014, Proposed).** Each level's
+  square snaps to the next coarser level's grid instead of every level sharing
+  one centre snapped to the coarsest; the partition stays exact (the
+  constructor asserts the nesting condition that guarantees it). The finest
+  level stays within one snap step of the camera — 128 blocks — where the
+  shared centre allowed 8 km at eight levels. `LodLevel::extended` is now the
+  one rule for building the menu's levels (vox-app and tests used two copies);
+  unload slack is per level, at least one snap step; LOD sampling's reach and
+  `closest_approach_chunks` use the level's own stride. Tests: exact
+  partition for eight levels at six camera positions (every coarse snap
+  phase, negative, several laps out), the fine level hugging the camera at
+  the coarse grid's worst offset, no rim thrash across a coarse boundary.
+  Visible change at today's three levels: small — the fine rings sit closer
+  to the player and move in 4- and 8-chunk steps. To confirm in play: walk
+  and fly at 3 and 5 levels; no holes or doubled terrain where levels meet,
+  no new popping.
+
 ### Remaining, in order
 
-1. **Tasks 1–6 below**, in order.
+1. **Tasks 2–6 below**, in order (task 2: more levels + view-distance
+   clamp).
 
 ## Why this milestone exists
 

@@ -265,3 +265,13 @@ real ground present.
   at a flat per-node cost — that is the point. If M11's curvature or a new ring
   layout changes how close a level can come, `closest_approach_chunks` is the
   one place that must change with it.
+
+---
+
+## Superseded in part (M11, 2026-10-14): the shared snapped centre
+
+The multi-level ring measured every level from one centre snapped to the
+coarsest stride. At M11's eight levels that centre could sit 8 km from the
+camera. **ADR-0014** replaces it with one square per level, each snapped to the
+next coarser level's grid; the partition stays exact. The rest of this ADR
+stands.

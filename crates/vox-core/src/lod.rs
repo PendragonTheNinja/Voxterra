@@ -1,4 +1,5 @@
-//! Multi-level LOD ring selection (Milestone 09, ADR-0008).
+//! Multi-level LOD ring selection (Milestone 09, ADR-0008; per-level centring
+//! ADR-0014).
 //!
 //! Pure bookkeeping, mirroring [`Streamer`](crate::streaming::Streamer): given
 //! the camera's chunk, [`LodRing`] tracks which coarse LOD *nodes* are loaded
@@ -17,46 +18,48 @@
 //!
 //! Strides **must be powers of two, each a multiple of the previous**, so the
 //! node grids *nest*: one stride-8 node is exactly 2x2 stride-4 nodes, which is
-//! exactly 4x4 stride-2 nodes. Nesting is what makes the level partition exact
-//! rather than approximate — a coarse node is never half-covered by a finer
-//! level, which is the failure that produces double terrain and z-fighting.
+//! exactly 4x4 stride-2 nodes.
 //!
-//! ## The partition (the "named trap", now at every boundary)
+//! ## The partition: one square per level (ADR-0014)
 //!
-//! Each level owns a square annulus measured in **chunks** around a *snapped
-//! center*: the camera's chunk floored to the **coarsest** stride. Snapping is
-//! essential — if each level centered on its own grid, the camera's differing
-//! offset within a level-2 node vs a level-8 node would misalign their
-//! boundaries and open gaps (or overlaps) between levels. One shared,
-//! coarsest-aligned center makes every boundary land on a grid line of *every*
-//! level, because the strides nest.
+//! Level `i` owns its **square** `Q_i` — half-width `outer_i` chunks around
+//! the camera's chunk floored to that level's **snap**: the next coarser
+//! level's stride, or its own for the coarsest. Its nodes are those inside
+//! `Q_i` and outside `Q_{i-1}`, the square of the level inside it (for level 0,
+//! the `lod_inner_chunks` square, snapped to level 0's own stride, or nothing).
 //!
-//! Level `i` covers `[inner_i, outer_i)` chunks from that center, with
-//! `inner_i = outer_{i-1}`. A node belongs to its level iff its whole region
-//! lies inside the outer square and entirely outside the inner one — so no node
-//! is ever half-owned. The constructor enforces the alignment; a violation is a
-//! programming error, not a tuning mistake.
+//! Exactness rests on alignment. `Q_i`'s edges lie on its snap grid — level
+//! `i+1`'s grid, which is also level `i`'s — so a node of either level is
+//! wholly inside or wholly outside it. And every square holds the one inside
+//! it, from any camera position, because the constructor demands
+//! `outer_i - outer_{i-1} >= snap_i - snap_{i-1}`: the most the two snapped
+//! centres can differ. A column is then covered by exactly the first level
+//! whose square holds it. No gaps (holes in the world), no overlaps (double
+//! terrain and z-fighting).
+//!
+//! Until M11 every level shared ONE centre, snapped to the coarsest stride.
+//! That was exact too, but put each level's edges up to a coarsest stride from
+//! where they belong — 8 km at a 64 km horizon. Per-level snapping keeps level
+//! `i` within one snap step of the camera, so the fine levels hug the player
+//! however coarse the outermost becomes.
 //!
 //! ## Where LOD begins, and why it underlaps
 //!
-//! `inner_0` is where LOD starts. Because the center is snapped, it can sit up
-//! to `coarsest_stride - 1` chunks from the true camera position, so an
-//! `inner_0` set flush against the full-resolution radius would leave a gap on
-//! the far side. LOD therefore **underlaps**: `inner_0` is chosen small enough
-//! (0 is always safe) that LOD covers everything full-res does and more, and
-//! the full-res chunks simply draw on top (depth-biased). Wasted coarse nodes
-//! under the near field are cheap; a hole in the world is not.
-//!
-//! Because the grids nest and boundaries align, the levels are provably
-//! disjoint and gapless: a world column beyond the full-res radius is covered
-//! by exactly one LOD node.
+//! `inner_0` is where LOD starts. Because the squares are snapped, an edge can
+//! sit up to a snap step from the true camera position, so an `inner_0` set
+//! flush against the full-resolution radius would leave a gap on the far side.
+//! LOD therefore **underlaps**: `inner_0` is chosen small enough (0 is always
+//! safe) that LOD covers everything full-res does and more, and full-res draws
+//! on top. Wasted coarse nodes under the near field are cheap; a hole in the
+//! world is not.
 //!
 //! ## Hysteresis
 //!
-//! Node unloading uses a slack margin beyond each level's outer edge, so a
-//! camera drifting on a boundary doesn't thrash. Handover between levels stays
-//! crisp: a region dropped by one level is picked up by its neighbour in the
-//! same update, so it is always covered by exactly one level.
+//! Node unloading uses slack beyond each level's outer edge — at least one
+//! snap step, so a camera standing on a snap boundary doesn't reload a row of
+//! nodes every time it crosses. Handover between levels stays crisp: a node
+//! inside the finer level's square is dropped at once, its region picked up by
+//! the finer level in the same update.
 
 use std::collections::{HashMap, HashSet};
 
@@ -84,8 +87,48 @@ impl LodNodeId {
 pub struct LodLevel {
     /// Chunks per node side. Powers of two, each a multiple of the previous.
     pub stride: i64,
-    /// Outer edge of this level, in chunks from the camera (exclusive).
+    /// Half-width of this level's square, in chunks around its snapped centre.
     pub outer_chunks: i64,
+}
+
+impl LodLevel {
+    /// `base` extended by `extra` coarser levels, each doubling stride and
+    /// radius, with every radius rounded onto the grid [`LodRing::new`]
+    /// requires. The one place that rule is applied: the settings menu and the
+    /// tests build their rings through it, so no reachable setting panics.
+    ///
+    /// Appending levels rather than scaling radii keeps the node count per
+    /// level roughly constant, so view distance costs linearly in levels —
+    /// scaling the radii alone is quadratic (x4 distance once produced 10 240
+    /// nodes and 4.3 GB).
+    pub fn extended(base: &[LodLevel], extra: u32, lod_inner_chunks: i64) -> Vec<LodLevel> {
+        let mut levels = base.to_vec();
+        for _ in 0..extra {
+            let last = *levels.last().expect("at least one base level");
+            levels.push(LodLevel {
+                stride: last.stride * 2,
+                outer_chunks: last.outer_chunks * 2,
+            });
+        }
+        // Each outer edge goes onto its snap grid and at least one snap step
+        // beyond the previous, which satisfies the nesting condition (the gap
+        // need only be `snap_i - snap_{i-1}`).
+        let mut prev = lod_inner_chunks;
+        for i in 0..levels.len() {
+            let snap = snap_of(&levels, i);
+            let want = levels[i].outer_chunks.max(prev + snap);
+            levels[i].outer_chunks = (want + snap - 1).div_euclid(snap) * snap;
+            prev = levels[i].outer_chunks;
+        }
+        levels
+    }
+}
+
+/// The grid level `i`'s square snaps to: the next coarser stride, so that
+/// level's nodes never straddle the square's edge; the coarsest snaps to its
+/// own.
+fn snap_of(levels: &[LodLevel], i: usize) -> i64 {
+    levels.get(i + 1).unwrap_or(&levels[i]).stride
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -93,6 +136,8 @@ struct LevelCfg {
     stride: i64,
     inner_chunks: i64,
     outer_chunks: i64,
+    /// Grid this level's square snaps to (see [`snap_of`]).
+    snap: i64,
 }
 
 /// What the [`LodRing`] wants the caller to do this update.
@@ -112,20 +157,67 @@ impl LodUpdate {
     }
 }
 
+/// A square of chunk columns: `[x0, x1) × [z0, z1)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Square {
+    x0: i64,
+    x1: i64,
+    z0: i64,
+    z1: i64,
+}
+
+impl Square {
+    /// Half-width `half` around `(cx, cz)` floored to the `snap` grid.
+    fn snapped(cam: ChunkPos, snap: i64, half: i64) -> Self {
+        let cx = cam.x.div_euclid(snap) * snap;
+        let cz = cam.z.div_euclid(snap) * snap;
+        Self {
+            x0: cx - half,
+            x1: cx + half,
+            z0: cz - half,
+            z1: cz + half,
+        }
+    }
+
+    fn grown(self, by: i64) -> Self {
+        Self {
+            x0: self.x0 - by,
+            x1: self.x1 + by,
+            z0: self.z0 - by,
+            z1: self.z1 + by,
+        }
+    }
+
+    fn is_empty(self) -> bool {
+        self.x0 >= self.x1
+    }
+
+    /// Whether the region `[ox, ox+s) × [oz, oz+s)` lies wholly inside.
+    fn contains_region(self, ox: i64, oz: i64, s: i64) -> bool {
+        ox >= self.x0 && ox + s <= self.x1 && oz >= self.z0 && oz + s <= self.z1
+    }
+
+    /// Whether that region lies wholly outside.
+    fn misses_region(self, ox: i64, oz: i64, s: i64) -> bool {
+        self.is_empty() || ox >= self.x1 || ox + s <= self.x0 || oz >= self.z1 || oz + s <= self.z0
+    }
+}
+
 /// Tracks the loaded LOD-node set across levels and computes ring deltas.
 pub struct LodRing {
     levels: Vec<LevelCfg>,
     loaded: HashSet<LodNodeId>,
     /// Extra chunks beyond a level's outer edge before a node is unloaded
-    /// (hysteresis).
+    /// (hysteresis); each level uses at least its own snap step.
     unload_margin_chunks: i64,
-    /// Coarsest stride; the shared center is snapped to this grid.
+    /// Coarsest stride.
     coarsest_stride: i64,
     /// World vertical band that LOD must cover, in blocks (inclusive min,
     /// exclusive max). Nodes stack vertically to span it.
     world_y: (i64, i64),
-    /// Snapped center (chunks) at the last recompute.
-    last_center: Option<(i64, i64)>,
+    /// Every square at the last recompute — the whole input to `update`
+    /// besides the loaded set, so an unchanged list means nothing to do.
+    last_squares: Option<Vec<Square>>,
 }
 
 impl LodRing {
@@ -134,13 +226,15 @@ impl LodRing {
     /// - `lod_inner_chunks`: where LOD begins (see "underlaps" in the module
     ///   docs — `0` is always gap-safe).
     /// - `levels`: finest to coarsest, each with its stride and outer edge.
+    ///   [`LodLevel::extended`] produces valid ones.
     /// - `unload_margin_chunks`: hysteresis slack.
     ///
     /// Panics if the configuration cannot produce an exact partition: strides
-    /// must be >= 1, powers of two, and each a multiple of the previous; radii
-    /// must strictly increase; and every boundary radius must be a multiple of
-    /// the strides it borders (so no node straddles two levels). These are
-    /// programming errors — a bad value would otherwise surface as double
+    /// must be >= 1, powers of two, and each a multiple of the previous; each
+    /// edge must lie on the grid it snaps to (`lod_inner_chunks` on level 0's
+    /// stride, each `outer` on its level's snap); and each square must clear
+    /// the one inside it by the nesting condition in the module docs. These
+    /// are programming errors — a bad value would otherwise surface as double
     /// terrain or a gap at a level boundary.
     pub fn new(
         lod_inner_chunks: i64,
@@ -178,52 +272,59 @@ impl LodRing {
                 "level {i}: outer {} must exceed inner {inner}",
                 lvl.outer_chunks
             );
-            // Both edges must land on this level's grid lines, or a node would
-            // straddle the boundary and be half-owned by two levels.
-            assert!(
-                inner % lvl.stride == 0,
-                "level {i}: inner radius {inner} must be a multiple of stride {}",
-                lvl.stride
-            );
-            assert!(
-                lvl.outer_chunks % lvl.stride == 0,
-                "level {i}: outer radius {} must be a multiple of stride {}",
-                lvl.outer_chunks,
-                lvl.stride
-            );
+            prev_stride = lvl.stride;
             cfgs.push(LevelCfg {
                 stride: lvl.stride,
                 inner_chunks: inner,
                 outer_chunks: lvl.outer_chunks,
+                snap: 0, // set below, once every stride is known
             });
             inner = lvl.outer_chunks;
-            prev_stride = lvl.stride;
+        }
+        for (i, c) in cfgs.iter_mut().enumerate() {
+            c.snap = snap_of(levels, i);
+        }
+        // The inner square of level 0 snaps to level 0's own stride.
+        let mut prev_snap = cfgs[0].stride;
+        for (i, c) in cfgs.iter().enumerate() {
+            // Both edges must land on this level's grid, or a node would
+            // straddle a square's edge and be half-owned by two levels. The
+            // inner edge is the previous square, on its snap (= this stride).
+            assert!(
+                c.inner_chunks % c.stride == 0,
+                "level {i}: inner radius {} must be a multiple of stride {}",
+                c.inner_chunks,
+                c.stride
+            );
+            assert!(
+                c.outer_chunks % c.snap == 0,
+                "level {i}: outer radius {} must be a multiple of {} (the stride its square snaps to)",
+                c.outer_chunks,
+                c.snap
+            );
+            // Nesting: the square must hold the one inside it from every
+            // camera position. Vacuous for an empty inner square.
+            if c.inner_chunks > 0 {
+                assert!(
+                    c.outer_chunks - c.inner_chunks >= c.snap - prev_snap,
+                    "level {i}: outer {} must clear inner {} by at least {} (snap {} vs {prev_snap})",
+                    c.outer_chunks,
+                    c.inner_chunks,
+                    c.snap - prev_snap,
+                    c.snap
+                );
+            }
+            prev_snap = c.snap;
         }
 
         let coarsest_stride = cfgs.last().expect("levels non-empty").stride;
-        // The shared center is snapped to the coarsest grid; every boundary
-        // radius must therefore also be a multiple of the coarsest stride, or
-        // the annuli would not align with the finer grids after snapping.
-        for (i, c) in cfgs.iter().enumerate() {
-            assert!(
-                c.inner_chunks % coarsest_stride == 0 && c.outer_chunks % coarsest_stride == 0,
-                "level {i}: radii ({}, {}) must be multiples of the coarsest stride {coarsest_stride}",
-                c.inner_chunks,
-                c.outer_chunks
-            );
-        }
-        assert!(
-            unload_margin_chunks % coarsest_stride == 0,
-            "unload margin must be a multiple of the coarsest stride {coarsest_stride}"
-        );
-
         Self {
             levels: cfgs,
             loaded: HashSet::new(),
             unload_margin_chunks,
             coarsest_stride,
             world_y: world_y_blocks,
-            last_center: None,
+            last_squares: None,
         }
     }
 
@@ -274,8 +375,10 @@ impl LodRing {
         self.levels[level as usize].stride
     }
 
-    /// Distance in BLOCKS from the snapped centre at which `level` hands over
-    /// to the next coarser one — where geomorph must be complete (ADR-0009).
+    /// Distance in BLOCKS from `level`'s snapped centre at which it hands
+    /// over to the next coarser one — where geomorph must be complete
+    /// (ADR-0009). The shader measures from the camera, which is within one
+    /// snap step of that centre.
     ///
     /// Returns `None` for the coarsest level, which has nothing to morph
     /// toward: the caller holds its morph factor at 0.
@@ -328,93 +431,98 @@ impl LodRing {
         &self.loaded
     }
 
-    /// The coarsest stride, in chunks: the grid the shared center snaps to.
+    /// The coarsest stride, in chunks.
     pub fn coarsest_stride(&self) -> i64 {
         self.coarsest_stride
+    }
+
+    /// The step, in chunks, by which `level`'s inner edge moves as the camera
+    /// travels: the snap of the square inside it, which is `level`'s own
+    /// stride. A node retired at that edge can be up to this much nearer the
+    /// camera by the time its replacement lands.
+    pub fn inner_snap_chunks(&self, level: u32) -> i64 {
+        self.stride(level)
     }
 
     /// The closest any node of `level` can come to the camera while that level
     /// owns it: the Chebyshev distance, in chunks, from the camera's chunk to
     /// the node's nearest chunk (0 = the camera stands in it).
     ///
-    /// The camera sits in `[c, c + S - 1]` of the snapped center `c` on each
-    /// axis (`S` = coarsest stride), and a node must clear the inner square
-    /// `[c - inner, c + inner)` entirely. The near side of that square is the
-    /// binding one: `inner - S + 1`. A level with no inner square (inner 0)
-    /// reaches the camera.
+    /// The square inside `level` has half-width `inner` around the camera
+    /// floored to `level`'s stride `S`, so the camera sits in `[c, c + S - 1]`
+    /// of its centre `c` and a node must clear `[c - inner, c + inner)`. The
+    /// near side is the binding one: `inner - S + 1`. A level with no square
+    /// inside it (inner 0) reaches the camera.
     ///
     /// This is what decides how carefully a level must be built. Only a level
     /// that can reach the full-resolution region has to honour the
     /// never-exceed contract exactly (ADR-0008, M10 amendment); one that
     /// cannot is always seen from further away than full-res reaches.
     pub fn closest_approach_chunks(&self, level: u32) -> i64 {
-        let inner = self.levels[level as usize].inner_chunks;
-        if inner == 0 {
+        let cfg = self.levels[level as usize];
+        if cfg.inner_chunks == 0 {
             0
         } else {
-            inner - self.coarsest_stride + 1
+            cfg.inner_chunks - cfg.stride + 1
         }
     }
 
-    /// The shared center all annuli are measured from: the camera's chunk
-    /// floored to the coarsest grid. See the module docs on why this must be
-    /// shared rather than per-level.
-    #[inline]
-    fn snapped_center(&self, cam_chunk: ChunkPos) -> (i64, i64) {
-        let s = self.coarsest_stride;
-        (cam_chunk.x.div_euclid(s) * s, cam_chunk.z.div_euclid(s) * s)
+    /// Level `i`'s square for a camera at `cam`; `i = -1` is the square inside
+    /// level 0 (`lod_inner_chunks`, possibly empty).
+    fn square(&self, i: isize, cam: ChunkPos) -> Square {
+        if i < 0 {
+            let first = self.levels[0];
+            Square::snapped(cam, first.stride, first.inner_chunks)
+        } else {
+            let c = self.levels[i as usize];
+            Square::snapped(cam, c.snap, c.outer_chunks)
+        }
     }
 
     /// Is `id` in its level's annulus, with `extra` chunks of outer slack
     /// (0 for load, the hysteresis margin for unload)?
     ///
-    /// Tested on the node's whole REGION, not its center: a node counts only if
-    /// it lies entirely inside the outer square and entirely outside the inner
-    /// one. Grid alignment guarantees these are the only two possibilities, so
-    /// no node is ever half-owned by two levels.
+    /// Tested on the node's whole REGION: a node counts only if it lies
+    /// entirely inside its level's square and entirely outside the square
+    /// inside it. Alignment guarantees these are the only two possibilities,
+    /// so no node is ever half-owned by two levels.
     fn in_annulus(&self, id: LodNodeId, cam_chunk: ChunkPos, extra: i64) -> bool {
-        let cfg = self.levels[id.level as usize];
-        let s = cfg.stride;
-        let (cx, cz) = self.snapped_center(cam_chunk);
+        let level = id.level as isize;
+        let s = self.levels[id.level as usize].stride;
         let (ox, oz) = (id.x * s, id.z * s);
-        let outer = cfg.outer_chunks + extra;
-        let inner = cfg.inner_chunks;
+        self.square(level, cam_chunk)
+            .grown(extra)
+            .contains_region(ox, oz, s)
+            && self.square(level - 1, cam_chunk).misses_region(ox, oz, s)
+    }
 
-        let within_outer =
-            ox >= cx - outer && ox + s <= cx + outer && oz >= cz - outer && oz + s <= cz + outer;
-        // Outside the inner square if either axis clears it entirely. With
-        // inner == 0 the "inner square" is empty, so nothing is excluded —
-        // otherwise the node the camera stands in would be skipped, leaving a
-        // hole directly underfoot.
-        let outside_inner = inner == 0
-            || ox >= cx + inner
-            || ox + s <= cx - inner
-            || oz >= cz + inner
-            || oz + s <= cz - inner;
-        within_outer && outside_inner
+    /// Unload slack at `level`: the configured margin, but never less than
+    /// the level's snap step, or a camera standing on a snap boundary would
+    /// reload a row of nodes each time it crossed.
+    fn unload_slack(&self, level: u32) -> i64 {
+        self.unload_margin_chunks
+            .max(self.levels[level as usize].snap)
     }
 
     /// Compute the load/unload delta for the camera's chunk position. A no-op
-    /// when the camera hasn't moved to a new finest-level node.
+    /// when no level's square has moved.
     pub fn update(&mut self, camera_chunk: ChunkPos) -> LodUpdate {
-        let center = self.snapped_center(camera_chunk);
-        if self.last_center == Some(center) {
+        let squares: Vec<Square> = (-1..self.levels.len() as isize)
+            .map(|i| self.square(i, camera_chunk))
+            .collect();
+        if self.last_squares.as_ref() == Some(&squares) {
             return LodUpdate::default();
         }
-        self.last_center = Some(center);
-        let (cx, cz) = center;
+        self.last_squares = Some(squares);
 
         let mut to_load = Vec::new();
         for (li, cfg) in self.levels.iter().enumerate() {
             let level = li as u32;
             let s = cfg.stride;
-            // Node cells spanning this level's outer square.
-            let lo_x = (cx - cfg.outer_chunks).div_euclid(s);
-            let hi_x = (cx + cfg.outer_chunks).div_euclid(s);
-            let lo_z = (cz - cfg.outer_chunks).div_euclid(s);
-            let hi_z = (cz + cfg.outer_chunks).div_euclid(s);
-            for nz in lo_z..=hi_z {
-                for nx in lo_x..=hi_x {
+            let sq = self.square(li as isize, camera_chunk);
+            // Node cells spanning this level's square.
+            for nz in sq.z0.div_euclid(s)..=(sq.z1 - 1).div_euclid(s) {
+                for nx in sq.x0.div_euclid(s)..=(sq.x1 - 1).div_euclid(s) {
                     let id = LodNodeId::new(level, nx, nz);
                     if self.in_annulus(id, camera_chunk, 0) && !self.loaded.contains(&id) {
                         to_load.push(id);
@@ -429,7 +537,7 @@ impl LodRing {
             .loaded
             .iter()
             .copied()
-            .filter(|&id| !self.in_annulus(id, camera_chunk, self.unload_margin_chunks))
+            .filter(|&id| !self.in_annulus(id, camera_chunk, self.unload_slack(id.level)))
             .collect();
 
         LodUpdate { to_load, to_unload }
@@ -449,7 +557,7 @@ impl LodRing {
     /// `update` re-requests everything.
     pub fn clear(&mut self) {
         self.loaded.clear();
-        self.last_center = None;
+        self.last_squares = None;
     }
 }
 
@@ -1012,7 +1120,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "must be a multiple of stride")]
+    #[should_panic(expected = "must be a multiple of 4")]
     fn rejects_misaligned_outer_radius() {
         // 30 is not a multiple of stride 4 → nodes would straddle the edge.
         LodRing::single_level(0, 4, 30, 8, TEST_Y);
@@ -1088,32 +1196,187 @@ mod tests {
     /// crashes the game from a slider drag.
     #[test]
     fn every_menu_reachable_config_constructs() {
-        let base = [(2i64, 16i64), (4, 32), (8, 64)];
-        let base_margin = 8i64;
-        for extra in 0..=2 {
-            let mut levels: Vec<(i64, i64)> = base.to_vec();
-            for _ in 0..extra {
-                let (s, o) = *levels.last().unwrap();
-                levels.push((s * 2, o * 2));
-            }
-            let coarsest = levels.last().unwrap().0;
-            let round_up = |v: i64| ((v + coarsest - 1) / coarsest) * coarsest;
-            let mut prev = 0i64;
-            let built: Vec<LodLevel> = levels
-                .iter()
-                .map(|&(stride, outer)| {
-                    let o = round_up(outer).max(prev + coarsest);
-                    prev = o;
-                    LodLevel {
-                        stride,
-                        outer_chunks: o,
-                    }
-                })
-                .collect();
+        // Up to the eight levels (strides 2..256) M11's 64 km horizon needs.
+        for extra in 0..=5 {
+            let built = LodLevel::extended(&base_levels(), extra, 0);
             // Must not panic for any reachable slider value.
-            let ring = LodRing::new(0, &built, round_up(base_margin), TEST_Y);
-            assert_eq!(ring.level_count(), built.len());
+            let ring = LodRing::new(0, &built, 8, TEST_Y);
+            assert_eq!(ring.level_count(), 3 + extra as usize);
         }
+        // The shipped three levels come through unchanged.
+        assert_eq!(LodLevel::extended(&base_levels(), 0, 0), base_levels());
+    }
+
+    /// The shipped base levels (vox-app's `LOD_LEVELS`).
+    fn base_levels() -> Vec<LodLevel> {
+        [(2, 16), (4, 32), (8, 64)]
+            .into_iter()
+            .map(|(stride, outer_chunks)| LodLevel {
+                stride,
+                outer_chunks,
+            })
+            .collect()
+    }
+
+    /// Eight levels, strides 2..256, out to 2 048 chunks (64 km).
+    fn eight_levels() -> LodRing {
+        LodRing::new(0, &LodLevel::extended(&base_levels(), 5, 0), 8, TEST_Y)
+    }
+
+    /// How many loaded nodes cover chunk column `(x, z)`, one lookup per level.
+    fn coverage(ring: &LodRing, x: i64, z: i64) -> usize {
+        (0..ring.level_count() as u32)
+            .filter(|&l| ring.loaded().contains(&ring.node_containing(l, x, z)))
+            .count()
+    }
+
+    /// Chunks per lap of the default world (ADR-0012): the ring works in the
+    /// unwrapped frame, so positions several laps out must behave alike.
+    const LAP: i64 = crate::planet::DEFAULT_WORLD_SIZE_BLOCKS / CHUNK_SIZE as i64;
+
+    /// Criterion 1: every column within the horizon is covered by exactly one
+    /// level, at many camera positions — every snap phase of the coarsest
+    /// grid, negative coordinates, several laps out.
+    #[test]
+    fn eight_levels_partition_exactly_anywhere() {
+        let cams = [
+            cp(0, 0),
+            cp(255, -1),
+            cp(-257, 129),
+            cp(37, -53),
+            cp(3 * LAP + 191, -2 * LAP - 77),
+            cp(-5 * LAP - 13, 4 * LAP + 250),
+        ];
+        for cam in cams {
+            let mut ring = eight_levels();
+            for id in ring.update(cam).to_load {
+                ring.mark_loaded(id);
+            }
+            // The outermost square, exactly as the ring places it.
+            let last = ring.levels[ring.level_count() - 1];
+            let sq = Square::snapped(cam, last.snap, last.outer_chunks);
+            let check = |x: i64, z: i64| {
+                let n = coverage(&ring, x, z);
+                assert_eq!(n, 1, "camera {cam:?}: column ({x},{z}) covered {n} times");
+            };
+            // Densely around the camera, where the fine levels meet ...
+            for z in cam.z - 80..cam.z + 80 {
+                for x in cam.x - 80..cam.x + 80 {
+                    check(x, z);
+                }
+            }
+            // ... every column on lines through the camera to the far edge,
+            // crossing every level boundary on both sides ...
+            for x in sq.x0..sq.x1 {
+                check(x, cam.z);
+            }
+            for z in sq.z0..sq.z1 {
+                check(cam.x, z);
+            }
+            // ... and a sparse lattice over the whole square.
+            for z in (sq.z0..sq.z1).step_by(37) {
+                for x in (sq.x0..sq.x1).step_by(37) {
+                    check(x, z);
+                }
+            }
+            // Just outside the square, nothing.
+            assert_eq!(coverage(&ring, sq.x1, cam.z), 0);
+            assert_eq!(coverage(&ring, cam.x, sq.z0 - 1), 0);
+        }
+    }
+
+    /// The point of per-level centring (ADR-0014): a fine level stays within
+    /// one snap step of the camera however coarse the outermost level is.
+    /// Under the shared centre, a camera at x = 255 had every level centred
+    /// on x = 0, its fine ring 255 chunks (8 km) off.
+    #[test]
+    fn fine_levels_hug_the_camera() {
+        let mut ring = eight_levels();
+        let cam = cp(255, -1);
+        let update = ring.update(cam);
+        let (outer0, snap0) = (ring.levels[0].outer_chunks, ring.levels[0].snap);
+        for id in update.to_load.iter().filter(|id| id.level == 0) {
+            let d = nearest_chunk_dist(&ring, *id, cam);
+            assert!(
+                d < outer0 + snap0,
+                "level-0 node {id:?} is {d} chunks from the camera"
+            );
+        }
+        // And level 0 reaches out to at least outer - snap on every side.
+        for id in update.to_load {
+            ring.mark_loaded(id);
+        }
+        for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+            let r = outer0 - snap0;
+            let (x, z) = (cam.x + dx * r, cam.z + dz * r);
+            assert!(
+                ring.loaded().contains(&ring.node_containing(0, x, z)),
+                "level 0 does not reach ({x},{z})"
+            );
+        }
+    }
+
+    /// A camera standing on a coarse snap boundary must not reload the far
+    /// rim every time it steps across: the unload slack is at least one snap
+    /// step. (The inner edge, where a level hands over to the finer one, is
+    /// crisp by design — a region inside the finer square is dropped at once
+    /// so two levels never draw the same ground — so nodes there may move.)
+    #[test]
+    fn crossing_a_coarse_snap_boundary_back_and_forth_does_not_thrash() {
+        let mut ring = eight_levels();
+        let apply = |ring: &mut LodRing, cam: ChunkPos| {
+            let u = ring.update(cam);
+            for id in &u.to_unload {
+                ring.mark_unloaded(*id);
+            }
+            for id in &u.to_load {
+                ring.mark_loaded(*id);
+            }
+            u
+        };
+        apply(&mut ring, cp(255, 0));
+        apply(&mut ring, cp(256, 0));
+        let cam = cp(255, 0);
+        let back = apply(&mut ring, cam);
+        let coarse = ring.level_count() - 1;
+        // Anything the step back moved lies near the inner edge, never out at
+        // the rim: within the finer square's reach plus its snap.
+        let reach = ring.levels[coarse - 1].outer_chunks + ring.levels[coarse - 1].snap;
+        for id in back.to_load.iter().chain(&back.to_unload) {
+            if id.level as usize == coarse {
+                let d = nearest_chunk_dist(&ring, *id, cam);
+                assert!(
+                    d < reach,
+                    "rim node {id:?} ({d} chunks out) moved on stepping back"
+                );
+            }
+        }
+        assert!(
+            back.to_load.len() + back.to_unload.len() < ring.loaded().len() / 4,
+            "stepping back moved most of the ring"
+        );
+    }
+
+    /// Stepping one chunk moves only the levels whose snap was crossed, and
+    /// the delta stays a small fraction of the ring.
+    #[test]
+    fn a_step_with_eight_levels_streams_a_small_delta() {
+        let mut ring = eight_levels();
+        let first = ring.update(cp(0, 0));
+        let full = first.to_load.len();
+        for id in first.to_load {
+            ring.mark_loaded(id);
+        }
+        let next = ring.update(cp(-1, 0)); // crosses every snap grid at once
+        assert!(
+            next.to_load.len() < full / 4,
+            "delta {} vs full {full}",
+            next.to_load.len()
+        );
+        assert!(
+            ring.update(cp(-2, 0)).is_empty(),
+            "no square moved, yet the ring recomputed"
+        );
     }
 
     // --- Player edits at every LOD level (M09 ghost-block fix) ---------------
@@ -1399,7 +1662,9 @@ mod tests {
             TEST_Y,
         );
         assert_eq!(ring.closest_approach_chunks(0), 0);
-        assert_eq!(ring.closest_approach_chunks(2), 64 - 32 + 1);
+        // Level 2's inner edge snaps to its own stride (8), not the coarsest
+        // (32) as under the shared centre (ADR-0014).
+        assert_eq!(ring.closest_approach_chunks(2), 64 - 8 + 1);
         assert_closest_approach_holds(&mut ring);
     }
 
