@@ -1825,6 +1825,16 @@ const WATER_ALPHA: u8 = 150;
 /// Columns either side of the centre the full-res mask covers: as far as any
 /// chunk can be resident, unload band included — the band is exactly where a
 /// mask sized to the load radius missed overlap (M10 A1).
+/// How far, in blocks, the LOD shader moves a point away from the camera
+/// before asking whether full resolution draws its column (lod.wgsl's
+/// `FULLRES_NUDGE`; a test keeps the two equal). Every LOD wall the camera
+/// sees belongs to the cell behind it, so this puts a wall lying exactly on
+/// the edge of full resolution in its own cell instead of leaving it to float
+/// error — which discarded fragments of terrace steps there, showing sky
+/// (2026-10-16). Large against interpolation error, small enough that at most
+/// a sixteenth of a block of LOD draws inside full res, under its terrain.
+const FULLRES_NUDGE: f32 = 1.0 / 16.0;
+
 const FULLRES_MASK_RADIUS: i64 = vox_core::MAX_RESIDENT_RADIUS;
 // Checked at compile time: a mask short of the largest unload radius misses
 // the band, and nothing else would notice.
@@ -1997,6 +2007,30 @@ mod tests {
     /// must agree to the column, or LOD vanishes one column off from where
     /// full resolution actually is.
     fn shader_lookup(texels: &[u8], placement: [f32; 4], x: f32, z: f32) -> bool {
+        lookup_column(texels, placement, x, z)
+    }
+
+    /// lod.wgsl's `under_fullres` as the LOD passes call it, with the camera:
+    /// the point is first moved FULLRES_NUDGE blocks horizontally away from
+    /// the camera, into the cell that owns a camera-facing wall.
+    fn shader_lookup_from(
+        texels: &[u8],
+        placement: [f32; 4],
+        x: f32,
+        z: f32,
+        camera: (f32, f32),
+    ) -> bool {
+        let (hx, hz) = (x - camera.0, z - camera.1);
+        let len = hx.hypot(hz);
+        let (nx, nz) = if len > 1e-3 {
+            (x + hx / len * FULLRES_NUDGE, z + hz / len * FULLRES_NUDGE)
+        } else {
+            (x, z)
+        };
+        lookup_column(texels, placement, nx, nz)
+    }
+
+    fn lookup_column(texels: &[u8], placement: [f32; 4], x: f32, z: f32) -> bool {
         let side = placement[3] as i32;
         let cx = ((x - placement[0]) / placement[2]).floor() as i32;
         let cz = ((z - placement[1]) / placement[2]).floor() as i32;
@@ -2004,6 +2038,45 @@ mod tests {
             return false;
         }
         texels[(cx + cz * side) as usize] > 127
+    }
+
+    /// The shader's nudge is the one the tests check.
+    #[test]
+    fn the_shader_nudges_by_fullres_nudge() {
+        let line = format!("const FULLRES_NUDGE: f32 = {};", FULLRES_NUDGE);
+        assert!(LOD_SHADER.contains(&line), "lod.wgsl lacks `{line}`");
+    }
+
+    /// THE white boxes (2026-10-16): where a terrace step rises outward
+    /// across the edge of full resolution, the step's face exists only as an
+    /// LOD wall — full res draws no face toward a chunk that will never load
+    /// — and that wall lies exactly on the edge of the masked column. Judged
+    /// at the fragment's own position, float error sends some fragments into
+    /// the masked column; they are discarded, nothing is behind them, and the
+    /// sky shows through the step. Judged in the cell that owns the wall —
+    /// the one behind it, away from the camera — none is.
+    #[test]
+    fn a_wall_on_the_full_res_edge_is_judged_by_the_cell_behind_it() {
+        let s = CHUNK_SIZE as f32;
+        let center = ChunkPos::new(0, 0, 0);
+        // Full resolution draws column (0, 0); the step rises at its +X edge.
+        let texels = fullres_mask_texels(center, |cx, cz| (cx, cz) == (0, 0));
+        let placement = fullres_mask_placement(center, center);
+        let camera = (10.0, 16.0); // inside the full-res column, facing +X
+        for err in [-1e-4f32, -1e-3, 0.0, 1e-4] {
+            let x = s + err; // on the boundary plane, give or take rounding
+            for z in [1.0, 16.0, 31.0] {
+                assert!(
+                    !shader_lookup_from(&texels, placement, x, z, camera),
+                    "a wall fragment at x = {x} on the edge was discarded"
+                );
+            }
+        }
+        // The nudge must not let LOD into the column it guards: anything more
+        // than the nudge inside is still masked.
+        for x in [s - 2.0 * FULLRES_NUDGE, 16.0, 1.0] {
+            assert!(shader_lookup_from(&texels, placement, x, 16.0, camera));
+        }
     }
 
     /// Every point of a covered column is found covered, and every point of

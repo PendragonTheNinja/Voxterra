@@ -183,6 +183,21 @@ the remote matches it, and starts at the first unchecked item.*
   distance; near terrain unchanged; no colour seam where full resolution
   meets LOD; night still fades distant terrain to dark.
 
+- [x] **In play, 2026-10-16: curvature and aerial perspective confirmed**
+  ("curvature looks great", the atmosphere "works great").
+- [x] **Fix, found in play: white boxes on terrace steps at the edge of full
+  resolution.** Where a step rises outward across that edge, full res draws
+  no face for it (it faces a chunk that will never load), so its only face is
+  an LOD wall lying exactly on the edge of the full-res mask. The LOD shader
+  judged each fragment by its own position, float error sent some into the
+  masked column, and those were discarded with nothing behind them but sky.
+  The shader now asks a sixteenth of a block away from the camera: back faces
+  are culled, so every visible wall belongs to the cell behind it.
+  Reproduction test failed first (a fragment at x = 31.9999 discarded), then
+  passed; `FULLRES_NUDGE` is pinned equal in Rust and WGSL by a test. To
+  confirm in play: the screenshot's spot — steps crossing the edge of the
+  loaded area — shows no white.
+
 ### Remaining, in order
 
 1. **Task 6, part 2 — in play, then close.** The owner confirms tasks 3, 5

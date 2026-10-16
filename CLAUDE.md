@@ -271,8 +271,8 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   owner's in-play check and 32/64 km numbers, then the retro and the tag.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 287, vox-mesh 56, vox-worldgen 31, vox-render 14 passing as of
-  M11 task 5), then start the first unchecked item.
+  vox-core 287, vox-mesh 56, vox-worldgen 31, vox-render 16 passing as of
+  the M11 white-box fix), then start the first unchecked item.
 - **Roadmap after M11:** 12 — Climate & Biomes (spec not yet written). The
   longer-range order, and the owner's ideas for the whole game, are in
   `docs/vision.md` — ideas and a proposed order, not decisions; each becomes a

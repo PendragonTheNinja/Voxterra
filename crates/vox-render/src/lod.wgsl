@@ -90,15 +90,32 @@ var<uniform> sky: SkyChunk;
 @group(3) @binding(1)
 var fullres_mask: texture_2d<f32>;
 
+// Mirror of vox-render's FULLRES_NUDGE (a test keeps them equal).
+const FULLRES_NUDGE: f32 = 0.0625;
+
 // Does full resolution draw the chunk column under this point? LOD must not
 // draw there at all: under translucent near water it cannot hide behind the
 // real terrain, so any overlap shows (M10 A1).
+//
+// Asked a sixteenth of a block AWAY from the camera, horizontally. Back faces
+// are culled, so every LOD wall drawn faces the camera and belongs to the cell
+// behind it. A wall lying exactly on the edge of full resolution — a terrace
+// step rising outward across it, whose face full res never draws because it
+// faces a chunk that will never load — was otherwise judged by float error,
+// and the fragments that fell inside were discarded with only sky behind them
+// (white boxes along the steps, 2026-10-16).
 fn under_fullres(world_rel: vec3<f32>) -> bool {
     let side = i32(sky.fullres.w);
     if (side <= 0) {
         return false;
     }
-    let column = vec2<i32>(floor((world_rel.xz - sky.fullres.xy) / sky.fullres.z));
+    let away = world_rel.xz - sky.cam_scale.xz;
+    let len = length(away);
+    var at = world_rel.xz;
+    if (len > 1e-3) {
+        at = at + away / len * FULLRES_NUDGE;
+    }
+    let column = vec2<i32>(floor((at - sky.fullres.xy) / sky.fullres.z));
     if (any(column < vec2<i32>(0)) || any(column >= vec2<i32>(side))) {
         return false;
     }
