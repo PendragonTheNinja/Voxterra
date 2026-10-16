@@ -50,6 +50,7 @@ to run the tests. Same class of thing as the pre-existing let-chain in
 | `manual_range_contains` | `x >= a && x <= b` | `(a..=b).contains(&x)` |
 | `doc_lazy_continuation` | wrapped doc-comment bullet without indent | indent continuation lines |
 | `duplicated_attributes` | repeated `#[derive]`/attr | merge them |
+| `dead_code` (rustc, via `-D warnings`) | a Rust mirror of a shader constant used only by tests (`FULLRES_NUDGE`, M11) | `#[cfg(test)]` on it; `cargo test` alone never flags it, only the non-test clippy pass does |
 | `dead_code` | leftover binding from a refactor (e.g. `line_axis`) | delete it — don't paper over with `let _ =` |
 | `manual_div_ceil` | `((x + n - 1) / n)` on **unsigned** ints | `x.div_ceil(n)` — but ONLY for unsigned. `div_ceil` on **signed** ints (`i64`) is still unstable (`int_roundings`), so signed code must keep the manual form. Applying clippy's suggestion blindly to an `i64` produces a compile error. |
 | `too_many_arguments` | `emit_rect` (11 args) | genuinely warranted here → explicit `#[allow(clippy::too_many_arguments)]` with a reason |

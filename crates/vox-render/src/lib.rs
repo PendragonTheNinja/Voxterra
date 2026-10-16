@@ -1833,6 +1833,8 @@ const WATER_ALPHA: u8 = 150;
 /// error — which discarded fragments of terrace steps there, showing sky
 /// (2026-10-16). Large against interpolation error, small enough that at most
 /// a sixteenth of a block of LOD draws inside full res, under its terrain.
+/// Test-only: the shader carries the value; this copy exists to check it.
+#[cfg(test)]
 const FULLRES_NUDGE: f32 = 1.0 / 16.0;
 
 const FULLRES_MASK_RADIUS: i64 = vox_core::MAX_RESIDENT_RADIUS;
