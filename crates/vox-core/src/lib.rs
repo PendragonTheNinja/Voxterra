@@ -33,9 +33,11 @@ pub use lod::{
     EDITS_FORMAT_VERSION, EditedColumns, EditsDecodeError, LodLevel, LodNodeId, LodRing, LodUpdate,
 };
 pub use planet::{
-    DEFAULT_WORLD_SIZE_BLOCKS, MAX_WORLD_SIZE_BLOCKS, MIN_WORLD_SIZE_BLOCKS, SEA_LEVEL_BLOCKS,
-    SEA_SURFACE_CHUNK_Y, WORLD_SIZE_QUANTUM_BLOCKS, WORLD_Y_MAX_BLOCKS, WORLD_Y_MIN_BLOCKS,
-    WorldShape, WorldShapeError, chunk_in_vertical_bounds, find_spawn, in_vertical_bounds,
+    CURVATURE_RADIUS_BLOCKS, DEFAULT_WORLD_SIZE_BLOCKS, MAX_WORLD_SIZE_BLOCKS,
+    MIN_WORLD_SIZE_BLOCKS, SEA_LEVEL_BLOCKS, SEA_SURFACE_CHUNK_Y, WORLD_SIZE_QUANTUM_BLOCKS,
+    WORLD_Y_MAX_BLOCKS, WORLD_Y_MIN_BLOCKS, WorldShape, WorldShapeError, below_horizon,
+    chunk_in_vertical_bounds, curvature_coefficient, curvature_drop_blocks, find_spawn,
+    horizon_distance_blocks, in_vertical_bounds,
 };
 pub use raycast::{RayHit, cell_overlaps_aabb, raycast_blocks, raycast_voxels};
 pub use registry::{BlockRegistry, BlockType};

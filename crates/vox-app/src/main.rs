@@ -2483,8 +2483,14 @@ impl ApplicationHandler for App {
                         end: fog_end,
                     };
                     let cam_rel = self.camera.render_relative(render_origin);
-                    let morph = vox_render::MorphParams {
-                        band: self.settings.lod_morph_band,
+                    let shape = vox_render::ShapeParams {
+                        morph_band: self.settings.lod_morph_band,
+                        // The shaders' 1/2R, or 0 for a flat world (ADR-0015).
+                        curvature: if self.settings.earth_curvature {
+                            vox_core::curvature_coefficient() as f32
+                        } else {
+                            0.0
+                        },
                     };
                     renderer.set_sky(
                         self.world_time,
@@ -2492,7 +2498,7 @@ impl ApplicationHandler for App {
                         [cam_rel.x, cam_rel.y, cam_rel.z],
                         fog,
                         self.settings.star_intensity,
-                        morph,
+                        shape,
                     );
 
                     let ui_frame = ui_output.as_ref().map(|o| vox_render::UiFrame {

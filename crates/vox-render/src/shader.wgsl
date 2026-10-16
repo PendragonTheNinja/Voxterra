@@ -39,7 +39,8 @@ var block_sampler: sampler;
 // some of it.
 //   cam_scale : xyz = camera position (render-relative), w = sky_scale
 //   fog_color : rgb = colour terrain fades toward, w = strength (0 = off)
-//   fog_range : x = fog start, y = fog end (blocks), zw reserved
+//   fog_range : x = fog start, y = fog end (blocks), z = curvature
+//               coefficient 1/2R (0 = flat; curvature.wgsl), w reserved
 //   morph     : x = geomorph band width in blocks — lod.wgsl only (ADR-0009)
 //   fullres   : where the full-resolution column mask sits — xy = its corner
 //               (render-relative blocks), z = column size, w = side in
@@ -78,7 +79,8 @@ struct VsOut {
 fn vs_main(in: VsIn) -> VsOut {
     var out: VsOut;
     let world_rel = in.position + chunk.offset.xyz;
-    out.clip_position = camera.view_proj * vec4<f32>(world_rel, 1.0);
+    // Curved for drawing only; `world_rel` stays flat for fog (curvature.wgsl).
+    out.clip_position = camera.view_proj * vec4<f32>(curve(world_rel), 1.0);
     out.uv = in.uv;
     out.layer = in.layer;
     out.sky = in.sky;

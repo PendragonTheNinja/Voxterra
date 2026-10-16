@@ -29,6 +29,11 @@ pub struct Settings {
     pub lod_extra_levels: i32,
     /// Draw coarse LOD terrain at all.
     pub lod_enabled: bool,
+    /// Draw the terrain curving away over Earth's radius (ADR-0015), so plains
+    /// sink below the horizon a few kilometres out while mountains rise above
+    /// it. Visual only, and free (a uniform); off draws the world flat, for
+    /// comparison.
+    pub earth_curvature: bool,
     /// Vertical field of view, degrees.
     pub fov_degrees: f32,
 
@@ -94,6 +99,7 @@ impl Default for Settings {
             lod_enabled: true,
             fov_degrees: 70.0,
             fog_enabled: true,
+            earth_curvature: true,
             fog_auto: true,
             fog_start_frac: 0.20,
             fog_end_frac: 0.98,

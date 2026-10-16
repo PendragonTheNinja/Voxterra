@@ -39,6 +39,12 @@ const DEPTH_NEARER: wgpu::CompareFunction = wgpu::CompareFunction::Greater;
 /// "Nearer than, or exactly at, what is there" under reversed-Z.
 const DEPTH_NEARER_OR_EQUAL: wgpu::CompareFunction = wgpu::CompareFunction::GreaterEqual;
 
+/// The terrain shaders, each with the ONE curvature function appended
+/// (curvature.wgsl, ADR-0015): full resolution and LOD must curve identically
+/// or the boundary between them cracks.
+const TERRAIN_SHADER: &str = concat!(include_str!("shader.wgsl"), include_str!("curvature.wgsl"));
+const LOD_SHADER: &str = concat!(include_str!("lod.wgsl"), include_str!("curvature.wgsl"));
+
 /// The perspective projection for this renderer's depth convention.
 ///
 /// Every view-projection the renderer is given MUST be built from this: a
@@ -98,6 +104,47 @@ impl Frustum {
         }
         true
     }
+}
+
+/// Whether a LOD node can be skipped this frame (ADR-0015), judged where the
+/// shaders draw it rather than where it sits on the flat world.
+///
+/// - **Frustum, curved.** Curvature only lowers terrain, by up to `d²k` at
+///   the box's farthest horizontal corner, so the box is stretched down by
+///   that much before the frustum test. Testing the flat box would cull
+///   terrain that curves down into view.
+/// - **Horizon.** A node wholly below the line of sight grazing the sea-level
+///   surface is hidden by the curve itself ([`vox_core::below_horizon`]),
+///   tested at its nearest point and highest top, which is conservative.
+///   Only with curvature on: on a flat world nothing sinks.
+///
+/// `min`/`max`, `camera` and `sea_top` (the sea surface's Y) are all
+/// render-relative; `curvature` is the shaders' coefficient (0 = flat).
+fn lod_node_culled(
+    frustum: &Frustum,
+    min: Vec3,
+    max: Vec3,
+    camera: Vec3,
+    curvature: f32,
+    sea_top: f32,
+) -> bool {
+    let nearest = |lo: f32, hi: f32, c: f32| (lo - c).max(c - hi).max(0.0);
+    let farthest = |lo: f32, hi: f32, c: f32| (c - lo).abs().max((hi - c).abs());
+    let far_sq =
+        farthest(min.x, max.x, camera.x).powi(2) + farthest(min.z, max.z, camera.z).powi(2);
+    let lowered = Vec3::new(min.x, min.y - far_sq * curvature, min.z);
+    if !frustum.intersects_aabb(lowered, max) {
+        return true;
+    }
+    if curvature <= 0.0 {
+        return false;
+    }
+    let near = nearest(min.x, max.x, camera.x).hypot(nearest(min.z, max.z, camera.z));
+    vox_core::below_horizon(
+        f64::from(camera.y - sea_top),
+        f64::from(near),
+        f64::from(max.y - sea_top),
+    )
 }
 
 /// A mesh that has been uploaded to GPU buffers, with its world-space
@@ -172,21 +219,26 @@ pub struct FogParams {
     pub end: f32,
 }
 
-/// Geomorph inputs for one frame (M09 amendment A4, ADR-0009).
+/// Where this frame's terrain vertices go, beyond their mesh positions: the
+/// geomorph band (M09 amendment A4, ADR-0009) and Earth curvature (ADR-0015).
 ///
 /// Distant LOD lerps toward the next coarser level's silhouette as the camera
 /// nears a ring boundary, so the handover swaps geometry for geometry that
 /// already matches. Per-node data (where each level's morph completes) rides in
-/// that node's offset uniform; these two values are global to the frame.
+/// that node's offset uniform; these values are global to the frame.
 #[derive(Debug, Clone, Copy)]
-pub struct MorphParams {
+pub struct ShapeParams {
     /// Width in blocks of the band before each boundary over which the morph
     /// runs. 0 disables morphing.
     ///
     /// Distance is measured from the CAMERA (`cam_scale.xyz`, already in this
     /// uniform for fog) rather than the ring's snapped centre, because the
     /// snapped centre is frozen between ring updates — see lod.wgsl.
-    pub band: f32,
+    pub morph_band: f32,
+    /// Curvature coefficient `1/2R` (`vox_core::curvature_coefficient`), or
+    /// 0 to draw the world flat. Both terrain shaders and the LOD culling use
+    /// this one value (curvature.wgsl).
+    pub curvature: f32,
 }
 
 pub struct Renderer {
@@ -247,6 +299,11 @@ pub struct Renderer {
     /// Most recent sky_scale, also used to dim the background clear color until
     /// the procedural sky pass replaces it (task 3b).
     sky_scale: f32,
+    /// This frame's camera position (render-relative) and curvature
+    /// coefficient, as the shaders have them — the LOD culling must judge
+    /// the terrain where the shaders draw it (ADR-0015).
+    camera_rel: Vec3,
+    curvature: f32,
 
     // --- Procedural sky pass (M07 task 3b) ---
     /// Fullscreen sky pipeline (gradient + sun + moon + stars), drawn first.
@@ -496,7 +553,7 @@ impl Renderer {
         // shade f32 (M07/ADR-0007). ---
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("chunk shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(TERRAIN_SHADER.into()),
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -616,7 +673,7 @@ impl Renderer {
         // skylight-only by design. Same bind groups, same uniforms.
         let lod_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("lod shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("lod.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(LOD_SHADER.into()),
         });
         // Matches vox_mesh::LodVertex: position, uv, layer, sky, morph_y,
         // shade. Slot 4 is the MORPH TARGET here, where the full-res layout
@@ -908,6 +965,8 @@ impl Renderer {
             fullres_texels: Vec::new(),
             fullres_center: ChunkPos::new(0, 0, 0),
             sky_scale: 1.0,
+            camera_rel: Vec3::ZERO,
+            curvature: 0.0,
             sky_pipeline,
             sky_pass_buffer,
             sky_pass_bind_group,
@@ -1237,16 +1296,19 @@ impl Renderer {
         camera_rel: [f32; 3],
         fog: FogParams,
         star_intensity: f32,
-        morph: MorphParams,
+        shape: ShapeParams,
     ) {
         let sky_scale = time.sky_scale().clamp(0.0, 1.0);
         self.sky_scale = sky_scale;
+        self.camera_rel = Vec3::from(camera_rel);
+        self.curvature = shape.curvature;
 
         // Chunk-shader uniform (group 3). This writes vec4s 0-3; vec4 4 (the
         // full-res mask placement) belongs to `set_fullres_columns`:
         //   0: camera position (render-relative) + sky_scale
         //   1: fog colour rgb + strength
-        //   2: fog start, fog end, reserved, reserved
+        //   2: fog start, fog end, curvature coefficient 1/2R (0 = flat;
+        //      curvature.wgsl, ADR-0015), reserved
         //   3: geomorph band width, reserved, reserved, reserved
         // The camera position is needed per-fragment to measure view distance
         // for fog; it is render-relative so it matches vertex positions under
@@ -1268,9 +1330,9 @@ impl Renderer {
             fog.strength,
             fog.start,
             fog.end,
+            shape.curvature,
             0.0,
-            0.0,
-            morph.band,
+            shape.morph_band,
             0.0,
             0.0,
             0.0,
@@ -1333,6 +1395,21 @@ impl Renderer {
 
         // Build the view frustum once per frame for culling.
         let frustum = Frustum::from_view_proj(Mat4::from_cols_array_2d(&view_proj));
+        // LOD nodes are culled where the shaders draw them: curved, and not
+        // at all beyond the horizon (ADR-0015).
+        let sea_top =
+            (vox_core::SEA_LEVEL_BLOCKS + 1 - self.render_origin.y * CHUNK_SIZE as i64) as f32;
+        let (camera_rel, curvature) = (self.camera_rel, self.curvature);
+        let lod_culled = |mesh: &GpuMesh| {
+            lod_node_culled(
+                &frustum,
+                mesh.aabb_min,
+                mesh.aabb_max,
+                camera_rel,
+                curvature,
+                sea_top,
+            )
+        };
         let mut drawn = 0usize;
         let mut tris = 0usize;
 
@@ -1421,7 +1498,7 @@ impl Renderer {
                         if self.suppressed_lod.contains(key) {
                             continue;
                         }
-                        if !frustum.intersects_aabb(mesh.aabb_min, mesh.aabb_max) {
+                        if lod_culled(mesh) {
                             continue;
                         }
                         pass.set_bind_group(1, &mesh.offset_bind_group, &[]);
@@ -1468,7 +1545,7 @@ impl Renderer {
                 for (key, mesh) in self.lod_meshes.iter() {
                     if mesh.index_count == mesh.opaque_index_count
                         || self.suppressed_lod.contains(key)
-                        || !frustum.intersects_aabb(mesh.aabb_min, mesh.aabb_max)
+                        || lod_culled(mesh)
                     {
                         continue;
                     }
@@ -1986,6 +2063,101 @@ mod tests {
 
     fn cube(center: Vec3) -> (Vec3, Vec3) {
         (center - Vec3::splat(0.5), center + Vec3::splat(0.5))
+    }
+
+    // ---- Curvature (ADR-0015) ----
+
+    /// Every shader the renderer creates parses and validates — the composed
+    /// terrain shaders above all, since curvature.wgsl is only valid once
+    /// appended. A WGSL error otherwise surfaces as a panic at startup on the
+    /// owner's machine (docs/notes/clippy-lints.md).
+    #[test]
+    fn every_shader_validates() {
+        use wgpu::naga;
+        for (name, src) in [
+            ("terrain", TERRAIN_SHADER),
+            ("lod", LOD_SHADER),
+            ("sky", include_str!("sky.wgsl")),
+            ("highlight", include_str!("highlight.wgsl")),
+        ] {
+            let module = naga::front::wgsl::parse_str(src)
+                .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(src)));
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        }
+    }
+
+    /// Full resolution and LOD must curve identically, or the boundary cracks:
+    /// both carry the one appended function, neither has its own, and both
+    /// draw through it.
+    #[test]
+    fn both_terrain_shaders_curve_with_the_one_function() {
+        let curvature = include_str!("curvature.wgsl");
+        for (name, own, composed) in [
+            ("terrain", include_str!("shader.wgsl"), TERRAIN_SHADER),
+            ("lod", include_str!("lod.wgsl"), LOD_SHADER),
+        ] {
+            assert!(composed.ends_with(curvature), "{name}");
+            assert!(!own.contains("fn curve("), "{name} defines its own curve");
+            assert!(
+                own.contains("camera.view_proj * vec4<f32>(curve(world_rel), 1.0)"),
+                "{name} does not draw through curve()"
+            );
+        }
+    }
+
+    /// A camera at `eye` looking along -Z, pitched down by `pitch` radians,
+    /// seeing out to 100 km.
+    fn far_frustum(eye: Vec3, pitch: f32) -> Frustum {
+        let dir = Vec3::new(0.0, -pitch.sin(), -pitch.cos());
+        let view = Mat4::look_to_rh(eye, dir, Vec3::Y);
+        Frustum::from_view_proj(perspective(FOV, ASPECT, NEAR, 100_000.0) * view)
+    }
+
+    fn k() -> f32 {
+        vox_core::curvature_coefficient() as f32
+    }
+
+    /// Looking down from altitude, terrain 60 km out lies above the frustum's
+    /// top plane on the flat world but curves down into view. Culling the
+    /// flat box would delete what the shader draws.
+    #[test]
+    fn terrain_that_curves_into_view_is_kept() {
+        let eye = Vec3::new(0.0, 2000.0, 0.0);
+        let f = far_frustum(eye, 0.8);
+        let (lo, hi) = (
+            Vec3::new(-100.0, -10_000.0, -60_100.0),
+            Vec3::new(100.0, -9_950.0, -59_900.0),
+        );
+        assert!(
+            lod_node_culled(&f, lo, hi, eye, 0.0, 0.0),
+            "flat: above the view"
+        );
+        assert!(
+            !lod_node_culled(&f, lo, hi, eye, k(), 0.0),
+            "curved: in view"
+        );
+    }
+
+    /// From standing height, low ground 20 km out is below the horizon with
+    /// curvature on, and drawn without it.
+    #[test]
+    fn low_ground_beyond_the_horizon_is_culled() {
+        let eye = Vec3::new(0.0, 1.62, 0.0);
+        let f = far_frustum(eye, 0.0);
+        let (lo, hi) = (
+            Vec3::new(-50.0, 0.0, -20_050.0),
+            Vec3::new(50.0, 5.0, -19_950.0),
+        );
+        assert!(lod_node_culled(&f, lo, hi, eye, k(), 0.0));
+        assert!(!lod_node_culled(&f, lo, hi, eye, 0.0, 0.0));
+        // A mountain at the same distance stands above the horizon.
+        let peak = Vec3::new(50.0, 600.0, -19_950.0);
+        assert!(!lod_node_culled(&f, lo, peak, eye, k(), 0.0));
     }
 
     #[test]

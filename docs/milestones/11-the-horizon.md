@@ -150,11 +150,33 @@ the remote matches it, and starts at the first unchecked item.*
   Left for later: merging WALLS along runs, the bigger share at coarse
   strides, under the same morph constraint.
 
+- [x] **Task 5 — curvature and horizon culling (ADR-0015, Proposed).**
+  `curve()` in `curvature.wgsl`, appended to both terrain shaders so full
+  resolution and LOD drop by the same `d²/2R` (Earth's radius, ADR-0012 §5);
+  the coefficient rides in the terrain uniform's spare `fog_range.z` from
+  `vox_core::curvature_coefficient`, and the menu's "Earth curvature" toggle
+  zeroes it for comparison. Clip position only — fog, the full-res mask and
+  all of the simulation stay flat. LOD culling now judges nodes where they
+  are drawn: boxes stretched down by the drop for the frustum test, and a
+  node wholly below the sight line grazing the sea-level surface skipped
+  (`vox_core::below_horizon`, conservative). Horizon culling removes less than
+  criterion 5 expected — 105 of 1 600 nodes from standing height at spawn,
+  36 from 100 blocks up, none from 1 000 — because nearly every 8 km node
+  holds ground that does show over the horizon, as the milestone intends.
+  vox-render's tests now run headlessly in cloud sessions, and gained naga
+  validation of every shader (it caught a deliberately broken one) plus the
+  culling cases. To confirm in play: on a plain, terrain falls away past a
+  few km while distant ranges stand above the horizon; toggle curvature to
+  compare; no crack or shimmer where full resolution meets LOD (they share
+  one function); at 32 and 64 km no z-fighting (reversed-Z, task 4).
+
 ### Remaining, in order
 
-1. **Tasks 4–6 below**, in order. Task 4 (reverse-Z) shipped in M10
-   (ADR-0013) — confirm it holds at 32 and 64 km — so next is task 5:
-   curvature and horizon culling.
+1. **Task 6 — atmosphere retune, performance pass, retro.** Fog for tens of
+   kilometres, wavelength-dependent (distant terrain turns blue-violet, see
+   "Changes at M10 close"); criterion 10's numbers at 32 and 64 km; ADR-0014
+   and 0015 accepted or revised; retrospective; CLAUDE.md status; commit,
+   then tag `v0.11.0-m11`.
 
 ## Why this milestone exists
 

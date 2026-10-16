@@ -241,6 +241,7 @@ impl SettingsUi {
                             .weak(),
                         );
                         ui.checkbox(&mut settings.lod_enabled, "LOD terrain");
+                        ui.checkbox(&mut settings.earth_curvature, "Earth curvature");
                         ui.add(
                             egui::Slider::new(
                                 &mut settings.fov_degrees,

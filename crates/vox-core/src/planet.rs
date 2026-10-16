@@ -388,6 +388,65 @@ pub fn find_spawn(
     None
 }
 
+// ---- Visual curvature (ADR-0012 §5, ADR-0015) -------------------------------
+
+/// Radius the terrain is drawn curving over, in blocks: Earth's (ADR-0012 §5),
+/// not the torus's ~32.6 km, which would put the ground-level horizon at ~330
+/// blocks. Visual only — physics, collision, the raycast and every distance in
+/// the simulation stay flat.
+pub const CURVATURE_RADIUS_BLOCKS: f64 = 6_371_000.0;
+
+/// How far curvature lowers a point `distance` blocks away horizontally:
+/// `d² / 2R`. Both terrain shaders apply exactly this (their coefficient is
+/// [`curvature_coefficient`]), and the renderer's culling assumes it, so all
+/// three agree on what is drawn where.
+///
+/// The parabola, not the sphere's `R - sqrt(R² - d²)`: they differ by
+/// `d⁴/8R³`, under 0.01 block at 64 km, and the parabola is one multiply in
+/// a shader where the sphere is a square root of a difference of huge numbers
+/// in `f32`.
+pub fn curvature_drop_blocks(distance: f64) -> f64 {
+    distance * distance * curvature_coefficient()
+}
+
+/// `1 / 2R`: what the shaders multiply a squared horizontal distance by.
+pub fn curvature_coefficient() -> f64 {
+    0.5 / CURVATURE_RADIUS_BLOCKS
+}
+
+/// Distance to the horizon, in blocks, for an eye `eye_height` blocks above
+/// the sea-level surface: where the sight line grazes the curve. `sqrt(2Rh)`
+/// for the parabola above. Zero at or below the surface.
+pub fn horizon_distance_blocks(eye_height: f64) -> f64 {
+    (2.0 * CURVATURE_RADIUS_BLOCKS * eye_height.max(0.0)).sqrt()
+}
+
+/// Whether a point `distance` blocks away horizontally, `top` blocks above
+/// the sea-level surface, lies entirely below the horizon seen from an eye
+/// `eye_height` above that surface — hidden by the curve itself.
+///
+/// The occluder assumed is the sea-level surface, the lowest anything is drawn
+/// (ground below sea level is under water, whose surface is at sea level), so
+/// real terrain only hides more: `true` is always safe to cull. And `false`
+/// whenever unsure — an eye at or below the surface, or a point nearer than
+/// the horizon.
+///
+/// In the curved frame the surface is `y = -x²/2R`; the sight line from the
+/// eye touching it at the horizon distance `x_t` is `y = eye - x·x_t/R`, and a
+/// point is hidden when its curved height `top - d²/2R` is below that line.
+/// Beyond the horizon the gap only grows with distance, so testing a node at
+/// its NEAREST distance and HIGHEST point is conservative for all of it.
+pub fn below_horizon(eye_height: f64, distance: f64, top: f64) -> bool {
+    if eye_height <= 0.0 {
+        return false;
+    }
+    let x_t = horizon_distance_blocks(eye_height);
+    if distance <= x_t {
+        return false;
+    }
+    top - curvature_drop_blocks(distance) < eye_height - distance * x_t / CURVATURE_RADIUS_BLOCKS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -662,5 +721,69 @@ mod tests {
         assert_eq!(r, None);
         let rings = W.size_x() / 2 / 4_096;
         assert!(calls <= 1 + 8 * (rings * (rings + 1) / 2) as u64);
+    }
+
+    // ---- Visual curvature ----
+
+    /// The horizons M11 promises (its "What real life means here" table),
+    /// which is to say: the radius is Earth's.
+    #[test]
+    fn horizons_are_earths() {
+        let km = |b: f64| b / 1000.0;
+        assert!((km(horizon_distance_blocks(1.62)) - 4.5).abs() < 0.1);
+        assert!((km(horizon_distance_blocks(500.0)) - 80.0).abs() < 1.0);
+        assert_eq!(horizon_distance_blocks(0.0), 0.0);
+        assert_eq!(horizon_distance_blocks(-5.0), 0.0);
+    }
+
+    /// From the ground, a 1 150-block summit stays above the horizon out to
+    /// ~120 km, and a plain sinks below it a few kilometres out.
+    #[test]
+    fn mountains_rise_over_the_horizon_and_plains_sink() {
+        let eye = 1.62;
+        assert!(!below_horizon(eye, 115_000.0, 1150.0));
+        assert!(below_horizon(eye, 135_000.0, 1150.0));
+        assert!(
+            !below_horizon(eye, 4_000.0, 0.0),
+            "a plain before the horizon"
+        );
+        assert!(below_horizon(eye, 6_000.0, 0.0), "a plain beyond it");
+    }
+
+    /// Never culls what might show: an eye at or below the surface, or
+    /// anything nearer than the horizon, whatever its height.
+    #[test]
+    fn below_horizon_is_conservative() {
+        assert!(!below_horizon(0.0, 500_000.0, -1000.0));
+        assert!(!below_horizon(-30.0, 500_000.0, -1000.0));
+        let eye = 300.0;
+        let x_t = horizon_distance_blocks(eye);
+        assert!(!below_horizon(eye, x_t, -1e9));
+        // And beyond the horizon, once hidden, hidden further out too — the
+        // property that makes testing a node's nearest point enough.
+        let top = 200.0;
+        let mut was_hidden = false;
+        for k in 0..400 {
+            let d = x_t + 500.0 * k as f64;
+            let hidden = below_horizon(eye, d, top);
+            assert!(!was_hidden || hidden, "visible again at {d}");
+            was_hidden = hidden;
+        }
+        assert!(was_hidden);
+    }
+
+    /// The point where the sight line grazes the surface is ON the curve: the
+    /// line and the parabola agree there, so the two formulas are consistent.
+    #[test]
+    fn the_grazing_line_touches_the_curve_at_the_horizon() {
+        for eye in [1.62, 50.0, 2000.0] {
+            let x_t = horizon_distance_blocks(eye);
+            let on_curve = -curvature_drop_blocks(x_t);
+            let on_line = eye - x_t * x_t / CURVATURE_RADIUS_BLOCKS;
+            assert!((on_curve - on_line).abs() < 1e-6 * eye.max(1.0));
+        }
+        // Parabola vs sphere: under 0.01 block at 64 km.
+        let (r, d) = (CURVATURE_RADIUS_BLOCKS, 65_536.0f64);
+        assert!((curvature_drop_blocks(d) - (r - (r * r - d * d).sqrt())).abs() < 0.01);
     }
 }
