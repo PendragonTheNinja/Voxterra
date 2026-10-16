@@ -2481,6 +2481,12 @@ impl ApplicationHandler for App {
                         // changing LOD levels doesn't require re-tuning fog.
                         start: fog_start,
                         end: fog_end,
+                        density: self.settings.effective_atmosphere(),
+                        // Above the sea surface (the top of the highest water
+                        // block): the height the air thins from.
+                        eye_height: (self.camera.position.y
+                            - (vox_core::SEA_LEVEL_BLOCKS + 1) as f64)
+                            as f32,
                     };
                     let cam_rel = self.camera.render_relative(render_origin);
                     let shape = vox_render::ShapeParams {

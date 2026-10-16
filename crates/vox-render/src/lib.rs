@@ -39,11 +39,20 @@ const DEPTH_NEARER: wgpu::CompareFunction = wgpu::CompareFunction::Greater;
 /// "Nearer than, or exactly at, what is there" under reversed-Z.
 const DEPTH_NEARER_OR_EQUAL: wgpu::CompareFunction = wgpu::CompareFunction::GreaterEqual;
 
-/// The terrain shaders, each with the ONE curvature function appended
-/// (curvature.wgsl, ADR-0015): full resolution and LOD must curve identically
-/// or the boundary between them cracks.
-const TERRAIN_SHADER: &str = concat!(include_str!("shader.wgsl"), include_str!("curvature.wgsl"));
-const LOD_SHADER: &str = concat!(include_str!("lod.wgsl"), include_str!("curvature.wgsl"));
+/// The terrain shaders, each with the ONE curvature function (curvature.wgsl,
+/// ADR-0015) and the ONE atmosphere function (atmosphere.wgsl, ADR-0016)
+/// appended: full resolution and LOD must curve identically or the boundary
+/// between them cracks, and must see through the same air or it shows.
+const TERRAIN_SHADER: &str = concat!(
+    include_str!("shader.wgsl"),
+    include_str!("curvature.wgsl"),
+    include_str!("atmosphere.wgsl")
+);
+const LOD_SHADER: &str = concat!(
+    include_str!("lod.wgsl"),
+    include_str!("curvature.wgsl"),
+    include_str!("atmosphere.wgsl")
+);
 
 /// The perspective projection for this renderer's depth convention.
 ///
@@ -217,6 +226,13 @@ pub struct FogParams {
     pub start: f32,
     /// Distance (blocks) where fog reaches full strength.
     pub end: f32,
+    /// Air density multiplier for aerial perspective (ADR-0016): 1 is Earth's
+    /// sea-level air, 0 turns it off. `color` is also what the air scatters
+    /// in.
+    pub density: f32,
+    /// The eye's height above sea level, in blocks — air and haze thin with
+    /// height, so the view from a summit is clearer.
+    pub eye_height: f32,
 }
 
 /// Where this frame's terrain vertices go, beyond their mesh positions: the
@@ -1308,8 +1324,10 @@ impl Renderer {
         //   0: camera position (render-relative) + sky_scale
         //   1: fog colour rgb + strength
         //   2: fog start, fog end, curvature coefficient 1/2R (0 = flat;
-        //      curvature.wgsl, ADR-0015), reserved
-        //   3: geomorph band width, reserved, reserved, reserved
+        //      curvature.wgsl, ADR-0015), air density (atmosphere.wgsl,
+        //      ADR-0016)
+        //   3: geomorph band width, eye height above sea level, reserved,
+        //      reserved
         // The camera position is needed per-fragment to measure view distance
         // for fog; it is render-relative so it matches vertex positions under
         // the floating origin (ADR-0002). Geomorph reuses it in the VERTEX
@@ -1331,9 +1349,9 @@ impl Renderer {
             fog.start,
             fog.end,
             shape.curvature,
-            0.0,
+            fog.density,
             shape.morph_band,
-            0.0,
+            fog.eye_height,
             0.0,
             0.0,
         ];
@@ -2091,21 +2109,38 @@ mod tests {
         }
     }
 
-    /// Full resolution and LOD must curve identically, or the boundary cracks:
-    /// both carry the one appended function, neither has its own, and both
-    /// draw through it.
+    /// Full resolution and LOD must curve identically and see through the
+    /// same air, or the boundary between them shows: both carry the one
+    /// appended curvature and atmosphere, neither has its own, and both use
+    /// them.
     #[test]
-    fn both_terrain_shaders_curve_with_the_one_function() {
-        let curvature = include_str!("curvature.wgsl");
+    fn both_terrain_shaders_share_curvature_and_atmosphere() {
+        let shared = format!(
+            "{}{}",
+            include_str!("curvature.wgsl"),
+            include_str!("atmosphere.wgsl")
+        );
         for (name, own, composed) in [
             ("terrain", include_str!("shader.wgsl"), TERRAIN_SHADER),
             ("lod", include_str!("lod.wgsl"), LOD_SHADER),
         ] {
-            assert!(composed.ends_with(curvature), "{name}");
+            assert!(composed.ends_with(&shared), "{name}");
             assert!(!own.contains("fn curve("), "{name} defines its own curve");
+            assert!(
+                !own.contains("fn atmosphere("),
+                "{name} defines its own air"
+            );
+            assert!(
+                !own.contains("fog_range.x"),
+                "{name} still fogs on its own instead of through atmosphere()"
+            );
             assert!(
                 own.contains("camera.view_proj * vec4<f32>(curve(world_rel), 1.0)"),
                 "{name} does not draw through curve()"
+            );
+            assert!(
+                own.contains("return atmosphere(color, in.world_rel);"),
+                "{name} does not light through atmosphere()"
             );
         }
     }

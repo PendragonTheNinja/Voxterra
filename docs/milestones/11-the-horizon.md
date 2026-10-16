@@ -170,13 +170,27 @@ the remote matches it, and starts at the first unchecked item.*
   compare; no crack or shimmer where full resolution meets LOD (they share
   one function); at 32 and 64 km no z-fighting (reversed-Z, task 4).
 
+- [x] **Task 6, part 1 — aerial perspective (ADR-0016, Proposed).** One
+  `atmosphere()` in `atmosphere.wgsl`, appended to both terrain shaders like
+  curvature: per-channel extinction with real sea-level Rayleigh
+  (5.8 / 13.5 / 33.1 × 10⁻⁶ per block) and haze (21 × 10⁻⁶) coefficients,
+  thinning with height (8 km / 1.2 km), in-scattering the horizon sky colour;
+  then the existing distance fade, kept because air alone does not hide where
+  terrain ends. A dark green hill is unchanged at 0.5 km, teal-grey at 10 km,
+  pale blue at 32 km, nearly sky at 64 km; clearer from a summit. New "air
+  density" slider (1 = Earth's air, 0 = off); the fog toggle switches the
+  whole atmosphere. To confirm in play: each ridge bluer and fainter with
+  distance; near terrain unchanged; no colour seam where full resolution
+  meets LOD; night still fades distant terrain to dark.
+
 ### Remaining, in order
 
-1. **Task 6 — atmosphere retune, performance pass, retro.** Fog for tens of
-   kilometres, wavelength-dependent (distant terrain turns blue-violet, see
-   "Changes at M10 close"); criterion 10's numbers at 32 and 64 km; ADR-0014
-   and 0015 accepted or revised; retrospective; CLAUDE.md status; commit,
-   then tag `v0.11.0-m11`.
+1. **Task 6, part 2 — in play, then close.** The owner confirms tasks 3, 5
+   and 6 part 1 in play (each item's "to confirm" above) and takes
+   criterion 10's numbers at 32 km and 64 km (6 and 8 levels): standing and
+   sprint-fly fps, worst frame, `lod`, GPU MB and triangles, on land and over
+   ocean. Then ADRs 0014–0016 accepted or revised, the retrospective here,
+   CLAUDE.md status, commit, and tag `v0.11.0-m11`.
 
 ## Why this milestone exists
 

@@ -40,8 +40,10 @@ var block_sampler: sampler;
 //   cam_scale : xyz = camera position (render-relative), w = sky_scale
 //   fog_color : rgb = colour terrain fades toward, w = strength (0 = off)
 //   fog_range : x = fog start, y = fog end (blocks), z = curvature
-//               coefficient 1/2R (0 = flat; curvature.wgsl), w reserved
-//   morph     : x = geomorph band width in blocks — lod.wgsl only (ADR-0009)
+//               coefficient 1/2R (0 = flat; curvature.wgsl), w = air density
+//               multiplier (0 = no aerial perspective; atmosphere.wgsl)
+//   morph     : x = geomorph band width in blocks — lod.wgsl only (ADR-0009),
+//               y = eye height above sea level (atmosphere.wgsl), zw reserved
 //   fullres   : where the full-resolution column mask sits — xy = its corner
 //               (render-relative blocks), z = column size, w = side in
 //               columns (0 = no mask yet) — lod.wgsl only (M10 A1)
@@ -152,21 +154,9 @@ fn lit(in: VsOut, albedo: vec3<f32>) -> vec3<f32> {
     let sky_lit = light_curve(in.sky) * sky_scale;
     let block_lit = light_curve(in.block);
     let brightness = in.shade * max(sky_lit, block_lit);
-    var color = albedo * brightness;
+    let color = albedo * brightness;
 
-    // Distance fog (M09 amendment A2). Terrain fades toward the sky as it
-    // recedes, which is what makes the LOD detail transitions unreadable:
-    // contrast drops before the change in resolution becomes visible. Squaring
-    // the ramp keeps nearby terrain crisp and concentrates the fade far out.
-    let fog_strength = sky.fog_color.w;
-    if (fog_strength > 0.0) {
-        let dist = length(in.world_rel - sky.cam_scale.xyz);
-        let t = clamp(
-            (dist - sky.fog_range.x) / max(sky.fog_range.y - sky.fog_range.x, 1.0),
-            0.0,
-            1.0,
-        );
-        color = mix(color, sky.fog_color.rgb, t * t * fog_strength);
-    }
-    return color;
+    // Aerial perspective and the distance fade, shared with lod.wgsl
+    // (atmosphere.wgsl, ADR-0016).
+    return atmosphere(color, in.world_rel);
 }

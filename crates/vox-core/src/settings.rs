@@ -57,6 +57,10 @@ pub struct Settings {
     pub fog_end: f32,
     /// 0 = off, 1 = full.
     pub fog_strength: f32,
+    /// Density of the air for aerial perspective (ADR-0016): 1 is Earth's
+    /// sea-level air — distant terrain turns blue-grey and hazy as real
+    /// mountains do — 0 turns it off. Applied with `fog_enabled`.
+    pub atmosphere: f32,
 
     // --- Geomorph (ADR-0009) ---
     /// Width in blocks of the band before each LOD ring boundary over which
@@ -106,6 +110,7 @@ impl Default for Settings {
             fog_start: 420.0,
             fog_end: 2000.0,
             fog_strength: 1.0,
+            atmosphere: 1.0,
             lod_morph_band: 192.0,
             time_paused: false,
             day_length_secs: 24.0 * 60.0,
@@ -132,6 +137,7 @@ pub mod ranges {
     pub const FOG_START: (f32, f32) = (0.0, 8000.0);
     pub const FOG_END: (f32, f32) = (16.0, 16000.0);
     pub const FOG_STRENGTH: (f32, f32) = (0.0, 1.0);
+    pub const ATMOSPHERE: (f32, f32) = (0.0, 3.0);
     pub const FOG_FRAC: (f32, f32) = (0.0, 1.0);
     pub const LOD_MORPH_BAND: (f32, f32) = (0.0, 512.0);
     pub const DAY_LENGTH_SECS: (f32, f32) = (10.0, 86_400.0);
@@ -167,6 +173,9 @@ impl Settings {
         self.fog_strength = self
             .fog_strength
             .clamp(ranges::FOG_STRENGTH.0, ranges::FOG_STRENGTH.1);
+        self.atmosphere = self
+            .atmosphere
+            .clamp(ranges::ATMOSPHERE.0, ranges::ATMOSPHERE.1);
         self.lod_morph_band = self
             .lod_morph_band
             .clamp(ranges::LOD_MORPH_BAND.0, ranges::LOD_MORPH_BAND.1);
@@ -220,6 +229,15 @@ impl Settings {
             0.0
         }
     }
+
+    /// Air density as applied: the fog toggle switches the whole atmosphere.
+    pub fn effective_atmosphere(&self) -> f32 {
+        if self.fog_enabled {
+            self.atmosphere
+        } else {
+            0.0
+        }
+    }
 }
 
 #[cfg(test)]
@@ -241,6 +259,7 @@ mod tests {
             lod_extra_levels: 99,
             fov_degrees: -10.0,
             fog_strength: 5.0,
+            atmosphere: 99.0,
             star_intensity: -1.0,
             ..Default::default()
         };
@@ -249,6 +268,7 @@ mod tests {
         assert_eq!(s.lod_extra_levels, ranges::LOD_EXTRA_LEVELS.1);
         assert_eq!(s.fov_degrees, ranges::FOV_DEGREES.0);
         assert_eq!(s.fog_strength, ranges::FOG_STRENGTH.1);
+        assert_eq!(s.atmosphere, ranges::ATMOSPHERE.1);
         assert_eq!(s.star_intensity, ranges::STAR_INTENSITY.0);
     }
 

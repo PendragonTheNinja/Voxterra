@@ -265,9 +265,10 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   2026-10-14: task 0 (why relighting doubled), the `light.rs` `opaque` fix and
   tasks 1–2 (per-level ring centring, ADR-0014 Proposed; eight levels with
   the half-period clamp) are done and confirmed in play; tasks 3 (flat-cell
-  merging) and 5 (Earth curvature and horizon culling, ADR-0015 Proposed)
-  are done and await in-play confirmation (task 4, reverse-Z, shipped in
-  M10); next is task 6 (atmosphere, performance pass, retro).
+  merging), 5 (Earth curvature and horizon culling, ADR-0015 Proposed) and
+  6's aerial perspective (ADR-0016 Proposed) are done and await in-play
+  confirmation (task 4, reverse-Z, shipped in M10). What remains is the
+  owner's in-play check and 32/64 km numbers, then the retro and the tag.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
   vox-core 287, vox-mesh 56, vox-worldgen 31, vox-render 14 passing as of

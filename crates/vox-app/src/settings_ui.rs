@@ -309,6 +309,20 @@ impl SettingsUi {
                                 )
                                 .text("strength"),
                             );
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut settings.atmosphere,
+                                    ranges::ATMOSPHERE.0..=ranges::ATMOSPHERE.1,
+                                )
+                                .text("air density"),
+                            );
+                            ui.label(
+                                egui::RichText::new(
+                                    "Distant terrain turns blue and hazy through the air;                                      1 is Earth's, 0 is off.",
+                                )
+                                .small()
+                                .weak(),
+                            );
                         });
                     });
 
