@@ -315,6 +315,8 @@ pub struct Renderer {
     /// Most recent sky_scale, also used to dim the background clear color until
     /// the procedural sky pass replaces it (task 3b).
     sky_scale: f32,
+    /// The adapter's name, for reports (the benchmark's header).
+    gpu_name: String,
     /// This frame's camera position (render-relative) and curvature
     /// coefficient, as the shaders have them — the LOD culling must judge
     /// the terrain where the shaders draw it (ADR-0015).
@@ -376,6 +378,7 @@ impl Renderer {
         .expect("no suitable GPU adapter found");
 
         log::info!("GPU: {:?}", adapter.get_info().name);
+        let gpu_name = adapter.get_info().name;
 
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
@@ -984,6 +987,7 @@ impl Renderer {
             fullres_texels: Vec::new(),
             fullres_center: ChunkPos::new(0, 0, 0),
             sky_scale: 1.0,
+            gpu_name,
             camera_rel: Vec3::ZERO,
             curvature: 0.0,
             debug_holes: false,
@@ -1380,6 +1384,16 @@ impl Renderer {
         };
         self.queue
             .write_buffer(&self.sky_pass_buffer, 0, bytemuck::bytes_of(&sky_uniform));
+    }
+
+    /// The GPU in use, as the driver names it.
+    pub fn gpu_name(&self) -> &str {
+        &self.gpu_name
+    }
+
+    /// The surface's size in pixels.
+    pub fn surface_size(&self) -> (u32, u32) {
+        (self.config.width, self.config.height)
     }
 
     /// Debug: paint the sky flat magenta, so every pixel where it shows

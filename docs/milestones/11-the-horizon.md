@@ -217,15 +217,31 @@ the remote matches it, and starts at the first unchecked item.*
   confirm in play: no specks in the distance. (The triangular wedges along
   one-block steps in the same session's screenshot are full resolution's
   step faces with ambient occlusion split along their diagonal — unchanged.)
+- [ ] **In play, 2026-10-16: the specks persist after the fan fix** (still
+  far off, still when standing, gone while moving), so T-junctions were not
+  their cause, or not the only one. Debug keys (`9a87f4b`): **H** paints the
+  sky magenta (are the specks holes onto the sky?), **J** rebuilds LOD with
+  flat-cell merging off, **K** with skirts off. Awaiting the owner's results.
+- [x] **Benchmark mode: `cargo run -p vox-app -- --bench`.** One fixed,
+  repeatable run instead of hand-timed retro runs: default settings, noon
+  with time paused, eight phases — {6, 8 levels} × {land, ocean} ×
+  {standing 20 s, sprint-flying 30 s along +X at 120 m/s} — each started
+  only once every queue has been empty for a second (60 s timeout, reported
+  if hit). The ocean start is the nearest spot whose whole 3.6 km path is
+  ≥ 30 blocks under the sea. Reports per phase: median fps, 1% low, worst
+  frame, relight and mesh ms/s, dirty peak and end, LOD nodes, GPU MB,
+  median triangles, loaded chunks. Writes `bench/bench-<unix time>.md`
+  (git-ignored), logs the same table and quits. Logic in `vox-app/src/bench.rs`
+  (6 tests).
 
 ### Remaining, in order
 
-1. **Task 6, part 2 — in play, then close.** The owner confirms tasks 3, 5
-   and 6 part 1 in play (each item's "to confirm" above) and takes
-   criterion 10's numbers at 32 km and 64 km (6 and 8 levels): standing and
-   sprint-fly fps, worst frame, `lod`, GPU MB and triangles, on land and over
-   ocean. Then ADRs 0014–0016 accepted or revised, the retrospective here,
-   CLAUDE.md status, commit, and tag `v0.11.0-m11`.
+1. **Task 6, part 2 — in play, then close.** The owner runs the speck check
+   above and `--bench` (nothing else running) for criterion 10's numbers at
+   32 km and 64 km. Then ADRs 0014–0016 accepted or revised, the
+   retrospective here (known issue so far: over ocean at 8 levels the sprint
+   `dirty` backlog climbs to 1 000–1 460 without draining), CLAUDE.md status,
+   commit, and tag `v0.11.0-m11`.
 
 ## Why this milestone exists
 

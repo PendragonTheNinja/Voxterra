@@ -271,8 +271,12 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   owner's in-play check and 32/64 km numbers, then the retro and the tag.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 287, vox-mesh 57, vox-worldgen 31, vox-render 16 passing as of
-  the M11 speck fix), then start the first unchecked item.
+  vox-core 287, vox-mesh 57, vox-worldgen 31, vox-render 16, vox-app 6
+  passing as of the M11 benchmark), then start the first unchecked item.
+- **Performance numbers come from `cargo run -p vox-app -- --bench`** (from
+  M11): a fixed script over land and ocean at 6 and 8 LOD levels that writes
+  `bench/bench-<time>.md` and quits. Compare runs from it, not hand-timed
+  flights; close other heavy programs first.
 - **Roadmap after M11:** 12 — Climate & Biomes (spec not yet written). The
   longer-range order, and the owner's ideas for the whole game, are in
   `docs/vision.md` — ideas and a proposed order, not decisions; each becomes a

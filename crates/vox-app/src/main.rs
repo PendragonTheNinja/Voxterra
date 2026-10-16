@@ -15,7 +15,11 @@ use vox_core::{
 };
 use vox_mesh::{mesh_chunk, ChunkNeighbors, LodMeshData, MeshData};
 
+mod bench;
 mod settings_ui;
+
+// The benchmark flies at spectator sprint speed; keep the two one number.
+const _: () = assert!(FlyCamera::SPEED * FlyCamera::SPRINT_MULTIPLIER == bench::SPRINT_SPEED);
 use settings_ui::SettingsUi;
 use vox_render::Renderer;
 use vox_worldgen::{Generator, LodSampling};
@@ -601,6 +605,14 @@ struct App {
     /// last telemetry line — shows where frame time goes during bursts.
     relight_ms_accum: f32,
     mesh_ms_accum: f32,
+    /// Relight and mesh time since startup, never reset — the benchmark
+    /// takes differences across a phase.
+    relight_ms_total: f64,
+    mesh_ms_total: f64,
+    /// `--bench` was given: run the benchmark script once the renderer is up.
+    bench_requested: bool,
+    bench: Option<bench::Bench>,
+    bench_started: Option<Instant>,
     telemetry_frames: u32,
     /// Longest single frame in the current telemetry interval, in ms. Average
     /// fps hides hitches — a 144 fps average with one 40 ms frame reads as
@@ -746,6 +758,11 @@ impl Default for App {
             telemetry_accum: 0.0,
             relight_ms_accum: 0.0,
             mesh_ms_accum: 0.0,
+            relight_ms_total: 0.0,
+            mesh_ms_total: 0.0,
+            bench_requested: false,
+            bench: None,
+            bench_started: None,
             telemetry_frames: 0,
             worst_frame_ms: 0.0,
 
@@ -1353,7 +1370,9 @@ impl App {
                     break;
                 }
             }
-            self.relight_ms_accum += start.elapsed().as_secs_f32() * 1000.0;
+            let ms = start.elapsed().as_secs_f32() * 1000.0;
+            self.relight_ms_accum += ms;
+            self.relight_ms_total += f64::from(ms);
         }
 
         // --- Mesh pass (time-budgeted, parallel). ---
@@ -1413,7 +1432,9 @@ impl App {
                     break;
                 }
             }
-            self.mesh_ms_accum += start.elapsed().as_secs_f32() * 1000.0;
+            let ms = start.elapsed().as_secs_f32() * 1000.0;
+            self.mesh_ms_accum += ms;
+            self.mesh_ms_total += f64::from(ms);
         }
     }
 
@@ -1486,6 +1507,134 @@ impl App {
 
     /// Outermost LOD radius in blocks, for sizing the camera's far plane and
     /// the automatic fog range.
+    /// Begin the benchmark (`--bench`, bench.rs): fix the settings and the
+    /// light, and find where its land and ocean phases start.
+    ///
+    /// Both starts are derived from the world alone, so a given world always
+    /// benchmarks the same ground: land at the spawn, ocean at the nearest
+    /// point around it with deep water under the whole sprint path. The
+    /// camera flies 40 blocks over the highest ground (or the sea) along that
+    /// path, so a sprint never passes through a hill.
+    fn start_bench(&mut self) {
+        let generator = self.generator;
+        let shape = self.store.shape();
+        let (sx, sz) = (
+            self.camera.position.x.floor() as i64,
+            self.camera.position.z.floor() as i64,
+        );
+        let path = (bench::SPRINT_SPEED * bench::SPRINT_SECS) as i64;
+        const ABOVE: f64 = 40.0;
+        let highest = (0..=path)
+            .step_by(64)
+            .map(|d| generator.surface_height(sx + d, sz))
+            .max()
+            .unwrap_or(0);
+        let land = [sx as f64 + 0.5, highest as f64 + ABOVE, sz as f64 + 0.5];
+        let sea = vox_core::SEA_LEVEL_BLOCKS;
+        let ocean_xz = vox_core::find_spawn(
+            shape,
+            sx,
+            sz,
+            SPAWN_SEARCH_STRIDE,
+            SPAWN_SEARCH_RINGS,
+            |x, z| {
+                (0..=path)
+                    .step_by(300)
+                    .all(|d| generator.surface_height(x + d, z) < sea - 30)
+            },
+        );
+        let (gpu, (w, h)) = self
+            .renderer
+            .as_ref()
+            .map(|r| (r.gpu_name().to_string(), r.surface_size()))
+            .unwrap_or_default();
+        let mut header = vec![
+            format!("GPU: {gpu}, {w}×{h}"),
+            format!(
+                "World: seed {:#x}, {} × {} km; start ({sx}, {sz})",
+                self.store.seed(),
+                shape.size_x() / 1000,
+                shape.size_z() / 1000
+            ),
+            "Settings: defaults (full-res radius 8, curvature on, air density 1), \
+             spectator, noon, time frozen"
+                .to_string(),
+        ];
+        let ocean = match ocean_xz {
+            Some((x, z)) => [x as f64 + 0.5, (sea + 1) as f64 + ABOVE, z as f64 + 0.5],
+            None => {
+                header.push("No deep ocean found near spawn: ocean phases ran on land".into());
+                land
+            }
+        };
+        self.settings = vox_core::Settings::default();
+        self.camera.mode = MoveMode::Spectator;
+        self.time_paused = true;
+        self.time_accum = 0.5 * vox_core::TICKS_PER_DAY as f64;
+        self.world_time = vox_core::WorldTime::from_ticks(self.time_accum as u64);
+        log::info!("bench: starting — land at {land:?}, ocean at {ocean:?}");
+        self.bench = Some(bench::Bench::new(land, ocean, header));
+        self.bench_started = Some(Instant::now());
+    }
+
+    /// One frame of the benchmark: measure, then do what the script says.
+    /// Returns true when the run is over and the program should exit.
+    fn bench_tick(&mut self, raw_dt: f32) -> bool {
+        let now = self
+            .bench_started
+            .map_or(0.0, |t| t.elapsed().as_secs_f64());
+        let (lod_nodes, gpu_mb, tris) = self.renderer.as_ref().map_or((0, 0.0, 0), |r| {
+            (
+                r.lod_count(),
+                r.buffer_bytes() as f32 / 1.048576e6,
+                r.tris_last_frame(),
+            )
+        });
+        let sample = bench::Sample {
+            frame_ms: raw_dt * 1000.0,
+            dirty: self.dirty.len(),
+            relight: self.relight.len(),
+            gen_in_flight: self.gen_in_flight.len(),
+            lod_backlog: self.lod_pending_set.len() + self.lod_in_flight.len(),
+            lod_nodes,
+            gpu_mb,
+            tris,
+            loaded: self.streamer.loaded_count(),
+            relight_ms_total: self.relight_ms_total,
+            mesh_ms_total: self.mesh_ms_total,
+        };
+        let Some(b) = self.bench.as_mut() else {
+            return false;
+        };
+        let tick = b.tick(now, sample);
+        if let Some(levels) = tick.apply_levels {
+            // Applied this frame by the usual settings check, which rebuilds
+            // the LOD exactly once.
+            self.settings.lod_extra_levels = levels;
+        }
+        if let Some(eye) = tick.camera {
+            self.camera.position = DVec3::from_array(eye);
+            self.camera.velocity = DVec3::ZERO;
+            self.camera.yaw = 0.0; // along +X, the sprint direction
+            self.camera.pitch = bench::PITCH;
+        }
+        let Some(report) = tick.done else {
+            return false;
+        };
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let path = format!("bench/bench-{secs}.md");
+        match std::fs::create_dir_all("bench").and_then(|()| std::fs::write(&path, &report)) {
+            Ok(()) => log::info!("bench: results written to {path}"),
+            Err(e) => log::error!("bench: could not write {path}: {e}"),
+        }
+        for line in report.lines() {
+            log::info!("{line}");
+        }
+        true
+    }
+
     fn lod_far_blocks(&self) -> f32 {
         (self.lod_far_chunks * CHUNK_SIZE_I) as f32
     }
@@ -2374,11 +2523,25 @@ impl ApplicationHandler for App {
                     self.world_time = vox_core::WorldTime::from_ticks(self.time_accum as u64);
                 }
 
+                // Benchmark mode (`--bench`) flies the camera itself and ends
+                // the program when its script is done.
+                if self.bench_requested && self.bench.is_none() && self.renderer.is_some() {
+                    self.start_bench();
+                }
+                if self.bench.is_some() && self.bench_tick(raw_dt) {
+                    event_loop.exit();
+                    return;
+                }
+
                 // Motion integrates in f64: an f32 frame time is exact enough,
                 // an f32 POSITION is what loses the step far from the origin.
-                match self.camera.mode {
-                    MoveMode::Spectator => self.camera.update_spectator(&self.keys, f64::from(dt)),
-                    MoveMode::Survival => self.physics_update(f64::from(dt)),
+                if self.bench.is_none() {
+                    match self.camera.mode {
+                        MoveMode::Spectator => {
+                            self.camera.update_spectator(&self.keys, f64::from(dt))
+                        }
+                        MoveMode::Survival => self.physics_update(f64::from(dt)),
+                    }
                 }
 
                 // Camera's current chunk drives both streaming and the
@@ -2611,6 +2774,10 @@ fn main() {
     let event_loop = EventLoop::new().expect("failed to create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = App::default();
+    // `cargo run -p vox-app -- --bench`: the fixed performance run (bench.rs).
+    let mut app = App {
+        bench_requested: std::env::args().any(|a| a == "--bench"),
+        ..Default::default()
+    };
     event_loop.run_app(&mut app).expect("event loop error");
 }
