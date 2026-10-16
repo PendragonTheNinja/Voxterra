@@ -18,7 +18,8 @@ struct SkyUniform {
     sun: vec4<f32>,
     // xyz = moon direction (toward moon), w = moon illumination (0 new .. 1 full)
     moon: vec4<f32>,
-    // x = star intensity knob, y = milky-way knob, z = twinkle knob, w spare
+    // x = star intensity knob, y = milky-way knob, z = twinkle knob,
+    // w = debug hole check (1 = flat magenta; see `Renderer::set_debug_holes`)
     params: vec4<f32>,
 };
 
@@ -230,5 +231,10 @@ fn fs_sky(in: VsOut) -> @location(0) vec4<f32> {
     let dith_amt = mix(0.35, 1.5, clamp(sky_scale, 0.0, 1.0)) / 255.0;
     col += vec3<f32>((ign(in.clip.xy) - 0.5) * dith_amt);
 
+    // Debug (H): a flat, unnatural colour, so any pixel where the sky shows
+    // through the terrain stands out from fog, texture and haze.
+    if (sky.params.w > 0.5) {
+        return vec4<f32>(1.0, 0.0, 1.0, 1.0);
+    }
     return vec4<f32>(col, 1.0);
 }

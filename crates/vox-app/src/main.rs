@@ -585,6 +585,11 @@ struct App {
     /// with skirts off, they are skirts losing the depth test to their
     /// neighbour's top face. Not a setting; always starts on.
     lod_skirts: bool,
+    /// Debug (`J`): build LOD with flat-cell merging (the default) or one top
+    /// quad per cell, to tell whether an artifact comes from merging.
+    lod_merge: bool,
+    /// Debug (`H`): sky painted magenta so holes in the terrain stand out.
+    debug_holes: bool,
     /// Nodes wanted but not yet spawned (the ring is requested all at once but
     /// generated a few per frame). Drained nearest-camera-first, so this is a
     /// set rather than a queue — insertion order carries no meaning.
@@ -734,6 +739,8 @@ impl Default for App {
             lod_retired: HashSet::new(),
             lod_retire_age: 0,
             lod_skirts: true,
+            lod_merge: true,
+            debug_holes: false,
             lod_pending_set: HashSet::new(),
 
             telemetry_accum: 0.0,
@@ -1916,6 +1923,7 @@ impl App {
                     0 // no border walls at all (see `lod_skirts`)
                 };
                 let edits = Arc::clone(&self.edited_columns);
+                let merge = self.lod_merge;
                 rayon::spawn(move || {
                     let mut heights =
                         generator.lod_heightfield(origin.x, origin.z, stride, sampling);
@@ -1923,7 +1931,7 @@ impl App {
                     // dug ground, so without this the coarse surface floats
                     // above the hole and shows through it (the "ghost block").
                     edits.apply_to_node(&mut heights, origin.x, origin.z, stride, origin_y);
-                    let mesh = vox_mesh::mesh_lod_heightfield(
+                    let mesh = vox_mesh::mesh_lod_heightfield_with(
                         &heights,
                         stride as i32,
                         origin_y,
@@ -1937,6 +1945,7 @@ impl App {
                             }
                         },
                         skirt,
+                        merge,
                     );
                     let _ = tx.send((n, mesh));
                 });
@@ -2260,6 +2269,26 @@ impl ApplicationHandler for App {
                                     } else {
                                         "off"
                                     }
+                                );
+                            } else if code == KeyCode::KeyH {
+                                // Debug: magenta sky, so cracks and missing
+                                // faces show as unmistakable magenta pixels.
+                                self.debug_holes = !self.debug_holes;
+                                if let Some(r) = self.renderer.as_mut() {
+                                    r.set_debug_holes(self.debug_holes);
+                                }
+                                log::info!(
+                                    "hole check (magenta sky) {}",
+                                    if self.debug_holes { "ON" } else { "off" }
+                                );
+                            } else if code == KeyCode::KeyJ {
+                                // Debug: rebuild LOD with or without flat-cell
+                                // merging, to tell whether an artifact is it.
+                                self.lod_merge = !self.lod_merge;
+                                self.reset_lod();
+                                log::info!(
+                                    "LOD flat-cell merging {} (rebuilding LOD)",
+                                    if self.lod_merge { "ON" } else { "off" }
                                 );
                             } else if code == KeyCode::KeyK {
                                 // Debug: rebuild LOD with or without skirts, to

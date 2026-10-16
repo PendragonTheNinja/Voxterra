@@ -320,6 +320,9 @@ pub struct Renderer {
     /// the terrain where the shaders draw it (ADR-0015).
     camera_rel: Vec3,
     curvature: f32,
+    /// Debug: draw the sky flat magenta so holes in the terrain stand out
+    /// (`set_debug_holes`).
+    debug_holes: bool,
 
     // --- Procedural sky pass (M07 task 3b) ---
     /// Fullscreen sky pipeline (gradient + sun + moon + stars), drawn first.
@@ -983,6 +986,7 @@ impl Renderer {
             sky_scale: 1.0,
             camera_rel: Vec3::ZERO,
             curvature: 0.0,
+            debug_holes: false,
             sky_pipeline,
             sky_pass_buffer,
             sky_pass_bind_group,
@@ -1367,10 +1371,21 @@ impl Renderer {
             moon: [moon[0], moon[1], moon[2], time.moon_illumination()],
             // params.x = star intensity knob, driven by the settings slider
             // (it was a hardcoded 1.0, so the slider did nothing); yzw reserved.
-            params: [star_intensity, 0.0, 0.0, 0.0],
+            params: [
+                star_intensity,
+                0.0,
+                0.0,
+                if self.debug_holes { 1.0 } else { 0.0 },
+            ],
         };
         self.queue
             .write_buffer(&self.sky_pass_buffer, 0, bytemuck::bytes_of(&sky_uniform));
+    }
+
+    /// Debug: paint the sky flat magenta, so every pixel where it shows
+    /// through the terrain — a crack, a missing face — is unmistakable.
+    pub fn set_debug_holes(&mut self, on: bool) {
+        self.debug_holes = on;
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {

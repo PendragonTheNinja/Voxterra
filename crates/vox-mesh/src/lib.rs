@@ -2279,8 +2279,29 @@ pub fn mesh_lod_heightfield(
     heights: &[i32],
     h_stride: i32,
     origin_y: i32,
+    layer_of: impl FnMut(BlockId, usize) -> u32,
+    skirt_depth_blocks: i32,
+) -> LodMeshData {
+    mesh_lod_heightfield_with(
+        heights,
+        h_stride,
+        origin_y,
+        layer_of,
+        skirt_depth_blocks,
+        true,
+    )
+}
+
+/// [`mesh_lod_heightfield`] with flat-cell merging switchable (`merge_flat`
+/// false: one top quad per cell, as before M11 task 3) — for diagnosing
+/// artifacts in play (vox-app's `J` key).
+pub fn mesh_lod_heightfield_with(
+    heights: &[i32],
+    h_stride: i32,
+    origin_y: i32,
     mut layer_of: impl FnMut(BlockId, usize) -> u32,
     skirt_depth_blocks: i32,
+    merge_flat: bool,
 ) -> LodMeshData {
     assert_eq!(
         heights.len(),
@@ -2344,7 +2365,7 @@ pub fn mesh_lod_heightfield(
             let h = at(cx, cz);
             // Cells along x, then whole rows along z.
             let (mut wx, mut wz) = (1, 1);
-            if still(cx, cz) {
+            if merge_flat && still(cx, cz) {
                 let joins = |x: i32, z: i32| !covered[idx(x, z)] && still(x, z) && at(x, z) == h;
                 while cx + wx < n && joins(cx + wx, cz) {
                     wx += 1;
