@@ -198,6 +198,26 @@ the remote matches it, and starts at the first unchecked item.*
   confirm in play: the screenshot's spot — steps crossing the edge of the
   loaded area — shows no white.
 
+- [x] **In play, 2026-10-16: the white boxes are gone.**
+- [x] **Fix, found in play: white specks scattered over distant terrain —
+  T-junctions from task 3.** A merged top quad's edge ran past the corners
+  of every wall and single cell beside it; rasterization does not promise to
+  close such a junction, so single pixels of sky leaked through, mostly far
+  away where triangles are thin. A merged region is now a FAN from its
+  centre with a vertex at every cell corner along its border (each triangle
+  stored as a quad with a repeated corner, keeping LOD pieces four vertices;
+  the repeat's zero-area half is discarded by the GPU), or one quad per cell
+  where that is fewer. Test `top_faces_have_no_t_junctions` failed first,
+  then passed; coverage is now checked per triangle. Merging therefore saves
+  less than task 3 reported: triangles per node 3 176 → 2 376 at stride 2,
+  3 647 → 3 037 at 4, 3 994 → 3 465 at 8, 5 200 → 4 894 at 32, 6 362 → 6 017
+  at 256 — about a tenth over eight levels, not a quarter (that figure
+  counted rectangles that were not watertight). The `tris` telemetry counts
+  the zero-area halves too, so it reads somewhat above what is drawn. To
+  confirm in play: no specks in the distance. (The triangular wedges along
+  one-block steps in the same session's screenshot are full resolution's
+  step faces with ambient occlusion split along their diagonal — unchanged.)
+
 ### Remaining, in order
 
 1. **Task 6, part 2 — in play, then close.** The owner confirms tasks 3, 5

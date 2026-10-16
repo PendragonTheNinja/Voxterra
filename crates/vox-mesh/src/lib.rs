@@ -2223,6 +2223,58 @@ fn emit_lod_rect(
         .extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
 }
 
+/// Emit a level rectangle `[x0, x1) × [z0, z1)` at height `y` as a fan from
+/// its centre, with a vertex at every cell corner along its border (`step`
+/// apart), so every neighbouring wall or cell meets it at a shared vertex —
+/// no T-junctions, which rasterization does not promise to close (the white
+/// specks of 2026-10-16). Each triangle is stored as a quad whose last corner
+/// repeats, keeping every LOD piece four vertices; the repeat makes the
+/// second triangle zero-area, which the GPU discards. Winding matches
+/// `emit_lod_rect`'s tops (+Z first, then +X), so back-face culling keeps it.
+/// Only for rectangles that do not move under morph: `morph_y` is `y`.
+#[allow(clippy::too_many_arguments)]
+fn emit_lod_fan(
+    mesh: &mut LodMeshData,
+    (x0, z0, x1, z1): (f32, f32, f32, f32),
+    y: f32,
+    step: f32,
+    layer: u32,
+    sky: f32,
+    shade: f32,
+) {
+    let (nx, nz) = (((x1 - x0) / step) as i32, ((z1 - z0) / step) as i32);
+    let mut border: Vec<(f32, f32)> = Vec::with_capacity(2 * (nx + nz) as usize);
+    for k in 0..nz {
+        border.push((x0, z0 + k as f32 * step));
+    }
+    for k in 0..nx {
+        border.push((x0 + k as f32 * step, z1));
+    }
+    for k in 0..nz {
+        border.push((x1, z1 - k as f32 * step));
+    }
+    for k in 0..nx {
+        border.push((x1 - k as f32 * step, z0));
+    }
+    let vert = |(x, z): (f32, f32)| LodVertex {
+        position: [x, y, z],
+        uv: [z - z0, x - x0],
+        layer,
+        sky,
+        morph_y: y,
+        shade,
+    };
+    let centre = vert(((x0 + x1) * 0.5, (z0 + z1) * 0.5));
+    for i in 0..border.len() {
+        let (a, b) = (border[i], border[(i + 1) % border.len()]);
+        let base = mesh.vertices.len() as u32;
+        mesh.vertices
+            .extend_from_slice(&[centre, vert(a), vert(b), vert(b)]);
+        mesh.indices
+            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+}
+
 pub fn mesh_lod_heightfield(
     heights: &[i32],
     h_stride: i32,
@@ -2307,19 +2359,41 @@ pub fn mesh_lod_heightfield(
                 }
             }
             let top = (h - origin_y + 1) as f32;
-            let coarse_top = (coarse_at(cx, cz) - origin_y + 1) as f32;
-            emit_lod_rect(
-                &mut mesh,
-                [(cx * h_stride) as f32, top, (cz * h_stride) as f32],
-                axis_unit(2),
-                axis_unit(0),
-                (wz * h_stride) as f32,
-                (wx * h_stride) as f32,
-                layer_of(grass, 2),
-                sky,
-                top_shade,
-                [coarse_top; 4],
-            );
+            let layer = layer_of(grass, 2);
+            let s = h_stride as f32;
+            // A fan costs one triangle per cell of border; one quad per cell
+            // costs one per cell of area. Whichever is fewer — and both are
+            // free of T-junctions, unlike one quad stretched over the lot.
+            if 2 * (wx + wz) < wx * wz {
+                let (x0, z0) = (cx as f32 * s, cz as f32 * s);
+                emit_lod_fan(
+                    &mut mesh,
+                    (x0, z0, x0 + wx as f32 * s, z0 + wz as f32 * s),
+                    top,
+                    s,
+                    layer,
+                    sky,
+                    top_shade,
+                );
+            } else {
+                for z in cz..cz + wz {
+                    for x in cx..cx + wx {
+                        let coarse_top = (coarse_at(x, z) - origin_y + 1) as f32;
+                        emit_lod_rect(
+                            &mut mesh,
+                            [x as f32 * s, top, z as f32 * s],
+                            axis_unit(2),
+                            axis_unit(0),
+                            s,
+                            s,
+                            layer,
+                            sky,
+                            top_shade,
+                            [coarse_top; 4],
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -2611,13 +2685,15 @@ mod heightfield_tests {
         assert_eq!(mesh.opaque_index_count as usize, mesh.indices.len());
     }
 
-    /// A flat field is ONE top quad (M11 flat-cell merging) and no interior
-    /// walls — only the border skirts.
+    /// A flat field is one merged top — a fan, one triangle per border cell
+    /// (M11 flat-cell merging, T-junction free) — and no interior walls,
+    /// only the border skirts.
     #[test]
-    fn flat_field_is_one_top_plus_border_skirts() {
+    fn flat_field_is_one_fan_plus_border_skirts() {
         let mesh = mesh_lod_heightfield(&flat(20), 4, 0, |_, _| 0, 8);
-        // 1 merged top + 4 borders x 32 skirt walls.
-        assert_eq!(mesh.quad_count(), 1 + 4 * LOD_CELLS);
+        // 4 x 32 fan pieces + 4 borders x 32 skirt walls, against 32 x 32
+        // tops unmerged.
+        assert_eq!(mesh.quad_count(), 4 * LOD_CELLS + 4 * LOD_CELLS);
     }
 
     // ---- Flat-cell merging (M11 task 3) ----
@@ -2684,9 +2760,10 @@ mod heightfield_tests {
             .collect()
     }
 
-    /// Merging must change how many quads draw the tops, never what they
-    /// draw: every cell covered by exactly one top, at its exact height and
-    /// its exact morph target.
+    /// Merging must change how many triangles draw the tops, never what
+    /// they draw: a point in every cell (off-centre, so never on a fan's
+    /// shared edge) lies under exactly one top triangle, at
+    /// the cell's exact height and its exact morph target.
     #[test]
     fn merged_tops_cover_every_cell_once_at_its_height_and_morph() {
         let n = LOD_CELLS as i32;
@@ -2698,39 +2775,43 @@ mod heightfield_tests {
         ] {
             for (stride, origin_y) in [(2, 0), (4, -40), (8, 7)] {
                 let mesh = faces_as_layers(&heights, stride, origin_y);
-                let mut count = vec![0u32; LOD_CELLS * LOD_CELLS];
-                for (x0, x1, z0, z1, y, morph_y) in top_rects(&mesh) {
-                    let s = stride as f32;
-                    for cz in (z0 / s) as i32..(z1 / s) as i32 {
-                        for cx in (x0 / s) as i32..(x1 / s) as i32 {
-                            let i = (cz * n + cx) as usize;
-                            count[i] += 1;
-                            let at = |x: i32, z: i32| heights[(z * n + x) as usize];
-                            let (bx, bz) = (cx & !1, cz & !1);
-                            let coarse = at(bx, bz)
-                                .min(at(bx + 1, bz))
-                                .min(at(bx, bz + 1))
-                                .min(at(bx + 1, bz + 1));
-                            assert_eq!(
-                                y,
-                                (at(cx, cz) - origin_y + 1) as f32,
-                                "{label} ({cx},{cz})"
-                            );
-                            assert_eq!(
-                                morph_y,
-                                (coarse - origin_y + 1) as f32,
-                                "{label} ({cx},{cz})"
-                            );
+                let tops: Vec<[LodVertex; 3]> = mesh
+                    .opaque_indices()
+                    .chunks_exact(3)
+                    .map(|t| [0, 1, 2].map(|k| mesh.vertices[t[k] as usize]))
+                    .filter(|t| t[0].layer == 2)
+                    .collect();
+                let s = stride as f32;
+                for cz in 0..n {
+                    for cx in 0..n {
+                        let (px, pz) = ((cx as f32 + 0.37) * s, (cz as f32 + 0.61) * s);
+                        let under: Vec<&[LodVertex; 3]> =
+                            tops.iter().filter(|t| contains_xz(t, px, pz)).collect();
+                        assert_eq!(under.len(), 1, "{label}, stride {stride}: cell ({cx},{cz})");
+                        let at = |x: i32, z: i32| heights[(z * n + x) as usize];
+                        let (bx, bz) = (cx & !1, cz & !1);
+                        let coarse = at(bx, bz)
+                            .min(at(bx + 1, bz))
+                            .min(at(bx, bz + 1))
+                            .min(at(bx + 1, bz + 1));
+                        for v in under[0] {
+                            assert_eq!(v.position[1], (at(cx, cz) - origin_y + 1) as f32);
+                            assert_eq!(v.morph_y, (coarse - origin_y + 1) as f32);
                         }
                     }
                 }
-                assert!(
-                    count.iter().all(|&c| c == 1),
-                    "{label}, stride {stride}: a cell is covered {:?} times",
-                    count.iter().find(|&&c| c != 1)
-                );
             }
         }
+    }
+
+    /// Whether `(px, pz)` lies strictly inside the triangle's XZ projection
+    /// (zero-area triangles contain nothing).
+    fn contains_xz(t: &[LodVertex; 3], px: f32, pz: f32) -> bool {
+        let p = |i: usize| (t[i].position[0], t[i].position[2]);
+        let cross =
+            |a: (f32, f32), b: (f32, f32)| (b.0 - a.0) * (pz - a.1) - (b.1 - a.1) * (px - a.0);
+        let d = [cross(p(0), p(1)), cross(p(1), p(2)), cross(p(2), p(0))];
+        d.iter().all(|&v| v > 1e-4) || d.iter().all(|&v| v < -1e-4)
     }
 
     /// ADR-0009's condition on merging: a quad covering more than one cell
@@ -2747,12 +2828,73 @@ mod heightfield_tests {
         }
     }
 
-    /// Open seabed is where merging pays most: one ground quad for the node.
+    /// Every vertex position in the opaque range, quantised to 1/16 block.
+    fn vertex_set(mesh: &LodMeshData) -> std::collections::HashSet<(i64, i64, i64)> {
+        let q = |v: f32| (v * 16.0).round() as i64;
+        mesh.opaque_indices()
+            .iter()
+            .map(|&i| {
+                let p = mesh.vertices[i as usize].position;
+                (q(p[0]), q(p[1]), q(p[2]))
+            })
+            .collect()
+    }
+
+    /// THE white specks (2026-10-16): no vertex may lie partway along a top
+    /// face's edge. A T-junction like that is a crack rasterization does not
+    /// promise to close — single pixels of sky, mostly far away where the
+    /// triangles are thin. Merged top quads made one at every cell corner of
+    /// every wall and single cell along their edges.
     #[test]
-    fn open_seabed_is_one_ground_quad() {
+    fn top_faces_have_no_t_junctions() {
+        for (label, heights) in [
+            ("plateaus", plateaus()),
+            ("flat", flat(9)),
+            ("varied", varied()),
+        ] {
+            for stride in [2, 4] {
+                let mesh = faces_as_layers(&heights, stride, 0);
+                let verts = vertex_set(&mesh);
+                let q = |v: f32| (v * 16.0).round() as i64;
+                let ix = mesh.opaque_indices();
+                for tri in ix.chunks_exact(3) {
+                    let p: Vec<[f32; 3]> = tri
+                        .iter()
+                        .map(|&i| mesh.vertices[i as usize].position)
+                        .collect();
+                    if mesh.vertices[tri[0] as usize].layer != 2 {
+                        continue; // walls: not what merging changed
+                    }
+                    for (a, b) in [(p[0], p[1]), (p[1], p[2]), (p[2], p[0])] {
+                        // Walk the edge in cell steps; any vertex strictly
+                        // between its ends is a T-junction.
+                        let len = ((b[0] - a[0]).abs()).max((b[2] - a[2]).abs());
+                        let steps = (len / stride as f32).round() as i64;
+                        for k in 1..steps {
+                            let f = k as f32 / steps as f32;
+                            let pt = (
+                                q(a[0] + (b[0] - a[0]) * f),
+                                q(a[1]),
+                                q(a[2] + (b[2] - a[2]) * f),
+                            );
+                            assert!(
+                                !verts.contains(&pt),
+                                "{label}, stride {stride}: vertex {pt:?}/16 inside top edge {a:?}-{b:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Open seabed is where merging pays most: one fan, a triangle per
+    /// border cell, where 1 024 quads drew it unmerged.
+    #[test]
+    fn open_seabed_is_one_ground_fan() {
         let sea = vox_core::SEA_LEVEL_BLOCKS as i32;
         let mesh = faces_as_layers(&flat(sea - 300), 8, 0);
-        assert_eq!(top_rects(&mesh).len(), 1);
+        assert_eq!(top_rects(&mesh).len(), 4 * LOD_CELLS);
     }
 
     /// **Vertical detail is exact**: the top face sits at the column's true
