@@ -217,11 +217,29 @@ the remote matches it, and starts at the first unchecked item.*
   confirm in play: no specks in the distance. (The triangular wedges along
   one-block steps in the same session's screenshot are full resolution's
   step faces with ambient occlusion split along their diagonal — unchanged.)
-- [ ] **In play, 2026-10-16: the specks persist after the fan fix** (still
-  far off, still when standing, gone while moving), so T-junctions were not
-  their cause, or not the only one. Debug keys (`9a87f4b`): **H** paints the
-  sky magenta (are the specks holes onto the sky?), **J** rebuilds LOD with
-  flat-cell merging off, **K** with skirts off. Awaiting the owner's results.
+- [x] **In play, 2026-10-16: the specks persist after the fan fix** (still
+  far off, still when standing, gone while moving), so the top faces' T-junctions
+  were not the only cause. Debug keys (`9a87f4b`): **H** paints the sky
+  magenta, **J** rebuilds LOD with flat-cell merging off, **K** with skirts
+  off. Owner's results, 2026-10-17: every speck turns magenta (holes onto the
+  sky); J and K change nothing (skirts are needed — the white boxes return
+  without them).
+- [x] **Fix: T-junctions between walls.** Two walls side by side in one
+  vertical plane meet along a corner line, and each ended at its own cells'
+  heights, so the taller one's edge ran past the other's corners — a
+  T-junction on most corner lines in rough terrain, merging or not, and
+  between neighbouring skirts on node borders too. Walls are now collected
+  first, every wall's top and bottom is recorded on both its corner lines,
+  and each wall is emitted with a vertex at every breakpoint on its two
+  vertical edges (`emit_lod_wall`, a zipper of triangles; unchanged where it
+  has none). Test `no_opaque_face_has_a_t_junction` (every axis-aligned edge
+  of every opaque face, merging on and off, strides 2 and 4) failed first,
+  then passed. Cost in drawn triangles per node on real terrain (seed
+  0x7e22ac0de): stride 2 2 817 → 2 855, 4 2 947 → 2 995, 8 3 109 → 3 181,
+  32 4 403 → 4 815, 256 5 987 → 7 847 — the coarsest level's walls are the
+  tallest. Known limit: added vertices morph linearly up their own wall, so
+  two walls sharing one may part slightly inside a morph band while it
+  animates. To confirm in play: H shows no magenta specks in the distance.
 - [x] **Benchmark mode: `cargo run -p vox-app -- --bench`.** One fixed,
   repeatable run instead of hand-timed retro runs: default settings, noon
   with time paused, eight phases — {6, 8 levels} × {land, ocean} ×
@@ -234,13 +252,39 @@ the remote matches it, and starts at the first unchecked item.*
   (git-ignored), logs the same table and quits. Logic in `vox-app/src/bench.rs`
   (6 tests).
 
+- [x] **Benchmark, 2026-10-17 (owner's run, before the wall fix):** RTX 4060,
+  800×600 window, seed 0x7e22ac0de, defaults (radius 8, curvature on, air
+  density 1). Every phase settled (2.2–2.3 s from standing, 1.0 s into the
+  sprints); no timeouts.
+
+  | Phase | fps median | 1% low | Worst ms | Relight ms/s | Mesh ms/s | Dirty peak / end | LOD nodes | GPU MB | Tris M |
+  |---|---|---|---|---|---|---|---|---|---|
+  | 6 levels, land, standing | 905 | 477 | 91.8* | 0 | 0 | 0 / 0 | 1216 | 448 | 1.36 |
+  | 6 levels, land, sprint | 135 | 64 | 21.5 | 94 | 582 | 883 / 649 | 1424 | 472 | 1.58 |
+  | 8 levels, land, standing | 778 | 436 | 4.3 | 0 | 0 | 0 / 0 | 1600 | 639 | 1.98 |
+  | 8 levels, land, sprint | 128 | 62 | 20.4 | 94 | 574 | 896 / 658 | 1872 | 694 | 1.83 |
+  | 6 levels, ocean, standing | 788 | 429 | 4.4 | 0 | 0 | 0 / 0 | 1216 | 451 | 1.73 |
+  | 6 levels, ocean, sprint | 129 | 64 | 22.3 | 98 | 591 | 901 / 674 | 1424 | 454 | 1.52 |
+  | 8 levels, ocean, standing | 753 | 409 | 4.8 | 0 | 0 | 0 / 0 | 1600 | 641 | 1.97 |
+  | 8 levels, ocean, sprint | 126 | 62 | 22.3 | 98 | 582 | 929 / 729 | 1872 | 676 | 1.73 |
+
+  \* The first phase's worst frame is start-up (pipelines and first uploads);
+  every later standing phase's is under 5 ms. Reading: 64 km costs ~14% of
+  standing fps over 32 km and ~5% while sprinting; sprint-fly holds M10's
+  ~130 fps median at both. Meshing is the sprint bottleneck — ~580 ms/s of
+  mesh work against ~95 of relight — and the `dirty` backlog does not drain
+  during a 30 s sprint on land or sea (ends 650–730), though it empties within
+  seconds of stopping. The 800×600 window flatters fps against full-screen
+  play; later runs should keep the same size to compare.
+
 ### Remaining, in order
 
-1. **Task 6, part 2 — in play, then close.** The owner runs the speck check
-   above and `--bench` (nothing else running) for criterion 10's numbers at
-   32 km and 64 km. Then ADRs 0014–0016 accepted or revised, the
-   retrospective here (known issue so far: over ocean at 8 levels the sprint
-   `dirty` backlog climbs to 1 000–1 460 without draining), CLAUDE.md status,
+1. **Task 6, part 2 — in play, then close.** The owner confirms the wall
+   fix with H (no magenta specks); the benchmark above is criterion 10's
+   numbers, and an optional rerun after the fix shows the triangle cost.
+   Then ADRs 0014–0016 accepted or revised, the retrospective here (known
+   issue: the sprint `dirty` backlog does not drain at 120 m/s, land or sea —
+   meshing-bound), CLAUDE.md status,
    commit, and tag `v0.11.0-m11`.
 
 ## Why this milestone exists

@@ -2275,6 +2275,107 @@ fn emit_lod_fan(
     }
 }
 
+/// Emit a wall like [`emit_lod_rect`], but with a vertex at every height in
+/// `left` and `right` — the breakpoints strictly inside `(bottom, top)` on its
+/// two vertical edges (horizontal parameter 0 and `width`). Two walls side by
+/// side in one plane meet along a vertical corner line, and each stops at its
+/// own cells' heights; without a vertex wherever the other has one, the line
+/// is a T-junction and leaks single pixels of sky (the white specks,
+/// 2026-10-17). Triangles are stored as quads with a repeated corner, like
+/// [`emit_lod_fan`]. Morph targets interpolate linearly up the wall, so every
+/// added vertex stays on its own wall's edge throughout the morph.
+#[allow(clippy::too_many_arguments)]
+fn emit_lod_wall(
+    mesh: &mut LodMeshData,
+    base: [f32; 3],
+    u_dir: [f32; 3],
+    v_dir: [f32; 3],
+    width: f32,
+    (bottom, top): (i32, i32),
+    u_vertical: bool,
+    (left, right): (&[i32], &[i32]),
+    layer: u32,
+    sky: f32,
+    shade: f32,
+    (morph_bottom, morph_top): (f32, f32),
+) {
+    let height = (top - bottom) as f32;
+    if left.is_empty() && right.is_empty() {
+        let (uw, uh) = if u_vertical {
+            (height, width)
+        } else {
+            (width, height)
+        };
+        // Corners run (0,0)→(uw,0)→(uw,uh)→(0,uh).
+        let corner_morph_y = if u_vertical {
+            [morph_bottom, morph_top, morph_top, morph_bottom]
+        } else {
+            [morph_bottom, morph_bottom, morph_top, morph_top]
+        };
+        emit_lod_rect(
+            mesh,
+            base,
+            u_dir,
+            v_dir,
+            uw,
+            uh,
+            layer,
+            sky,
+            shade,
+            corner_morph_y,
+        );
+        return;
+    }
+    // (s, y): s across the wall, y up it, node-local.
+    let vert = |s: f32, y: i32| {
+        let t = (y - bottom) as f32;
+        let (du, dv) = if u_vertical { (t, s) } else { (s, t) };
+        LodVertex {
+            position: [
+                base[0] + u_dir[0] * du + v_dir[0] * dv,
+                base[1] + u_dir[1] * du + v_dir[1] * dv,
+                base[2] + u_dir[2] * du + v_dir[2] * dv,
+            ],
+            uv: [du, dv],
+            layer,
+            sky,
+            morph_y: morph_bottom + (morph_top - morph_bottom) * t / height,
+            shade,
+        }
+    };
+    let chain = |inner: &[i32]| {
+        let mut c = Vec::with_capacity(inner.len() + 2);
+        c.push(bottom);
+        c.extend_from_slice(inner);
+        c.push(top);
+        c
+    };
+    let (l, r) = (chain(left), chain(right));
+    // Zip the two edges bottom to top. Each triangle is counter-clockwise in
+    // (s, y); emit_lod_rect's quads are counter-clockwise in (u, v), which is
+    // (s, y) mirrored when u runs up — so those triangles reverse.
+    let (mut i, mut j) = (0, 0);
+    while i + 1 < l.len() || j + 1 < r.len() {
+        let up_left = j + 1 == r.len() || (i + 1 < l.len() && l[i + 1] <= r[j + 1]);
+        let tri = if up_left {
+            i += 1;
+            [vert(0.0, l[i - 1]), vert(width, r[j]), vert(0.0, l[i])]
+        } else {
+            j += 1;
+            [vert(0.0, l[i]), vert(width, r[j - 1]), vert(width, r[j])]
+        };
+        let [a, b, c] = if u_vertical {
+            [tri[2], tri[1], tri[0]]
+        } else {
+            tri
+        };
+        let at = mesh.vertices.len() as u32;
+        mesh.vertices.extend_from_slice(&[a, b, c, c]);
+        mesh.indices
+            .extend_from_slice(&[at, at + 1, at + 2, at, at + 2, at + 3]);
+    }
+}
+
 pub fn mesh_lod_heightfield(
     heights: &[i32],
     h_stride: i32,
@@ -2418,13 +2519,29 @@ pub fn mesh_lod_heightfield_with(
         }
     }
 
+    // Walls are collected first, so every one can then carry a vertex at
+    // every height where any wall on the same vertical corner line ends
+    // (`emit_lod_wall`). Corners are indexed (cx, cz) on the cell-corner grid.
+    struct Wall {
+        base: [f32; 3],
+        u_dir: [f32; 3],
+        v_dir: [f32; 3],
+        span: (i32, i32),
+        u_vertical: bool,
+        corners: [(i32, i32); 2],
+        layer: u32,
+        shade: f32,
+        morph: (f32, f32),
+    }
+    let mut walls: Vec<Wall> = Vec::new();
+    let corner_idx = |(x, z): (i32, i32)| (z * (n + 1) + x) as usize;
+    let mut breaks: Vec<Vec<i32>> = vec![Vec::new(); ((n + 1) * (n + 1)) as usize];
+    let w = h_stride as f32;
     for cz in 0..n {
         for cx in 0..n {
             let h = at(cx, cz) - origin_y;
             let coarse_h = coarse_at(cx, cz) - origin_y;
             let (x0, z0) = ((cx * h_stride) as f32, (cz * h_stride) as f32);
-            let w = h_stride as f32;
-            let top = (h + 1) as f32;
             let coarse_top = (coarse_h + 1) as f32;
 
             // Vertical walls down to each lower neighbour. Outside the node,
@@ -2479,70 +2596,83 @@ pub fn mesh_lod_heightfield_with(
                 // is degenerate at one end has ZERO height there rather than
                 // negative height (which would be an inverted quad). It opens
                 // up smoothly as the morph carries it to the other end.
-                let wall_bottom = (neighbour.min(h) + 1) as f32;
-                let wall_height = top - wall_bottom;
+                let (bottom, top) = (neighbour.min(h) + 1, h + 1);
+                let wall_bottom = bottom as f32;
                 let shade = face_brightness(axis, positive);
                 let layer = layer_of(grass, face_index);
                 let plane = if positive { w } else { 0.0 };
                 // Winding follows FACE_DIRS so back-face culling keeps these.
                 // `u_vertical` records which of the two quad axes runs UP, so
-                // the morph targets land on the right corners.
-                let (base, u_dir, v_dir, uw, uh, u_vertical) = match (axis, positive) {
+                // the morph targets land on the right corners. The horizontal
+                // axis always runs +X or +Z from `corners[0]`.
+                let (base, u_dir, v_dir, u_vertical) = match (axis, positive) {
                     (0, true) => (
                         [x0 + plane, wall_bottom, z0],
                         axis_unit(1),
                         axis_unit(2),
-                        wall_height,
-                        w,
                         true,
                     ),
-                    (0, false) => (
-                        [x0, wall_bottom, z0],
-                        axis_unit(2),
-                        axis_unit(1),
-                        w,
-                        wall_height,
-                        false,
-                    ),
+                    (0, false) => ([x0, wall_bottom, z0], axis_unit(2), axis_unit(1), false),
                     (2, true) => (
                         [x0, wall_bottom, z0 + plane],
                         axis_unit(0),
                         axis_unit(1),
-                        w,
-                        wall_height,
                         false,
                     ),
-                    _ => (
-                        [x0, wall_bottom, z0],
-                        axis_unit(1),
-                        axis_unit(0),
-                        wall_height,
-                        w,
-                        true,
-                    ),
+                    _ => ([x0, wall_bottom, z0], axis_unit(1), axis_unit(0), true),
                 };
-                let morph_top = coarse_top;
+                let corners = match (axis, positive) {
+                    (0, true) => [(cx + 1, cz), (cx + 1, cz + 1)],
+                    (0, false) => [(cx, cz), (cx, cz + 1)],
+                    (2, true) => [(cx, cz + 1), (cx + 1, cz + 1)],
+                    _ => [(cx, cz), (cx + 1, cz)],
+                };
+                for c in corners {
+                    breaks[corner_idx(c)].extend([bottom, top]);
+                }
                 let morph_bottom = (coarse_neighbour.min(coarse_h) + 1) as f32;
-                // Corners run (0,0)→(uw,0)→(uw,uh)→(0,uh).
-                let corner_morph_y = if u_vertical {
-                    [morph_bottom, morph_top, morph_top, morph_bottom]
-                } else {
-                    [morph_bottom, morph_bottom, morph_top, morph_top]
-                };
-                emit_lod_rect(
-                    &mut mesh,
+                walls.push(Wall {
                     base,
                     u_dir,
                     v_dir,
-                    uw,
-                    uh,
+                    span: (bottom, top),
+                    u_vertical,
+                    corners,
                     layer,
-                    sky,
                     shade,
-                    corner_morph_y,
-                );
+                    morph: (morph_bottom, coarse_top),
+                });
             }
         }
+    }
+    for b in &mut breaks {
+        b.sort_unstable();
+        b.dedup();
+    }
+    for wall in &walls {
+        let (bottom, top) = wall.span;
+        let inside = |c: (i32, i32)| -> Vec<i32> {
+            breaks[corner_idx(c)]
+                .iter()
+                .copied()
+                .filter(|&y| bottom < y && y < top)
+                .collect()
+        };
+        let (left, right) = (inside(wall.corners[0]), inside(wall.corners[1]));
+        emit_lod_wall(
+            &mut mesh,
+            wall.base,
+            wall.u_dir,
+            wall.v_dir,
+            w,
+            wall.span,
+            wall.u_vertical,
+            (&left, &right),
+            wall.layer,
+            sky,
+            wall.shade,
+            wall.morph,
+        );
     }
     // The sea surface (ADR-0011 decision 1c): a translucent quad at sea level
     // over every cell whose ground is below it, after all the ground, so it
@@ -2902,6 +3032,81 @@ mod heightfield_tests {
                                 !verts.contains(&pt),
                                 "{label}, stride {stride}: vertex {pt:?}/16 inside top edge {a:?}-{b:?}"
                             );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// THE white specks, still there after the fans (2026-10-17: the
+    /// magenta-sky check showed them as holes; merging and skirts off changed
+    /// nothing). No vertex of ANY opaque face — walls and skirts included —
+    /// may lie partway along an axis-aligned edge of another. Two walls side
+    /// by side in one plane meet along a vertical corner line, and each stops
+    /// at its own cells' heights: the taller one's edge ran past the other's
+    /// corners, a T-junction on every such line in rough terrain.
+    #[test]
+    fn no_opaque_face_has_a_t_junction() {
+        use std::collections::HashMap;
+        let q = |v: f32| (v * 16.0).round() as i64;
+        let rough = {
+            let mut s = 0x9e37_79b9u32;
+            (0..LOD_CELLS * LOD_CELLS)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 17;
+                    s ^= s << 5;
+                    (s % 9) as i32 - 4
+                })
+                .collect::<Vec<i32>>()
+        };
+        for (label, heights) in [
+            ("plateaus", plateaus()),
+            ("varied", varied()),
+            ("rough", rough),
+            ("flat", flat(9)),
+        ] {
+            for stride in [2, 4] {
+                for merge in [true, false] {
+                    let mesh =
+                        mesh_lod_heightfield_with(&heights, stride, 0, |_, f| f as u32, 4, merge);
+                    // Every axis-aligned triangle edge, by the line it lies on:
+                    // for axis a, the key is the other two coordinates and the
+                    // value the edge's span along a. Diagonals are interior to
+                    // a quad or fan and shared by construction.
+                    let mut on_line: HashMap<(usize, i64, i64), Vec<(i64, i64)>> = HashMap::new();
+                    for tri in mesh.opaque_indices().chunks_exact(3) {
+                        let p: Vec<[i64; 3]> = tri
+                            .iter()
+                            .map(|&i| mesh.vertices[i as usize].position.map(q))
+                            .collect();
+                        for (a, b) in [(p[0], p[1]), (p[1], p[2]), (p[2], p[0])] {
+                            let differ: Vec<usize> = (0..3).filter(|&k| a[k] != b[k]).collect();
+                            let [axis] = differ[..] else { continue };
+                            let key = match axis {
+                                0 => (0, a[1], a[2]),
+                                1 => (1, a[0], a[2]),
+                                _ => (2, a[0], a[1]),
+                            };
+                            let span = (a[axis].min(b[axis]), a[axis].max(b[axis]));
+                            on_line.entry(key).or_default().push(span);
+                        }
+                    }
+                    // Two edges overlapping along one line must meet end to
+                    // end: an end of one strictly inside the other is a
+                    // T-junction — a crack rasterization need not close.
+                    for (key, spans) in &on_line {
+                        for &(lo, hi) in spans {
+                            for &(a, b) in spans {
+                                let overlap = a < hi && lo < b;
+                                let inside = |v: i64| lo < v && v < hi;
+                                assert!(
+                                    !(overlap && (inside(a) || inside(b))),
+                                    "{label}, stride {stride}, merge {merge}: edge {a}..{b} \
+                                     ends inside edge {lo}..{hi} on line {key:?} (1/16 blocks)"
+                                );
+                            }
                         }
                     }
                 }
