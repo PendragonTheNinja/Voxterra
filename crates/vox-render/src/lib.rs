@@ -258,7 +258,10 @@ pub struct ShapeParams {
 }
 
 pub struct Renderer {
-    surface: wgpu::Surface<'static>,
+    /// The window's surface; `None` for a headless renderer, which draws into
+    /// `offscreen` instead (`Renderer::new_headless`).
+    surface: Option<wgpu::Surface<'static>>,
+    offscreen: Option<wgpu::Texture>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
@@ -376,20 +379,7 @@ impl Renderer {
             force_fallback_adapter: false,
         }))
         .expect("no suitable GPU adapter found");
-
-        log::info!("GPU: {:?}", adapter.get_info().name);
-        let gpu_name = adapter.get_info().name;
-
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("main device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                memory_hints: wgpu::MemoryHints::Performance,
-            },
-            None,
-        ))
-        .expect("failed to acquire device");
+        let (device, queue) = request_device(&adapter);
 
         let mut config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
@@ -416,6 +406,98 @@ impl Renderer {
             }
         }
         surface.configure(&device, &config);
+        Self::build(device, queue, config, Some(surface), &adapter)
+    }
+
+    /// A renderer with no window, drawing `width × height` frames into a
+    /// texture that `read_frame` returns — so the real pipelines, shaders and
+    /// draw loop can be checked without a display (on any adapter wgpu finds,
+    /// a software one included). Panics if there is none.
+    pub fn new_headless(width: u32, height: u32) -> Self {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .expect("no suitable GPU adapter found");
+        let (device, queue) = request_device(&adapter);
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            width: width.max(1),
+            height: height.max(1),
+            present_mode: wgpu::PresentMode::Fifo,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+            view_formats: vec![],
+        };
+        Self::build(device, queue, config, None, &adapter)
+    }
+
+    /// The headless frame last rendered, as tightly packed RGBA8 rows
+    /// (sRGB-encoded, as a window would show it). Panics on a windowed
+    /// renderer.
+    pub fn read_frame(&self) -> Vec<u8> {
+        let texture = self
+            .offscreen
+            .as_ref()
+            .expect("read_frame needs a headless renderer");
+        let (w, h) = (self.config.width, self.config.height);
+        let row = (w * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("frame readback"),
+            size: u64::from(row * h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("frame readback"),
+            });
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(Some(encoder.finish()));
+        let slice = buffer.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |r| r.expect("frame readback failed"));
+        self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
+        let data = slice.get_mapped_range();
+        let mut out = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            let start = (y * row) as usize;
+            out.extend_from_slice(&data[start..start + (w * 4) as usize]);
+        }
+        out
+    }
+
+    fn build(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        config: wgpu::SurfaceConfiguration,
+        surface: Option<wgpu::Surface<'static>>,
+        adapter: &wgpu::Adapter,
+    ) -> Self {
+        log::info!("GPU: {:?}", adapter.get_info().name);
+        let gpu_name = adapter.get_info().name;
+        let offscreen = surface
+            .is_none()
+            .then(|| create_offscreen(&device, &config));
 
         let depth_view = create_depth_view(&device, &config);
 
@@ -962,6 +1044,7 @@ impl Renderer {
         let egui_renderer = egui_wgpu::Renderer::new(&device, config.format, None, 1, false);
         Self {
             surface,
+            offscreen,
             device,
             queue,
             config,
@@ -1408,7 +1491,10 @@ impl Renderer {
         }
         self.config.width = width;
         self.config.height = height;
-        self.surface.configure(&self.device, &self.config);
+        match &self.surface {
+            Some(surface) => surface.configure(&self.device, &self.config),
+            None => self.offscreen = Some(create_offscreen(&self.device, &self.config)),
+        }
         // Depth buffer dimensions must always match the surface.
         self.depth_view = create_depth_view(&self.device, &self.config);
     }
@@ -1425,16 +1511,19 @@ impl Renderer {
     /// alone. The UI is drawn last, over the finished frame, with no depth
     /// attachment.
     pub fn render(&mut self, view_proj: [[f32; 4]; 4], ui: Option<UiFrame<'_>>) {
-        let frame = match self.surface.get_current_texture() {
-            Ok(frame) => frame,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                self.surface.configure(&self.device, &self.config);
-                return;
-            }
-            Err(e) => {
-                log::error!("surface error: {e:?}");
-                return;
-            }
+        let frame = match &self.surface {
+            Some(surface) => match surface.get_current_texture() {
+                Ok(frame) => Some(frame),
+                Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                    surface.configure(&self.device, &self.config);
+                    return;
+                }
+                Err(e) => {
+                    log::error!("surface error: {e:?}");
+                    return;
+                }
+            },
+            None => None,
         };
 
         self.queue
@@ -1460,9 +1549,14 @@ impl Renderer {
         let mut drawn = 0usize;
         let mut tris = 0usize;
 
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let target = match &frame {
+            Some(frame) => &frame.texture,
+            None => self
+                .offscreen
+                .as_ref()
+                .expect("a headless renderer has a target"),
+        };
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut encoder = self
             .device
@@ -1661,7 +1755,9 @@ impl Renderer {
         }
 
         self.queue.submit(Some(encoder.finish()));
-        frame.present();
+        if let Some(frame) = frame {
+            frame.present();
+        }
     }
 }
 
@@ -1917,6 +2013,38 @@ fn fullres_mask_placement(center: ChunkPos, render_origin: ChunkPos) -> [f32; 4]
         s as f32,
         FULLRES_MASK_SIDE as f32,
     ]
+}
+
+fn request_device(adapter: &wgpu::Adapter) -> (wgpu::Device, wgpu::Queue) {
+    pollster::block_on(adapter.request_device(
+        &wgpu::DeviceDescriptor {
+            label: Some("main device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            memory_hints: wgpu::MemoryHints::Performance,
+        },
+        None,
+    ))
+    .expect("failed to acquire device")
+}
+
+/// The colour target of a headless renderer, sized and formatted like the
+/// surface it stands in for.
+fn create_offscreen(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("offscreen frame"),
+        size: wgpu::Extent3d {
+            width: config.width,
+            height: config.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: config.format,
+        usage: config.usage,
+        view_formats: &[],
+    })
 }
 
 fn create_depth_view(

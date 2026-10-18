@@ -2448,6 +2448,21 @@ impl ApplicationHandler for App {
                                     "LOD skirts {} (rebuilding LOD)",
                                     if self.lod_skirts { "ON" } else { "off" }
                                 );
+                            } else if code == KeyCode::KeyP {
+                                // Debug: everything needed to rebuild this
+                                // exact frame headlessly (the speck hunt).
+                                let (w, h) =
+                                    self.renderer.as_ref().map_or((0, 0), |r| r.surface_size());
+                                log::info!(
+                                    "VIEW pos {:.2} {:.2} {:.2} yaw {:.4} pitch {:.4} window {w}x{h} time {:.3} | {:?}",
+                                    self.camera.position.x,
+                                    self.camera.position.y,
+                                    self.camera.position.z,
+                                    self.camera.yaw,
+                                    self.camera.pitch,
+                                    self.world_time.time_of_day(),
+                                    self.settings
+                                );
                             } else if let Some(slot) = digit_slot(code) {
                                 self.select_block_slot(slot);
                             } else {
@@ -2780,4 +2795,176 @@ fn main() {
         ..Default::default()
     };
     event_loop.run_app(&mut app).expect("event loop error");
+}
+
+#[cfg(test)]
+mod specks_scratch {
+    use super::*;
+
+    /// Scratch: render the LOD ring headlessly with a magenta sky and count
+    /// isolated magenta pixels (holes). Env: SPECK_EXTRA, SPECK_X, SPECK_Y
+    /// (or SPECK_UP above ground), SPECK_Z, SPECK_YAW, SPECK_PITCH, SPECK_W,
+    /// SPECK_H, SPECK_FOV, SPECK_MORPH, SPECK_CURVE, SPECK_OUT — the P key's
+    /// VIEW line has them all.
+    #[test]
+    #[ignore]
+    fn specks() {
+        let env = |k: &str, d: f64| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        let (w, h) = (env("SPECK_W", 1280.0) as u32, env("SPECK_H", 720.0) as u32);
+        let shape = WorldShape::default();
+        let generator = vox_worldgen::Generator::new(0x7e22ac0de, shape);
+        let registry = vox_core::BlockRegistry::default_set();
+        let mut settings = vox_core::Settings::default();
+        settings.fov_degrees = env("SPECK_FOV", settings.fov_degrees as f64) as f32;
+        settings.lod_morph_band = env("SPECK_MORPH", settings.lod_morph_band as f64) as f32;
+        let extra = env("SPECK_EXTRA", 3.0) as u32;
+        let levels = vox_core::LodLevel::extended(&LOD_LEVELS, extra, LOD_INNER_CHUNKS);
+        let far_blocks = (levels.last().unwrap().outer_chunks * CHUNK_SIZE_I) as f32;
+        let band = (vox_core::WORLD_Y_MIN_BLOCKS, vox_core::WORLD_Y_MAX_BLOCKS);
+        let mut ring = LodRing::new(LOD_INNER_CHUNKS, &levels, LOD_UNLOAD_MARGIN_CHUNKS, band);
+
+        let (x, z) = (env("SPECK_X", -19711.5), env("SPECK_Z", 20480.5));
+        let ground = generator.surface_height(x as i64, z as i64) as f64;
+        let y = std::env::var("SPECK_Y").ok().and_then(|v| v.parse().ok());
+        let pos = DVec3::new(x, y.unwrap_or(ground + env("SPECK_UP", 40.0)), z);
+        let cam_chunk = ChunkPos::new(
+            (pos.x.floor() as i64) >> 5,
+            (pos.y.floor() as i64) >> 5,
+            (pos.z.floor() as i64) >> 5,
+        );
+        let update = ring.update(cam_chunk);
+
+        let grass = vox_core::registry::GRASS;
+        let stone = vox_core::registry::STONE;
+        let water = vox_core::registry::WATER;
+        let gl: [u32; 6] = std::array::from_fn(|f| registry.face_layer(grass, f));
+        let sl: [u32; 6] = std::array::from_fn(|f| registry.face_layer(stone, f));
+        let wl: [u32; 6] = std::array::from_fn(|f| registry.face_layer(water, f));
+
+        let mut r = vox_render::Renderer::new_headless(w, h);
+        r.set_render_origin(cam_chunk);
+        r.set_debug_holes(true);
+        let unload = 8 + 2; // default radius 8 + streamer slack, roughly
+        use rayon::prelude::*;
+        let meshes: Vec<_> = update
+            .to_load
+            .par_iter()
+            .map(|n| {
+                let stride = ring.stride(n.level);
+                let (bx, by, bz) = ring.node_origin_blocks(*n);
+                let reach = unload + ring.inner_snap_chunks(n.level);
+                let sampling = if ring.closest_approach_chunks(n.level) <= reach {
+                    LodSampling::Exact
+                } else {
+                    LodSampling::Sparse
+                };
+                let heights = generator.lod_heightfield(bx, bz, stride, sampling);
+                let mesh = vox_mesh::mesh_lod_heightfield(
+                    &heights,
+                    stride as i32,
+                    by as i32,
+                    |b, f| {
+                        if b == grass {
+                            gl[f]
+                        } else if b == water {
+                            wl[f]
+                        } else {
+                            sl[f]
+                        }
+                    },
+                    LOD_SKIRT_DEPTH_CELLS * stride as i32,
+                );
+                (*n, mesh)
+            })
+            .collect();
+        for (n, mesh) in &meshes {
+            let span = ring.span_blocks(n.level) as f32;
+            let origin = App::lod_node_origin_chunk(&ring, *n);
+            let morph_end = ring.morph_end_blocks(n.level).map_or(0.0, |b| b as f32);
+            r.set_lod_mesh(origin, n.level, span, morph_end, mesh);
+        }
+
+        let far = (far_blocks * 1.6).max(1000.0);
+        let render_origin = cam_chunk.origin();
+        let rel = (pos
+            - DVec3::new(
+                render_origin.x as f64,
+                render_origin.y as f64,
+                render_origin.z as f64,
+            ))
+        .as_vec3();
+        let (yaw, pitch) = (env("SPECK_YAW", 0.0), env("SPECK_PITCH", -0.12));
+        let fwd = DVec3::new(
+            pitch.cos() * yaw.cos(),
+            pitch.sin(),
+            pitch.cos() * yaw.sin(),
+        )
+        .as_vec3();
+        let proj = vox_render::perspective(
+            settings.fov_degrees.to_radians(),
+            w as f32 / h as f32,
+            0.1,
+            far,
+        );
+        let view_proj = proj * Mat4::look_to_rh(rel, fwd, Vec3::Y);
+        let time = vox_core::WorldTime::from_ticks((0.5 * vox_core::TICKS_PER_DAY as f64) as u64);
+        let (fog_start, fog_end) = settings.fog_range(far / 1.6);
+        let fog = vox_render::FogParams {
+            color: [0.68, 0.82, 0.95],
+            strength: settings.effective_fog_strength(),
+            start: fog_start,
+            end: fog_end,
+            density: settings.effective_atmosphere(),
+            eye_height: (pos.y - (vox_core::SEA_LEVEL_BLOCKS + 1) as f64) as f32,
+        };
+        let shape_p = vox_render::ShapeParams {
+            morph_band: settings.lod_morph_band,
+            curvature: if env("SPECK_CURVE", 1.0) > 0.0 {
+                vox_core::curvature_coefficient() as f32
+            } else {
+                0.0
+            },
+        };
+        r.set_sky(
+            time,
+            view_proj.inverse().to_cols_array_2d(),
+            [rel.x, rel.y, rel.z],
+            fog,
+            1.0,
+            shape_p,
+        );
+        r.set_fullres_columns(cam_chunk, |_, _| false);
+        r.render(view_proj.to_cols_array_2d(), None);
+        let px = r.read_frame();
+
+        let magenta = |i: usize| px[i * 4] > 240 && px[i * 4 + 1] < 20 && px[i * 4 + 2] > 240;
+        let (wi, hi) = (w as usize, h as usize);
+        let mut isolated = 0;
+        for y in 1..hi - 1 {
+            for x in 1..wi - 1 {
+                let i = y * wi + x;
+                if magenta(i) {
+                    let n = [i - 1, i + 1, i - wi, i + wi]
+                        .iter()
+                        .filter(|&&j| magenta(j))
+                        .count();
+                    if n <= 1 {
+                        isolated += 1;
+                    }
+                }
+            }
+        }
+        println!(
+            "nodes {} tris {} isolated magenta pixels: {isolated}",
+            meshes.len(),
+            r.tris_last_frame()
+        );
+        let out = std::env::var("SPECK_OUT").unwrap_or("/tmp/specks.rgba".into());
+        std::fs::write(&out, &px).unwrap();
+    }
 }

@@ -240,6 +240,20 @@ the remote matches it, and starts at the first unchecked item.*
   tallest. Known limit: added vertices morph linearly up their own wall, so
   two walls sharing one may part slightly inside a morph band while it
   animates. To confirm in play: H shows no magenta specks in the distance.
+- [ ] **In play, 2026-10-18: the specks remain, magenta under H.** Neither
+  T-junction fix touched them, and the skirts are ruled out too (on real
+  terrain no node border steps further than a skirt reaches: 0 of 10 240
+  border pairs at any stride). New instrument: `Renderer::new_headless` and
+  `read_frame` draw the real pipelines into a texture on any adapter —
+  lavapipe in the cloud container (`apt-get install mesa-vulkan-drivers`) —
+  and the ignored test `specks_scratch::specks` renders the whole LOD ring
+  with a magenta sky and counts pinholes. It finds almost none: 0–11 per
+  frame at 6 and 8 levels, 800×600 to 1920×1080, 40 to 2 000 blocks up,
+  curvature on or off, before and after the wall fix — so the game's specks
+  come from something the harness does not do (full resolution and its
+  mask, node retirement, the GPU). Next: the owner presses **P** on a
+  speckled view (logs a `VIEW` line: position, yaw, pitch, window, time,
+  settings) and the harness renders that exact frame.
 - [x] **Benchmark mode: `cargo run -p vox-app -- --bench`.** One fixed,
   repeatable run instead of hand-timed retro runs: default settings, noon
   with time paused, eight phases — {6, 8 levels} × {land, ocean} ×
