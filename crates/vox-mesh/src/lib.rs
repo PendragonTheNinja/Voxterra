@@ -761,6 +761,109 @@ fn ao_factor(level: u8) -> f32 {
 ///   +Z: X×Y=+Z   -Z: Y×X=-Z
 /// With this choice, emitting corners base, base+u, base+u+v, base+v gives
 /// CCW winding viewed from outside — matching wgpu's default front face.
+/// Which cells could show a face, per direction, as bit rows — the greedy
+/// mesher's prefilter (M12 task 1).
+///
+/// The mask sweep visits 6 × 32³ cells per chunk, and before this asked each
+/// one the full face question through the padded arrays — ~180 instructions
+/// a cell, nearly all of them answering "no": a surface chunk has a few
+/// thousand visible faces among its 196 608 candidates. Rows of 32 cells
+/// along X as `u64` bits answer the cheap part of the question for 32 cells
+/// at once: a face needs a block that renders, against a neighbour that does
+/// not occlude, and — when only one non-occluding block is anywhere in reach
+/// (water, in practice) — not two of those meeting. Only cells that pass are
+/// asked the real question (`MeshInput::shows_face`), so this can only drop
+/// cells that question would reject: the mesh is identical, which
+/// `prefiltered_greedy_mesh_is_identical` pins.
+struct FaceCandidates {
+    /// Per direction (`FACE_DIRS` order), per `(y, z)` at `y * 32 + z`: bit
+    /// `x` set if the cell at `(x, y, z)` might show that face.
+    rows: Vec<u32>,
+    /// Per direction and slice: does any cell in the slice pass?
+    slice_any: [[bool; CHUNK_SIZE]; 6],
+}
+
+impl FaceCandidates {
+    fn new(input: &MeshInput) -> Self {
+        // Padded rows: bit x + 1 is chunk x (-1..=32), row (y + 1) + (z + 1) * PAD.
+        let mut renders = vec![0u64; PAD * PAD];
+        let mut opaque = vec![0u64; PAD * PAD];
+        let mut clear = vec![0u64; PAD * PAD];
+        let mut clear_block: Option<BlockId> = None;
+        let mut one_clear = true;
+        for z in 0..PAD {
+            for y in 0..PAD {
+                let r = y + z * PAD;
+                for x in 0..PAD {
+                    let i = MeshInput::idx(x, y, z);
+                    let b = input.block[i];
+                    if b.is_air() {
+                        continue;
+                    }
+                    renders[r] |= 1 << x;
+                    if input.opaque[i] {
+                        opaque[r] |= 1 << x;
+                    } else {
+                        clear[r] |= 1 << x;
+                        match clear_block {
+                            None => clear_block = Some(b),
+                            Some(c) if c != b => one_clear = false,
+                            Some(_) => {}
+                        }
+                    }
+                }
+            }
+        }
+        let n = CHUNK_SIZE;
+        let mut rows = vec![0u32; 6 * n * n];
+        let mut slice_any = [[false; CHUNK_SIZE]; 6];
+        for (d, &(axis, positive, _, _)) in FACE_DIRS.iter().enumerate() {
+            let step: isize = if positive { 1 } else { -1 };
+            let mut all_rows = 0u32;
+            for z in 0..n {
+                for y in 0..n {
+                    let r = (y + 1) + (z + 1) * PAD;
+                    // The neighbour's row, shifted so its bits line up with
+                    // this row's cells.
+                    let neighbour = |plane: &[u64]| match axis {
+                        0 if positive => plane[r] >> 1,
+                        0 => plane[r] << 1,
+                        1 => plane[(r as isize + step) as usize],
+                        _ => plane[(r as isize + step * PAD as isize) as usize],
+                    };
+                    let mut cand = renders[r] & !neighbour(&opaque);
+                    if one_clear {
+                        cand &= !(clear[r] & neighbour(&clear));
+                    }
+                    let bits = (cand >> 1) as u32;
+                    rows[d * n * n + y * n + z] = bits;
+                    all_rows |= bits;
+                    if bits != 0 {
+                        match axis {
+                            1 => slice_any[d][y] = true,
+                            2 => slice_any[d][z] = true,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            if axis == 0 {
+                for (x, any) in slice_any[d].iter_mut().enumerate() {
+                    *any = all_rows >> x & 1 != 0;
+                }
+            }
+        }
+        Self { rows, slice_any }
+    }
+
+    /// Might the cell at chunk coords `c` show face `d`?
+    #[inline]
+    fn has(&self, d: usize, c: [i32; 3]) -> bool {
+        let n = CHUNK_SIZE;
+        self.rows[d * n * n + c[1] as usize * n + c[2] as usize] >> c[0] & 1 != 0
+    }
+}
+
 const FACE_DIRS: [(usize, bool, usize, usize); 6] = [
     (0, true, 1, 2),
     (0, false, 2, 1),
@@ -978,11 +1081,21 @@ pub fn mesh_chunk(
     layer_of: impl FnMut(BlockId, usize) -> u32,
     occludes: impl FnMut(BlockId) -> bool,
 ) -> MeshData {
-    mesh_chunk_greedy(chunk, neighbors, layer_of, occludes, chunk.is_uniform())
+    mesh_chunk_greedy(
+        chunk,
+        neighbors,
+        layer_of,
+        occludes,
+        chunk.is_uniform(),
+        true,
+    )
 }
 
-/// [`mesh_chunk`], with the uniform-chunk shortcut a parameter so tests can
-/// compare it against the full sweep.
+/// [`mesh_chunk`], with its two shortcuts parameters so tests can compare
+/// each against the full sweep.
+///
+/// `prefilter`: ask the face question only of cells [`FaceCandidates`] lets
+/// through, and skip slices where it lets none through.
 ///
 /// `boundary_only`: sweep only each direction's outermost slice. Exact for a
 /// uniform chunk — inside it every face is between two cells of one block,
@@ -997,6 +1110,7 @@ fn mesh_chunk_greedy(
     mut layer_of: impl FnMut(BlockId, usize) -> u32,
     occludes: impl FnMut(BlockId) -> bool,
     boundary_only: bool,
+    prefilter: bool,
 ) -> MeshData {
     let mut mesh = MeshData::default();
     let mut transparent = MeshData::default();
@@ -1004,6 +1118,7 @@ fn mesh_chunk_greedy(
     if input.all_air {
         return mesh;
     }
+    let candidates = prefilter.then(|| FaceCandidates::new(&input));
 
     let size = CHUNK_SIZE;
     // Per-slice mask: each visible face cell carries its block AND its four
@@ -1032,6 +1147,12 @@ fn mesh_chunk_greedy(
         };
 
         for slice in slices {
+            if candidates
+                .as_ref()
+                .is_some_and(|c| !c.slice_any[face_index][slice])
+            {
+                continue;
+            }
             // --- Build the visibility mask for this slice. ---
             let mut any = false;
             for v in 0..size {
@@ -1041,9 +1162,16 @@ fn mesh_chunk_greedy(
                     coords[u_axis] = u as i32;
                     coords[v_axis] = v as i32;
 
+                    let cell = &mut mask[at(u, v)];
+                    if candidates
+                        .as_ref()
+                        .is_some_and(|c| !c.has(face_index, coords))
+                    {
+                        *cell = None;
+                        continue;
+                    }
                     let block = input.block(coords[0], coords[1], coords[2]);
 
-                    let cell = &mut mask[at(u, v)];
                     if block.is_air() {
                         *cell = None;
                         continue;
@@ -2081,6 +2209,74 @@ mod tests {
         chunk
     }
 
+    /// The prefilter (`FaceCandidates`, M12 task 1) must change nothing:
+    /// over random chunks — sparse to dense, with water, and with two
+    /// different see-through blocks meeting (where it cannot drop clear-clear
+    /// pairs) — against random, sealed and absent neighbours, with light
+    /// varying, the mesh is identical to the unfiltered sweep's.
+    #[test]
+    fn prefiltered_greedy_mesh_is_identical() {
+        const GLASS: BlockId = BlockId(10);
+        let water_only = |b: BlockId| !b.is_air() && b != WATER;
+        let two_clear = |b: BlockId| !b.is_air() && b != WATER && b != GLASS;
+        let offsets = [
+            (-1, 0, 0),
+            (1, 0, 0),
+            (0, -1, 0),
+            (0, 1, 0),
+            (0, 0, -1),
+            (0, 0, 1),
+        ];
+        let mut faces = 0;
+        for seed in 0..12u64 {
+            let mut rng = SplitMix64::new(0xFACE + seed);
+            let fill = 5 + (seed * 17) % 95;
+            // Blocks 1..=10: 9 is water, 10 is glass.
+            let mut chunk = random_chunk(&mut rng, fill, 10);
+            if seed % 3 == 0 {
+                // A sea over a seabed: the common ocean chunk.
+                for pos in LocalPos::iter() {
+                    let b = if pos.y() < 12 { STONE } else { WATER };
+                    chunk.set(pos, b);
+                }
+            }
+            for pos in LocalPos::iter() {
+                if rng.next().is_multiple_of(4) {
+                    chunk.set_sky_light(pos, (rng.next() % 16) as u8);
+                }
+            }
+            let nbrs: Vec<Chunk> = (0..6)
+                .map(|_| {
+                    let fill = 30 + rng.next() % 60;
+                    random_chunk(&mut rng, fill, 10)
+                })
+                .collect();
+            let mut n = ChunkNeighbors::NONE;
+            for (k, &(dx, dy, dz)) in offsets.iter().enumerate() {
+                n = match (seed + k as u64) % 3 {
+                    0 => n.with(dx, dy, dz, &nbrs[k]),
+                    1 => n.with_sealed(dx, dy, dz),
+                    _ => n,
+                };
+            }
+            for (name, occludes) in [
+                ("water", &water_only as &dyn Fn(BlockId) -> bool),
+                ("water and glass", &two_clear),
+            ] {
+                let full = mesh_chunk_greedy(&chunk, &n, WHITE, occludes, false, false);
+                let fast = mesh_chunk_greedy(&chunk, &n, WHITE, occludes, false, true);
+                assert_eq!(full.vertices, fast.vertices, "seed {seed}, {name}");
+                assert_eq!(full.indices, fast.indices, "seed {seed}, {name}");
+                assert_eq!(
+                    full.opaque_index_count, fast.opaque_index_count,
+                    "seed {seed}, {name}"
+                );
+                faces += full.indices.len();
+            }
+        }
+        assert!(faces > 0);
+    }
+
     /// The uniform shortcut (`boundary_only`, M12 task 1) must change
     /// nothing: for uniform chunks of rock, water and air, against every kind
     /// of neighbour — none, sealed, random, like, unlike — the mesh is
@@ -2131,8 +2327,8 @@ mod tests {
                         (_, _) => n.with(dx, dy, dz, &mixed[k]),
                     };
                 }
-                let full = mesh_chunk_greedy(&chunk, &n, WHITE, water_passes, false);
-                let fast = mesh_chunk_greedy(&chunk, &n, WHITE, water_passes, true);
+                let full = mesh_chunk_greedy(&chunk, &n, WHITE, water_passes, false, false);
+                let fast = mesh_chunk_greedy(&chunk, &n, WHITE, water_passes, true, false);
                 assert_eq!(full.vertices, fast.vertices, "{name}, case {case}");
                 assert_eq!(full.indices, fast.indices, "{name}, case {case}");
                 assert_eq!(

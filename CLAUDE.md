@@ -260,15 +260,17 @@ The owner's ideas for all of them, and a proposed order, are recorded in
 - **Active milestone:** 12 — Performance Pass
   (`docs/milestones/12-performance-pass.md`, spec written 2026-10-31).
   Task 0 done (instruments + the owner's baseline, recorded in the spec).
-  Task 1 under way: uniform chunks now mesh only their boundary slices
-  (−61% mesh CPU per chunk headlessly); next, the owner's `--bench` to
-  confirm in game, then mixed (surface) chunks. No low-end
+  Task 1 under way: uniform chunks mesh only their boundary slices
+  (in game: µs/chunk −49%, sprint backlog 1 040 → ~430) and a bitwise
+  prefilter skips cells that cannot show a face (headless: −83% mesh CPU
+  per chunk overall). Next: the owner's `--bench` on the prefilter, then
+  `MeshInput::build`. No low-end
   machine exists yet — the spec says how to judge low-end performance by
   proxy.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 287, vox-mesh 64, vox-worldgen 31, vox-render 17, vox-app 8
-  passing as of M12 task 1's first fix), then start the first unchecked item.
+  vox-core 287, vox-mesh 65, vox-worldgen 31, vox-render 17, vox-app 8
+  passing as of M12 task 1's prefilter), then start the first unchecked item.
 - **Instruments (from M11):** the P key logs a `VIEW` line (exact position,
   angles, window, settings) and a `hole_census` — the frame re-rendered six
   ways on the player's GPU with pinholes counted per variant. In the cloud

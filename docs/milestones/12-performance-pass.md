@@ -179,7 +179,51 @@ Pillar 1 is performance on low-end hardware, and M11's benchmark (RTX 4060,
 
      What remains of a uniform chunk is mostly `MeshInput::build`; mixed
      chunks are now ~85% of the mesh CPU on this path and are the next
-     target. The in-game effect needs the owner's `--bench`.
+     target.
+
+     **In game (owner's `--bench`, 2026-10-31, same machine and window),
+     sprint phases, before → after:**
+
+     | | Baseline | Boundary slices |
+     |---|---|---|
+     | Mesh µs per chunk (CPU) | 1 595–1 690 | **804–841 (−49%)** |
+     | Chunks meshed per second | 1 591–1 684 | 2 121–2 240 (+33%) |
+     | Backlog at the end, 8 levels | 1 046 / 1 028 | **414 / 454 (−58%)** |
+     | fps median, 8 levels | 114 / 113 | 122 / 113 |
+     | Relight ms/s | 175–179 | 172–181 |
+
+     Standing phases, encode, draws and triangles are unchanged within
+     noise, as they should be. Criterion 3 (≤ ~350) not yet met. Halving
+     the cost per chunk raised throughput only a third: the workers now do
+     ~1.8 s of meshing a second where they did ~2.6, so time inside the
+     4 ms pass but outside the jobs (choosing candidates, uploads, rayon
+     hand-off per 8-chunk sub-batch) is now a real share — to measure once
+     the jobs stop shrinking.
+   - [x] **A bitwise prefilter for the face sweep** (2026-10-31). Callgrind
+     on the 381 mixed chunks (dev build): ~36 M instructions a chunk, ~78%
+     in `mesh_chunk`'s own mask loop and the `cidx` calls it makes (not
+     inlined at opt-level 1) — ~180 instructions for each of 196 608 cell
+     questions, nearly all answered "no". Corner light, AO, merging and
+     `emit_sealed_rect` together were under 6%; `MeshInput::build` ~22%.
+     `FaceCandidates` builds rows of cells along X as bits — renders,
+     occludes, and (when only one see-through block is in reach) clear —
+     and finds each direction's possible faces 32 cells at a time; only
+     those cells are asked `shows_face`, and slices with none are skipped.
+     It can only drop cells that question rejects, so the mesh is identical:
+     `prefiltered_greedy_mesh_is_identical` (random chunks, a sea over a
+     seabed, water and glass meeting, random / sealed / absent neighbours,
+     varying light) fails if the X shift is reversed or the one-clear-block
+     rule is applied with two.
+
+     | Dev build, µs per chunk (same 1 296 chunks) | Original | Boundary slices | + prefilter |
+     |---|---|---|---|
+     | Uniform rock / sea | ~3 200 | ~350 | ~320 |
+     | Mixed | ~3 700 | ~3 600 | **~1 120** |
+     | Mean | 3 350 | 1 300 | **554 (−83% overall)** |
+
+     Release build: mean 396 µs, mixed 783. `MeshInput::build` (~350 µs in
+     the dev build) is now most of every uniform chunk's cost and a third of
+     a mixed one's — the next target, after the owner's bench.
 2. **LOD as true triangles** (criterion 4).
 3. **Draw-call measurement, then batching if warranted** (criterion 5).
 4. **Retro.**
