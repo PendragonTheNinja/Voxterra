@@ -258,14 +258,16 @@ The owner's ideas for all of them, and a proposed order, are recorded in
 ## Current status
 
 - **Active milestone:** 12 — Performance Pass
-  (`docs/milestones/12-performance-pass.md`, spec written 2026-10-31, not
-  started). Start with its task 0: a `--bench` baseline on the
-  `v0.11.0-m11` tag. No low-end machine exists yet — the spec says how to
-  judge low-end performance by proxy.
+  (`docs/milestones/12-performance-pass.md`, spec written 2026-10-31).
+  Task 0's instruments are in (2026-10-31: meshed/s, mesh µs per chunk,
+  encode ms, draws, triangles submitted vs drawn); next is the owner's
+  `--bench` baseline run on them, before any optimisation. No low-end
+  machine exists yet — the spec says how to judge low-end performance by
+  proxy.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 287, vox-mesh 61, vox-worldgen 31, vox-render 17, vox-app 6
-  passing as of the M11 close), then start the first unchecked item.
+  vox-core 287, vox-mesh 63, vox-worldgen 31, vox-render 17, vox-app 8
+  passing as of M12 task 0's instruments), then start the first unchecked item.
 - **Instruments (from M11):** the P key logs a `VIEW` line (exact position,
   angles, window, settings) and a `hole_census` — the frame re-rendered six
   ways on the player's GPU with pinholes counted per variant. In the cloud

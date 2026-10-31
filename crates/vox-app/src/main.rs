@@ -284,37 +284,54 @@ fn relight_chunks_parallel(
 /// toward an unlit nothing (the dark line around the loaded disc). The
 /// judgement needs the streamer, so the caller makes it on the main thread;
 /// the workers only read it.
+///
+/// Also returns the summed CPU time of the jobs, milliseconds: the wall time
+/// of the pass hides how much work the workers did, and per-chunk cost is
+/// what the M12 profile optimises.
 fn mesh_chunks_parallel(
     world: &World,
     registry: &BlockRegistry,
     jobs: &[(ChunkPos, u8)],
-) -> Vec<(ChunkPos, MeshData)> {
-    jobs.par_iter()
-        .filter_map(|&(pos, sealed)| {
-            let chunk = world.chunk(pos)?;
-            let mut neighbors = ChunkNeighbors::of(world, pos);
-            for (bit, &(dx, dy, dz)) in NEIGHBOR_OFFSETS.iter().enumerate() {
-                if sealed & (1 << bit) != 0 {
-                    neighbors = neighbors.with_sealed(dx, dy, dz);
-                }
-            }
-            // Texture array (ADR-0003): resolve each face's layer via the
-            // registry. The closure borrows the registry (Sync), shared
-            // across the rayon workers.
-            // VISUAL: faces cull against OPAQUE neighbours (ADR-0011).
-            let mesh = mesh_chunk(
-                chunk,
-                &neighbors,
-                |b, face| registry.face_layer(b, face),
-                |b| registry.is_opaque(b),
-            );
-            if mesh.is_empty() {
-                None
-            } else {
-                Some((pos, mesh))
-            }
+) -> (Vec<(ChunkPos, MeshData)>, f64) {
+    let results: Vec<(Option<(ChunkPos, MeshData)>, f64)> = jobs
+        .par_iter()
+        .map(|&job| {
+            let start = Instant::now();
+            let mesh = mesh_one_chunk(world, registry, job);
+            (mesh, start.elapsed().as_secs_f64() * 1000.0)
         })
-        .collect()
+        .collect();
+    let cpu_ms = results.iter().map(|(_, ms)| ms).sum();
+    (results.into_iter().filter_map(|(m, _)| m).collect(), cpu_ms)
+}
+
+fn mesh_one_chunk(
+    world: &World,
+    registry: &BlockRegistry,
+    (pos, sealed): (ChunkPos, u8),
+) -> Option<(ChunkPos, MeshData)> {
+    let chunk = world.chunk(pos)?;
+    let mut neighbors = ChunkNeighbors::of(world, pos);
+    for (bit, &(dx, dy, dz)) in NEIGHBOR_OFFSETS.iter().enumerate() {
+        if sealed & (1 << bit) != 0 {
+            neighbors = neighbors.with_sealed(dx, dy, dz);
+        }
+    }
+    // Texture array (ADR-0003): resolve each face's layer via the
+    // registry. The closure borrows the registry (Sync), shared
+    // across the rayon workers.
+    // VISUAL: faces cull against OPAQUE neighbours (ADR-0011).
+    let mesh = mesh_chunk(
+        chunk,
+        &neighbors,
+        |b, face| registry.face_layer(b, face),
+        |b| registry.is_opaque(b),
+    );
+    if mesh.is_empty() {
+        None
+    } else {
+        Some((pos, mesh))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -609,6 +626,10 @@ struct App {
     /// takes differences across a phase.
     relight_ms_total: f64,
     mesh_ms_total: f64,
+    /// Chunks meshed since startup, and the summed CPU time of their jobs
+    /// (`mesh_chunks_parallel`) — the benchmark's per-chunk mesh cost.
+    meshed_total: u64,
+    mesh_cpu_ms_total: f64,
     /// `--bench` was given: run the benchmark script once the renderer is up.
     bench_requested: bool,
     bench: Option<bench::Bench>,
@@ -762,6 +783,8 @@ impl Default for App {
             mesh_ms_accum: 0.0,
             relight_ms_total: 0.0,
             mesh_ms_total: 0.0,
+            meshed_total: 0,
+            mesh_cpu_ms_total: 0.0,
             bench_requested: false,
             bench: None,
             bench_started: None,
@@ -1417,7 +1440,9 @@ impl App {
                     .iter()
                     .map(|&p| (p, self.sealed_faces(p, camera_chunk)))
                     .collect();
-                let meshes = mesh_chunks_parallel(&self.world, &self.registry, &jobs);
+                let (meshes, cpu_ms) = mesh_chunks_parallel(&self.world, &self.registry, &jobs);
+                self.mesh_cpu_ms_total += cpu_ms;
+                self.meshed_total += jobs.len() as u64;
                 if let Some(renderer) = self.renderer.as_mut() {
                     let produced: HashSet<ChunkPos> = meshes.iter().map(|(p, _)| *p).collect();
                     // A batch chunk that produced no mesh (all air, or fully
@@ -1586,13 +1611,17 @@ impl App {
         let now = self
             .bench_started
             .map_or(0.0, |t| t.elapsed().as_secs_f64());
-        let (lod_nodes, gpu_mb, tris) = self.renderer.as_ref().map_or((0, 0.0, 0), |r| {
-            (
-                r.lod_count(),
-                r.buffer_bytes() as f32 / 1.048576e6,
-                r.tris_last_frame(),
-            )
-        });
+        let (lod_nodes, gpu_mb, tris, tris_drawn, draws, encode_ms) =
+            self.renderer.as_ref().map_or((0, 0.0, 0, 0, 0, 0.0), |r| {
+                (
+                    r.lod_count(),
+                    r.buffer_bytes() as f32 / 1.048576e6,
+                    r.tris_last_frame(),
+                    r.area_tris_last_frame(),
+                    r.draws_last_frame(),
+                    r.encode_ms_last_frame(),
+                )
+            });
         let sample = bench::Sample {
             frame_ms: raw_dt * 1000.0,
             dirty: self.dirty.len(),
@@ -1602,9 +1631,14 @@ impl App {
             lod_nodes,
             gpu_mb,
             tris,
+            tris_drawn,
+            draws,
+            encode_ms,
             loaded: self.streamer.loaded_count(),
             relight_ms_total: self.relight_ms_total,
             mesh_ms_total: self.mesh_ms_total,
+            meshed_total: self.meshed_total,
+            mesh_cpu_ms_total: self.mesh_cpu_ms_total,
         };
         let Some(b) = self.bench.as_mut() else {
             return false;

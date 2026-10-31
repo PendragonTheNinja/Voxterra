@@ -14,6 +14,11 @@
 //!
 //! Everything here is plain data and arithmetic; the app feeds it one
 //! [`Sample`] per frame and does what each [`Tick`] says.
+//!
+//! A second table (M12 task 0) reports what M12 changes and what a weaker
+//! machine would feel: chunks meshed per second and the CPU cost of each,
+//! the CPU time to encode a frame, draw calls, and triangles submitted
+//! against triangles that cover area.
 
 /// Where a phase runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,12 +108,21 @@ pub struct Sample {
     pub lod_backlog: usize,
     pub lod_nodes: usize,
     pub gpu_mb: f32,
+    /// Triangles submitted, and of those the ones with area.
     pub tris: usize,
+    pub tris_drawn: usize,
+    pub draws: usize,
+    /// CPU time to cull, encode and submit this frame, milliseconds.
+    pub encode_ms: f32,
     pub loaded: usize,
-    /// Running totals since startup, milliseconds — relight and mesh time
-    /// never reset, so a phase's cost is the difference across it.
+    /// Running totals since startup — relight and mesh time (milliseconds)
+    /// and chunks meshed never reset, so a phase's cost is the difference
+    /// across it. `mesh_ms_total` is the main thread's wall time in the mesh
+    /// pass; `mesh_cpu_ms_total` sums the workers' time per chunk.
     pub relight_ms_total: f64,
     pub mesh_ms_total: f64,
+    pub meshed_total: u64,
+    pub mesh_cpu_ms_total: f64,
 }
 
 impl Sample {
@@ -138,6 +152,13 @@ pub struct PhaseStats {
     pub gpu_mb: f32,
     pub tris_median: usize,
     pub loaded_end: usize,
+    pub meshed_per_s: f64,
+    /// Worker CPU time per chunk meshed, microseconds; 0 if none were.
+    pub mesh_us_per_chunk: f64,
+    pub encode_ms_median: f64,
+    pub encode_ms_p99: f64,
+    pub draws_median: usize,
+    pub tris_drawn_median: usize,
 }
 
 /// The `q` quantile (0..=1) of sorted values, nearest-rank.
@@ -159,8 +180,13 @@ pub fn summarize(
 ) -> PhaseStats {
     let mut ms: Vec<f64> = samples.iter().map(|s| f64::from(s.frame_ms)).collect();
     ms.sort_by(f64::total_cmp);
-    let mut tris: Vec<usize> = samples.iter().map(|s| s.tris).collect();
-    tris.sort_unstable();
+    let median_of = |f: fn(&Sample) -> usize| {
+        let mut v: Vec<usize> = samples.iter().map(f).collect();
+        v.sort_unstable();
+        v.get(v.len() / 2).copied().unwrap_or(0)
+    };
+    let mut encode: Vec<f64> = samples.iter().map(|s| f64::from(s.encode_ms)).collect();
+    encode.sort_by(f64::total_cmp);
     let (first, last) = (
         samples.first().copied().unwrap_or_default(),
         samples.last().copied().unwrap_or_default(),
@@ -193,8 +219,17 @@ pub fn summarize(
         dirty_end: last.dirty,
         lod_nodes: last.lod_nodes,
         gpu_mb: last.gpu_mb,
-        tris_median: tris.get(tris.len() / 2).copied().unwrap_or(0),
+        tris_median: median_of(|s| s.tris),
         loaded_end: last.loaded,
+        meshed_per_s: per_s(first.meshed_total as f64, last.meshed_total as f64),
+        mesh_us_per_chunk: match last.meshed_total - first.meshed_total {
+            0 => 0.0,
+            n => (last.mesh_cpu_ms_total - first.mesh_cpu_ms_total) * 1000.0 / n as f64,
+        },
+        encode_ms_median: quantile(&encode, 0.5),
+        encode_ms_p99: quantile(&encode, 0.99),
+        draws_median: median_of(|s| s.draws),
+        tris_drawn_median: median_of(|s| s.tris_drawn),
     }
 }
 
@@ -226,6 +261,30 @@ pub fn report(header: &[String], results: &[PhaseStats]) -> String {
             r.gpu_mb,
             r.tris_median as f64 / 1.0e6,
             r.loaded_end,
+        ));
+    }
+    out.push_str(
+        "\n| Phase | Meshed /s | Mesh µs/chunk (CPU) | Encode ms median / p99 | Draws \
+         | Tris submitted M | Tris drawn M | Zero-area % |\n\
+         |---|---|---|---|---|---|---|---|\n",
+    );
+    for r in results {
+        let padding = if r.tris_median > 0 {
+            100.0 * r.tris_median.saturating_sub(r.tris_drawn_median) as f64 / r.tris_median as f64
+        } else {
+            0.0
+        };
+        out.push_str(&format!(
+            "| {} | {:.0} | {:.0} | {:.2} / {:.2} | {} | {:.2} | {:.2} | {:.0} |\n",
+            r.label,
+            r.meshed_per_s,
+            r.mesh_us_per_chunk,
+            r.encode_ms_median,
+            r.encode_ms_p99,
+            r.draws_median,
+            r.tris_median as f64 / 1.0e6,
+            r.tris_drawn_median as f64 / 1.0e6,
+            padding,
         ));
     }
     out
@@ -435,6 +494,44 @@ mod tests {
         assert_eq!((s.relight_ms_per_s, s.mesh_ms_per_s), (150.0, 450.0));
     }
 
+    #[test]
+    fn mesh_cost_per_chunk_is_worker_time_over_chunks_meshed() {
+        let mut a = sample(5.0, 0);
+        a.meshed_total = 100;
+        a.mesh_cpu_ms_total = 50.0;
+        let mut b = a;
+        b.meshed_total = 500;
+        b.mesh_cpu_ms_total = 250.0;
+        let s = summarize("x".into(), 0.0, false, &[a, b], 4.0);
+        assert_eq!(s.meshed_per_s, 100.0);
+        assert_eq!(s.mesh_us_per_chunk, 500.0, "200 ms over 400 chunks");
+        // Standing still meshes nothing, and that is not a division by zero.
+        let s = summarize("x".into(), 0.0, false, &[b, b], 4.0);
+        assert_eq!((s.meshed_per_s, s.mesh_us_per_chunk), (0.0, 0.0));
+    }
+
+    #[test]
+    fn the_second_table_reports_encode_draws_and_padding() {
+        let frames: Vec<Sample> = (0..100)
+            .map(|i| Sample {
+                frame_ms: 2.0,
+                encode_ms: if i == 99 { 3.0 } else { 0.5 },
+                draws: 900,
+                tris: 2_000_000,
+                tris_drawn: 1_500_000,
+                ..Default::default()
+            })
+            .collect();
+        let s = summarize("6 levels, land, sprint".into(), 0.0, false, &frames, 1.0);
+        assert_eq!((s.encode_ms_median, s.encode_ms_p99), (0.5, 0.5));
+        assert_eq!(s.draws_median, 900);
+        let r = report(&[], &[s]);
+        assert!(
+            r.contains("| 6 levels, land, sprint | 0 | 0 | 0.50 / 0.50 | 900 | 2.00 | 1.50 | 25 |"),
+            "{r}"
+        );
+    }
+
     /// Run the whole script against a world that settles after `busy_for`
     /// seconds of every phase, at 100 fps.
     fn run(busy_for: f64) -> (Bench, Vec<Tick>) {
@@ -466,8 +563,9 @@ mod tests {
             .and_then(|t| t.done.clone())
             .expect("the run ended");
         assert_eq!(b.results.len(), 8);
+        // Once in each table.
         for phase in script() {
-            assert_eq!(report.matches(&format!("| {} |", phase.label())).count(), 1);
+            assert_eq!(report.matches(&format!("| {} |", phase.label())).count(), 2);
         }
         // Levels are applied only when they change: 6, 8, 6, 8.
         let applied: Vec<i32> = ticks.iter().filter_map(|t| t.apply_levels).collect();

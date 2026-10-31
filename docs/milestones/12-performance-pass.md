@@ -63,6 +63,21 @@ Pillar 1 is performance on low-end hardware, and M11's benchmark (RTX 4060,
 
 0. **Baseline and instruments.** Extend `--bench` (criterion 2); run it on
    the M11 tag.
+   - [x] Instruments (2026-10-31). The report gains a second table, one row
+     per phase: chunks meshed per second; mesh µs per chunk — the workers'
+     summed CPU time per job, not the main thread's wall time, which the
+     first table's mesh ms/s still reports; encode ms, median and p99 — CPU
+     from after acquiring the frame's target to after `submit`, so culling,
+     recording every pass and handing it to the driver, but not waiting for
+     a swapchain image; draw calls, every pass; triangles submitted and
+     triangles with area (`vox_mesh::area_triangles`, counted once per mesh
+     at upload), and the zero-area share between them. Code is the M11 tag
+     (`v0.11.0-m11` is the commit before) plus these counters; nothing
+     drawn or streamed changes.
+   - [ ] Baseline: the owner runs `cargo run -p vox-app -- --bench` (as in M11)
+     on the RTX 4060 and the table is recorded here, with the window size.
+   - [ ] Lavapipe worst case: one fixed headless frame's time in the cloud
+     container (see "Low-end hardware" below).
 1. **Profile meshing under streaming.** Where does `mesh_chunk` spend its
    time: building `MeshInput`, the per-slice masks, AO and light corners, the
    sealed-rectangle pass, allocation? Fix in order of measured share. Likely

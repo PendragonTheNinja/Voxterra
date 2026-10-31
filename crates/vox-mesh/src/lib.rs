@@ -97,6 +97,34 @@ impl MeshData {
     pub fn quad_count(&self) -> usize {
         self.indices.len() / 6
     }
+
+    /// How many of the triangles in `indices` (a slice of this mesh's, e.g.
+    /// [`Self::opaque_indices`]) cover any area — see [`area_triangles`].
+    pub fn area_triangles(&self, indices: &[u32]) -> usize {
+        area_triangles(indices, |i| self.vertices[i as usize].position)
+    }
+}
+
+/// How many triangles of `indices` cover area: all but the zero-area ones,
+/// whose corners are collinear (a quad's padding half with a repeated
+/// corner). The GPU discards those after paying to fetch and transform them,
+/// so "submitted" minus this is pure waste (M12 criterion 4). Exact, no
+/// tolerance: mesh positions are on a block grid, and a padding corner is a
+/// bit-for-bit copy.
+pub fn area_triangles(indices: &[u32], position: impl Fn(u32) -> [f32; 3]) -> usize {
+    indices
+        .chunks_exact(3)
+        .filter(|t| {
+            let (a, b, c) = (position(t[0]), position(t[1]), position(t[2]));
+            let (u, v) = (
+                [b[0] - a[0], b[1] - a[1], b[2] - a[2]],
+                [c[0] - a[0], c[1] - a[1], c[2] - a[2]],
+            );
+            u[1] * v[2] - u[2] * v[1] != 0.0
+                || u[2] * v[0] - u[0] * v[2] != 0.0
+                || u[0] * v[1] - u[1] * v[0] != 0.0
+        })
+        .count()
 }
 
 /// Vertex format for coarse LOD terrain (ADR-0009).
@@ -171,6 +199,11 @@ impl LodMeshData {
 
     pub fn quad_count(&self) -> usize {
         self.indices.len() / 6
+    }
+
+    /// As [`MeshData::area_triangles`].
+    pub fn area_triangles(&self, indices: &[u32]) -> usize {
+        area_triangles(indices, |i| self.vertices[i as usize].position)
     }
 }
 
@@ -1806,14 +1839,7 @@ mod tests {
     /// Triangles that cover area: everything but the zero-area padding of
     /// `emit_sealed_rect`'s triangles.
     fn drawn_triangles(mesh: &MeshData) -> usize {
-        mesh.indices
-            .chunks_exact(3)
-            .filter(|t| {
-                let p = |k: usize| mesh.vertices[t[k] as usize].position;
-                let n = cross(sub(p(1), p(0)), sub(p(2), p(0)));
-                n.iter().any(|&c| c != 0.0)
-            })
-            .count()
+        mesh.area_triangles(&mesh.indices)
     }
 
     /// The signature greedy result: a solid box is exactly 6 quads — one
@@ -3144,6 +3170,39 @@ mod heightfield_tests {
         // 4 x 32 fan pieces + 4 borders x 32 skirt walls, against 32 x 32
         // tops unmerged.
         assert_eq!(mesh.quad_count(), 4 * LOD_CELLS + 4 * LOD_CELLS);
+    }
+
+    // ---- Triangles submitted vs drawn (M12 task 0) ----
+
+    #[test]
+    fn area_triangles_skips_only_the_collinear() {
+        let p = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 1.0],
+            [1.0, 0.0, 1.0], // a repeated corner
+            [2.0, 0.0, 2.0], // collinear with 0 and 2
+        ];
+        let at = |i: u32| p[i as usize];
+        assert_eq!(area_triangles(&[0, 1, 2], at), 1);
+        assert_eq!(area_triangles(&[0, 2, 3], at), 0, "repeated corner");
+        assert_eq!(area_triangles(&[0, 2, 4], at), 0, "collinear");
+        assert_eq!(area_triangles(&[0, 1, 2, 0, 2, 3, 1, 2, 0], at), 2);
+    }
+
+    /// Pins today's padding so M12 task 2's removal of it shows as a
+    /// changed number, not a silent one: every fan and zipped-wall triangle
+    /// is stored as a quad, so a merged flat node submits about twice what
+    /// it draws.
+    #[test]
+    fn lod_fans_and_walls_pad_with_zero_area_halves() {
+        for heights in [flat(5), plateaus()] {
+            let mesh = faces_as_layers(&heights, 4, 0);
+            let submitted = mesh.indices.len() / 3;
+            let drawn = mesh.area_triangles(&mesh.indices);
+            assert!(drawn < submitted, "{drawn} of {submitted}");
+            assert!(2 * drawn >= submitted, "{drawn} of {submitted}");
+        }
     }
 
     // ---- Flat-cell merging (M11 task 3) ----

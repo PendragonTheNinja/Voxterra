@@ -166,6 +166,11 @@ struct GpuMesh {
     /// Indices `[0, opaque_index_count)` are drawn in the opaque pass, the
     /// rest in the transparent pass (ADR-0011). All of them for LOD nodes.
     opaque_index_count: u32,
+    /// Triangles in each range that cover area — submitted minus these is
+    /// zero-area padding the GPU discards (M12 criterion 4). Counted once at
+    /// upload, so a frame's telemetry only sums them.
+    opaque_area_tris: u32,
+    transparent_area_tris: u32,
     /// Vertex + index bytes on the GPU, tracked so the renderer can report
     /// total buffer memory without walking every mesh each frame.
     bytes: u64,
@@ -285,6 +290,16 @@ pub struct Renderer {
     /// Triangles submitted last frame (full-res + LOD), for telemetry: mesh
     /// count alone hides how much geometry the GPU is actually chewing.
     tris_last_frame: usize,
+    /// Of those, the ones with area: what the GPU rasterises.
+    area_tris_last_frame: usize,
+    /// Draw calls last frame, every pass — on a weak CPU, the per-draw cost
+    /// is what grows with view distance (M12 criterion 5).
+    draws_last_frame: usize,
+    /// CPU time last frame from after acquiring the target to after
+    /// `submit`: culling, recording every pass, and handing the work to the
+    /// driver. Excludes waiting for a swapchain image (vsync, a busy GPU),
+    /// which is not CPU cost.
+    encode_ms_last_frame: f32,
     /// Running total of vertex+index buffer bytes for all resident meshes
     /// (chunk + LOD) — the practical ceiling on render distance.
     buffer_bytes: u64,
@@ -1176,6 +1191,9 @@ impl Renderer {
             render_origin: ChunkPos::new(0, 0, 0),
             drawn_last_frame: 0,
             tris_last_frame: 0,
+            area_tris_last_frame: 0,
+            draws_last_frame: 0,
+            encode_ms_last_frame: 0.0,
             buffer_bytes: 0,
             highlight_pipeline,
             highlight_vertices,
@@ -1228,6 +1246,8 @@ impl Renderer {
             &mesh.indices,
         );
         gpu.opaque_index_count = mesh.opaque_index_count;
+        gpu.opaque_area_tris = mesh.area_triangles(mesh.opaque_indices()) as u32;
+        gpu.transparent_area_tris = mesh.area_triangles(mesh.transparent_indices()) as u32;
         self.buffer_bytes += gpu.bytes;
         if let Some(old) = self.meshes.insert(pos, gpu) {
             self.buffer_bytes -= old.bytes;
@@ -1309,6 +1329,8 @@ impl Renderer {
             index_buffer,
             index_count: indices.len() as u32,
             opaque_index_count: indices.len() as u32,
+            opaque_area_tris: 0,
+            transparent_area_tris: 0,
             bytes,
             aabb_min: offset + aabb_offset,
             aabb_max: offset + aabb_offset + extent,
@@ -1352,6 +1374,8 @@ impl Renderer {
             &mesh.indices,
         );
         gpu.opaque_index_count = mesh.opaque_index_count;
+        gpu.opaque_area_tris = mesh.area_triangles(mesh.opaque_indices()) as u32;
+        gpu.transparent_area_tris = mesh.area_triangles(mesh.transparent_indices()) as u32;
         self.buffer_bytes += gpu.bytes;
         if let Some(old) = self.lod_meshes.insert(key, gpu) {
             self.buffer_bytes -= old.bytes;
@@ -1438,6 +1462,22 @@ impl Renderer {
     /// Triangles submitted last frame (full-res + LOD).
     pub fn tris_last_frame(&self) -> usize {
         self.tris_last_frame
+    }
+
+    /// Triangles drawn last frame: those submitted that cover area.
+    pub fn area_tris_last_frame(&self) -> usize {
+        self.area_tris_last_frame
+    }
+
+    /// Draw calls issued last frame, all passes.
+    pub fn draws_last_frame(&self) -> usize {
+        self.draws_last_frame
+    }
+
+    /// CPU milliseconds last frame spent culling, encoding and submitting
+    /// (see the field for what is excluded).
+    pub fn encode_ms_last_frame(&self) -> f32 {
+        self.encode_ms_last_frame
     }
 
     /// Total GPU vertex+index buffer bytes across all resident meshes.
@@ -1646,6 +1686,7 @@ impl Renderer {
             },
             None => None,
         };
+        let encode_start = std::time::Instant::now();
 
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&view_proj));
@@ -1669,6 +1710,8 @@ impl Renderer {
         };
         let mut drawn = 0usize;
         let mut tris = 0usize;
+        let mut area_tris = 0usize;
+        let mut draws = 0usize;
 
         let target = match &frame {
             Some(frame) => &frame.texture,
@@ -1722,6 +1765,7 @@ impl Renderer {
             pass.set_pipeline(&self.sky_pipeline);
             pass.set_bind_group(0, &self.sky_pass_bind_group, &[]);
             pass.draw(0..3, 0..1);
+            draws += 1;
 
             if !self.meshes.is_empty() || !self.lod_meshes.is_empty() {
                 pass.set_pipeline(&self.pipeline);
@@ -1747,7 +1791,9 @@ impl Renderer {
                     pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..mesh.opaque_index_count, 0, 0..1);
                     drawn += 1;
+                    draws += 1;
                     tris += (mesh.opaque_index_count / 3) as usize;
+                    area_tris += mesh.opaque_area_tris as usize;
                 }
 
                 // Coarse LOD nodes (M08): same camera/texture/sky bind groups,
@@ -1775,7 +1821,9 @@ impl Renderer {
                         );
                         pass.draw_indexed(0..mesh.opaque_index_count, 0, 0..1);
                         drawn += 1;
+                        draws += 1;
                         tris += (mesh.opaque_index_count / 3) as usize;
+                        area_tris += mesh.opaque_area_tris as usize;
                     }
                 }
 
@@ -1801,7 +1849,9 @@ impl Renderer {
                     pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                     pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(mesh.opaque_index_count..mesh.index_count, 0, 0..1);
+                    draws += 1;
                     tris += ((mesh.index_count - mesh.opaque_index_count) / 3) as usize;
+                    area_tris += mesh.transparent_area_tris as usize;
                 }
 
                 // The LOD's sea surface (ADR-0011 decision 1c), over the LOD
@@ -1819,7 +1869,9 @@ impl Renderer {
                     pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                     pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(mesh.opaque_index_count..mesh.index_count, 0, 0..1);
+                    draws += 1;
                     tris += ((mesh.index_count - mesh.opaque_index_count) / 3) as usize;
+                    area_tris += mesh.transparent_area_tris as usize;
                 }
 
                 // Targeted-block highlight (M03 task 3): wireframe cube on
@@ -1830,12 +1882,14 @@ impl Renderer {
                     pass.set_bind_group(1, &self.highlight_bind_group, &[]);
                     pass.set_vertex_buffer(0, self.highlight_vertices.slice(..));
                     pass.draw(0..24, 0..1);
+                    draws += 1;
                 }
             }
         }
 
         self.drawn_last_frame = drawn;
         self.tris_last_frame = tris;
+        self.area_tris_last_frame = area_tris;
 
         // --- UI overlay (M09 amendment A3), last so it sits over the world ---
         if let Some(ui) = ui {
@@ -1880,6 +1934,10 @@ impl Renderer {
         }
 
         self.queue.submit(Some(encoder.finish()));
+        // The time includes the UI when it is open (its draws are egui's and
+        // not counted); the benchmark never opens it.
+        self.draws_last_frame = draws;
+        self.encode_ms_last_frame = encode_start.elapsed().as_secs_f32() * 1000.0;
         if let Some(frame) = frame {
             frame.present();
         }
