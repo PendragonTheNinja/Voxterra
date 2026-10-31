@@ -257,30 +257,28 @@ The owner's ideas for all of them, and a proposed order, are recorded in
 
 ## Current status
 
-- **Active milestone:** 11 — The Horizon
-  (`docs/milestones/11-the-horizon.md`). **The exact state and the ordered
-  list of remaining work is in that spec's "Status and remaining work — START
-  HERE" section.** Read its "Changes at M10 close" too: reverse-Z is already
-  done (ADR-0013) and distant water changed shape (ADR-0011 1c). As of
-  2026-10-14: task 0 (why relighting doubled), the `light.rs` `opaque` fix and
-  tasks 1–2 (per-level ring centring, ADR-0014 Proposed; eight levels with
-  the half-period clamp) are done and confirmed in play; tasks 3 (flat-cell
-  merging), 5 (Earth curvature and horizon culling, ADR-0015 Proposed) and
-  6's aerial perspective (ADR-0016 Proposed) are done and await in-play
-  confirmation (task 4, reverse-Z, shipped in M10). What remains is the
-  owner's in-play check and 32/64 km numbers, then the retro and the tag.
+- **Active milestone:** 12 — Performance Pass
+  (`docs/milestones/12-performance-pass.md`, spec written 2026-10-31, not
+  started). Start with its task 0: a `--bench` baseline on the
+  `v0.11.0-m11` tag. No low-end machine exists yet — the spec says how to
+  judge low-end performance by proxy.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
   vox-core 287, vox-mesh 61, vox-worldgen 31, vox-render 17, vox-app 6
-  passing as of the M11 full-res T-junction fix), then start the first unchecked item.
+  passing as of the M11 close), then start the first unchecked item.
+- **Instruments (from M11):** the P key logs a `VIEW` line (exact position,
+  angles, window, settings) and a `hole_census` — the frame re-rendered six
+  ways on the player's GPU with pinholes counted per variant. In the cloud
+  container `apt-get install mesa-vulkan-drivers` (after `apt-get update`)
+  gives lavapipe, and `Renderer::new_headless` + the ignored
+  `specks_scratch::specks` test render real frames there (env vars take a
+  `VIEW` line; `SPECK_FULLRES=1` adds full resolution).
 - **Performance numbers come from `cargo run -p vox-app -- --bench`** (from
   M11): a fixed script over land and ocean at 6 and 8 LOD levels that writes
   `bench/bench-<time>.md` and quits. Compare runs from it, not hand-timed
   flights; close other heavy programs first.
-- **Roadmap after M11:** 12 — Performance Pass
-  (`docs/milestones/12-performance-pass.md`, spec written 2026-10-31: meshing
-  under streaming, LOD without zero-area triangles, draw calls), then
-  13 — Climate & Biomes (spec not yet written). The
+- **Roadmap after M12:** 13 — Climate & Biomes (spec not yet written; start
+  from `docs/vision.md` §10's lessons on biomes and terrain shape). The
   longer-range order, and the owner's ideas for the whole game, are in
   `docs/vision.md` — ideas and a proposed order, not decisions; each becomes a
   milestone spec and ADRs before anything is built.
@@ -288,7 +286,16 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   are separate counters. ADRs number decisions in the order they are made;
   milestones number work in the order it is built. Matching numbers are
   coincidence — ADR-0011 (transparency) belongs to milestone M10.
-- **Last completed milestone:** 10 — Terrain & the Deep Vertical
+- **Last completed milestone:** 11 — The Horizon (2026-10-31); retrospective
+  with numbers at the end of `docs/milestones/11-the-horizon.md`. Shipped:
+  relight back under M10's cost (task 0); per-level ring centring (ADR-0014)
+  and eight levels to 64 km; flat-cell LOD merging; Earth curvature and
+  horizon culling (ADR-0015); aerial perspective (ADR-0016); `--bench`; the
+  headless renderer and the hole census. The white specks were T-junctions in
+  the full-resolution greedy mesh (`emit_sealed_rect`); census 84 → 2.
+  Carried into M12: the sprint backlog does not drain (meshing-bound) and LOD
+  pads triangles with zero-area halves.
+- **Prior milestone:** 10 — Terrain & the Deep Vertical
   (2026-10-01); retrospective with numbers at the end of
   `docs/milestones/10-terrain-and-deep-vertical.md`. Shipped: the elevation
   field tuned to walking time (ADR-0010); surface- and camera-following
@@ -299,7 +306,7 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   reversed-Z (ADR-0013). Criterion 8 **partly met**: backlog peaks 410 and
   drains as in M09, but sprint-fly median fell ~180 → ~130 fps with relight
   ~2× M09's — carried into M11 as task 0.
-- **Prior milestone:** 09 — LOD Levels & Streaming Quality (2026-08-25);
+- Milestone 09 — LOD Levels & Streaming Quality (2026-08-25);
   retrospective at the end of `docs/milestones/09-lod-octree-streaming.md`.
   Nearest-first streaming queues and the first-light gate; multi-level
   `LodRing`; heightfield LOD; fog; the ESC settings menu; geomorph (ADR-0009);

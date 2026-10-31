@@ -1,7 +1,7 @@
 # ADR-0015: Earth curvature in the terrain shaders, and horizon culling
 
-- **Status:** Proposed (M11 task 5, 2026-10-16). Accepted once the owner has
-  seen it in play.
+- **Status:** Accepted (2026-10-31, M11 close). Proposed with M11 task 5
+  on 2026-10-16; confirmed in play that day ("curvature looks great").
 - **Context:** M11 (The Horizon), criteria 4 and 5. ADR-0012 §5 fixed the
   radius — Earth's, not the torus's — and left the mechanism to this
   milestone. Depth for the long view is ADR-0013 (reversed-Z), already in.

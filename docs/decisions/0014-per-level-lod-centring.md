@@ -1,7 +1,7 @@
 # ADR-0014: Per-level LOD ring centring
 
-- **Status:** Proposed (M11 task 1, 2026-10-14). Accepted once the owner has
-  confirmed it in play; until then the code is on the M11 branch.
+- **Status:** Accepted (2026-10-31, M11 close). Proposed with M11 task 1
+  on 2026-10-14; confirmed in play the same day.
 - **Context:** M11 (The Horizon) needs eight LOD levels, strides 2–256 chunks,
   out to 64 km. Supersedes the shared snapped centre of ADR-0008's
   multi-level ring (as implemented in M09, `vox_core::lod`). The partition

@@ -336,15 +336,15 @@ the remote matches it, and starts at the first unchecked item.*
   seconds of stopping. The 800×600 window flatters fps against full-screen
   play; later runs should keep the same size to compare.
 
+- [x] **In play, 2026-10-31: the specks are gone.** "It's absolutely
+  clean." Census at the owner's view (radius 8, 3 levels, 1920×1057):
+  **as drawn 2** (from 84) — both at the top of the frame on the far
+  horizon, and both present with LOD alone; full resolution adds none.
+
 ### Remaining, in order
 
-1. **Task 6, part 2 — in play, then close.** The owner confirms the wall
-   fix with H (no magenta specks); the benchmark above is criterion 10's
-   numbers, and an optional rerun after the fix shows the triangle cost.
-   Then ADRs 0014–0016 accepted or revised, the retrospective here (known
-   issue: the sprint `dirty` backlog does not drain at 120 m/s, land or sea —
-   meshing-bound), CLAUDE.md status,
-   commit, and tag `v0.11.0-m11`.
+Nothing — M11 closed 2026-10-31. Retrospective at the end of this file; next
+is M12, `docs/milestones/12-performance-pass.md`.
 
 ## Why this milestone exists
 
@@ -486,3 +486,115 @@ numbers were taken on.
 - **Default view distance by hardware.** 32 km is the target on the development
   machine. Whether weaker hardware defaults lower, and how that is detected or
   chosen, is a release-time decision — noted here so it isn't forgotten.
+
+# Retrospective (2026-10-31)
+
+## What shipped
+
+- **Task 0 — why relighting doubled in M10.** A headless model of the live
+  relight loop found three causes: uniform air under open sky missed the fast
+  path; `top_sky` cost a hash lookup per block column; and the streamer
+  re-sampled terrain every frame, standing still included. Relight work in
+  the model 879 → 292 ms/s with identical results. Standing fps recovered
+  from M10's 733–817 to **908–1 052**.
+- **Lighting asks `opaque`** (ADR-0011's rule, missed in `light.rs`).
+- **Per-level ring centring (ADR-0014)** and **eight levels to 64 km**, with
+  the half-period clamp: the finest level stays within 128 blocks of the
+  camera where the shared centre allowed 8 km.
+- **Flat-cell merging** in LOD — open ocean is a handful of fans, not 1 024
+  quads. Watertight merging saves about a tenth of LOD triangles, not the
+  quarter first claimed (that figure counted rectangles that leaked).
+- **Earth curvature and horizon culling (ADR-0015).** One `curve()` in both
+  terrain shaders. Horizon culling removes little from the ground (105 of
+  1 600 nodes), as the ADR records.
+- **Aerial perspective (ADR-0016).** Real Rayleigh and haze coefficients per
+  colour channel, thinning with height, in front of the distance fade —
+  distant ridges turn blue, as asked in `docs/vision.md` §1.5.
+- **Instruments that outlive the milestone:** `--bench` (a fixed eight-phase
+  performance script writing a results table); `Renderer::new_headless` and
+  `read_frame` (the real renderer drawing offscreen on any adapter, lavapipe
+  included); the **P** key's `VIEW` line and `hole_census`, which re-renders
+  the player's frame six ways on their own GPU and counts pinholes.
+
+## Criteria
+
+| # | Criterion | Result |
+|---|---|---|
+| 1 | Per-level ring centring | Met (ADR-0014) |
+| 2 | Levels to 64 km | Met — eight levels, 1 600 nodes standing, 1 872 in flight |
+| 3 | View distance under half the period | Met |
+| 4 | Curvature, both shaders identical | Met — one shared function |
+| 5 | Horizon culling | Met, small payoff (105/1 600 from the ground) |
+| 6 | Flat-cell merging | Met, ~10% of LOD triangles |
+| 7 | Distant water | Met (shipped with ADR-0011 1c in M10, merged here) |
+| 8 | Reverse-Z | Met in M10 (ADR-0013) |
+| 9 | Atmosphere | Met (ADR-0016) |
+| 10 | Performance, 32 and 64 km | Met — table below |
+| 11 | Bookkeeping | ADRs 0014–0016 accepted; this retro |
+
+## Numbers (owner's RTX 4060, `--bench`, 2026-10-17, 800×600)
+
+| | 32 km (6 levels) | 64 km (8 levels) |
+|---|---|---|
+| Standing fps, land / ocean | 905 / 788 | 778 / 753 |
+| Sprint-fly fps, land / ocean | 135 / 129 | 128 / 126 |
+| LOD nodes standing / sprinting | 1 216 / 1 424 | 1 600 / 1 872 |
+| GPU memory | 448–472 MB | 639–694 MB |
+
+Sprint-flight holds M10's ~130 fps median out to 64 km; 64 km costs ~14% of
+standing fps over 32 km and ~5% while sprinting. Taken before the
+full-resolution T-junction fix, which adds full-res triangles (real chunks,
+9×9×5: shore 53 k → 72 k, inland 5.5 k → 16 k, hills 14 k → 25 k) — to be
+benchmarked at the start of M12.
+
+## Bugs found in play
+
+- **White boxes** where terrace steps cross the edge of full resolution: the
+  LOD mask judged walls lying exactly on its edge by float error. Fixed by
+  asking a sixteenth of a block away from the camera.
+- **The white specks** — the milestone's long tail. Single pixels of sky,
+  far off, only while standing still. Two fixes, each with a failing test,
+  removed real T-junctions from the **LOD** mesher (merged tops, then walls
+  and skirts) and changed nothing in play; the skirts were ruled out by
+  measurement. The headless harness then showed LOD almost watertight, so
+  the game had to differ — and the in-game census settled it in one run:
+  as drawn 84, **LOD alone 0**. The holes were T-junctions in the
+  **full-resolution** greedy mesh, exposed only since M10 A1's mask stopped
+  LOD drawing underneath (which is also why they vanished while moving:
+  columns still streaming fall outside the mask). Fixed by
+  `emit_sealed_rect`; census 84 → 2.
+- **Purple sea in the census screenshot** — not a bug: those view rays pass
+  under the surface over a seabed falling faster than they sink and leave the
+  2 km horizon. Water that absorbs with depth is in `docs/vision.md` §10.
+
+## Known, carried forward
+
+- **Sprint backlog does not drain** at 120 m/s (`dirty` ends at 650–730
+  after 30 s); meshing is ~580 ms/s against relight's ~95. **M12.**
+- **Zero-area padding in LOD** fans and walls — submitted triangles exceed
+  drawn. **M12.**
+- **Two LOD pinholes at the far horizon** in the owner's census (also 0–11
+  per frame on lavapipe, all far out). Not seen by eye; left for M12's
+  census runs.
+- Split wall vertices morph linearly up their own wall, so two walls sharing
+  one may part slightly inside a morph band while it animates.
+
+## Lessons
+
+1. **A failing test proves a bug exists, not that it is the bug the player
+   sees.** Both speck fixes followed CLAUDE.md lesson 1 and were real, but in
+   the wrong mesher. The question to ask before fixing is "does this test
+   reproduce *the player's* symptom?" — and for a rendering symptom only the
+   player's frame can answer it.
+2. **Measure on the player's machine, by elimination.** The census — the
+   same frame rendered with one ingredient removed at a time, counted on the
+   owner's GPU — found in one keypress what three rounds of theory missed.
+   Instruments that run where the bug lives beat reasoning about it.
+3. **Lossy images cannot carry single-pixel evidence.** Screenshots reached
+   the sandbox as WebP; a one-pixel speck does not survive. Count in the
+   game, log the numbers.
+4. **A headless renderer turns "Nathan is the only visual check" into "Nathan
+   is the final visual check."** Lavapipe ran the real pipelines in the cloud
+   container and reproduced the in-game result (21 → 5 pinholes) before the
+   fix shipped.
+

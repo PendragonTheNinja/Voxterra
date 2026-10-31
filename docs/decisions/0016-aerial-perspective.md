@@ -1,7 +1,7 @@
 # ADR-0016: Aerial perspective
 
-- **Status:** Proposed (M11 task 6, 2026-10-16). Accepted once the owner has
-  seen it in play.
+- **Status:** Accepted (2026-10-31, M11 close). Proposed with M11 task 6
+  on 2026-10-16; confirmed in play that day.
 - **Context:** M11 criterion 9 ("distant terrain fades toward sky colour so
   range reads as depth — aerial perspective, not a wall"), made
   wavelength-dependent at the owner's request on 2026-10-01: far mountains
