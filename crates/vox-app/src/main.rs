@@ -613,6 +613,8 @@ struct App {
     bench_requested: bool,
     bench: Option<bench::Bench>,
     bench_started: Option<Instant>,
+    /// P was pressed: run `Renderer::hole_census` after this frame.
+    census_requested: bool,
     telemetry_frames: u32,
     /// Longest single frame in the current telemetry interval, in ms. Average
     /// fps hides hitches — a 144 fps average with one 40 ms frame reads as
@@ -763,6 +765,7 @@ impl Default for App {
             bench_requested: false,
             bench: None,
             bench_started: None,
+            census_requested: false,
             telemetry_frames: 0,
             worst_frame_ms: 0.0,
 
@@ -2463,6 +2466,7 @@ impl ApplicationHandler for App {
                                     self.world_time.time_of_day(),
                                     self.settings
                                 );
+                                self.census_requested = true;
                             } else if let Some(slot) = digit_slot(code) {
                                 self.select_block_slot(slot);
                             } else {
@@ -2724,6 +2728,13 @@ impl ApplicationHandler for App {
                     renderer
                         .set_fullres_columns(origin_chunk, |cx, cz| fullres.contains(&(cx, cz)));
                     renderer.render(view_proj.to_cols_array_2d(), ui_frame);
+                    if std::mem::take(&mut self.census_requested) {
+                        for (name, holes, first) in
+                            renderer.hole_census(view_proj.to_cols_array_2d())
+                        {
+                            log::info!("HOLES {name}: {holes} {first:?}");
+                        }
+                    }
 
                     // Telemetry once per second: FPS, frustum-culling ratio,
                     // and streaming state (resident chunks, gen queue, dirty).
@@ -2848,7 +2859,7 @@ mod specks_scratch {
 
         let mut r = vox_render::Renderer::new_headless(w, h);
         r.set_render_origin(cam_chunk);
-        r.set_debug_holes(true);
+        r.set_debug_holes(std::env::var("SPECK_NOH").is_err());
         let unload = 8 + 2; // default radius 8 + streamer slack, roughly
         use rayon::prelude::*;
         let meshes: Vec<_> = update
@@ -2939,6 +2950,9 @@ mod specks_scratch {
             shape_p,
         );
         r.set_fullres_columns(cam_chunk, |_, _| false);
+        for (name, holes, first) in r.hole_census(view_proj.to_cols_array_2d()) {
+            println!("HOLES {name}: {holes} {first:?}");
+        }
         r.render(view_proj.to_cols_array_2d(), None);
         let px = r.read_frame();
 

@@ -356,6 +356,13 @@ pub struct Renderer {
     /// occludes them where they overlap.
     lod_meshes: HashMap<(ChunkPos, u32), GpuMesh>,
     lod_pipeline: wgpu::RenderPipeline,
+    /// `lod_pipeline` without its depth bias, for `hole_census`.
+    lod_pipeline_unbiased: wgpu::RenderPipeline,
+    /// What `render` draws; anything but the default only during
+    /// `hole_census`.
+    variant: DrawVariant,
+    /// Render into `offscreen` even with a window (`hole_census`).
+    force_offscreen: bool,
     /// The LOD's sea surface (ADR-0011 decision 1c).
     lod_transparent_pipeline: wgpu::RenderPipeline,
     /// Chunk faces of non-opaque blocks (water), drawn after everything
@@ -442,7 +449,7 @@ impl Renderer {
         let texture = self
             .offscreen
             .as_ref()
-            .expect("read_frame needs a headless renderer");
+            .expect("read_frame needs an offscreen frame");
         let (w, h) = (self.config.width, self.config.height);
         let row = (w * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
             * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -482,6 +489,112 @@ impl Renderer {
         for y in 0..h {
             let start = (y * row) as usize;
             out.extend_from_slice(&data[start..start + (w * 4) as usize]);
+        }
+        // A window's surface is often BGRA; callers get RGBA either way.
+        if matches!(
+            texture.format(),
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+        ) {
+            for px in out.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+        }
+        out
+    }
+
+    /// Debug (the speck hunt): render this frame offscreen several times
+    /// with the sky magenta, each time leaving one thing out, and count the
+    /// pinholes (`count_pinholes`) in each. Whatever removes the holes when
+    /// left out is what makes them — measured on the player's own GPU, which
+    /// a screenshot cannot carry: lossy compression smears single pixels
+    /// away. Returns each variant's name, pinhole count and first few
+    /// positions. Call after the frame's `set_sky` and `set_fullres_columns`.
+    pub fn hole_census(&mut self, view_proj: [[f32; 4]; 4]) -> Vec<CensusRow> {
+        let windowed_target = self.offscreen.is_none();
+        if windowed_target {
+            self.offscreen = Some(create_offscreen(
+                &self.device,
+                &wgpu::SurfaceConfiguration {
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                    ..self.config.clone()
+                },
+            ));
+        }
+        // params.w of the sky-pass uniform: magenta sky (see `set_debug_holes`).
+        const SKY_MAGENTA_OFFSET: wgpu::BufferAddress = 64 + 16 + 16 + 12;
+        let magenta = |r: &Self, on: bool| {
+            r.queue.write_buffer(
+                &r.sky_pass_buffer,
+                SKY_MAGENTA_OFFSET,
+                bytemuck::bytes_of(&if on { 1.0f32 } else { 0.0 }),
+            );
+        };
+        let mask = |r: &Self, on: bool| {
+            let placement = if on {
+                fullres_mask_placement(r.fullres_center, r.render_origin)
+            } else {
+                [0.0; 4]
+            };
+            r.queue.write_buffer(
+                &r.sky_buffer,
+                FULLRES_MASK_UNIFORM_OFFSET,
+                bytemuck::cast_slice(&placement),
+            );
+        };
+        let variants = [
+            ("as drawn", DrawVariant::ALL, true),
+            (
+                "no full-res chunks",
+                DrawVariant {
+                    chunks: false,
+                    ..DrawVariant::ALL
+                },
+                true,
+            ),
+            ("no full-res mask", DrawVariant::ALL, false),
+            (
+                "no LOD depth bias",
+                DrawVariant {
+                    lod_bias: false,
+                    ..DrawVariant::ALL
+                },
+                true,
+            ),
+            (
+                "no LOD culling",
+                DrawVariant {
+                    lod_cull: false,
+                    ..DrawVariant::ALL
+                },
+                true,
+            ),
+            (
+                "LOD alone, unculled, unmasked",
+                DrawVariant {
+                    chunks: false,
+                    lod_bias: true,
+                    lod_cull: false,
+                },
+                false,
+            ),
+        ];
+        self.force_offscreen = true;
+        magenta(self, true);
+        let mut out = Vec::new();
+        for (name, variant, mask_on) in variants {
+            self.variant = variant;
+            mask(self, mask_on);
+            self.render(view_proj, None);
+            let px = self.read_frame();
+            let holes = pinholes(&px, self.config.width, self.config.height);
+            out.push((name, holes.len(), holes.into_iter().take(8).collect()));
+        }
+        self.variant = DrawVariant::ALL;
+        self.force_offscreen = false;
+        mask(self, true);
+        magenta(self, self.debug_holes);
+        if windowed_target {
+            self.offscreen = None;
         }
         out
     }
@@ -790,65 +903,70 @@ impl Renderer {
                 3 => Float32, 4 => Float32, 5 => Float32
             ],
         };
-        let lod_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("lod pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &lod_shader,
-                entry_point: Some("vs_lod"),
-                compilation_options: Default::default(),
-                buffers: std::slice::from_ref(&lod_vertex_layout),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &lod_shader,
-                entry_point: Some("fs_lod"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: true,
-                depth_compare: DEPTH_NEARER,
-                stencil: Default::default(),
-                // Push LOD back so full-res occludes it in the overlap band.
-                //
-                // NEGATIVE under reversed-Z: back is toward 0. For a float
-                // buffer the constant term scales with the depth's own
-                // exponent, so 16 units is a push of ~2e-6 of the distance —
-                // 0.0005 blocks at the full-res edge. That is all it has to
-                // be: LOD never rises above real terrain, so the only contest
-                // is an exact tie where the two surfaces coincide, and 2e-6 is
-                // ~30x the float noise of computing the same point twice.
-                //
-                // NO slope-scaled term. It pushes each triangle back by its own
-                // screen-space depth slope, which is not uniform: a top face
-                // seen at a grazing angle is pushed about one pixel's worth of
-                // depth, a skirt facing the camera almost not at all. So along
-                // every node border the top face was pushed level with the
-                // skirt hidden behind it, and the skirt's top pixel row showed
-                // through — a line on every border (M10 A3, the "grid lines").
-                // The surfaces it exists to separate from full-res are
-                // coplanar with it, where the constant term is exact.
-                bias: wgpu::DepthBiasState {
-                    constant: -16,
-                    slope_scale: 0.0,
-                    clamp: 0.0,
+        let make_lod_pipeline = |bias: wgpu::DepthBiasState| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("lod pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &lod_shader,
+                    entry_point: Some("vs_lod"),
+                    compilation_options: Default::default(),
+                    buffers: std::slice::from_ref(&lod_vertex_layout),
                 },
-            }),
-            multisample: Default::default(),
-            multiview: None,
-            cache: None,
+                fragment: Some(wgpu::FragmentState {
+                    module: &lod_shader,
+                    entry_point: Some("fs_lod"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: Some(wgpu::Face::Back),
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: true,
+                    depth_compare: DEPTH_NEARER,
+                    stencil: Default::default(),
+                    bias,
+                }),
+                multisample: Default::default(),
+                multiview: None,
+                cache: None,
+            })
+        };
+        // Push LOD back so full-res occludes it in the overlap band.
+        //
+        // NEGATIVE under reversed-Z: back is toward 0. For a float
+        // buffer the constant term scales with the depth's own
+        // exponent, so 16 units is a push of ~2e-6 of the distance —
+        // 0.0005 blocks at the full-res edge. That is all it has to
+        // be: LOD never rises above real terrain, so the only contest
+        // is an exact tie where the two surfaces coincide, and 2e-6 is
+        // ~30x the float noise of computing the same point twice.
+        //
+        // NO slope-scaled term. It pushes each triangle back by its own
+        // screen-space depth slope, which is not uniform: a top face
+        // seen at a grazing angle is pushed about one pixel's worth of
+        // depth, a skirt facing the camera almost not at all. So along
+        // every node border the top face was pushed level with the
+        // skirt hidden behind it, and the skirt's top pixel row showed
+        // through — a line on every border (M10 A3, the "grid lines").
+        // The surfaces it exists to separate from full-res are
+        // coplanar with it, where the constant term is exact.
+        let lod_pipeline = make_lod_pipeline(wgpu::DepthBiasState {
+            constant: -16,
+            slope_scale: 0.0,
+            clamp: 0.0,
         });
+        // The same without the bias, for `hole_census` only.
+        let lod_pipeline_unbiased = make_lod_pipeline(wgpu::DepthBiasState::default());
 
         // --- LOD sea surface (ADR-0011 decision 1c): the LOD's own
         // translucent water over its own seabed, drawn in the transparent
@@ -1080,6 +1198,9 @@ impl Renderer {
             lod_meshes: HashMap::new(),
             suppressed_lod: HashSet::new(),
             lod_pipeline,
+            lod_pipeline_unbiased,
+            variant: DrawVariant::ALL,
+            force_offscreen: false,
             lod_transparent_pipeline,
             transparent_pipeline,
             egui_renderer,
@@ -1511,7 +1632,7 @@ impl Renderer {
     /// alone. The UI is drawn last, over the finished frame, with no depth
     /// attachment.
     pub fn render(&mut self, view_proj: [[f32; 4]; 4], ui: Option<UiFrame<'_>>) {
-        let frame = match &self.surface {
+        let frame = match self.surface.as_ref().filter(|_| !self.force_offscreen) {
             Some(surface) => match surface.get_current_texture() {
                 Ok(frame) => Some(frame),
                 Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
@@ -1612,7 +1733,7 @@ impl Renderer {
                 // Chunk world offset is baked into vertex positions at mesh
                 // time, so all chunks share one pipeline and bind group and
                 // differ only by their vertex/index buffers.
-                for mesh in self.meshes.values() {
+                for mesh in self.meshes.values().filter(|_| self.variant.chunks) {
                     // Frustum culling: skip chunks the camera can't see.
                     if !frustum.intersects_aabb(mesh.aabb_min, mesh.aabb_max) {
                         continue;
@@ -1633,13 +1754,17 @@ impl Renderer {
                 // but the depth-biased LOD pipeline so full-res occludes them
                 // where they overlap. Drawn after full-res.
                 if !self.lod_meshes.is_empty() {
-                    pass.set_pipeline(&self.lod_pipeline);
+                    pass.set_pipeline(if self.variant.lod_bias {
+                        &self.lod_pipeline
+                    } else {
+                        &self.lod_pipeline_unbiased
+                    });
                     for (key, mesh) in self.lod_meshes.iter() {
                         // Skip nodes whose ground full-res already covers.
-                        if self.suppressed_lod.contains(key) {
+                        if self.variant.lod_cull && self.suppressed_lod.contains(key) {
                             continue;
                         }
-                        if lod_culled(mesh) {
+                        if self.variant.lod_cull && lod_culled(mesh) {
                             continue;
                         }
                         pass.set_bind_group(1, &mesh.offset_bind_group, &[]);
@@ -1658,7 +1783,7 @@ impl Renderer {
                 // blend over everything opaque — full-res and LOD alike. Same
                 // bind-group layout, so groups 0, 2 and 3 stay bound.
                 pass.set_pipeline(&self.transparent_pipeline);
-                for (pos, mesh) in self.meshes.iter() {
+                for (pos, mesh) in self.meshes.iter().filter(|_| self.variant.chunks) {
                     if mesh.index_count == mesh.opaque_index_count {
                         continue;
                     }
@@ -1685,8 +1810,8 @@ impl Renderer {
                 pass.set_pipeline(&self.lod_transparent_pipeline);
                 for (key, mesh) in self.lod_meshes.iter() {
                     if mesh.index_count == mesh.opaque_index_count
-                        || self.suppressed_lod.contains(key)
-                        || lod_culled(mesh)
+                        || (self.variant.lod_cull
+                            && (self.suppressed_lod.contains(key) || lod_culled(mesh)))
                     {
                         continue;
                     }
@@ -2015,6 +2140,53 @@ fn fullres_mask_placement(center: ChunkPos, render_origin: ChunkPos) -> [f32; 4]
     ]
 }
 
+/// One `hole_census` variant: its name, its pinhole count and the first
+/// few pinholes' pixel positions.
+pub type CensusRow = (&'static str, usize, Vec<(u32, u32)>);
+
+/// Which parts of the scene `render` draws — all of them, except while
+/// `hole_census` leaves one out.
+#[derive(Clone, Copy)]
+struct DrawVariant {
+    chunks: bool,
+    lod_bias: bool,
+    lod_cull: bool,
+}
+
+impl DrawVariant {
+    const ALL: Self = Self {
+        chunks: true,
+        lod_bias: true,
+        lod_cull: true,
+    };
+}
+
+/// Pixels of the magenta debug sky (`set_debug_holes`) with at most one
+/// magenta neighbour of four: holes a pixel or so wide, not the sky itself
+/// or its edge. `rgba` is tightly packed rows.
+pub fn pinholes(rgba: &[u8], width: u32, height: u32) -> Vec<(u32, u32)> {
+    let (w, h) = (width as usize, height as usize);
+    let magenta = |x: usize, y: usize| {
+        let p = &rgba[(y * w + x) * 4..][..3];
+        p[0] > 200 && p[1] < 60 && p[2] > 200
+    };
+    let mut out = Vec::new();
+    for y in 1..h.saturating_sub(1) {
+        for x in 1..w.saturating_sub(1) {
+            if magenta(x, y) {
+                let near = [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)]
+                    .iter()
+                    .filter(|&&(a, b)| magenta(a, b))
+                    .count();
+                if near <= 1 {
+                    out.push((x as u32, y as u32));
+                }
+            }
+        }
+    }
+    out
+}
+
 fn request_device(adapter: &wgpu::Adapter) -> (wgpu::Device, wgpu::Queue) {
     pollster::block_on(adapter.request_device(
         &wgpu::DeviceDescriptor {
@@ -2071,6 +2243,33 @@ fn create_depth_view(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The census counts holes a pixel or so wide, never the sky: a lone
+    /// magenta pixel and a two-pixel crack count, a 3x3 patch and the
+    /// sky's edge do not.
+    #[test]
+    fn pinholes_are_lone_magenta_pixels() {
+        let (w, h) = (12u32, 8u32);
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        let mut paint = |x: u32, y: u32| {
+            let i = ((y * w + x) * 4) as usize;
+            px[i..i + 4].copy_from_slice(&[255, 0, 255, 255]);
+        };
+        for x in 0..w {
+            paint(x, 0); // the sky along the top edge
+            paint(x, 1);
+        }
+        paint(2, 5); // a pinhole
+        paint(5, 4); // a two-pixel crack
+        paint(5, 5);
+        for y in 4..7 {
+            for x in 8..11 {
+                paint(x, y); // a 3x3 hole: not a speck
+            }
+        }
+        let holes = pinholes(&px, w, h);
+        assert_eq!(holes, vec![(5, 4), (2, 5), (5, 5)]);
+    }
 
     const FOV: f32 = 1.2;
     const ASPECT: f32 = 16.0 / 9.0;

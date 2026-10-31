@@ -254,6 +254,20 @@ the remote matches it, and starts at the first unchecked item.*
   mask, node retirement, the GPU). Next: the owner presses **P** on a
   speckled view (logs a `VIEW` line: position, yaw, pitch, window, time,
   settings) and the harness renders that exact frame.
+
+  2026-10-31: the owner's first `VIEW` (radius 8, 3 levels, 1920×1057, near
+  sea level by the shore) renders in the harness with 5 pinholes, all at the
+  far horizon; the screenshot that came with it was lossy WebP, which
+  smeared any single-pixel speck away, so it could not be compared. **P now
+  also runs `Renderer::hole_census`** on the player's own GPU: the frame is
+  re-rendered offscreen with the sky magenta six ways — as drawn, without
+  full-res chunks, without the full-res mask, without the LOD depth bias,
+  without LOD culling, and LOD alone — and each variant's pinhole count
+  (`vox_render::pinholes`) is logged as a `HOLES` line. The variant that
+  drops to zero names the cause. Also seen in that screenshot, separately:
+  the near sea 90–250 blocks out shows the magenta sky through the water
+  (about 82, 61, 123 against blue-grey beyond) — inside the full-res
+  radius, so no seabed is drawn under that water. Not yet diagnosed.
 - [x] **Benchmark mode: `cargo run -p vox-app -- --bench`.** One fixed,
   repeatable run instead of hand-timed retro runs: default settings, noon
   with time paused, eight phases — {6, 8 levels} × {land, ocean} ×
