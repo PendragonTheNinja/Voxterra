@@ -109,9 +109,42 @@ Pillar 1 is performance on low-end hardware, and M11's benchmark (RTX 4060,
      backlog, instead. What the backlog says already: the same budget now
      drains ~50% fewer chunks — the full-resolution fix made each mesh
      dearer, as expected.
-   - [ ] **Baseline, second table:** the same run built from the instruments
-     commit, so meshed/s, µs per chunk, encode, draws and triangles drawn
-     have a before.
+   - [x] **Baseline, second table (owner's run, 2026-10-31, instruments
+     commit, same machine and window).** Its first table repeated the one
+     above within noise (sprint 113–120 fps, backlog ending 973–1 046,
+     relight 173–179 ms/s), so the relight rise is real, not noise.
+
+     | Phase | Meshed /s | Mesh µs/chunk (CPU) | Encode ms median / p99 | Draws | Tris submitted M | Tris drawn M | Zero-area % |
+     |---|---|---|---|---|---|---|---|
+     | 6 levels, land, standing | 0 | 0 | 0.51 / 0.88 | 613 | 1.82 | 1.39 | 24 |
+     | 6 levels, land, sprint | 1684 | 1595 | 0.89 / 1.76 | 577 | 1.64 | 1.24 | 24 |
+     | 8 levels, land, standing | 0 | 0 | 0.64 / 1.13 | 682 | 2.24 | 1.66 | 26 |
+     | 8 levels, land, sprint | 1626 | 1599 | 1.03 / 1.93 | 628 | 2.01 | 1.47 | 27 |
+     | 6 levels, ocean, standing | 0 | 0 | 0.64 / 1.05 | 673 | 1.83 | 1.41 | 23 |
+     | 6 levels, ocean, sprint | 1612 | 1690 | 0.94 / 1.76 | 570 | 1.57 | 1.19 | 24 |
+     | 8 levels, ocean, standing | 0 | 0 | 0.70 / 1.19 | 735 | 2.21 | 1.65 | 25 |
+     | 8 levels, ocean, sprint | 1591 | 1675 | 1.02 / 1.90 | 613 | 1.88 | 1.39 | 26 |
+
+     Reading:
+     - **Meshing:** ~1 600 chunks a second at ~1.6 ms of worker CPU each —
+       2.6 s of CPU every second. The backlog holds near 1 000 for the whole
+       sprint rather than growing: a steady lag, which only cheaper chunks
+       (or more budget) shorten.
+     - **Encode** is ~1.0 ms median at 8 levels while sprinting (p99
+       ~1.9 ms), ~0.65 standing: exactly criterion 5's ~1 ms line on a fast
+       CPU, so a machine four times slower would spend ~4 ms. Task 3 has a
+       measured case.
+     - **Draws** are 570–735, under the spec's estimate (~200 + 640–1 872):
+       frustum and horizon culling already drop most LOD nodes.
+     - **Zero-area triangles are 23–27% of everything submitted**, ~0.4–0.6 M
+       a frame, all of it LOD (full resolution has emitted true triangles
+       since `emit_sealed_rect`). Task 2's prize.
+     - **These numbers are a dev build.** `cargo run` builds the workspace's
+       own crates at `opt-level = 1` (dependencies at 3), and so did every
+       earlier benchmark — comparable with each other, not with what a player
+       runs. Headlessly (cloud container, real chunks off the land sprint
+       path) a release build meshes only ~13% faster, so the mesher's cost is
+       in the algorithm, not the profile.
    - [ ] Lavapipe worst case: one fixed headless frame's time in the cloud
      container (see "Low-end hardware" below).
 1. **Profile meshing under streaming.** Where does `mesh_chunk` spend its
