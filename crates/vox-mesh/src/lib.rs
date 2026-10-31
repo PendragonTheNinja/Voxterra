@@ -18,6 +18,7 @@
 //! must tighten accordingly — and the differential test must keep passing
 //! regardless (Milestone 01 spec, criterion 4).
 
+use std::collections::{HashMap, HashSet};
 use vox_core::{BlockId, CHUNK_SIZE, Chunk, ChunkPos, LocalPos, World};
 
 /// One mesh vertex. `repr(C)` + Pod so vox-render can cast the vertex
@@ -963,12 +964,14 @@ pub fn mesh_chunk(
     // Corner order is emit order (0,0),(1,0),(1,1),(0,1) in (u,v).
     type CellMask = (BlockId, [u16; 4], [u16; 4], [u8; 4]);
     let mut mask: Vec<Option<CellMask>> = vec![None; size * size];
+    // Every merged rectangle, emitted only once all are known, so each can
+    // carry a vertex wherever another one's corner touches its edge
+    // (`emit_sealed_rect`).
+    let mut rects: Vec<MergedRect> = Vec::new();
     let at = |u: usize, v: usize| u + v * size;
 
     for (face_index, &(axis, positive, u_axis, v_axis)) in FACE_DIRS.iter().enumerate() {
         let dir_shade = face_brightness(axis, positive);
-        let u_dir = axis_unit(u_axis);
-        let v_dir = axis_unit(v_axis);
 
         for slice in 0..size {
             // --- Build the visibility mask for this slice. ---
@@ -1053,10 +1056,6 @@ pub fn mesh_chunk(
 
                     // Positive faces sit at the far plane of the slice.
                     let plane = slice + usize::from(positive);
-                    let mut base = [0f32; 3];
-                    base[axis] = plane as f32;
-                    base[u_axis] = u0 as f32;
-                    base[v_axis] = v0 as f32;
 
                     // Recover per-corner channels: sums ÷4 gives the mean level
                     // (0..=15), ÷15 normalizes to 0..=1. Shade is the baked
@@ -1086,30 +1085,183 @@ pub fn mesh_chunk(
                     on[axis] = slice as i32;
                     on[u_axis] = u0 as i32;
                     on[v_axis] = v0 as i32;
-                    let target = if input.is_opaque(on[0], on[1], on[2]) {
-                        &mut mesh
-                    } else {
-                        &mut transparent
-                    };
-                    emit_rect(
-                        target,
-                        base,
-                        u_dir,
-                        v_dir,
-                        w as f32,
-                        h as f32,
-                        layer_of(block, face_index),
-                        c_sky,
-                        c_block,
-                        c_shade,
+                    let mut corner = [0i32; 3];
+                    corner[axis] = plane as i32;
+                    corner[u_axis] = u0 as i32;
+                    corner[v_axis] = v0 as i32;
+                    rects.push(MergedRect {
+                        corner,
+                        u_axis,
+                        v_axis,
+                        w: w as i32,
+                        h: h as i32,
+                        layer: layer_of(block, face_index),
+                        sky: c_sky,
+                        block: c_block,
+                        shade: c_shade,
                         flip,
-                    );
+                        opaque: input.is_opaque(on[0], on[1], on[2]),
+                    });
                 }
             }
         }
     }
 
+    let corners: HashSet<[i32; 3]> = rects.iter().flat_map(MergedRect::corners).collect();
+    for rect in &rects {
+        let target = if rect.opaque {
+            &mut mesh
+        } else {
+            &mut transparent
+        };
+        emit_sealed_rect(target, rect, &corners);
+    }
     MeshData::joined(mesh, transparent)
+}
+
+/// One greedy-merged face rectangle, in chunk-local block units: `corner`
+/// is its (0,0) corner, `w` cells along `u_axis` and `h` along `v_axis`.
+/// Per-corner attributes are in `emit_rect`'s order.
+struct MergedRect {
+    corner: [i32; 3],
+    u_axis: usize,
+    v_axis: usize,
+    w: i32,
+    h: i32,
+    layer: u32,
+    sky: [f32; 4],
+    block: [f32; 4],
+    shade: [f32; 4],
+    flip: bool,
+    opaque: bool,
+}
+
+impl MergedRect {
+    /// The point `du` along u and `dv` along v from the (0,0) corner.
+    fn at(&self, du: i32, dv: i32) -> [i32; 3] {
+        let mut p = self.corner;
+        p[self.u_axis] += du;
+        p[self.v_axis] += dv;
+        p
+    }
+
+    fn corners(&self) -> [[i32; 3]; 4] {
+        [
+            self.at(0, 0),
+            self.at(self.w, 0),
+            self.at(self.w, self.h),
+            self.at(0, self.h),
+        ]
+    }
+}
+
+/// Emit a merged rectangle with no T-junctions: a vertex at every point of
+/// its border where another rectangle has a corner, and at every block corner
+/// of its border lying on a face of the chunk — the neighbouring chunk's
+/// rectangles end there at points this chunk cannot see. Rasterization does
+/// not promise to close a T-junction, and at a distance, where triangles are
+/// a pixel wide, each one leaked single pixels of sky: the white specks
+/// (2026-10-31, found by `hole_census`). A rectangle with nothing on its
+/// border stays one quad. Otherwise its border splits at the (0,0) and (w,h)
+/// corners into two chains, zipped into n − 2 triangles for n border
+/// vertices — one more per added vertex, never more than one quad per cell,
+/// none degenerate — sharing the n vertices. Unlike everything else in a
+/// `MeshData`, these are not quads: three indices per triangle.
+fn emit_sealed_rect(mesh: &mut MeshData, rect: &MergedRect, corners: &HashSet<[i32; 3]>) {
+    let n = CHUNK_SIZE as i32;
+    let splits = |p: [i32; 3]| corners.contains(&p) || p.iter().any(|&c| c == 0 || c == n);
+    let (w, h) = (rect.w, rect.h);
+    // Interior points of one side, from `from` stepping by (du, dv).
+    let side = |(u0, v0): (i32, i32), (du, dv): (i32, i32), len: i32| {
+        (1..len)
+            .map(move |k| (u0 + du * k, v0 + dv * k))
+            .filter(|&(u, v)| splits(rect.at(u, v)))
+    };
+    // Counter-clockwise from (0,0): along the bottom, up the right side.
+    let mut lower = vec![(0, 0)];
+    lower.extend(side((0, 0), (1, 0), w));
+    lower.push((w, 0));
+    lower.extend(side((w, 0), (0, 1), h));
+    lower.push((w, h));
+    // Clockwise from (0,0): up the left side, along the top.
+    let mut upper = vec![(0, 0)];
+    upper.extend(side((0, 0), (0, 1), h));
+    upper.push((0, h));
+    upper.extend(side((0, h), (1, 0), w));
+    upper.push((w, h));
+
+    let u_dir = axis_unit(rect.u_axis);
+    let v_dir = axis_unit(rect.v_axis);
+    let base = rect.corner.map(|c| c as f32);
+    if lower.len() + upper.len() == 6 {
+        emit_rect(
+            mesh, base, u_dir, v_dir, w as f32, h as f32, rect.layer, rect.sky, rect.block,
+            rect.shade, rect.flip,
+        );
+        return;
+    }
+    // Attributes at (du, dv), bilinear between the four corners. Merged cells
+    // share their corner values, so a rectangle varies along at most one axis
+    // and this is exactly what its quad showed.
+    let (wf, hf) = (w as f32, h as f32);
+    let lerp4 = |c: [f32; 4], du: f32, dv: f32| {
+        let (s, t) = (du / wf, dv / hf);
+        let bottom = c[0] + (c[1] - c[0]) * s;
+        let top = c[3] + (c[2] - c[3]) * s;
+        bottom + (top - bottom) * t
+    };
+    let vert = |(du, dv): (i32, i32)| {
+        let (du, dv) = (du as f32, dv as f32);
+        Vertex {
+            position: std::array::from_fn(|k| base[k] + u_dir[k] * du + v_dir[k] * dv),
+            uv: [du, dv],
+            layer: rect.layer,
+            sky: lerp4(rect.sky, du, dv),
+            block: lerp4(rect.block, du, dv),
+            shade: lerp4(rect.shade, du, dv),
+        }
+    };
+    let area = |a: (i32, i32), b: (i32, i32), c: (i32, i32)| {
+        (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
+    };
+    // Each border vertex once, shared by every triangle that uses it.
+    let mut index: HashMap<(i32, i32), u32> = HashMap::new();
+    for &p in lower.iter().chain(&upper) {
+        index.entry(p).or_insert_with(|| {
+            mesh.vertices.push(vert(p));
+            mesh.vertices.len() as u32 - 1
+        });
+    }
+    let mut emit = |a: (i32, i32), b: (i32, i32), c: (i32, i32)| {
+        debug_assert!(
+            area(a, b, c) > 0,
+            "zipper made a clockwise or empty triangle"
+        );
+        mesh.indices
+            .extend_from_slice(&[index[&a], index[&b], index[&c]]);
+    };
+    // The chains share (0,0), so the first triangle steps along both.
+    emit(lower[0], lower[1], upper[1]);
+    // Zip: after that, each step takes the next point of one chain, and
+    // neither steps onto (w,h) alone — the last triangle closes on it from
+    // both. Between those ends no step is ever zero-area: three collinear
+    // points lie along one side, and each chain's points are on its own two
+    // sides, which meet the other's only at (0,0) and (w,h).
+    let (last_l, last_u) = (lower.len() - 1, upper.len() - 1);
+    let (mut i, mut j) = (1, 1);
+    while i + 1 < last_l || j + 1 < last_u {
+        // Advance the chain that is further behind, by share of its length.
+        let take_lower = j + 1 >= last_u
+            || (i + 1 < last_l && i as f32 / last_l as f32 <= j as f32 / last_u as f32);
+        if take_lower {
+            emit(lower[i], lower[i + 1], upper[j]);
+            i += 1;
+        } else {
+            emit(lower[i], upper[j + 1], upper[j]);
+            j += 1;
+        }
+    }
+    emit(lower[i], lower[last_l], upper[j]);
 }
 
 #[cfg(test)]
@@ -1364,6 +1516,69 @@ mod tests {
         }
     }
 
+    /// THE white specks, at last (2026-10-31): the owner's in-game census
+    /// (`Renderer::hole_census`) found 84 pinholes as drawn and none with LOD
+    /// alone — they are in the full-resolution meshes. A merged rectangle's
+    /// edge runs past the corners of the smaller faces beside it, a
+    /// T-junction, which rasterization need not close: single pixels of sky
+    /// where triangles are a pixel wide, far out in the full-res disc. No
+    /// end of an axis-aligned opaque edge may lie strictly inside another
+    /// edge on the same line.
+    #[test]
+    fn greedy_mesh_has_no_t_junctions() {
+        use std::collections::HashMap;
+        // Terraces of grass over stone, steps one to three blocks high, in
+        // both directions — the ground the specks were seen over.
+        let mut chunk = Chunk::new_air();
+        for z in 0..N {
+            for x in 0..N {
+                let top = 6 + (x / 5 + z / 7) % 4 + (x * 3 + z) % 11 / 7;
+                for y in 0..=top {
+                    let b = if y == top {
+                        vox_core::registry::GRASS
+                    } else {
+                        STONE
+                    };
+                    chunk.set(LocalPos::new(x as u8, y as u8, z as u8), b);
+                }
+            }
+        }
+        let mesh = mesh_chunk(&chunk, &ChunkNeighbors::NONE, WHITE, cubes);
+        let mut on_line: HashMap<(usize, i64, i64), Vec<(i64, i64)>> = HashMap::new();
+        let q = |v: f32| (v * 16.0).round() as i64;
+        for tri in mesh.opaque_indices().chunks_exact(3) {
+            let p: Vec<[i64; 3]> = tri
+                .iter()
+                .map(|&i| mesh.vertices[i as usize].position.map(q))
+                .collect();
+            for (a, b) in [(p[0], p[1]), (p[1], p[2]), (p[2], p[0])] {
+                let differ: Vec<usize> = (0..3).filter(|&k| a[k] != b[k]).collect();
+                let [axis] = differ[..] else { continue };
+                let key = match axis {
+                    0 => (0, a[1], a[2]),
+                    1 => (1, a[0], a[2]),
+                    _ => (2, a[0], a[1]),
+                };
+                on_line
+                    .entry(key)
+                    .or_default()
+                    .push((a[axis].min(b[axis]), a[axis].max(b[axis])));
+            }
+        }
+        let mut junctions = 0;
+        for spans in on_line.values() {
+            for &(lo, hi) in spans {
+                for &(a, b) in spans {
+                    let inside = |v: i64| lo < v && v < hi;
+                    if a < hi && lo < b && (inside(a) || inside(b)) {
+                        junctions += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(junctions, 0, "T-junctions in the greedy mesh");
+    }
+
     // -----------------------------------------------------------------
     // Sealed neighbours (M10 A3): no faces toward chunks that never load.
     // -----------------------------------------------------------------
@@ -1379,7 +1594,13 @@ mod tests {
         let greedy = mesh_chunk(&chunk, &sealed, WHITE, cubes);
         assert_eq!(open.quad_count(), 6 * N * N);
         assert_eq!(naive.quad_count(), 5 * N * N, "naive drew the void floor");
-        assert_eq!(greedy.quad_count(), 5, "greedy drew the void floor");
+        // Five sides, each with a vertex at every block corner of its border
+        // (faces on the chunk's face: `emit_sealed_rect`).
+        assert_eq!(
+            drawn_triangles(&greedy),
+            5 * (4 * N - 2),
+            "greedy drew the void floor"
+        );
         let floor_face = naive.indices.chunks_exact(6).any(|q| {
             let b = q[0] as usize;
             naive.vertices[b..b + 4]
@@ -1535,12 +1756,83 @@ mod tests {
     // Greedy: merging behavior.
     // -----------------------------------------------------------------
 
-    /// The signature greedy result: a fully solid chunk is exactly 6 quads
-    /// — one maximal rectangle per side.
+    /// A solid box clear of the chunk's faces, `lo..hi` on every axis.
+    fn interior_box(lo: u8, hi: u8) -> Chunk {
+        let mut chunk = Chunk::new_air();
+        for pos in LocalPos::iter() {
+            let (x, y, z) = (pos.x(), pos.y(), pos.z());
+            if (lo..hi).contains(&x) && (lo..hi).contains(&y) && (lo..hi).contains(&z) {
+                chunk.set(pos, STONE);
+            }
+        }
+        chunk
+    }
+
+    /// The zipper on its own: a rectangle lying on the chunk's face, with a
+    /// vertex at every block corner of its border, covers each cell exactly
+    /// once, counter-clockwise, in n − 2 triangles for its n border vertices.
     #[test]
-    fn greedy_solid_chunk_is_six_quads() {
-        let mesh = mesh_chunk(&Chunk::filled(STONE), &ChunkNeighbors::NONE, WHITE, cubes);
+    fn a_sealed_rectangle_covers_each_cell_once() {
+        for (w, h) in [(3, 2), (2, 3), (1, 4), (4, 1), (1, 1), (5, 5)] {
+            let rect = MergedRect {
+                corner: [4, 5, 0],
+                u_axis: 0,
+                v_axis: 1,
+                w,
+                h,
+                layer: 0,
+                sky: [1.0; 4],
+                block: [0.0; 4],
+                shade: [1.0; 4],
+                flip: false,
+                opaque: true,
+            };
+            let mut mesh = MeshData::default();
+            emit_sealed_rect(&mut mesh, &rect, &HashSet::new());
+            let cov = coverage(&mesh);
+            assert_eq!(cov.len(), (w * h) as usize, "{w}x{h}: cells missed");
+            assert!(
+                cov.values().all(|&c| c == 1),
+                "{w}x{h}: a cell covered twice"
+            );
+            assert!(
+                cov.keys().all(|k| k.1),
+                "{w}x{h}: wound the wrong way (u × v is +Z here)"
+            );
+            assert_eq!(drawn_triangles(&mesh) as i32, 2 * (w + h) - 2, "{w}x{h}");
+        }
+    }
+
+    /// Triangles that cover area: everything but the zero-area padding of
+    /// `emit_sealed_rect`'s triangles.
+    fn drawn_triangles(mesh: &MeshData) -> usize {
+        mesh.indices
+            .chunks_exact(3)
+            .filter(|t| {
+                let p = |k: usize| mesh.vertices[t[k] as usize].position;
+                let n = cross(sub(p(1), p(0)), sub(p(2), p(0)));
+                n.iter().any(|&c| c != 0.0)
+            })
+            .count()
+    }
+
+    /// The signature greedy result: a solid box is exactly 6 quads — one
+    /// maximal rectangle per side.
+    #[test]
+    fn greedy_solid_box_is_six_quads() {
+        let mesh = mesh_chunk(&interior_box(1, 31), &ChunkNeighbors::NONE, WHITE, cubes);
         assert_eq!(mesh.quad_count(), 6);
+    }
+
+    /// Faces ON the chunk's faces are the exception: the neighbouring
+    /// chunk's rectangles end at points this chunk cannot see, so each of
+    /// a solid chunk's sides carries a vertex at every block corner of its
+    /// border — 4 × 32 of them, zipped into 4 × 32 − 2 triangles
+    /// (`emit_sealed_rect`). Still a fraction of naive's 2 × 32 × 32.
+    #[test]
+    fn faces_on_the_chunk_face_have_a_vertex_at_every_border_corner() {
+        let mesh = mesh_chunk(&Chunk::filled(STONE), &ChunkNeighbors::NONE, WHITE, cubes);
+        assert_eq!(drawn_triangles(&mesh), 6 * (4 * N - 2));
     }
 
     /// Two adjacent same-type blocks: each exposed side merges into one
@@ -1655,36 +1947,53 @@ mod tests {
     fn coverage(mesh: &MeshData) -> HashMap<CellKey, u32> {
         let mut map: HashMap<CellKey, u32> = HashMap::new();
 
-        assert_eq!(mesh.indices.len() % 6, 0, "quads are 6 indices each");
-        for quad in mesh.indices.chunks_exact(6) {
-            let bi = quad.iter().copied().min().unwrap() as usize;
-            let (corners, _cbright) = quad_corners(mesh, quad);
-            let layer = mesh.vertices[bi].layer;
+        // Triangle by triangle, so a sealed rectangle's fan (`emit_sealed_rect`)
+        // counts like the quad it replaces: a cell is covered by the triangle
+        // holding its sample point, off-centre so no fan edge passes through.
+        assert_eq!(mesh.indices.len() % 3, 0, "triangles are 3 indices each");
+        for tri in mesh.indices.chunks_exact(3) {
+            let c: Vec<[f32; 3]> = tri
+                .iter()
+                .map(|&i| mesh.vertices[i as usize].position)
+                .collect();
+            let layer = mesh.vertices[tri[0] as usize].layer;
             assert!(
-                (0..4).all(|k| mesh.vertices[bi + k].layer == layer),
-                "quad has inconsistent layer"
+                tri.iter()
+                    .all(|&i| mesh.vertices[i as usize].layer == layer),
+                "triangle has inconsistent layer"
             );
-
-            // Plane axis: the coordinate identical across all four corners.
-            let axis = (0..3)
-                .find(|&a| corners.iter().all(|c| c[a] == corners[0][a]))
-                .expect("quad is not axis-aligned");
-            let plane = corners[0][axis] as i32;
-
-            // Outward sign from the winding normal of the first triangle.
-            let e1 = sub(corners[1], corners[0]);
-            let e2 = sub(corners[2], corners[0]);
-            let normal = cross(e1, e2);
-            assert!(normal[axis] != 0.0, "degenerate quad / wrong plane");
+            let normal = cross(sub(c[1], c[0]), sub(c[2], c[0]));
+            let Some(axis) = (0..3).find(|&a| normal[a] != 0.0) else {
+                continue; // a fan's zero-area padding
+            };
+            assert!(
+                c.iter().all(|p| p[axis] == c[0][axis]),
+                "triangle is not axis-aligned"
+            );
             let positive = normal[axis] > 0.0;
-
+            let plane = c[0][axis] as i32;
             let (a1, a2) = other_axes(axis);
-            let (min1, max1) = extent(&corners, a1);
-            let (min2, max2) = extent(&corners, a2);
-
-            for p in min1..max1 {
-                for q in min2..max2 {
-                    *map.entry((axis, positive, plane, p, q, layer)).or_insert(0) += 1;
+            let lo = |a: usize| c.iter().map(|p| p[a]).fold(f32::INFINITY, f32::min).floor() as i32;
+            let hi = |a: usize| {
+                c.iter()
+                    .map(|p| p[a])
+                    .fold(f32::NEG_INFINITY, f32::max)
+                    .ceil() as i32
+            };
+            let inside = |x: f32, y: f32| {
+                let d: Vec<f32> = (0..3)
+                    .map(|k| {
+                        let (p, q) = (c[k], c[(k + 1) % 3]);
+                        (q[a1] - p[a1]) * (y - p[a2]) - (q[a2] - p[a2]) * (x - p[a1])
+                    })
+                    .collect();
+                d.iter().all(|&v| v > 0.0) || d.iter().all(|&v| v < 0.0)
+            };
+            for p in lo(a1)..hi(a1) {
+                for q in lo(a2)..hi(a2) {
+                    if inside(p as f32 + 0.37, q as f32 + 0.61) {
+                        *map.entry((axis, positive, plane, p, q, layer)).or_insert(0) += 1;
+                    }
                 }
             }
         }
@@ -1711,16 +2020,6 @@ mod tests {
         ]
     }
 
-    fn extent(corners: &[[f32; 3]; 4], axis: usize) -> (i32, i32) {
-        let mut min = f32::INFINITY;
-        let mut max = f32::NEG_INFINITY;
-        for c in corners {
-            min = min.min(c[axis]);
-            max = max.max(c[axis]);
-        }
-        (min as i32, max as i32)
-    }
-
     fn random_chunk(rng: &mut SplitMix64, fill_percent: u64, types: u16) -> Chunk {
         let mut chunk = Chunk::new_air();
         for pos in LocalPos::iter() {
@@ -1732,19 +2031,19 @@ mod tests {
     }
 
     /// A greedy-merged W×H quad must carry UVs spanning 0..W / 0..H so the
-    /// texture-array layer tiles W×H times (not stretched). For a solid
-    /// chunk, each of the 6 faces is one 32×32 quad whose UVs span 0..32.
+    /// texture-array layer tiles W×H times (not stretched). For a 30-block
+    /// solid box, each of the 6 faces is one 30×30 quad whose UVs span 0..30.
     #[test]
     fn greedy_quad_uvs_tile_across_merge() {
-        let mesh = mesh_chunk(&Chunk::filled(STONE), &ChunkNeighbors::NONE, WHITE, cubes);
+        let mesh = mesh_chunk(&interior_box(1, 31), &ChunkNeighbors::NONE, WHITE, cubes);
         assert_eq!(mesh.quad_count(), 6);
         for quad in mesh.indices.chunks_exact(6) {
             let bi = quad[0] as usize;
             let uvs: Vec<[f32; 2]> = (0..4).map(|k| mesh.vertices[bi + k].uv).collect();
             let max_u = uvs.iter().map(|c| c[0]).fold(0.0_f32, f32::max);
             let max_v = uvs.iter().map(|c| c[1]).fold(0.0_f32, f32::max);
-            assert_eq!(max_u, 32.0, "merged face U should span the full 32");
-            assert_eq!(max_v, 32.0, "merged face V should span the full 32");
+            assert_eq!(max_u, 30.0, "merged face U should span the full 30");
+            assert_eq!(max_v, 30.0, "merged face V should span the full 30");
             assert_eq!(uvs[0], [0.0, 0.0]);
         }
     }
@@ -1814,8 +2113,8 @@ mod tests {
                 "seed {seed}: greedy and naive disagree on the visible surface"
             );
             assert!(
-                greedy.quad_count() <= naive.quad_count(),
-                "seed {seed}: greedy used more quads than naive"
+                drawn_triangles(&greedy) <= drawn_triangles(&naive),
+                "seed {seed}: greedy drew more triangles than naive"
             );
         }
     }

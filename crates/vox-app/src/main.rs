@@ -2949,7 +2949,44 @@ mod specks_scratch {
             1.0,
             shape_p,
         );
-        r.set_fullres_columns(cam_chunk, |_, _| false);
+        // SPECK_FULLRES=1: full resolution too, unlit, radius 8, like the
+        // game's disc, with the mask over the columns meshed.
+        let mut fullres: HashSet<(i64, i64)> = HashSet::new();
+        if std::env::var("SPECK_FULLRES").is_ok() {
+            let mut world = World::new();
+            let r8 = 8i64;
+            let mut targets = Vec::new();
+            for dz in -r8 - 1..=r8 + 1 {
+                for dx in -r8 - 1..=r8 + 1 {
+                    let (cx, cz) = (cam_chunk.x + dx, cam_chunk.z + dz);
+                    let top = generator.surface_height(cx * 32 + 16, cz * 32 + 16) >> 5;
+                    for cy in top - 3..=top + 3 {
+                        let pos = ChunkPos::new(cx, cy, cz);
+                        world.insert_chunk(pos, generator.generate_chunk(pos));
+                        if dx * dx + dz * dz <= r8 * r8 && (top - 2..=top + 2).contains(&cy) {
+                            targets.push(pos);
+                        }
+                    }
+                    if dx * dx + dz * dz <= r8 * r8 {
+                        fullres.insert((cx, cz));
+                    }
+                }
+            }
+            for pos in targets {
+                let chunk = world.chunk(pos).unwrap();
+                let n = ChunkNeighbors::of(&world, pos);
+                let m = mesh_chunk(
+                    chunk,
+                    &n,
+                    |b, f| registry.face_layer(b, f),
+                    |b| registry.is_opaque(b),
+                );
+                if !m.is_empty() {
+                    r.set_chunk_mesh(pos, &m);
+                }
+            }
+        }
+        r.set_fullres_columns(cam_chunk, |cx, cz| fullres.contains(&(cx, cz)));
         for (name, holes, first) in r.hole_census(view_proj.to_cols_array_2d()) {
             println!("HOLES {name}: {holes} {first:?}");
         }

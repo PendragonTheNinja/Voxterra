@@ -240,7 +240,7 @@ the remote matches it, and starts at the first unchecked item.*
   tallest. Known limit: added vertices morph linearly up their own wall, so
   two walls sharing one may part slightly inside a morph band while it
   animates. To confirm in play: H shows no magenta specks in the distance.
-- [ ] **In play, 2026-10-18: the specks remain, magenta under H.** Neither
+- [x] **In play, 2026-10-18: the specks remain, magenta under H.** Neither
   T-junction fix touched them, and the skirts are ruled out too (on real
   terrain no node border steps further than a skirt reaches: 0 of 10 240
   border pairs at any stride). New instrument: `Renderer::new_headless` and
@@ -268,6 +268,37 @@ the remote matches it, and starts at the first unchecked item.*
   the near sea 90–250 blocks out shows the magenta sky through the water
   (about 82, 61, 123 against blue-grey beyond) — inside the full-res
   radius, so no seabed is drawn under that water. Not yet diagnosed.
+  (Owner, same day: not a bug — those rays run under the surface over a
+  seabed falling ~1 in 10, faster than they sink, and leave the 2 km LOD
+  horizon. Checked against the generator: −16 at 300 blocks, −117 at 1 200,
+  −212 at 2 000. The real fix is water that absorbs with path length, a
+  later improvement.)
+- [x] **The specks found and fixed: T-junctions in the FULL-RESOLUTION
+  greedy mesh.** The owner's census (2026-10-31, RTX 4060): as drawn 84;
+  without the LOD bias or culling 84; without the mask 74; **LOD alone 0**.
+  The distant terrain was watertight all along; the holes were in the
+  full-res chunks, whose greedy rectangles' edges ran past the corners of
+  the smaller faces beside them, out where full-res triangles are a pixel
+  wide. Why they vanished while moving: columns still streaming are left out
+  of the mask, so LOD drew underneath and filled the cracks; standing still,
+  every column completes and the mask exposes them (the mask arrived in M10
+  A1 — LOD used to underlap everywhere). Test
+  `greedy_mesh_has_no_t_junctions` (a terraced chunk) found 1 017 and failed
+  first. Fix: `mesh_chunk` collects its rectangles, then
+  `emit_sealed_rect` gives each a vertex at every point of its border where
+  another rectangle has a corner, and at every block corner of its border
+  lying on a face of the chunk (the neighbour's corners there are unknown);
+  a rectangle with none stays one quad, otherwise its border zips into
+  n − 2 shared-vertex triangles (never more than naive; none degenerate;
+  three indices each — the one place a `MeshData` is not all quads). Tests
+  that counted quads on a lone solid chunk now use a box clear of the
+  chunk's faces; the greedy-versus-naive cost check counts triangles.
+  Harness with full resolution at the owner's first `VIEW`: old mesher 21
+  pinholes, new 5 — the 5 the LOD alone shows on lavapipe at the far
+  horizon. Cost, drawn full-res triangles over 9×9×5 real chunks: shore
+  53 290 → 72 176, inland 5 524 → 16 102, hills 14 076 → 25 498 — mostly
+  the chunk-face splits; tens of thousands against LOD's 0.5–2 M. To confirm
+  in play: P's `HOLES as drawn` near zero, and no specks by eye.
 - [x] **Benchmark mode: `cargo run -p vox-app -- --bench`.** One fixed,
   repeatable run instead of hand-timed retro runs: default settings, noon
   with time paused, eight phases — {6, 8 levels} × {land, ocean} ×
