@@ -74,8 +74,44 @@ Pillar 1 is performance on low-end hardware, and M11's benchmark (RTX 4060,
      at upload), and the zero-area share between them. Code is the M11 tag
      (`v0.11.0-m11` is the commit before) plus these counters; nothing
      drawn or streamed changes.
-   - [ ] Baseline: the owner runs `cargo run -p vox-app -- --bench` (as in M11)
-     on the RTX 4060 and the table is recorded here, with the window size.
+   - [x] **Baseline, first table (owner's run, 2026-10-31):** RTX 4060,
+     800×600 as in M11, seed 0x7e22ac0de, defaults (radius 8, curvature on,
+     air density 1). Built without the instruments (only the first table),
+     but the same code otherwise: the M11 tag, full-resolution fix in. Every
+     phase settled (2.4–2.8 s standing, 1.0 s into the sprints).
+
+     | Phase | fps median | 1% low | Worst ms | Relight ms/s | Mesh ms/s | Dirty peak / end | LOD nodes | GPU MB | Tris M | Loaded |
+     |---|---|---|---|---|---|---|---|---|---|---|
+     | 6 levels, land, standing | 927 | 635 | 5.5 | 0 | 0 | 0 / 0 | 1216 | 599 | 1.82 | 1432 |
+     | 6 levels, land, sprint | 119 | 53 | 27.0 | 173 | 591 | 1142 / 1017 | 1424 | 640 | 1.64 | 2204 |
+     | 8 levels, land, standing | 793 | 514 | 3.7 | 0 | 0 | 0 / 0 | 1600 | 957 | 2.24 | 1432 |
+     | 8 levels, land, sprint | 115 | 52 | 33.1 | 174 | 575 | 1181 / 1063 | 1872 | 1053 | 2.01 | 2204 |
+     | 6 levels, ocean, standing | 818 | 552 | 3.0 | 0 | 0 | 0 / 0 | 1216 | 591 | 1.83 | 1475 |
+     | 6 levels, ocean, sprint | 114 | 53 | 25.1 | 180 | 583 | 1155 / 1034 | 1424 | 603 | 1.57 | 2204 |
+     | 8 levels, ocean, standing | 752 | 487 | 3.6 | 0 | 0 | 0 / 0 | 1600 | 947 | 2.21 | 1475 |
+     | 8 levels, ocean, sprint | 111 | 53 | 30.8 | 182 | 570 | 1188 / 1056 | 1872 | 1015 | 1.88 | 2204 |
+
+     Against M11's run (2026-10-17, before the LOD wall fix and the
+     full-resolution fix): sprint fps 128 → 115 at 8 levels; the sprint
+     backlog ends ~1 060, not ~680 — **criterion 3's target is therefore
+     ≤ ~350** (a third of this baseline), not the ~240 the spec was written
+     with; GPU memory +35–50%; standing triangles +15–35%. Relight ms/s
+     nearly doubled (~95 → ~178) though no lighting or streaming code
+     changed between the runs — unexplained; a repeat run will say whether
+     it is noise.
+
+     **Mesh ms/s cannot measure meshing cost.** The mesh pass stops at
+     `MESH_TIME_MS` (4 ms, overshooting by up to one sub-batch), and
+     sprinting it is always full: 575 ms/s at 115 fps is 5.0 ms a frame, as
+     in M11. The number is the budget, not the work, so criterion 3's
+     "or mesh ms/s halves" can never be met by a faster mesher — judge
+     meshing by the second table's meshed/s and µs per chunk, and the
+     backlog, instead. What the backlog says already: the same budget now
+     drains ~50% fewer chunks — the full-resolution fix made each mesh
+     dearer, as expected.
+   - [ ] **Baseline, second table:** the same run built from the instruments
+     commit, so meshed/s, µs per chunk, encode, draws and triangles drawn
+     have a before.
    - [ ] Lavapipe worst case: one fixed headless frame's time in the cloud
      container (see "Low-end hardware" below).
 1. **Profile meshing under streaming.** Where does `mesh_chunk` spend its
