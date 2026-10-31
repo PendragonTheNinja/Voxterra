@@ -6,7 +6,7 @@ past the horizon while mountains rise above it from tens of kilometres out —
 and a frame rate that doesn't notice.
 
 Depends on M10 (the torus, `f64` world positions, and the sparse LOD sampler).
-Climate & Biomes (M12) comes after, and benefits: a biome you can see from
+Climate & Biomes (M13, after M12's performance pass) benefits: a biome you can see from
 30 km away is a destination.
 
 ## Changes at M10 close (2026-10-01)
@@ -456,7 +456,7 @@ numbers were taken on.
 
 ## Non-goals
 
-- **No climate, biomes or vegetation** — M12. The long view will be green; it
+- **No climate, biomes or vegetation** — M13. The long view will be green; it
   is judged on distance, stability and frame rate, not colour.
 - **No true sphere.** The world stays a torus with visual curvature (ADR-0012).
 - **No world-size selection UI.** Sizes stay a constant; the engine just has to

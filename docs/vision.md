@@ -294,7 +294,8 @@ natural, then on to the game. Each step needs the one before it.
 | M11 | **The Horizon** (spec written), with task 0 (why relighting doubled) and wavelength-dependent atmosphere (1.5) | Long views make every later worldgen step visible from tens of kilometres away |
 | — | **HUD basics** (section 7): hotbar, held block, hide HUD | Small; improves every play-test after it. Could slot in before or after Climate |
 | — | **Biome catalogue** — a design document, no code | The list must be fixed before climate is built to produce it (1.1) |
-| M12 | **Climate & Biomes** — temperature, precipitation, rain shadow, Köppen classes, surface materials, the size-scaling guarantee | Needs mountains (M10) to cast rain shadows |
+| M12 | **Performance Pass** (spec written 2026-10-31) — meshing under streaming, LOD without zero-area triangles, draw calls | M11's benchmark: sprint is meshing-bound and its backlog never drains; cheaper now than after biomes add load |
+| M13 | **Climate & Biomes** — temperature, precipitation, rain shadow, Köppen classes, surface materials, the size-scaling guarantee (and §10's lessons on biomes and terrain shape) | Needs mountains (M10) to cast rain shadows |
 | — | **Hydrology & erosion** — drainage, rivers with current, lakes above sea level, valleys | Needs precipitation; a river must know its upstream |
 | — | **Geology** — strata, caves, ores | Placer gold needs rivers; ores need the rock types |
 | — | **Block shapes & natural slopes** (1.4) | Needs final surface materials; touches meshing, lighting, collision once |
@@ -302,6 +303,93 @@ natural, then on to the game. Each step needs the one before it.
 | — | **World-creation settings** (1.2) | Once the systems with knobs exist |
 | — | Then the game: inventory and survival basics; entities (`vox-sim`); creatures (5); combat (6); progression (3); magic (4); dynamic water (1.3); chisels (2) | Gameplay waits for the world it happens in |
 
-Milestone numbers after M12 are left blank deliberately; they are assigned when
+Milestone numbers after M13 are left blank deliberately; they are assigned when
 each spec is written. The game-era ordering is the loosest part of this table
 and should be revisited once the world generator is complete.
+
+---
+
+## 10. Lessons from other engines
+
+### 10.1 PaleFernDev's Unity voxel engine (r/VoxelGameDev, October 2026)
+
+[The post](https://www.reddit.com/r/VoxelGameDev/comments/1ww3tvc/working_on_a_voxel_engine_in_unity_finally_got/):
+a custom voxel engine inside Unity with striking terrain and atmosphere,
+shared by Nathan on 2026-10-31. The author's technical notes and replies,
+with what each means for Voxterra. **Ideas, not decisions** — each waits for
+its milestone.
+
+**Already the same as ours** (a useful check that the architecture is
+sound): 32³ palette-compressed chunks; generate → light → mesh off the main
+thread; flood-fill sky and block light per vertex with the sun in the shader,
+so day/night never rebuilds chunks (ADR-0007); distant terrain in rings
+sampled from the same generator; edits stamped into the distant terrain;
+old geometry kept until its replacement covers the spot. A commenter's advice
+for block terrain — geomorphing plus a heightmap of exposed faces — is our
+LOD design (ADR-0008, ADR-0009). Our horizon reaches far further (64 km
+against his ~5 km).
+
+**For Climate & Biomes (M13).**
+- *Biomes are painted onto terrain; they do not decide its height.* Height
+  comes from a few large noise fields — continentalness, erosion,
+  peaks/valleys — remapped through curves (splines), with domain warp for the
+  base shape and a 3D density pass on top for overhangs and cliffs, kept
+  *relative to* the terrain height.
+- *Biome landforms are blended as heights, never as densities.* Each biome
+  may reshape its own ground (canyons, dunes, terraced savanna, karst towers,
+  volcanoes); lerping density fields of different scales does not work.
+- *Choose biomes from terrain values as well as climate.* Temperature and
+  humidity alone make every new biome shrink the others; adding
+  continentalness, erosion and ridges lets biomes share a climate but differ
+  in terrain (cold peaks against cold plains).
+- *Temperature falls with altitude*, so mountains get their own climate —
+  already implied by §1.1 and by real lapse rates.
+- *Very low-frequency climate noise* (biomes kilometres wide) plus variants
+  inside a biome.
+- *Variety comes less from octaves than from shaping:* domain warp, curve
+  remapping, mixing ridged and rounded noise, and masks giving each area its
+  own roughness; surface blocks do a lot of the work.
+
+  Claude's view: this fits our geology-first plan well. Elevation already
+  comes from large fields (ADR-0010); biomes painted on top and landforms
+  blended as heights keep worldgen deterministic per chunk. The M13 spec
+  should start from these points.
+
+**For distant terrain, once terrain has overhangs.** His far rings are real
+voxels at 2× and 4× scale, so overhangs survive at a distance; ours are
+heightfields — one height per cell — which is right while our terrain has no
+overhangs and cannot show them once a 3D density pass or caves arrive.
+Options then: voxel LOD for the nearer levels and heightfields beyond, or
+heightfields that keep a second surface. Needs an ADR before the first
+overhang ships.
+
+**For the atmosphere (§1.5).** His world edge fades into the sky as actually
+drawn at that pixel, so the fog matches the sky at any time of day — his
+sunset haze is pink. Our aerial perspective (ADR-0016) and edge fade both
+blend toward one fixed horizon colour. Keep the blue shift, but blend toward
+the sky's real colour along the view direction, for both. He also makes the
+fade follow how much has actually loaded, so on a fresh load the world grows
+out ring by ring and its end is never visible.
+
+**For performance (M12 and later).** GPU culling and indirect draws (M12
+measures whether our draw calls matter); a band between full resolution and
+LOD at the same voxel size but simplified — no caves or small plants, merged
+into big meshes — which mostly saves draw calls.
+
+**Further out.**
+- *Edits as commands*: every edit is a command, so undo/redo and batching are
+  free — useful for building (§2, chisels) and later for networking.
+- *Gameplay on the same world data*: raycasts, collision and pathfinding all
+  read one representation (another commenter: "if the terrain generator is
+  only good for drawing pixels, it's not a game engine"). Ours does for
+  raycast and collision; keep it so for pathfinding when entities arrive.
+- *Caves you can walk*: stacked floors of tunnel networks with flat floors,
+  plus large caverns with pillars, ravines and flooded lower levels (for the
+  Geology step).
+- *Water*: screen-space reflections, refraction, caustics and a flow
+  simulation (§1.3); and water that absorbs with path length, so deep water
+  goes dark instead of showing the sky past the end of the world (seen in
+  M11).
+- *Raymarched volumetric clouds* at half resolution that cast shadows and are
+  reflected in water.
+- *Optional real-time shadows and point lights* on top of flood-fill light.

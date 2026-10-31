@@ -277,7 +277,10 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   M11): a fixed script over land and ocean at 6 and 8 LOD levels that writes
   `bench/bench-<time>.md` and quits. Compare runs from it, not hand-timed
   flights; close other heavy programs first.
-- **Roadmap after M11:** 12 — Climate & Biomes (spec not yet written). The
+- **Roadmap after M11:** 12 — Performance Pass
+  (`docs/milestones/12-performance-pass.md`, spec written 2026-10-31: meshing
+  under streaming, LOD without zero-area triangles, draw calls), then
+  13 — Climate & Biomes (spec not yet written). The
   longer-range order, and the owner's ideas for the whole game, are in
   `docs/vision.md` — ideas and a proposed order, not decisions; each becomes a
   milestone spec and ADRs before anything is built.
