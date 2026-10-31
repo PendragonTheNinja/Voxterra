@@ -84,8 +84,22 @@ Pillar 1 is performance on low-end hardware, and M11's benchmark (RTX 4060,
   first and does the cheap things.
 - **No change to what is generated.** `GENERATOR_VERSION` does not move.
 
-## Open questions for the owner
+## Low-end hardware without a low-end machine
 
-- **A low-end reference machine.** Pillar 1 needs numbers from weak hardware,
-  not just the RTX 4060. Is there a laptop or integrated-GPU machine the
-  benchmark can run on? Without one, "low-end" stays an estimate.
+No weaker machine is available (owner, 2026-10-31), so low-end performance is
+judged by proxy until one is:
+
+- **Budgets, not just fps.** Report CPU milliseconds per frame (encode,
+  streaming, uploads) and per-job costs, not only fps on the RTX 4060 — a
+  machine four times slower has a quarter of the headroom, and fps at 900
+  hides where it would go.
+- **Scale with work, not hardware.** Prefer changes that cut work per chunk,
+  per node and per frame (fewer triangles, draws, allocations), which help on
+  any machine, over ones that trade CPU for GPU or the reverse.
+- **A software renderer as the worst case.** The cloud container runs the
+  real renderer on lavapipe (CPU-only Vulkan) through
+  `Renderer::new_headless`; a fixed headless frame's time there is a
+  repeatable, if pessimistic, stand-in for weak graphics.
+- **Defaults stay modest.** The default view distance and load radius are
+  chosen for an ordinary machine, not the development one (M11's open
+  question).
