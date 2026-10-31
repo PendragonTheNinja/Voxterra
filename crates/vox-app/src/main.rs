@@ -1605,6 +1605,23 @@ impl App {
         self.bench_started = Some(Instant::now());
     }
 
+    /// What the `dirty` set is waiting on, judged as the mesh pass judges
+    /// it (for the benchmark: `bench::DirtySplit`).
+    fn dirty_split(&self) -> bench::DirtySplit {
+        let camera_chunk = self.camera.block_pos().chunk();
+        let mut split = bench::DirtySplit::default();
+        for &p in &self.dirty {
+            if self.relight.contains(&p) {
+                split.relight += 1;
+            } else if self.ready_for_first_mesh(p, camera_chunk) {
+                split.ready += 1;
+            } else {
+                split.neighbours += 1;
+            }
+        }
+        split
+    }
+
     /// One frame of the benchmark: measure, then do what the script says.
     /// Returns true when the run is over and the program should exit.
     fn bench_tick(&mut self, raw_dt: f32) -> bool {
@@ -1639,6 +1656,11 @@ impl App {
             mesh_ms_total: self.mesh_ms_total,
             meshed_total: self.meshed_total,
             mesh_cpu_ms_total: self.mesh_cpu_ms_total,
+            dirty_split: self
+                .bench
+                .as_ref()
+                .is_some_and(|b| b.ends_this_frame(now))
+                .then(|| self.dirty_split()),
         };
         let Some(b) = self.bench.as_mut() else {
             return false;

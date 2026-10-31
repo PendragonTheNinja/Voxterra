@@ -97,6 +97,21 @@ pub fn script() -> Vec<Phase> {
     phases
 }
 
+/// What the `dirty` set (chunks waiting for a mesh) is waiting on. Once
+/// meshing kept up (M12 task 1), a backlog left at the end of a sprint could
+/// be chunks the mesher has not reached, or chunks it may not mesh yet —
+/// still queued for relight, or waiting for a face neighbour that is still
+/// coming (`ready_for_first_mesh`). Those are fixed by different work.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DirtySplit {
+    /// Could be meshed this frame.
+    pub ready: usize,
+    /// Still queued for relight (light first, mesh once).
+    pub relight: usize,
+    /// Waiting for its first complete neighbourhood.
+    pub neighbours: usize,
+}
+
 /// One frame's measurements.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Sample {
@@ -123,6 +138,9 @@ pub struct Sample {
     pub mesh_ms_total: f64,
     pub meshed_total: u64,
     pub mesh_cpu_ms_total: f64,
+    /// Only on a phase's last frame ([`Bench::ends_this_frame`]): judging
+    /// every dirty chunk's neighbours costs real main-thread time.
+    pub dirty_split: Option<DirtySplit>,
 }
 
 impl Sample {
@@ -159,6 +177,7 @@ pub struct PhaseStats {
     pub encode_ms_p99: f64,
     pub draws_median: usize,
     pub tris_drawn_median: usize,
+    pub dirty_split_end: Option<DirtySplit>,
 }
 
 /// The `q` quantile (0..=1) of sorted values, nearest-rank.
@@ -230,6 +249,7 @@ pub fn summarize(
         encode_ms_p99: quantile(&encode, 0.99),
         draws_median: median_of(|s| s.draws),
         tris_drawn_median: median_of(|s| s.tris_drawn),
+        dirty_split_end: last.dirty_split,
     }
 }
 
@@ -265,8 +285,8 @@ pub fn report(header: &[String], results: &[PhaseStats]) -> String {
     }
     out.push_str(
         "\n| Phase | Meshed /s | Mesh µs/chunk (CPU) | Encode ms median / p99 | Draws \
-         | Tris submitted M | Tris drawn M | Zero-area % |\n\
-         |---|---|---|---|---|---|---|---|\n",
+         | Tris submitted M | Tris drawn M | Zero-area % | Dirty end: ready / relight / neighbours |\n\
+         |---|---|---|---|---|---|---|---|---|\n",
     );
     for r in results {
         let padding = if r.tris_median > 0 {
@@ -275,7 +295,7 @@ pub fn report(header: &[String], results: &[PhaseStats]) -> String {
             0.0
         };
         out.push_str(&format!(
-            "| {} | {:.0} | {:.0} | {:.2} / {:.2} | {} | {:.2} | {:.2} | {:.0} |\n",
+            "| {} | {:.0} | {:.0} | {:.2} / {:.2} | {} | {:.2} | {:.2} | {:.0} | {} |\n",
             r.label,
             r.meshed_per_s,
             r.mesh_us_per_chunk,
@@ -285,6 +305,10 @@ pub fn report(header: &[String], results: &[PhaseStats]) -> String {
             r.tris_median as f64 / 1.0e6,
             r.tris_drawn_median as f64 / 1.0e6,
             padding,
+            r.dirty_split_end.map_or("–".to_string(), |d| format!(
+                "{} / {} / {}",
+                d.ready, d.relight, d.neighbours
+            )),
         ));
     }
     out
@@ -343,6 +367,15 @@ impl Bench {
             ocean,
             header,
             levels_applied: None,
+        }
+    }
+
+    /// Will the frame at `now` be the running phase's last? The app measures
+    /// the costly [`DirtySplit`] only then.
+    pub fn ends_this_frame(&self, now: f64) -> bool {
+        match (&self.state, self.phases.get(self.index)) {
+            (State::Running { since, .. }, Some(phase)) => now - since >= phase.secs,
+            _ => false,
         }
     }
 
@@ -527,7 +560,9 @@ mod tests {
         assert_eq!(s.draws_median, 900);
         let r = report(&[], &[s]);
         assert!(
-            r.contains("| 6 levels, land, sprint | 0 | 0 | 0.50 / 0.50 | 900 | 2.00 | 1.50 | 25 |"),
+            r.contains(
+                "| 6 levels, land, sprint | 0 | 0 | 0.50 / 0.50 | 900 | 2.00 | 1.50 | 25 | – |"
+            ),
             "{r}"
         );
     }
@@ -575,6 +610,34 @@ mod tests {
             .results
             .iter()
             .all(|r| (r.settle_secs - 3.0).abs() < 0.02 && !r.settle_timed_out));
+    }
+
+    #[test]
+    fn the_dirty_split_is_asked_for_once_per_phase_and_reported_from_the_last_frame() {
+        let mut b = Bench::new([0.0, 50.0, 0.0], [9000.0, 40.0, 0.0], vec![]);
+        let mut asked = 0;
+        let mut report = None;
+        for frame in 0..200_000 {
+            let now = frame as f64 * 0.01;
+            let mut s = sample(10.0, 0);
+            if b.ends_this_frame(now) {
+                asked += 1;
+                s.dirty_split = Some(DirtySplit {
+                    ready: 1,
+                    relight: 2,
+                    neighbours: asked,
+                });
+            }
+            if let Some(r) = b.tick(now, s).done {
+                report = Some(r);
+                break;
+            }
+        }
+        assert_eq!(asked, 8, "once per phase");
+        let report = report.expect("the run ended");
+        assert!(report.contains("| 1 / 2 / 1 |"), "{report}");
+        assert!(report.contains("| 1 / 2 / 8 |"), "{report}");
+        assert!(b.results.iter().all(|r| r.dirty_split_end.is_some()));
     }
 
     #[test]

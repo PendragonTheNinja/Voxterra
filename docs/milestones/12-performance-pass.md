@@ -223,7 +223,35 @@ Pillar 1 is performance on low-end hardware, and M11's benchmark (RTX 4060,
 
      Release build: mean 396 µs, mixed 783. `MeshInput::build` (~350 µs in
      the dev build) is now most of every uniform chunk's cost and a third of
-     a mixed one's — the next target, after the owner's bench.
+     a mixed one's.
+
+     **In game (owner's `--bench`, 2026-10-31), sprint phases:**
+
+     | | Baseline | Boundary slices | + prefilter |
+     |---|---|---|---|
+     | Mesh µs per chunk (CPU) | ~1 640 | ~820 | **540–590** |
+     | Chunks meshed per second | ~1 630 | ~2 170 | 2 476–2 555 |
+     | Mesh ms/s (main thread) | ~575 | ~550 | **365–391** |
+     | Backlog end, 6 / 8 levels | ~1 000 / ~1 040 | ~450 / ~430 | 385–392 / 374–395 |
+     | fps median, 6 / 8 levels | ~117 / ~113 | ~121 / ~118 | **645–755 / 575–616** |
+     | 1% low | 51–53 | 52–55 | 57–61 |
+
+     The mesh pass no longer fills its 4 ms budget, so the sprint frame
+     rate is 5–6× what it was, close to standing. Headlessly the prefilter
+     cut ~57% per chunk; in game ~30%, so in-game chunks are less like the
+     sample (more re-meshes of surface chunks, which the prefilter helps
+     least) — `MeshInput::build` is the obvious remaining share either way.
+     Standing phases, encode, draws and triangles unchanged within noise.
+
+     **Criterion 3 is 7–13% short (≤ ~350 asked, 374–395 measured) — but
+     with the budget no longer full, the backlog may not be meshing's at
+     all.** It can hold chunks still queued for relight and chunks waiting
+     for a neighbour that is still being generated (the first-mesh gate),
+     which no mesher speed drains. The benchmark now splits the backlog on
+     each phase's last frame — ready / relight / neighbours — to say which.
+   - [ ] The owner's bench with the backlog split, then the next fix chosen
+     by it: `MeshInput::build` if chunks are ready and waiting; relight or
+     generation if not.
 2. **LOD as true triangles** (criterion 4).
 3. **Draw-call measurement, then batching if warranted** (criterion 5).
 4. **Retro.**
