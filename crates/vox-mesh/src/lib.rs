@@ -975,8 +975,28 @@ pub fn mesh_chunk_naive(
 pub fn mesh_chunk(
     chunk: &Chunk,
     neighbors: &ChunkNeighbors,
+    layer_of: impl FnMut(BlockId, usize) -> u32,
+    occludes: impl FnMut(BlockId) -> bool,
+) -> MeshData {
+    mesh_chunk_greedy(chunk, neighbors, layer_of, occludes, chunk.is_uniform())
+}
+
+/// [`mesh_chunk`], with the uniform-chunk shortcut a parameter so tests can
+/// compare it against the full sweep.
+///
+/// `boundary_only`: sweep only each direction's outermost slice. Exact for a
+/// uniform chunk — inside it every face is between two cells of one block,
+/// which `shows_face` always culls (opaque against opaque, water against
+/// water), so faces can only appear where the chunk meets a neighbour. Most
+/// of the stream is uniform: buried rock and deep sea, which emit nothing
+/// and used to cost a surface chunk's full 6 × 32-slice sweep (M12 task 1:
+/// ~3 ms each, two thirds of the mesh jobs along the benchmark's path).
+fn mesh_chunk_greedy(
+    chunk: &Chunk,
+    neighbors: &ChunkNeighbors,
     mut layer_of: impl FnMut(BlockId, usize) -> u32,
     occludes: impl FnMut(BlockId) -> bool,
+    boundary_only: bool,
 ) -> MeshData {
     let mut mesh = MeshData::default();
     let mut transparent = MeshData::default();
@@ -1005,8 +1025,13 @@ pub fn mesh_chunk(
 
     for (face_index, &(axis, positive, u_axis, v_axis)) in FACE_DIRS.iter().enumerate() {
         let dir_shade = face_brightness(axis, positive);
+        let slices = match (boundary_only, positive) {
+            (false, _) => 0..size,
+            (true, false) => 0..1,
+            (true, true) => size - 1..size,
+        };
 
-        for slice in 0..size {
+        for slice in slices {
             // --- Build the visibility mask for this slice. ---
             let mut any = false;
             for v in 0..size {
@@ -2054,6 +2079,71 @@ mod tests {
             }
         }
         chunk
+    }
+
+    /// The uniform shortcut (`boundary_only`, M12 task 1) must change
+    /// nothing: for uniform chunks of rock, water and air, against every kind
+    /// of neighbour — none, sealed, random, like, unlike — the mesh is
+    /// identical, vertex for vertex, to the full 32-slice sweep's.
+    #[test]
+    fn uniform_chunks_mesh_the_same_from_their_boundary_slices() {
+        let mut rng = SplitMix64::new(0x5EED);
+        let rock = Chunk::filled(STONE);
+        let sea = Chunk::filled(WATER);
+        let other = Chunk::filled(BlockId(4));
+        let air = Chunk::new_air();
+        let mixed: Vec<Chunk> = (0..6).map(|_| random_chunk(&mut rng, 50, 10)).collect();
+        for (fill, name) in [(STONE, "rock"), (WATER, "water"), (BlockId::AIR, "air")] {
+            let mut chunk = if fill.is_air() {
+                Chunk::new_air()
+            } else {
+                Chunk::filled(fill)
+            };
+            // Light varying across the chunk, so corner light and merging
+            // are under test too, not just which faces appear.
+            for pos in LocalPos::iter() {
+                if rng.next().is_multiple_of(3) {
+                    chunk.set_sky_light(pos, (rng.next() % 16) as u8);
+                }
+            }
+            assert!(chunk.is_uniform(), "{name}");
+            let offsets = [
+                (-1, 0, 0),
+                (1, 0, 0),
+                (0, -1, 0),
+                (0, 1, 0),
+                (0, 0, -1),
+                (0, 0, 1),
+            ];
+            for case in 0..7 {
+                let mut n = ChunkNeighbors::NONE;
+                for (k, &(dx, dy, dz)) in offsets.iter().enumerate() {
+                    n = match (case, k % 3) {
+                        (0, _) => n,
+                        (1, _) => n.with_sealed(dx, dy, dz),
+                        (2, _) => n.with(dx, dy, dz, &mixed[k]),
+                        (3, _) => n.with(dx, dy, dz, &rock),
+                        (4, _) => n.with(dx, dy, dz, &sea),
+                        (5, 0) => n.with(dx, dy, dz, &air),
+                        (5, 1) => n.with(dx, dy, dz, &other),
+                        (5, _) => n.with(dx, dy, dz, &sea),
+                        (_, 0) => n.with_sealed(dx, dy, dz),
+                        (_, _) => n.with(dx, dy, dz, &mixed[k]),
+                    };
+                }
+                let full = mesh_chunk_greedy(&chunk, &n, WHITE, water_passes, false);
+                let fast = mesh_chunk_greedy(&chunk, &n, WHITE, water_passes, true);
+                assert_eq!(full.vertices, fast.vertices, "{name}, case {case}");
+                assert_eq!(full.indices, fast.indices, "{name}, case {case}");
+                assert_eq!(
+                    full.opaque_index_count, fast.opaque_index_count,
+                    "{name}, case {case}"
+                );
+                if case == 2 && !fill.is_air() {
+                    assert!(!full.is_empty(), "{name}: the test should see faces");
+                }
+            }
+        }
     }
 
     /// A greedy-merged W×H quad must carry UVs spanning 0..W / 0..H so the

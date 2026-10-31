@@ -56,6 +56,7 @@ to run the tests. Same class of thing as the pre-existing let-chain in
 | `too_many_arguments` | `emit_rect` (11 args) | genuinely warranted here → explicit `#[allow(clippy::too_many_arguments)]` with a reason |
 | `manual_range_contains` (negated form) | `ix < 0 \|\| ix >= cells` — a bounds *reject*, not a bounds accept | `!(0..cells).contains(&ix)`. The lint fires on both polarities; the reject form is easy to miss when scanning for the `>= a && <= b` shape in the checklist. |
 | `cloned_ref_to_slice_refs` | `buffers: &[vertex_layout.clone()]` — cloning a value only to make a one-element slice of it, when a second pipeline also needed the layout (A1, 2026-09-26) | `std::slice::from_ref(&vertex_layout)`: borrow, don't clone. Newer than the sandbox's Rust 1.75, so found only on the native run. |
+| `manual_is_multiple_of` | `rng.next() % 3 == 0` on a `u64` in a test (M12, 2026-10-31) | `rng.next().is_multiple_of(3)` — **unsigned only** (stable since Rust 1.87). Existing `% n == 0` on unsigned ints elsewhere predates the lint's arrival in this toolchain and is untouched; new code must use the method. |
 
 ---
 

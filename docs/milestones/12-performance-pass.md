@@ -156,6 +156,30 @@ Pillar 1 is performance on low-end hardware, and M11's benchmark (RTX 4060,
      chunks are ~86% of the stream (CLAUDE.md lesson 6);
    - buffers reused across slices and jobs instead of allocated per call;
    - the sealed-rectangle corner set built without a hash set.
+   - [x] **Uniform chunks sweep only their boundary slices** (2026-10-31).
+     Profile (headless, cloud container, 1 296 real chunks along the land
+     sprint path, the surface band ±2 chunks, every face neighbour present):
+     915 uniform — 474 buried rock, 366 deep sea, 75 air — and 381 mixed.
+     Every uniform rock and sea chunk emitted nothing, yet cost ~3.0 ms, the
+     same as a surface chunk: the full 6 × 32-slice mask sweep.
+     `MeshInput::build` was only ~0.2 ms of it, and a release build was only
+     ~13% faster than the dev build, so the cost was the algorithm. Inside a
+     uniform chunk every face is between two cells of one block, which
+     `shows_face` always culls, so only each direction's outermost slice can
+     show a face — 6 slices, not 192. Exact; the test
+     `uniform_chunks_mesh_the_same_from_their_boundary_slices` compares it
+     vertex for vertex with the full sweep against seven neighbour mixes
+     (and fails if the slice is off by one).
+
+     | Dev build (opt-level 1), µs per chunk | Before | After |
+     |---|---|---|
+     | Uniform rock / sea | ~3 200 | ~350 |
+     | Mixed | ~3 700 | ~3 600 |
+     | Mean, all 1 296 | 3 350 | **1 300 (−61%)** |
+
+     What remains of a uniform chunk is mostly `MeshInput::build`; mixed
+     chunks are now ~85% of the mesh CPU on this path and are the next
+     target. The in-game effect needs the owner's `--bench`.
 2. **LOD as true triangles** (criterion 4).
 3. **Draw-call measurement, then batching if warranted** (criterion 5).
 4. **Retro.**
