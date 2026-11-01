@@ -257,10 +257,12 @@ The owner's ideas for all of them, and a proposed order, are recorded in
 
 ## Current status
 
-- **Active milestone:** none — M13 closed 2026-11-01. Next on the roadmap
-  (`docs/vision.md` §9): **Hydrology & erosion** — drainage, rivers with
-  current, lakes, valleys, and landforms shaped by each climate; it reads
-  M13's climate maps. Its spec is not yet written: write it first. No
+- **Active milestone:** 14 — Rivers, Lakes & Valleys
+  (`docs/milestones/14-rivers-lakes-and-valleys.md`, **draft** spec
+  2026-11-01): drainage, rivers, lakes, wetlands, deltas, valleys, each
+  climate zone with Earth's own kind of water at our scale. Nothing is built
+  until the owner answers its open questions (split with an M15 for
+  climate landforms, biome additions, world-creation time, currents). No
   low-end machine exists yet — M12's spec says how to judge low-end
   performance by proxy.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
