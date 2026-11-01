@@ -3279,19 +3279,72 @@ pub fn mesh_lod_heightfield_with(
     )
 }
 
-/// The LOD mesh of a heightfield whose cells each have a top block (M13):
-/// a cell's top and the walls it stands on take that block's faces, so a
-/// distant desert reads as sand and an ice cap as snow, as they do up close.
-/// Flat cells merge only with cells of the same block.
+/// A cell with no standing water, in [`LodCells::water`].
+pub const LOD_DRY: i32 = i32::MIN;
+
+/// The 32×32 cells of an LOD node: each one's ground height, top block, and
+/// the top block of the water standing on it ([`LOD_DRY`] for none).
+#[derive(Clone, Copy)]
+pub struct LodCells<'a> {
+    pub heights: &'a [i32],
+    pub tops: &'a [BlockId],
+    pub water: &'a [i32],
+}
+
+/// The sea's water for a heightfield: sea level over every cell below it.
+pub fn lod_sea(heights: &[i32]) -> Vec<i32> {
+    let sea = vox_core::SEA_LEVEL_BLOCKS as i32;
+    heights
+        .iter()
+        .map(|&h| if h < sea { sea } else { LOD_DRY })
+        .collect()
+}
+
+/// [`mesh_lod_cells`] with the sea as the only water (M13's form).
 pub fn mesh_lod_surface(
     heights: &[i32],
     tops: &[BlockId],
+    h_stride: i32,
+    origin_y: i32,
+    layer_of: impl FnMut(BlockId, usize) -> u32,
+    skirt_depth_blocks: i32,
+    merge_flat: bool,
+) -> LodMeshData {
+    let water = lod_sea(heights);
+    mesh_lod_cells(
+        LodCells {
+            heights,
+            tops,
+            water: &water,
+        },
+        h_stride,
+        origin_y,
+        layer_of,
+        skirt_depth_blocks,
+        merge_flat,
+    )
+}
+
+/// The LOD mesh of a node's cells (M13, M14): a cell's top and the walls it
+/// stands on take its top block's faces, so a distant desert reads as sand
+/// and an ice cap as snow, as they do up close; flat cells merge only with
+/// cells of the same block. Then the water: a translucent surface at each
+/// cell's own water level — the sea's, a lake's, a river's — over every
+/// cell with water standing on it.
+pub fn mesh_lod_cells(
+    cells: LodCells,
     h_stride: i32,
     origin_y: i32,
     mut layer_of: impl FnMut(BlockId, usize) -> u32,
     skirt_depth_blocks: i32,
     merge_flat: bool,
 ) -> LodMeshData {
+    let LodCells {
+        heights,
+        tops,
+        water,
+    } = cells;
+    assert_eq!(water.len(), heights.len(), "a water level per cell");
     assert_eq!(
         heights.len(),
         LOD_CELLS * LOD_CELLS,
@@ -3566,27 +3619,30 @@ pub fn mesh_lod_surface(
             wall.morph,
         );
     }
-    // The sea surface (ADR-0011 decision 1c): a translucent quad at sea level
-    // over every cell whose ground is below it, after all the ground, so it
-    // lands in the transparent index range. Coplanar, so runs along a row
-    // merge into one quad — an open-ocean node is 32 quads, not 1 024. It
-    // never rises above what full resolution shows: a cell's ground is the
-    // MINIMUM of its columns, so over a column of land the sea surface is at
-    // or below that land's top.
+    // The water surface (ADR-0011 decision 1c; M14 for rivers and lakes): a
+    // translucent quad at each cell's water level over every cell with water
+    // standing on it, after all the ground, so it lands in the transparent
+    // index range. Runs along a row at one level merge into one quad — an
+    // open-ocean node is 32 quads, not 1 024. It never rises above what full
+    // resolution shows: a cell's ground is the MINIMUM of its columns, and
+    // its water is the water standing on that lowest column.
     mesh.opaque_index_count = mesh.indices.len() as u32;
-    let sea = vox_core::SEA_LEVEL_BLOCKS as i32;
-    let sea_top = (sea + 1 - origin_y) as f32;
     let water_layer = layer_of(vox_core::registry::WATER, 2);
     let w = h_stride as f32;
+    let wet = |cx: i32, cz: i32| {
+        let level = water[(cz * n + cx) as usize];
+        (level != LOD_DRY && level > at(cx, cz)).then_some(level)
+    };
     for cz in 0..n {
         let mut cx = 0;
         while cx < n {
-            if at(cx, cz) >= sea {
+            let Some(level) = wet(cx, cz) else {
                 cx += 1;
                 continue;
-            }
+            };
+            let sea_top = (level + 1 - origin_y) as f32;
             let run_start = cx;
-            while cx < n && at(cx, cz) < sea {
+            while cx < n && wet(cx, cz) == Some(level) {
                 cx += 1;
             }
             emit_lod_rect(
@@ -3637,6 +3693,54 @@ mod heightfield_tests {
     }
 
     // ---- Distant water (ADR-0011 decision 1c) ----
+
+    /// Rivers and lakes far off (M14): water stands at each cell's own
+    /// level, over its own cells only, and runs at different levels are
+    /// separate surfaces.
+    #[test]
+    fn lod_water_stands_at_each_cells_level() {
+        let n = LOD_CELLS;
+        let mut heights = flat(50);
+        let mut water = vec![LOD_DRY; n * n];
+        // A lake at 40 over ground at 30 in rows 0..4, a river at 20 over
+        // ground at 15 in row 10, dry land elsewhere.
+        for z in 0..4 {
+            for x in 0..n {
+                heights[z * n + x] = 30;
+                water[z * n + x] = 40;
+            }
+        }
+        for x in 0..n {
+            heights[10 * n + x] = 15;
+            water[10 * n + x] = 20;
+        }
+        let tops = vec![vox_core::registry::GRASS; n * n];
+        let mesh = mesh_lod_cells(
+            LodCells {
+                heights: &heights,
+                tops: &tops,
+                water: &water,
+            },
+            4,
+            0,
+            |_, _| 0,
+            4,
+            true,
+        );
+        let (_, wet) = lod_ranges(&mesh);
+        let mut levels: Vec<i32> = wet.iter().map(|v| v.position[1] as i32).collect();
+        levels.sort_unstable();
+        levels.dedup();
+        assert_eq!(levels, vec![21, 41], "water tops at level + 1");
+        for v in &wet {
+            let row = (v.position[2] / 4.0) as usize;
+            let level = v.position[1] as i32;
+            assert!(
+                (level == 41 && row <= 4) || (level == 21 && (10..=11).contains(&row)),
+                "water at {level} in row {row}"
+            );
+        }
+    }
 
     /// Distinct layers so a test can tell sea from land by texture.
     fn sea_or_land(b: BlockId, _face: usize) -> u32 {

@@ -73,9 +73,14 @@ exactly as the seabed is, and the lighting invariants hold unchanged.
   a release build, noisy): chunk generation and LOD sampling pay it. The
   per-thread reach cache halved it; `--bench` will say whether more is
   needed.
-- **The LOD does not show river or lake water yet** — it draws their beds.
-  Task 5 (distant water) generalises the LOD's sea surface to a per-cell
-  water level.
+- **The LOD shows the same water** (task 5): `Generator::lod_surface`
+  returns each cell's water — the top of the water standing on the lowest
+  column it sampled, the column that sets its ground — and
+  `vox_mesh::mesh_lod_cells` draws the translucent surface at each cell's
+  own level, the sea's generalised (ADR-0011 decision 1c). A frozen lake
+  rises to its ice as a polar sea does. Tested: at stride 1 every cell's
+  water is its column's. Small streams fade with distance on their own:
+  sparse sampling rarely lands in a one-block channel.
 - The fill rule is a single function (`materials::block_in` with the
   column's `Water`), as the water design requires, so the simulation (layer
   2) can ask what "settled" means for any column.

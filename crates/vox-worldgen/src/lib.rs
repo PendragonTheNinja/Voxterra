@@ -74,6 +74,12 @@ pub struct Generator {
     drainage: Arc<OnceLock<DrainageMap>>,
 }
 
+/// The LOD's mark for a dry cell (`vox_mesh::LOD_DRY`; vox-worldgen does not
+/// depend on vox-mesh).
+const fn vox_mesh_dry() -> i32 {
+    i32::MIN
+}
+
 /// The top of a column's standing water, or `i64::MIN` where it has none.
 fn wet_top(w: &Water) -> i64 {
     match w.body {
@@ -439,7 +445,7 @@ impl Generator {
         out
     }
     /// [`Self::lod_heightfield`] with each cell's top block (M13), for
-    /// `vox_mesh::mesh_lod_surface`: what full resolution shows at the column
+    /// `vox_mesh::mesh_lod_cells`: what full resolution shows at the column
     /// that sets the cell's height — its lowest sample — classified exactly
     /// as the chunk generator classifies it, so a distant desert is sand, an
     /// ice cap snow, a seabed mud, sand or gravel.
@@ -447,13 +453,18 @@ impl Generator {
     /// A polar sea's cell rises to sea level as ice: ice is the solid top
     /// there (ADR-0011's `solid` is the terrain top the LOD draws), and with
     /// it the LOD sea surface stops at the ice edge as the near sea does.
+    ///
+    /// And each cell's water (M14), for `vox_mesh::mesh_lod_cells`: the top
+    /// block of the water standing on that same lowest column — a river's,
+    /// a lake's, the sea's — or `i32::MIN` (`vox_mesh::LOD_DRY`) for none. A
+    /// frozen lake, like a polar sea, rises to its ice.
     pub fn lod_surface(
         &self,
         origin_x: i64,
         origin_z: i64,
         h_stride: i64,
         sampling: LodSampling,
-    ) -> (Vec<i32>, Vec<BlockId>) {
+    ) -> (Vec<i32>, Vec<BlockId>, Vec<i32>) {
         debug_assert!(h_stride >= 1);
         let n = CHUNK_SIZE as i64;
         let probes = match sampling {
@@ -463,6 +474,7 @@ impl Generator {
         let step = h_stride / probes;
         let mut heights = vec![0i32; (n * n) as usize];
         let mut tops = vec![blocks::AIR; (n * n) as usize];
+        let mut water = vec![vox_mesh_dry(); (n * n) as usize];
         for cz in 0..n {
             for cx in 0..n {
                 let bx = origin_x + cx * h_stride;
@@ -482,16 +494,26 @@ impl Generator {
                 let (h, x, z, s) = lowest;
                 let col = self.column_with(x, z, s.expect("at least one sample"));
                 let at = (cz * n + cx) as usize;
+                let wet = wet_top(&col.water);
                 if col.biome == biome::Biome::PolarSea {
                     heights[at] = SEA_LEVEL_BLOCKS as i32;
+                    tops[at] = vox_core::registry::ICE;
+                } else if wet > h && self.block_in(&col, wet) == vox_core::registry::ICE {
+                    // A frozen lake: its ice is the top, as sea ice is.
+                    heights[at] = wet as i32;
                     tops[at] = vox_core::registry::ICE;
                 } else {
                     heights[at] = h as i32;
                     tops[at] = self.block_in(&col, h);
+                    if wet > h {
+                        water[at] = wet as i32; // a river's or a lake's (M14)
+                    } else if h < SEA_LEVEL_BLOCKS {
+                        water[at] = SEA_LEVEL_BLOCKS as i32;
+                    }
                 }
             }
         }
-        (heights, tops)
+        (heights, tops, water)
     }
 }
 
@@ -717,7 +739,7 @@ mod tests {
         assert!(found.contains_key(&Biome::PolarSea) && found.contains_key(&Biome::HotDesert));
         for (biome, (x, z)) in found {
             let (ox, oz) = (x - 16, z - 16);
-            let (heights, tops) = g.lod_surface(ox, oz, 1, LodSampling::Exact);
+            let (heights, tops, _) = g.lod_surface(ox, oz, 1, LodSampling::Exact);
             for cz in 0..32i64 {
                 for cx in 0..32i64 {
                     let at = (cz * 32 + cx) as usize;
@@ -734,11 +756,11 @@ mod tests {
                 }
             }
             // Coarser: heights are the plain heightfield's, except polar
-            // seas, raised to their ice.
-            let (h8, t8) = g.lod_surface(ox, oz, 8, LodSampling::Sparse);
+            // seas and frozen lakes (M14), raised to their ice.
+            let (h8, t8, _) = g.lod_surface(ox, oz, 8, LodSampling::Sparse);
             let plain = g.lod_heightfield(ox, oz, 8, LodSampling::Sparse);
             for k in 0..h8.len() {
-                if t8[k] == vox_core::registry::ICE && h8[k] == SEA_LEVEL_BLOCKS as i32 {
+                if t8[k] == vox_core::registry::ICE {
                     assert!(plain[k] <= h8[k]);
                 } else {
                     assert_eq!(h8[k], plain[k], "{biome:?}");
@@ -989,6 +1011,43 @@ mod tests {
             }
         }
         assert!(checked > 0, "no deep lake to check");
+    }
+
+    /// Criterion 8 for water (M14 task 5): at full resolution the LOD's cell
+    /// is the column, so its water is the column's own — a river's, a
+    /// lake's or the sea's, at that level — or its ice.
+    #[test]
+    fn lod_water_is_the_columns_water() {
+        let shape = WorldShape::new(65_536, 65_536).unwrap();
+        let g = Generator::new(0x41_7E45, shape);
+        let d = g.drainage();
+        let (nx, nz) = d.cells();
+        let (cw, ch) = d.cell_blocks();
+        let mut wet = 0;
+        for j in (0..nz).step_by(37) {
+            for i in (0..nx).step_by(37) {
+                let (ox, oz) = ((i as f64 * cw) as i64, (j as f64 * ch) as i64);
+                let (heights, tops, water) = g.lod_surface(ox, oz, 1, LodSampling::Exact);
+                for k in 0..heights.len() {
+                    let (x, z) = (ox + (k % 32) as i64, oz + (k / 32) as i64);
+                    let (s, w) = g.ground(x, z);
+                    let top = wet_top(&w);
+                    if tops[k] == vox_core::registry::ICE {
+                        continue; // frozen: the ice is the top
+                    }
+                    let expect = if top > s.height {
+                        top as i32
+                    } else if s.height < SEA_LEVEL_BLOCKS {
+                        SEA_LEVEL_BLOCKS as i32
+                    } else {
+                        i32::MIN
+                    };
+                    assert_eq!(water[k], expect, "({x}, {z})");
+                    wet += usize::from(top > s.height);
+                }
+            }
+        }
+        assert!(wet > 0, "no river or lake sampled");
     }
 
     /// Chunks far above any surface are all air and stored uniformly.

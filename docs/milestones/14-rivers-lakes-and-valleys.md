@@ -353,6 +353,14 @@ becomes an ADR; the simulation itself remains its own milestone.
 4. Lakes, salt flats, floodplains, wetlands, deltas, waterfalls; the new
    biomes.
 5. Distant water in the LOD (criterion 8).
+   - [x] The LOD's water at each cell's own level (`mesh_lod_cells`,
+     `LodCells`; `lod_surface` returns the water of the column it sampled):
+     rivers and lakes continue past full resolution; frozen lakes rise to
+     their ice. Tested (`lod_water_is_the_columns_water`, vox-mesh
+     `lod_water_stands_at_each_cells_level`); seen in renders.
+   - [ ] Large rivers as ribbons for kilometres: today a river is drawn
+     where a sample lands in it — at far levels, by chance. Judge on the
+     owner's walk before building more.
 6. The owner's walk, `--bench`, retro.
 
 ## Non-goals

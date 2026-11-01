@@ -2192,15 +2192,24 @@ impl App {
                 let merge = self.lod_merge;
                 let layers = Arc::clone(&layers);
                 rayon::spawn(move || {
-                    let (mut heights, tops) =
+                    let (mut heights, tops, mut water) =
                         generator.lod_surface(origin.x, origin.z, stride, sampling);
                     // Fold in player edits. The seed always reads higher than
                     // dug ground, so without this the coarse surface floats
                     // above the hole and shows through it (the "ghost block").
                     edits.apply_to_node(&mut heights, origin.x, origin.z, stride, origin_y);
-                    let mesh = vox_mesh::mesh_lod_surface(
-                        &heights,
-                        &tops,
+                    // Ground dug below sea level shows the sea, as before M14.
+                    for (w, sea) in water.iter_mut().zip(vox_mesh::lod_sea(&heights)) {
+                        if *w == vox_mesh::LOD_DRY {
+                            *w = sea;
+                        }
+                    }
+                    let mesh = vox_mesh::mesh_lod_cells(
+                        vox_mesh::LodCells {
+                            heights: &heights,
+                            tops: &tops,
+                            water: &water,
+                        },
                         stride as i32,
                         origin_y,
                         |b, face| layers.get(b.0 as usize).map_or(0, |l| l[face]),
@@ -3005,10 +3014,13 @@ mod specks_scratch {
                 } else {
                     LodSampling::Sparse
                 };
-                let (heights, tops) = generator.lod_surface(bx, bz, stride, sampling);
-                let mesh = vox_mesh::mesh_lod_surface(
-                    &heights,
-                    &tops,
+                let (heights, tops, water) = generator.lod_surface(bx, bz, stride, sampling);
+                let mesh = vox_mesh::mesh_lod_cells(
+                    vox_mesh::LodCells {
+                        heights: &heights,
+                        tops: &tops,
+                        water: &water,
+                    },
                     stride as i32,
                     by as i32,
                     |b, f| registry.face_layer(b, f),
