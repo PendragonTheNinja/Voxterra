@@ -278,7 +278,8 @@ impl Generator {
     }
 
     /// The inclusive chunk-Y span of the terrain surface across one chunk
-    /// column `(cx, cz)` — the layers that streaming keeps around the ground.
+    /// column `(cx, cz)` — the layers that streaming keeps around the ground
+    /// and the rivers and lakes standing on it.
     ///
     /// Sampled at the column's four corners and its centre rather than one
     /// point: a 32-block-wide column can hold a cliff, and a single sample
@@ -295,9 +296,12 @@ impl Generator {
         let mut lo = i64::MAX;
         let mut hi = i64::MIN;
         for (ox, oz) in [(0, 0), (e, 0), (0, e), (e, e), (e / 2, e / 2)] {
-            let h = self.surface_height(bx + ox, bz + oz);
-            lo = lo.min(h);
-            hi = hi.max(h);
+            // Standing water counts as surface (M14): a lake's surface is
+            // tens of blocks above its bed, in layers the ground alone would
+            // never load.
+            let (s, w) = self.ground(bx + ox, bz + oz);
+            lo = lo.min(s.height);
+            hi = hi.max(s.height).max(wet_top(&w));
         }
         (lo.div_euclid(s), hi.div_euclid(s))
     }
@@ -957,6 +961,34 @@ mod tests {
             held_by_air.len(),
             &held_by_air[..held_by_air.len().min(8)]
         );
+    }
+
+    /// A lake's surface is in the span streaming loads (M14): it can stand
+    /// tens of blocks above its bed, in chunk layers above the ground's.
+    #[test]
+    fn the_surface_span_reaches_standing_water() {
+        let g = Generator::new(0x0007_E22A_C0DE, WorldShape::DEFAULT);
+        let d = g.drainage();
+        let (nx, nz) = d.cells();
+        let (cw, ch) = d.cell_blocks();
+        let mut checked = 0;
+        'cells: for j in (0..nz).step_by(5) {
+            for i in (0..nx).step_by(5) {
+                let x = ((i as f64 + 0.5) * cw) as i64;
+                let z = ((j as f64 + 0.5) * ch) as i64;
+                let (s, w) = g.ground(x, z);
+                if wet_top(&w) < s.height + 2 * CHUNK_SIZE as i64 {
+                    continue;
+                }
+                let (lo, hi) = g.surface_span_chunks(x >> 5, z >> 5);
+                assert!(lo <= s.height >> 5 && (w.level >> 5) <= hi, "({x}, {z})");
+                checked += 1;
+                if checked == 20 {
+                    break 'cells;
+                }
+            }
+        }
+        assert!(checked > 0, "no deep lake to check");
     }
 
     /// Chunks far above any surface are all air and stored uniformly.

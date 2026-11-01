@@ -15,3 +15,6 @@ milestone is kept here, with the commit it shows.
 | `valleys.png` | `688a5ab` | The eroded ground, hill-shaded so the valleys read |
 | `view-gorge.jpg` | `688a5ab` | A river-cut valley at about (143 300, 106 100), looking downstream (south-east) from 250 blocks up: V-shaped sides cut ~470 blocks deep at the deepest, opening to the lowland. No river water yet (task 3) |
 | `view-first-river.jpg` | task 3 | The first river in the chunks (~10 m³/s, ~25 blocks wide) near (153 280, 36 800), looking upstream (north) from 60 blocks up: settled water in its channel, a tributary joining from the right. Past full resolution its bed shows dry (silt) — the LOD's water is task 5 |
+| `view-frozen-lake-before-span-fix.jpg` | task 3 | A mountain lake (surface 756) from 300 blocks: its ice only in the chunks the streaming span happened to cover — the span followed the ground, 60 blocks below the lake's surface (a real bug; fixed, with a test) |
+| `view-frozen-lake.jpg` | task 3 | The same lake from its shore after the fix: frozen over (mean annual temperature below −2 °C). Beyond the full-resolution disc the LOD shows its silt bed — the LOD's water is task 5 |
+| `view-salt-flats.jpg` | task 3 | Salt flats near (87 744, 15 936) in a closed basin of the subtropical desert: white playa pans in the sand, badlands beyond |

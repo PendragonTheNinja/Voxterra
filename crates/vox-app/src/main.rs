@@ -3084,8 +3084,9 @@ mod specks_scratch {
             for dz in -r8 - 1..=r8 + 1 {
                 for dx in -r8 - 1..=r8 + 1 {
                     let (cx, cz) = (cam_chunk.x + dx, cam_chunk.z + dz);
-                    let top = generator.surface_height(cx * 32 + 16, cz * 32 + 16) >> 5;
-                    for cy in top - 3..=top + 3 {
+                    // The game's span (ground and standing water, M14).
+                    let (lo, hi) = generator.surface_span_chunks(cx, cz);
+                    for cy in lo - 3..=hi + 3 {
                         let pos = ChunkPos::new(cx, cy, cz);
                         let mut chunk = generator.generate_chunk(pos);
                         // SPECK_LIT=1: full daylight in every non-opaque cell —
@@ -3100,7 +3101,7 @@ mod specks_scratch {
                             }
                         }
                         world.insert_chunk(pos, chunk);
-                        if dx * dx + dz * dz <= r8 * r8 && (top - 2..=top + 2).contains(&cy) {
+                        if dx * dx + dz * dz <= r8 * r8 && (lo - 2..=hi + 2).contains(&cy) {
                             targets.push(pos);
                         }
                     }
