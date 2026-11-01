@@ -157,6 +157,12 @@ pub fn river_kind(slope: f32, q: f32, arid: bool, cold: bool) -> RiverKind {
     }
 }
 
+/// A reach that falls this far (blocks), and twice as far as the river
+/// below it, does it at once: a waterfall at a step in the profile.
+const FALL_FROM: f32 = 12.0;
+/// How far past the lip the falling sheet of water reaches, blocks.
+const FALL_SHEET: f32 = 1.5;
+
 /// Steeper than this, a river is a torrent.
 const TORRENT_SLOPE: f32 = 0.01;
 /// Braided rivers: slopes and the least discharge.
@@ -193,6 +199,10 @@ struct Reach {
     discharge: f32,
     mouth: bool,
     kind: RiverKind,
+    /// Where along the reach (0..1) its whole drop falls at once, if it
+    /// falls enough to be a waterfall; and how long the reach is, blocks.
+    fall: Option<f32>,
+    len: f32,
 }
 
 thread_local! {
@@ -270,7 +280,27 @@ impl DrainageMap {
                 let d = d as f32;
                 let t = t as f32;
                 let half = 0.5 * (reach.width.0 + (reach.width.1 - reach.width.0) * t);
-                let surface = reach.level.0 + (reach.level.1 - reach.level.0) * t;
+                // A waterfall: the pool above holds its level to the lip and
+                // the sheet just past it; the river below runs at its own.
+                // Its banks stand at the upper level a little further, a
+                // cliff beside the falling water.
+                let (surface, sheet, cliff) = match reach.fall {
+                    Some(lip) => {
+                        let past = (t - lip) * reach.len;
+                        let upper = past < FALL_SHEET;
+                        let level = if upper { reach.level.0 } else { reach.level.1 };
+                        (
+                            level,
+                            (0.0..FALL_SHEET).contains(&past),
+                            past < FALL_SHEET + 2.0,
+                        )
+                    }
+                    None => (
+                        reach.level.0 + (reach.level.1 - reach.level.0) * t,
+                        false,
+                        false,
+                    ),
+                };
                 let level = surface.floor();
                 let out = d - half;
                 if nearest.is_none_or(|n: Near| out < n.out) {
@@ -291,7 +321,11 @@ impl DrainageMap {
                 ceiling = ceiling.min(level + 1.0 + give);
                 // The levee holds the water beside it, which on a steep reach
                 // stands up to a block's fall higher than here.
-                let held = (surface + reach.slope).ceil();
+                let held = if cliff && reach.fall.is_some() {
+                    reach.level.0.floor()
+                } else {
+                    (surface + reach.slope).ceil()
+                };
                 floor = floor.max(held + 1.0 - give);
                 if out < 0.0 && best.is_none_or(|b| out < b.0) {
                     let depth = reach.depth.0 + (reach.depth.1 - reach.depth.0) * t;
@@ -307,6 +341,10 @@ impl DrainageMap {
                         RiverKind::Meandering => (Bed::Silt, false),
                     };
                     h = if bar { level } else { level - deep };
+                    if sheet {
+                        // The falling sheet stands on the river below's bed.
+                        h = reach.level.1.floor() - deep;
+                    }
                     // A wadi's channel holds no water: its level is its bed.
                     let water = if reach.kind == RiverKind::Wadi {
                         h
@@ -454,6 +492,12 @@ impl DrainageMap {
         best.map_or((0.0, 0.0), |(_, vx, vz)| (vx, vz))
     }
 
+    /// Whether the reach leaving cell `(i, j)` has a waterfall.
+    pub fn waterfall_at(&self, i: usize, j: usize) -> bool {
+        self.reach(i as i64, j as i64)
+            .is_some_and(|r| r.fall.is_some())
+    }
+
     /// The kind of river leaving cell `(i, j)`, if one does.
     pub fn river_kind_at(&self, i: usize, j: usize) -> Option<RiverKind> {
         self.reach(i as i64, j as i64).map(|r| r.kind)
@@ -505,7 +549,23 @@ impl DrainageMap {
         let depth = |q: f32| deep.unwrap_or_else(|| depth(q));
         let (w0, w1) = (width(q), width(qr));
         let (a0, a1) = (wander(w0), wander(w1));
+        // A waterfall is a step in the long profile, not a steep one: it
+        // falls at least FALL_FROM, and twice what the river below does.
+        let below = {
+            let d = self.flow[r];
+            if d == HERE {
+                0.0
+            } else {
+                let rr = neighbours(r, self.nx, self.nz)[d as usize];
+                (level_of(r) - level_of(rr).min(level_of(r))).max(0.0)
+            }
+        };
+        let drop = lc - lr;
+        let fall =
+            (drop >= FALL_FROM && drop >= 2.0 * below && kind != RiverKind::Wadi).then_some(0.5);
         Some(Reach {
+            fall,
+            len: step,
             out: w0.max(w1) * 0.5 + BANK_REACH + BASE_WANDER + a0.max(a1),
             from,
             to,

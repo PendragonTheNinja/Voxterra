@@ -372,8 +372,12 @@ becomes an ADR; the simulation itself remains its own milestone.
      the delta threshold scales with world area.
    - [x] Backed-up water is a lake even where a stream crosses it (stream
      cells had been left as straight strips of land across a lake).
-   - [ ] Waterfalls and rapids as features (today: whole-block steps where
-     a river's profile falls; 2+ block steps are rare).
+   - [x] Waterfalls (ADR-0020 §8, owner's decision 2026-11-01: static
+     sheets until water can fall): at steps in the long profile (12+
+     blocks, twice the river below), a sheet over a cliff; water's side
+     faces run down in the shader, white. ~1 900 on the default world.
+     Rapids are the whole-block steps elsewhere. The fingerprint now
+     samples water.
    - [ ] Deltas' distributary channels; oxbow lakes.
 5. Distant water in the LOD (criterion 8).
    - [x] The LOD's water at each cell's own level (`mesh_lod_cells`,

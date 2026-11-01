@@ -1232,6 +1232,46 @@ mod tests {
             eat(&[col.biome as u8]);
             eat(&g.block_at(x, col.surface.height, z).0.to_le_bytes());
         }
+        // Water (M14): scattered columns almost never land on a river, so a
+        // change to channels, banks, lakes, waterfalls or wetlands moved no
+        // pin. Sites chosen from the network itself — every kind of river,
+        // waterfalls, lakes, closed basins — each sampled across its banks.
+        let d = g.drainage();
+        let (nx, nz) = d.cells();
+        let (cw, ch) = d.cell_blocks();
+        let mut sites: Vec<(usize, usize)> = Vec::new();
+        let mut wanted = [8usize; 7]; // four kinds, waterfalls, lakes, sinks
+        for j in (0..nz).step_by(13) {
+            for i in (0..nx).step_by(11) {
+                let slot = if d.waterfall_at(i, j) {
+                    Some(4)
+                } else if let Some(k) = d.river_kind_at(i, j) {
+                    Some(k as usize)
+                } else if d.is_sink(i, j) {
+                    Some(6)
+                } else if d.is_lake(i, j) {
+                    Some(5)
+                } else {
+                    None
+                };
+                if let Some(k) = slot
+                    && wanted[k] > 0
+                {
+                    wanted[k] -= 1;
+                    sites.push((i, j));
+                }
+            }
+        }
+        for (i, j) in sites {
+            let (x0, z0) = ((i as f64 * cw) as i64, (j as f64 * ch) as i64);
+            for z in (z0 - 32..z0 + 160).step_by(3) {
+                for x in (x0 - 32..x0 + 160).step_by(3) {
+                    let (sf, w) = g.ground(x, z);
+                    eat(&sf.height.to_le_bytes());
+                    eat(&wet_top(&w).to_le_bytes());
+                }
+            }
+        }
         h
     }
 
@@ -1247,7 +1287,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (4, 0xf2e4_60ec_708f_d3e3);
+        const PINNED: (u32, u64) = (4, 0x54c2_4f2f_37bc_8f7a);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),

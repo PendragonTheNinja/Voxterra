@@ -99,6 +99,25 @@ evaporation) or ice-scoured (cache format 2):
 
 Speed (§6) follows from slope and depth for all of them.
 
+### 8. Waterfalls: the one place water stands against air
+
+A reach that falls 12+ blocks, and at least twice what the river below
+it falls — a step in the long profile, not merely a steep one — drops all
+at once at its middle: the pool above keeps its level to the lip, a sheet
+1.5 blocks deep past it holds water from the lower river's bed up to the
+upper level, and the banks beside it stand at the upper level a little
+further, a cliff. The sheet's downstream face meets only the lower water,
+so the never-held-by-air test still guards everything else (it accepts
+water stepping down to lower water). In settled water (the hybrid's layer
+1) the sheet is static; flow.wgsl runs every water side face's texture
+straight down, white with foam, so it reads as falling (owner's decision,
+2026-11-01, until layer 2 makes water fall). ~1 900 on the default world.
+
+The terrain fingerprint now also samples columns at rivers of every kind,
+waterfalls, lakes and closed basins chosen from the network: scattered
+columns almost never landed on water, and a waterfall change had moved no
+pin (checked: disabling waterfalls now fails it).
+
 ## Consequences
 
 - `ground` costs ~2× the eroded surface per column (~0.6 against ~0.3 µs in

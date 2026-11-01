@@ -13,7 +13,8 @@
 // cycle apart, and cross-faded so the one about to jump back weighs nothing
 // (the usual flow-map technique): water drifts at its speed, forever, with
 // no stretching. Still water — lakes, the sea — has no flow and does not
-// move. Fast water foams.
+// move. Fast water foams. Water's side faces — waterfalls, the steps of
+// rapids — run straight down.
 
 @group(3) @binding(4)
 var flow_tex: texture_2d<f32>;
@@ -23,6 +24,9 @@ var flow_tex: texture_2d<f32>;
 const WATER_LAYER: u32 = 8u;
 const FLOW_MAX: f32 = 4.0;
 const FLOW_CYCLE: f32 = 4.0;
+// How fast falling water's sides run down, blocks a second. A whole number
+// of blocks per clock wrap (4 000 s), so the wrap never shows.
+const FALL_SPEED: f32 = 3.0;
 
 // The water's velocity under a point, blocks per second (x, z).
 fn flow_at(world_rel: vec3<f32>) -> vec2<f32> {
@@ -49,7 +53,12 @@ fn water_sample(layer: u32, face_uv: vec2<f32>, world_rel: vec3<f32>, normal: ve
     // flow.
     let s0 = textureSample(block_tex, block_sampler, uv - flow * (p0 * FLOW_CYCLE), layer);
     let s1 = textureSample(block_tex, block_sampler, uv - flow * (p1 * FLOW_CYCLE), layer);
-    let c = mix(s0, s1, abs(1.0 - 2.0 * p0));
-    let foam = smoothstep(1.5, 3.5, length(flow)) * 0.6;
+    // Water's sides are falling water — a waterfall's sheet, a rapid's
+    // step (M14): its texture runs straight down.
+    let falling_uv = vec2<f32>(world_rel.x + world_rel.z, -world_rel.y - t * FALL_SPEED);
+    let falling = textureSample(block_tex, block_sampler, falling_uv, layer);
+    let c = select(mix(s0, s1, abs(1.0 - 2.0 * p0)), falling, is_water && !top);
+    // Fast water foams; falling water is white water.
+    let foam = max(smoothstep(1.5, 3.5, length(flow)) * 0.6, select(0.0, 0.35, is_water && !top));
     return vec4<f32>(mix(c.rgb, vec3<f32>(0.92, 0.95, 0.97), foam), mix(c.a, 1.0, foam * 0.8));
 }
