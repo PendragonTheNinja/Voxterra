@@ -656,7 +656,10 @@ mod tests {
         // neighbours, so their patch noise is as close as any neighbours'.
         for z in (0..sz).step_by(1_009) {
             let (last, first) = (g.column(sx - 1, z), g.column(sx, z));
-            assert!((last.patch - first.patch).abs() < 0.2, "patch jumps at the seam, z = {z}");
+            assert!(
+                (last.patch - first.patch).abs() < 0.2,
+                "patch jumps at the seam, z = {z}"
+            );
             assert!((last.surface.height - first.surface.height).abs() <= 3);
         }
     }
