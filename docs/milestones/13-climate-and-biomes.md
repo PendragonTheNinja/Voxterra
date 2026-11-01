@@ -320,9 +320,10 @@ horizon.
      patches, a sand beach, badlands far off), equatorial rainforest (deep
      green), the subtropical desert (sand, hamada, gravelly cold desert on
      raised ground, red badlands), the polar ice cap (snow, sea ice at the
-     coast) — show biomes to the horizon with no pinholes. The near/far
-     colour seam can only be judged in play (the harness's full-resolution
-     chunks are unlit).
+     coast) — show biomes to the horizon with no pinholes. With
+     `SPECK_FULLRES=1 SPECK_LIT=1` (full resolution, daylit crudely in the
+     harness), the bench's steppe shows its yellowed grass continuing from
+     the full-resolution steps into the LOD with no visible seam.
    - **Found:** shallow seas over pale sand read grey through water of
      constant opacity (the old grass seabed hid it). Water that absorbs
      with depth would fix it — `docs/vision.md` §10, not M13's.
@@ -336,6 +337,10 @@ horizon.
      blocks. Boundaries partly follow terrain contours (temperature falls
      with height), so a stronger fine octave would speckle rather than
      blend; left for the owner's walk to judge.
+   - **Meshing cost unchanged** by the new materials and patches: the
+     1 296 sprint-path chunks mesh to 271 868 triangles against 271 162
+     before materials (+0.3%), at the same time per chunk (dev build) —
+     patches fall mostly where faces were already split by light and steps.
    - **The fingerprint now sees biomes**: the fraying changed no height and
      none of the 24 sampled chunk columns, so the fingerprint stayed the
      same — a terrain change that would have slipped through unversioned.

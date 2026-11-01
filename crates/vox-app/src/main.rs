@@ -2929,7 +2929,8 @@ mod specks_scratch {
     /// (or SPECK_UP above ground), SPECK_Z, SPECK_YAW, SPECK_PITCH, SPECK_W,
     /// SPECK_H, SPECK_FOV, SPECK_MORPH, SPECK_CURVE, SPECK_OUT — the P key's
     /// VIEW line has them all — and SPECK_FRAMES (time that many frames),
-    /// SPECK_NOCLIMATE (no biome colour).
+    /// SPECK_NOCLIMATE (no biome colour), SPECK_LIT (daylight the
+    /// full-resolution chunks).
     #[test]
     #[ignore]
     fn specks() {
@@ -3071,7 +3072,19 @@ mod specks_scratch {
                     let top = generator.surface_height(cx * 32 + 16, cz * 32 + 16) >> 5;
                     for cy in top - 3..=top + 3 {
                         let pos = ChunkPos::new(cx, cy, cz);
-                        world.insert_chunk(pos, generator.generate_chunk(pos));
+                        let mut chunk = generator.generate_chunk(pos);
+                        // SPECK_LIT=1: full daylight in every non-opaque cell —
+                        // crude next to real propagation (no shade under
+                        // overhangs), but enough to judge colour across the
+                        // full-res/LOD edge (M13). Unlit by default.
+                        if std::env::var("SPECK_LIT").is_ok() {
+                            for p in LocalPos::iter() {
+                                if !registry.is_opaque(chunk.get(p)) {
+                                    chunk.set_sky_light(p, 15);
+                                }
+                            }
+                        }
+                        world.insert_chunk(pos, chunk);
                         if dx * dx + dz * dz <= r8 * r8 && (top - 2..=top + 2).contains(&cy) {
                             targets.push(pos);
                         }
