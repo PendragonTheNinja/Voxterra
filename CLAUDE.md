@@ -278,10 +278,13 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   `GENERATOR_VERSION` 4); the network is cached in the world folder
   (`drainage.cache`); criterion 4 surveyed over six seeds
   (`drainage_survey`: closed basins high, ~29% vs Earth's 18%, carried to
-  M15). Task 3 (stage-2 channels, ADR-0020 proposed) is
-  mostly built: rivers, lakes, salt flats in the chunks (`Generator::ground`,
-  `drainage::rivers`). Next: task 5's distant water (the LOD shows beds
-  only, now done), then task 4. vox-worldgen now 66 tests. No
+  M15). Tasks 3–5 mostly built (ADR-0020 proposed): rivers,
+  lakes, salt flats, floodplains, wetlands and deltas in the chunks
+  (`Generator::ground`, `drainage::rivers`); the nine water biomes (32 in
+  all, every one in every world); the LOD draws rivers and lakes at their
+  own levels. Open: the flow map (water visibly flowing, river kinds —
+  criterion 10), waterfalls, distributaries and oxbows, `--bench`, and the
+  owner's walk. vox-worldgen now 66 tests. No
   low-end machine exists yet — M12's spec says how to judge low-end
   performance by proxy.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
