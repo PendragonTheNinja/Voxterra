@@ -146,7 +146,7 @@ const OROGENY_GATE_LO: f32 = 0.10;
 const OROGENY_GATE_HI: f32 = 0.52;
 /// Uplift at full orogeny, in blocks. The ceiling a summit can reach, and only
 /// where the field saturates across a very wide region.
-const MAX_UPLIFT: f32 = 1_150.0;
+pub(crate) const MAX_UPLIFT: f32 = 1_150.0;
 
 // --- Detail ----------------------------------------------------------------
 
@@ -223,7 +223,30 @@ pub struct Elevation {
     trench: Octave,
     trench_gate: Octave,
     detail: [Octave; 3],
+    /// Not part of the height: noise that lets biome boundaries wander
+    /// (M13), kept here so it tiles with the world like every other field.
+    boundary: [Octave; 2],
 }
+
+/// What a column's surface is made of, as the elevation field knows it — the
+/// height and the two stages climate classification reads (M13). Every field
+/// is a pure function of `(x, z)`, so the chunk generator, the LOD sampler
+/// and any readout agree on them exactly.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Surface {
+    /// Blocks above sea level; see [`Elevation::height`].
+    pub height: i64,
+    /// [`Elevation::relief`]: how rough the region is, `[0, 1]`.
+    pub relief: f32,
+    /// Blocks of the height raised by mountain building (0 off the ranges,
+    /// up to `MAX_UPLIFT`).
+    pub uplift: f32,
+}
+
+/// Wavelengths of the biome-boundary noise, blocks: edges wander over a
+/// kilometre or so, with finer fraying.
+const BOUNDARY_WAVELENGTHS: [i64; 2] = [1_400, 350];
+const BOUNDARY_WEIGHTS: [f32; 2] = [1.0, 0.4];
 
 impl Elevation {
     pub fn new(seed: u64, shape: WorldShape) -> Self {
@@ -239,6 +262,7 @@ impl Elevation {
             trench: oct(TRENCH_WAVELENGTH),
             trench_gate: oct(TRENCH_GATE_WAVELENGTH),
             detail: DETAIL_WAVELENGTHS.map(oct),
+            boundary: BOUNDARY_WAVELENGTHS.map(oct),
         };
         e.continent_offset = e.calibrate_coastline();
         e
@@ -276,12 +300,55 @@ impl Elevation {
     /// world width. The column is wrapped ONCE here and every stage below works
     /// in canonical coordinates, rather than each octave wrapping for itself.
     pub fn height(&self, x: i64, z: i64) -> i64 {
-        self.height_canonical(self.shape.canonical_x(x), self.shape.canonical_z(z))
+        self.surface(x, z).height
+    }
+
+    /// The height with the relief and uplift it was built from, at no extra
+    /// cost: the composition computes them anyway.
+    pub fn surface(&self, x: i64, z: i64) -> Surface {
+        self.surface_canonical(self.shape.canonical_x(x), self.shape.canonical_z(z))
+    }
+
+    /// How large this world's continents are, against the default world's:
+    /// the coarsest continent octave's real wavelength over the default
+    /// size's. 1 at the default size; ~0.2 in the smallest world, where
+    /// every octave keeps at least three cells around the world (ADR-0012)
+    /// and continents shrink with it. Climate distances that are really
+    /// "how far into a continent" scale by this (ADR-0017).
+    pub fn continent_scale(&self) -> f32 {
+        let wavelength = |size: i64, nx: u32| size as f32 / nx as f32;
+        let default = WorldShape::DEFAULT;
+        let here = wavelength(self.shape.size_x(), self.continent[0].nx);
+        let there = wavelength(
+            default.size_x(),
+            default.cells_around_x(CONTINENT_WAVELENGTHS[0]),
+        );
+        here / there
+    }
+
+    /// Two independent noises in `[-1, 1]` for wandering biome boundaries
+    /// (M13): one for temperature, one for precipitation. Hashed with salts
+    /// apart from every terrain octave's, so they do not follow the terrain.
+    pub fn boundary_noise(&self, x: i64, z: i64) -> (f32, f32) {
+        let (x, z) = (self.shape.canonical_x(x), self.shape.canonical_z(z));
+        let pair = |salt: u64| {
+            let (mut sum, mut norm) = (0.0, 0.0);
+            for (oct, w) in self.boundary.iter().zip(BOUNDARY_WEIGHTS.iter()) {
+                let o = Octave {
+                    salt: oct.salt ^ salt,
+                    ..*oct
+                };
+                sum += self.value_noise(x, z, &o) * w;
+                norm += w;
+            }
+            sum / norm
+        };
+        (pair(0x7E3D_0001), pair(0x9A1F_0002))
     }
 
     /// The single composition point. Every stage feeds in here and nowhere
     /// else, so a future erosion pass has one place to attach.
-    fn height_canonical(&self, x: i64, z: i64) -> i64 {
+    fn surface_canonical(&self, x: i64, z: i64) -> Surface {
         let c = self.continent_c(x, z) - self.continent_offset;
         let CoastalProfile {
             mut base,
@@ -330,10 +397,14 @@ impl Elevation {
             * lerp(COASTAL_CALM_FLOOR, 1.0, calm);
 
         let h = base + massif + self.detail_c(x, z) * amplitude;
-        (h.round() as i64).clamp(
-            WORLD_Y_MIN_BLOCKS + BOUND_MARGIN,
-            WORLD_Y_MAX_BLOCKS - BOUND_MARGIN,
-        )
+        Surface {
+            height: (h.round() as i64).clamp(
+                WORLD_Y_MIN_BLOCKS + BOUND_MARGIN,
+                WORLD_Y_MAX_BLOCKS - BOUND_MARGIN,
+            ),
+            relief,
+            uplift: massif,
+        }
     }
 
     // --- Stages. Each has a public form taking any (x, z) — for tuning and

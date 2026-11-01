@@ -59,26 +59,37 @@ degrees. Parallelism never reduces across threads.
 | Altitude | lapse rate | 6.5 °C/km | **32 °C per 1 000 blocks** |
 | Winds | moisture swept along each row: easterlies within ~30°, westerlies ~30–60°, polar easterlies, blended ±5° at the edges | three-cell circulation | as Earth, twice round the torus |
 | Ocean | moisture taken up over the sea toward a capacity falling 4.5% per °C | Clausius–Clapeyron (~7%), damped for annual totals | equatorial sea ~3 000 mm/yr |
-| Rising / sinking air | a rain multiplier by latitude | ITCZ wet, subtropical highs dry | 1.6 at the equator, 0.4 at 22–30°, 1.25 at 45–55°, 0.4 at the poles |
-| Interiors | moisture falls by e over ~35 km of land (60% recycled); interiors colder by up to 9 °C at high latitudes | rain reaches thousands of km inland | continents are ~60× smaller than Earth's |
+| Rising / sinking air | a rain multiplier by latitude | ITCZ wet, subtropical highs dry | 1.6 at the equator, 0.25–0.28 at 22–30°, 1.25 at 45–55°, 0.4 at the poles |
+| Interiors | moisture falls by e over ~30 km of land at the default size (60% recycled), **4× faster in the 15–30° belt**; interiors colder by up to 9 °C at high latitudes | rain reaches thousands of km inland; hot subtropical interiors dry incoming air fast (the Sahara is dry well inland of both coasts) | continents are ~60× smaller than Earth's |
 | Rain shadows | air lifted over high ground cools; above what it can hold it rains harder (up to 5×) and is stripped out, reaching the lee dry | windward slopes 2–5× | windward 3.3× the lee, measured over 817 ridges |
 | Sideways mixing | moisture diffuses between neighbouring rows as it travels; a final blur | winds are not lines | streaks from single peaks removed |
 
 **The lapse rate is exaggerated on purpose** (owner, 2026-11-01): our peaks
 reach ~1 360 blocks against Earth's 8 850 m (ADR-0010), so at Earth's rate
 the highest would be ~9 °C colder than its coast and no mountain would carry
-snow. 32 °C per 1 000 blocks puts permanent snow (mean ≤ −3 °C) above ~940
-blocks at the equator, ~470 at 45°, ~110 at 60° and at sea level near the
-poles — the M13 snowline targets. The cost, accepted: high plateaus run
+snow. 32 °C per 1 000 blocks puts permanent snow (mean ≤ −5 °C) above
+~1 000 blocks at the equator, ~530 at 45°, ~170 at 60° and at sea level
+near the poles — the M13 snowline targets. The cost, accepted: high plateaus run
 cool, so taiga can sit on a 300-block plateau in the temperate belt.
 
-### 5. Stage 2 reads the grid, then applies local detail
+### 5. "Into a continent" scales with the continents
+
+Distances that really mean "how far into a continent" — the drying length
+and continental cooling — are multiplied by `Elevation::continent_scale`:
+the world's continent wavelength over the default world's (1 at the default
+size, ~0.2 at the smallest). Without it a 32 km world's ~10 km continents
+never dried out and had no deserts at all (`docs/vision.md` §1.1: climate
+scale grows with the world, landform scale does not; small worlds must
+still hold every biome).
+
+### 6. Stage 2 reads the grid, then applies local detail
 
 A column reads sea-level temperature and precipitation by bilinear
 interpolation between cell centres, wrapping with the torus (content
 addressing — part of terrain generation, one of CLAUDE.md's three
 canonicalising sites), then cools for its own exact height. Boundary noise
-and classification are M13 task 2.
+(two octaves, 1 400 and 350 blocks, ±1.5 °C and ±22% rain) lets biome
+edges wander; classification is `vox_worldgen::biome` (M13 task 2).
 
 ## Measured (seed 0x7e22ac0de and three others, default size)
 

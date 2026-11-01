@@ -13,6 +13,8 @@
 use std::io::Write;
 use std::path::Path;
 
+use crate::biome::Biome;
+
 /// Write an 8-bit RGB image as a PNG.
 pub(crate) fn write_png(path: &Path, w: u32, h: u32, rgb: &[u8]) -> std::io::Result<()> {
     assert_eq!(rgb.len(), (w * h * 3) as usize, "image size");
@@ -107,6 +109,36 @@ pub(crate) fn elevation_colour(h: i64) -> [u8; 3] {
         ],
         h as f32,
     )
+}
+
+/// A colour per biome, chosen to read like an atlas: greens for forest,
+/// yellows and tans for grass and dry land, white for ice, blues for sea.
+pub(crate) fn biome_colour(b: Biome) -> [u8; 3] {
+    match b {
+        Biome::TropicalRainforest => [18, 100, 32],
+        Biome::TropicalDryForest => [92, 130, 40],
+        Biome::Savanna => [190, 180, 80],
+        Biome::HotDesert => [235, 205, 140],
+        Biome::HotSteppe => [210, 175, 110],
+        Biome::Mediterranean => [150, 160, 90],
+        Biome::TemperateGrassland => [175, 200, 110],
+        Biome::ColdDesert => [190, 180, 160],
+        Biome::TemperateForest => [60, 140, 60],
+        Biome::TemperateRainforest => [30, 110, 90],
+        Biome::BorealForest => [40, 90, 70],
+        Biome::Tundra => [150, 150, 120],
+        Biome::IceSheet => [245, 250, 255],
+        Biome::AlpineMeadow => [140, 170, 120],
+        Biome::AlpineRock => [170, 165, 160],
+        Biome::Badlands => [190, 100, 50],
+        Biome::SandBeach => [245, 230, 170],
+        Biome::ShingleBeach => [150, 145, 135],
+        Biome::RockyCoast => [110, 105, 100],
+        Biome::WarmShallowSea => [60, 170, 200],
+        Biome::TemperateSea => [50, 110, 170],
+        Biome::PolarSea => [170, 200, 225],
+        Biome::DeepOcean => [20, 40, 100],
+    }
 }
 
 /// Mean annual temperature colours, °C: ice white through blue, green at
@@ -316,10 +348,216 @@ mod tests {
             "land temperature % <-3 / -3..5 / 5..15 / 15..22 / >22 C: {:?}",
             pct(&t_bins)
         );
-        for (name, img) in [("temperature", &temp), ("precipitation", &rain)] {
+        // Biomes, from the generator's own classification.
+        let mut biomes = rgb.clone();
+        let mut counts = [0u32; 23];
+        let mut land = 0u32;
+        for j in 0..px {
+            let z = (f64::from(j) * step) as i64;
+            for i in 0..px {
+                let x = (f64::from(i) * step) as i64;
+                let col = g.column(x, z);
+                counts[col.biome as usize] += 1;
+                land += u32::from(!col.biome.is_sea());
+                let at = ((j * px + i) * 3) as usize;
+                if rgb[at..at + 3] != [0, 0, 0] {
+                    biomes[at..at + 3].copy_from_slice(&biome_colour(col.biome));
+                }
+            }
+        }
+        let total = px * px;
+        for b in Biome::ALL {
+            let n = counts[b as usize];
+            let of = if b.is_sea() { total } else { land };
+            println!(
+                "  {:<22} {:>5.1}% of {}",
+                b.name(),
+                100.0 * f64::from(n) / f64::from(of),
+                if b.is_sea() { "the world" } else { "land" }
+            );
+        }
+        for (name, img) in [
+            ("temperature", &temp),
+            ("precipitation", &rain),
+            ("biomes", &biomes),
+        ] {
             let path = dir.join(format!("{name}-{:x}-{}.png", g.seed(), shape.size_x()));
             write_png(&path, px, px, img).unwrap();
             println!("wrote {}", path.display());
+        }
+    }
+}
+
+/// Biome shares over many worlds (M13 criteria 3 and 5): every biome in
+/// every world, in Earth-like proportions.
+///
+/// `cargo test -p vox-worldgen --release biome_survey -- --ignored
+/// --nocapture`; env `SURVEY_SEEDS` (default 8) and `SURVEY_SIZES`
+/// (comma-separated blocks, default the default size).
+#[cfg(test)]
+mod survey {
+    use crate::Generator;
+    use crate::biome::Biome;
+    use vox_core::WorldShape;
+
+    /// Per-biome share of a world: land biomes of its land, sea biomes of
+    /// the world. Sampled on a grid, plus a finer pass along the shores,
+    /// where coasts are narrower than any coarse grid.
+    pub(crate) fn shares(g: &Generator, px: i64) -> ([f64; 23], Vec<i64>, Vec<i64>) {
+        let shape = g.shape();
+        let step = shape.size_x() / px;
+        let (mut counts, mut land, mut total) = ([0u64; 23], 0u64, 0u64);
+        for j in 0..px {
+            for i in 0..px {
+                let b = g.column(i * step, j * step).biome;
+                counts[b as usize] += 1;
+                total += 1;
+                land += u64::from(!b.is_sea());
+            }
+        }
+        let mut out = [0.0; 23];
+        for b in Biome::ALL {
+            let of = if b.is_sea() { total } else { land.max(1) };
+            out[b as usize] = counts[b as usize] as f64 / of as f64;
+        }
+        // Coasts are narrower than any coarse grid: measure them exactly,
+        // on a few whole rows walked block by block.
+        let (mut coast, mut row_land) = ([0u64; 23], 0u64);
+        // Lengths of unbroken land-biome stretches along those rows (coasts
+        // left out: they are shore, not a place to cross).
+        let mut runs = Vec::new();
+        // As many rows as ~6 M columns allow, at most 64.
+        let rows = (6_000_000 / shape.size_x()).clamp(4, 64);
+        for j in (0..px).step_by((px / rows).max(1) as usize) {
+            let z = j * step;
+            let (mut current, mut len) = (None, 0i64);
+            for x in 0..shape.size_x() {
+                let b = g.column(x, z).biome;
+                if !b.is_sea() {
+                    row_land += 1;
+                    coast[b as usize] += u64::from(b.is_coast());
+                }
+                let place = (!b.is_sea() && !b.is_coast()).then_some(b);
+                if place == current {
+                    len += 1;
+                } else {
+                    if current.is_some() {
+                        runs.push(len);
+                    }
+                    (current, len) = (place, 1);
+                }
+            }
+        }
+        for b in Biome::ALL.into_iter().filter(|b| b.is_coast()) {
+            out[b as usize] = coast[b as usize] as f64 / row_land.max(1) as f64;
+        }
+        // And north–south, across the climate belts rather than along them.
+        let mut ns_runs = Vec::new();
+        for i in (0..px).step_by((px / rows).max(1) as usize) {
+            let x = i * step;
+            let (mut current, mut len) = (None, 0i64);
+            for z in 0..shape.size_z() {
+                let b = g.column(x, z).biome;
+                let place = (!b.is_sea() && !b.is_coast()).then_some(b);
+                if place == current {
+                    len += 1;
+                } else {
+                    if current.is_some() {
+                        ns_runs.push(len);
+                    }
+                    (current, len) = (place, 1);
+                }
+            }
+        }
+        (out, runs, ns_runs)
+    }
+
+    /// M13 criterion 3: every biome in the catalogue, in every world, for
+    /// every seed tried — from 64 km up (the 32 km world is the open
+    /// question in the M13 spec). Minutes in a release build:
+    /// `cargo test -p vox-worldgen --release every_biome -- --ignored`.
+    #[test]
+    #[ignore]
+    fn every_biome_in_every_world() {
+        for size in [65_536, 204_800, 524_288] {
+            let shape = WorldShape::new(size, size).unwrap();
+            for seed in 0..8u64 {
+                let g = Generator::new(seed.wrapping_mul(0x0051_7CC1_B727) ^ 0x000B_103E, shape);
+                let (s, _, _) = shares(&g, 300);
+                let missing: Vec<&str> = Biome::ALL
+                    .iter()
+                    .filter(|b| s[**b as usize] == 0.0)
+                    .map(|b| b.name())
+                    .collect();
+                assert!(
+                    missing.is_empty(),
+                    "size {size}, seed {:#x}: no {missing:?}",
+                    g.seed()
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn biome_survey() {
+        let seeds: u64 = std::env::var("SURVEY_SEEDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8);
+        let sizes: Vec<i64> = std::env::var("SURVEY_SIZES").ok().map_or_else(
+            || vec![WorldShape::DEFAULT.size_x()],
+            |s| s.split(',').filter_map(|v| v.trim().parse().ok()).collect(),
+        );
+        for size in sizes {
+            let shape = WorldShape::new(size, size).expect("a legal size");
+            let mut sum = [0.0f64; 23];
+            let mut min = [f64::MAX; 23];
+            let mut missing = [0u32; 23];
+            let (mut runs, mut ns_runs) = (Vec::new(), Vec::new());
+            for seed in 0..seeds {
+                let g = Generator::new(seed.wrapping_mul(0x9E37_79B9) ^ 0x7e22ac0de, shape);
+                let (s, r, ns) = shares(&g, 300);
+                runs.extend(r);
+                ns_runs.extend(ns);
+                for k in 0..23 {
+                    sum[k] += s[k];
+                    min[k] = min[k].min(s[k]);
+                    missing[k] += u32::from(s[k] == 0.0);
+                }
+            }
+            // Walking scale (criterion 6): stretches weighted by length — the
+            // stretch a walker is standing in — at ground sprint.
+            for (dir, mut runs) in [("east-west", runs), ("north-south", ns_runs)] {
+                let total: i64 = runs.iter().sum();
+                runs.sort_unstable();
+                let (mut acc, mut median) = (0i64, 0i64);
+                for &r in &runs {
+                    acc += r;
+                    if acc * 2 >= total {
+                        median = r;
+                        break;
+                    }
+                }
+                const SPRINT: f64 = 5.612;
+                println!(
+                    "size {size}, walking {dir}: the biome stretch a walker stands in is {median} blocks \
+                     (median by length), {:.1} min at sprint; {:.1}% of land lies in stretches under 100 blocks",
+                    median as f64 / SPRINT / 60.0,
+                    100.0 * runs.iter().filter(|&&r| r < 100).sum::<i64>() as f64 / total as f64
+                );
+            }
+            println!("size {size}, {seeds} seeds: mean% (min%) [seeds without it]");
+            for b in Biome::ALL {
+                let k = b as usize;
+                println!(
+                    "  {:<22} {:>5.1} ({:>4.2}) [{}]",
+                    b.name(),
+                    100.0 * sum[k] / seeds as f64,
+                    100.0 * min[k],
+                    missing[k]
+                );
+            }
         }
     }
 }

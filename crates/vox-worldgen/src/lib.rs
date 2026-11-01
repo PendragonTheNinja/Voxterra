@@ -18,11 +18,16 @@
 //!   forever. This is what makes a world reproducible from a seed and lets
 //!   the streamer regenerate instead of always loading from disk.
 
+pub mod biome;
 pub mod climate;
 pub mod elevation;
 #[cfg(test)]
 mod map;
 
+use std::sync::{Arc, OnceLock};
+
+use biome::Column;
+use climate::ClimateMap;
 use elevation::Elevation;
 use vox_core::{BlockId, CHUNK_SIZE, Chunk, ChunkPos, LocalPos, SEA_LEVEL_BLOCKS, WorldShape};
 
@@ -55,11 +60,16 @@ pub enum LodSampling {
 const LOD_SPARSE_PROBES: i64 = 4;
 
 /// Terrain generator for one world seed.
-#[derive(Clone, Copy, Debug)]
+///
+/// `Clone`, cheaply: the stage-1 climate map is shared behind an `Arc` and
+/// built on first use (ADR-0017), so a generator used only for heights never
+/// pays for it.
+#[derive(Clone, Debug)]
 pub struct Generator {
     seed: u64,
     shape: WorldShape,
     elevation: Elevation,
+    climate: Arc<OnceLock<ClimateMap>>,
 }
 
 /// Version of the terrain this generator produces for a given seed and world
@@ -86,7 +96,30 @@ impl Generator {
             seed,
             shape,
             elevation: Elevation::new(seed, shape),
+            climate: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// The world's stage-1 climate map, built on first use (~0.5 s at the
+    /// default size) and shared by every clone of this generator. Call it
+    /// once at world load so the cost is paid there, not by the first chunk.
+    pub fn climate(&self) -> &ClimateMap {
+        self.climate
+            .get_or_init(|| ClimateMap::build(&self.elevation, self.shape))
+    }
+
+    /// A column's surface, climate and biome (M13): the single place they
+    /// are put together, so the chunk generator, the LOD sampler and the
+    /// player's readout agree on every column.
+    pub fn column(&self, wx: i64, wz: i64) -> Column {
+        let surface = self.elevation.surface(wx, wz);
+        let climate = self.climate();
+        biome::classify(
+            surface,
+            climate.sea_level_temperature(wx, wz),
+            climate.precipitation(wx, wz),
+            self.elevation.boundary_noise(wx, wz),
+        )
     }
 
     /// The size of the world this generator makes.

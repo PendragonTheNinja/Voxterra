@@ -701,6 +701,15 @@ impl Default for App {
         // Streaming follows the SURFACE, so a camera far from any surface loads
         // terrain it cannot see: the chunks are resident, just 3 km below.
         let generator = Generator::new(seed, shape);
+        // Stage-1 climate (ADR-0017), built here so world load pays for it
+        // rather than whichever chunk happens to be generated first.
+        let started = Instant::now();
+        let climate = generator.climate();
+        log::info!(
+            "climate map: {:?} built in {:.0} ms",
+            climate,
+            started.elapsed().as_secs_f64() * 1000.0
+        );
         let (spawn_x, spawn_z) = vox_core::find_spawn(
             shape,
             0,
@@ -1179,7 +1188,7 @@ impl App {
         // 1. Ask the streamer what should change. A still camera over a
         //    settled world costs nothing; otherwise spans come from the cache,
         //    so only columns new to the neighbourhood sample the terrain.
-        let generator = self.generator;
+        let generator = self.generator.clone();
         self.spans
             .prune(camera_chunk, self.streamer.unload_radius() + 1);
         let spans = &mut self.spans;
@@ -1232,7 +1241,7 @@ impl App {
                 continue;
             }
             self.gen_in_flight.insert(pos);
-            let generator = self.generator;
+            let generator = self.generator.clone();
             let store = self.store.clone();
             let tx = self.gen_tx.clone();
             rayon::spawn(move || {
@@ -1544,7 +1553,7 @@ impl App {
     /// camera flies 40 blocks over the highest ground (or the sea) along that
     /// path, so a sprint never passes through a hill.
     fn start_bench(&mut self) {
-        let generator = self.generator;
+        let generator = self.generator.clone();
         let shape = self.store.shape();
         let (sx, sz) = (
             self.camera.position.x.floor() as i64,
@@ -1620,6 +1629,25 @@ impl App {
             }
         }
         split
+    }
+
+    /// The column under the camera, as the generator classifies it (M13):
+    /// biome, mean annual temperature at the ground, annual precipitation
+    /// and latitude — `docs/biomes.md`'s terms, for play-testing climate.
+    /// The seed's column, not edits: a dug pit reads as the ground it was.
+    fn place_readout(&self) -> String {
+        let (x, z) = (
+            self.camera.position.x.floor() as i64,
+            self.camera.position.z.floor() as i64,
+        );
+        let c = self.generator.column(x, z);
+        format!(
+            "{} {:.0}C {:.0}mm lat {:.1}",
+            c.biome.name(),
+            c.temperature,
+            c.precipitation,
+            self.store.shape().latitude_degrees(z)
+        )
     }
 
     /// One frame of the benchmark: measure, then do what the script says.
@@ -2120,9 +2148,9 @@ impl App {
                 // column, and the edit overlay is saved with the world, so the
                 // gather added nothing but the cost (M10 A3).
                 //
-                // Copied into the rayon job (Generator is Copy, so this is free).
+                // Copied into the rayon job (a cheap clone: the climate map is shared behind an Arc).
                 let sampling = self.lod_sampling(n.level);
-                let generator = self.generator;
+                let generator = self.generator.clone();
                 let tx = self.lod_tx.clone();
                 let origin_y = origin.y as i32;
                 let skirt = if self.lod_skirts {
@@ -2513,13 +2541,14 @@ impl ApplicationHandler for App {
                                 let (w, h) =
                                     self.renderer.as_ref().map_or((0, 0), |r| r.surface_size());
                                 log::info!(
-                                    "VIEW pos {:.2} {:.2} {:.2} yaw {:.4} pitch {:.4} window {w}x{h} time {:.3} | {:?}",
+                                    "VIEW pos {:.2} {:.2} {:.2} yaw {:.4} pitch {:.4} window {w}x{h} time {:.3} | {} | {:?}",
                                     self.camera.position.x,
                                     self.camera.position.y,
                                     self.camera.position.z,
                                     self.camera.yaw,
                                     self.camera.pitch,
                                     self.world_time.time_of_day(),
+                                    self.place_readout(),
                                     self.settings
                                 );
                                 self.census_requested = true;
@@ -2646,6 +2675,13 @@ impl ApplicationHandler for App {
                 self.targeted = hit;
 
                 let loaded = self.streamer.loaded_count();
+                // Where the player stands, for the telemetry line (M13) —
+                // only on the frame that logs it.
+                let place = if self.telemetry_accum + dt >= 1.0 {
+                    self.place_readout()
+                } else {
+                    String::new()
+                };
                 let in_flight = self.gen_in_flight.len();
                 let dirty = self.dirty.len();
                 let relight = self.relight.len();
@@ -2800,7 +2836,7 @@ impl ApplicationHandler for App {
                         let fps = self.telemetry_frames as f32 / self.telemetry_accum;
                         let lod_backlog = self.lod_pending_set.len() + self.lod_in_flight.len();
                         log::info!(
-                            "{:.0} fps (worst {:.1}ms) | drawn {}/{} | {:.2}M tris | {:.0}MB gpu | lod {}+{} | loaded {} | hmap {}k | gen {} | dirty {} | relight {} | lt {:.0}ms msh {:.0}ms",
+                            "{:.0} fps (worst {:.1}ms) | drawn {}/{} | {:.2}M tris | {:.0}MB gpu | lod {}+{} | loaded {} | hmap {}k | gen {} | dirty {} | relight {} | lt {:.0}ms msh {:.0}ms | {}",
                             fps,
                             self.worst_frame_ms,
                             renderer.drawn_last_frame(),
@@ -2819,6 +2855,7 @@ impl ApplicationHandler for App {
                             relight,
                             self.relight_ms_accum,
                             self.mesh_ms_accum,
+                            place,
                         );
                         self.telemetry_accum = 0.0;
                         self.telemetry_frames = 0;

@@ -197,9 +197,10 @@ horizon.
      circles marked, and prints land shares by rainfall and temperature and
      mean land rainfall per 10° of latitude. A dependency-free PNG writer
      (stored deflate). The elevation map is the "before".
-   - [ ] In-game readouts (biome, temperature, rainfall, latitude on the
-     telemetry and `VIEW` lines) — with task 2, once the generator carries
-     the climate.
+   - [x] In-game readouts (2026-11-01): the telemetry line ends with the
+     column under the camera — `temperate forest 11C 950mm lat 41.2` — and
+     so does the **P** key's `VIEW` line. The climate map is built at world
+     load, its time logged (`climate map: … built in … ms`).
 1. **Climate maps (stage 1).** ADR-0017. The grid, temperature, winds,
    moisture advection, rain shadow, ocean moderation. Tests for criterion 4's
    physical causes. Tune against the world map, many seeds, every size.
@@ -218,6 +219,54 @@ horizon.
      `GENERATOR_VERSION` unchanged until task 3.
 2. **Classification.** Climate + terrain → biome, with boundary noise. Tests
    for criteria 3, 5 and 6.
+   - [x] **Done headlessly (2026-11-01)** — `vox_worldgen::biome`:
+     `Generator::column(x, z)` gives a column's surface, temperature,
+     precipitation and biome, from `Elevation::surface` (height with the
+     relief and uplift it was built from, at no extra cost) and the climate
+     map — pure functions of `(x, z)`, so chunks, LOD and readouts agree.
+     Dryness is Köppen's own threshold (`20·T + 140` mm); mountains get a
+     treeline and snowline; mountains inside an ice-sheet climate are ice
+     sheet, as Antarctica's are; shingle on cold or rough shores.
+     `Generator` became `Clone` (the climate map is shared behind an `Arc`,
+     built on first use). Unit tests: Earth's climates classify as Earth
+     does (Manaus, Serengeti, Sahara, Sahel, Paris, Seattle, Gobi, Great
+     Plains, Seville, Arkhangelsk, Yakutsk, Antarctica), tree- and
+     snowlines, shores and seas, badlands.
+   - **Tuning, from the survey** (`biome_survey`, ignored, release build;
+     24 seeds per size). First pass: hot desert 0.5% of land, badlands
+     5.1%, temperate forest 23%. Changes, each physical: drier subtropical
+     sinking air; air over land dries 4× faster in the 15–30° belt;
+     badlands need desert-level dryness and real roughness; a narrower
+     Mediterranean band; the snowline at −5 °C; ice-sheet mountains;
+     temperate rainforest wet *for its temperature* (≥ 4× the aridity
+     threshold, ≥ 1 300 mm); drying and continental cooling scaled by the
+     world's continent size (see "Open question" below).
+   - **Criterion 5 — met.** Default size, 24 seeds, % of land (Earth in
+     brackets, rough): tropical rainforest 7.4 (7–9), dry forest 6.2 (4–6),
+     savanna ~9 (10–14), hot desert ~6 (12–14), hot steppe ~7 (5–8),
+     Mediterranean 0.5 (2–3), temperate grassland 5.1 (6–8), cold desert
+     ~7 (3–5), temperate forest 14.9 (8–12), temperate rainforest 1.9
+     (1–2), boreal 8.5 (11), tundra ~7 (6–8), ice sheet ~12 (9–10), alpine
+     ~5 (3–5), badlands ~2 (1–2); seas: polar sea ~6% of the world, deep
+     ocean ~50%. Groups: deserts and steppe ~27% (25–35 asked), forests
+     ~39% (30–40), tundra and ice ~19% (10–20). **Off Earth, recorded:** hot
+     desert about half Earth's share and temperate forest ~1.5×; the
+     Mediterranean band is thin, because what makes Rome Mediterranean is
+     a dry summer, and climate here has no seasons.
+   - **Criterion 3 — met from 64 km up.** `every_biome_in_every_world`
+     (ignored; ~100 s in release) asserts every biome in 24 worlds at 64,
+     205 and 524 km on seeds the tuning never saw. The survey agrees over
+     24 more seeds per size. **The smallest world (32 km) is open:**
+     temperate rainforest is missing in 5 of 24 seeds and alpine rock and
+     snow in 1 — see "Open question".
+   - **Criterion 6 — met.** The biome stretch a walker stands in, at
+     ground sprint, default size: ~12 minutes walking north–south (across
+     the climate belts), ~23 east–west (along them); at 64 km, 5 and 15.
+     0.3% of land lies in flickers under 100 blocks.
+   - The world map now draws the biomes (`biomes-<seed>-<size>.png`) and
+     prints each biome's share.
+   - Chunks do not read biomes yet: `GENERATOR_VERSION` unchanged until
+     task 3.
 3. **Surface materials.** The new blocks and their tiles; per-biome
    profiles (top, beneath, depth); beaches and rocky coasts; seabeds; sea
    ice; snow and ice sheets. `GENERATOR_VERSION` bump and re-pin.
@@ -260,6 +309,23 @@ horizon.
   judged by looking at the planet, then by walking on it.
 - Measure chunk generation under streaming (lesson 6): uniform chunks must
   stay O(1) — a buried-rock chunk should not classify 1 024 columns.
+
+## Open question (2026-11-01)
+
+**The smallest legal world (32 km across) cannot promise every biome.** In
+24 seeds, 5 have no temperate rainforest and 1 no alpine rock and snow. Both
+need landforms — a wet windward coast in the westerlies, a range above the
+snowline — and a 32 km world has room for very few: its continents are
+~10 km, and mountain belts keep their walking-scale size (ADR-0010). Three
+ways forward:
+
+- **(a)** accept it, and state the guarantee from 64 km up (the smallest
+  world becomes "may lack the rarest biomes");
+- **(b)** shrink landforms in small worlds, as `docs/vision.md` §1.1
+  foresaw ("in the smallest worlds landform scale has to shrink enough that
+  a few ranges still fit") — an elevation change, so a `GENERATOR_VERSION`
+  bump in task 3 anyway;
+- **(c)** raise the smallest legal size to 64 km.
 
 ## Decisions (owner, 2026-11-01)
 
