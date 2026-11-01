@@ -47,12 +47,16 @@ var block_sampler: sampler;
 //   fullres   : where the full-resolution column mask sits — xy = its corner
 //               (render-relative blocks), z = column size, w = side in
 //               columns (0 = no mask yet) — lod.wgsl only (M10 A1)
+//   climate_a, climate_b : the climate map's placement — climate.wgsl
+//               (M13, ADR-0018)
 struct SkyChunk {
     cam_scale: vec4<f32>,
     fog_color: vec4<f32>,
     fog_range: vec4<f32>,
     morph: vec4<f32>,
     fullres: vec4<f32>,
+    climate_a: vec4<f32>,
+    climate_b: vec4<f32>,
 };
 @group(3) @binding(0)
 var<uniform> sky: SkyChunk;
@@ -113,7 +117,7 @@ fn light_curve(level: f32) -> f32 {
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let tex = textureSample(block_tex, block_sampler, in.uv, in.layer);
-    return vec4<f32>(lit(in, tex.rgb), 1.0);
+    return vec4<f32>(lit(in, biome_albedo(tex.rgb, in.layer, in.world_rel)), 1.0);
 }
 
 // Transparent pass (ADR-0011): identical lighting and fog, blended over the

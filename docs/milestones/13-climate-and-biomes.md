@@ -302,6 +302,30 @@ horizon.
      path; 12 keeps all but 4%.
 4. **Biome colour and the LOD.** ADR-0018; the chosen colouring; surface
    material per LOD cell; criterion 7's tests.
+   - [x] **Done headlessly (2026-11-01)** — ADR-0018 (proposed). The LOD
+     wears each cell's top block (`Generator::lod_surface`,
+     `vox_mesh::mesh_lod_surface`: per-cell tops, walls in their cell's
+     block, merging only within a block); polar seas rise to their ice.
+     Grass is tinted in both terrain shaders from the climate map
+     (`climate.wgsl`): temperature cooled for the fragment's height, wetness
+     against Köppen's threshold, five-colour blend, taken in linear light.
+   - Tests: **criterion 7** — at stride 1 every LOD cell's height and top
+     equal full resolution's, in every biome; per-cell tops survive merging
+     (fails if merging ignores the block); walls take the higher cell's
+     block; the climate texels round-trip through the shader's decoding;
+     the shader's grass layers and reference colour are pinned to the
+     registry and the tile.
+   - **Headless renders (lavapipe, 960×540, 8 levels)** of four places —
+     the benchmark's coast (hot steppe: yellowed grass, sand and coarse-dirt
+     patches, a sand beach, badlands far off), equatorial rainforest (deep
+     green), the subtropical desert (sand, hamada, gravelly cold desert on
+     raised ground, red badlands), the polar ice cap (snow, sea ice at the
+     coast) — show biomes to the horizon with no pinholes. The near/far
+     colour seam can only be judged in play (the harness's full-resolution
+     chunks are unlit).
+   - **Found:** shallow seas over pale sand read grey through water of
+     constant opacity (the old grass seabed hid it). Water that absorbs
+     with depth would fix it — `docs/vision.md` §10, not M13's.
 5. **Owner's walk.** A play session on foot and in flight, judged at walking
    speed, with fixes; `--bench` (criterion 9).
 6. **Retro.**

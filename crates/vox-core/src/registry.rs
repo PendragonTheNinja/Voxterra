@@ -178,8 +178,8 @@ pub const MUD: BlockId = BlockId(21);
 // single source of truth. ---
 const L_STONE: u32 = 0;
 const L_DIRT: u32 = 1;
-const L_GRASS_TOP: u32 = 2;
-const L_GRASS_SIDE: u32 = 3;
+pub const L_GRASS_TOP: u32 = 2;
+pub const L_GRASS_SIDE: u32 = 3;
 const L_SAND: u32 = 4;
 const L_COBBLE: u32 = 5;
 const L_PLANKS: u32 = 6;

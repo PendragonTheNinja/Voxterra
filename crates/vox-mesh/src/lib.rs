@@ -3263,6 +3263,31 @@ pub fn mesh_lod_heightfield_with(
     heights: &[i32],
     h_stride: i32,
     origin_y: i32,
+    layer_of: impl FnMut(BlockId, usize) -> u32,
+    skirt_depth_blocks: i32,
+    merge_flat: bool,
+) -> LodMeshData {
+    let grass = [vox_core::registry::GRASS; LOD_CELLS * LOD_CELLS];
+    mesh_lod_surface(
+        heights,
+        &grass,
+        h_stride,
+        origin_y,
+        layer_of,
+        skirt_depth_blocks,
+        merge_flat,
+    )
+}
+
+/// The LOD mesh of a heightfield whose cells each have a top block (M13):
+/// a cell's top and the walls it stands on take that block's faces, so a
+/// distant desert reads as sand and an ice cap as snow, as they do up close.
+/// Flat cells merge only with cells of the same block.
+pub fn mesh_lod_surface(
+    heights: &[i32],
+    tops: &[BlockId],
+    h_stride: i32,
+    origin_y: i32,
     mut layer_of: impl FnMut(BlockId, usize) -> u32,
     skirt_depth_blocks: i32,
     merge_flat: bool,
@@ -3272,9 +3297,10 @@ pub fn mesh_lod_heightfield_with(
         LOD_CELLS * LOD_CELLS,
         "heightfield must be 32x32"
     );
+    assert_eq!(tops.len(), heights.len(), "a top block per cell");
     let n = LOD_CELLS as i32;
     let mut mesh = LodMeshData::default();
-    let grass = vox_core::registry::GRASS;
+    let top_of = |cx: i32, cz: i32| tops[(cz * n + cx) as usize];
 
     // Distant LOD is sky-lit surface only. Day/night dims it through the same
     // `sky_scale` uniform as the near field.
@@ -3327,10 +3353,13 @@ pub fn mesh_lod_heightfield_with(
                 continue;
             }
             let h = at(cx, cz);
+            let block = top_of(cx, cz);
             // Cells along x, then whole rows along z.
             let (mut wx, mut wz) = (1, 1);
             if merge_flat && still(cx, cz) {
-                let joins = |x: i32, z: i32| !covered[idx(x, z)] && still(x, z) && at(x, z) == h;
+                let joins = |x: i32, z: i32| {
+                    !covered[idx(x, z)] && still(x, z) && at(x, z) == h && top_of(x, z) == block
+                };
                 while cx + wx < n && joins(cx + wx, cz) {
                     wx += 1;
                 }
@@ -3344,7 +3373,7 @@ pub fn mesh_lod_heightfield_with(
                 }
             }
             let top = (h - origin_y + 1) as f32;
-            let layer = layer_of(grass, 2);
+            let layer = layer_of(block, 2);
             let s = h_stride as f32;
             // A fan costs one triangle per cell of border; one quad per cell
             // costs one per cell of area. Whichever is fewer — and both are
@@ -3462,7 +3491,7 @@ pub fn mesh_lod_heightfield_with(
                 let (bottom, top) = (neighbour.min(h) + 1, h + 1);
                 let wall_bottom = bottom as f32;
                 let shade = face_brightness(axis, positive);
-                let layer = layer_of(grass, face_index);
+                let layer = layer_of(top_of(cx, cz), face_index);
                 let plane = if positive { w } else { 0.0 };
                 // Winding follows FACE_DIRS so back-face culling keeps these.
                 // `u_vertical` records which of the two quad axes runs UP, so
@@ -3714,6 +3743,63 @@ mod heightfield_tests {
             1 + 4 * LOD_CELLS + 4 * 4 * LOD_CELLS,
             "fan vertices are shared"
         );
+    }
+
+    // ---- Per-cell top blocks (M13 task 4) ----
+
+    /// A flat field half sand, half grass: every cell's top is its own
+    /// block's top layer — merging joins flat cells of one block only, so no
+    /// merged rectangle or fan spans the boundary.
+    #[test]
+    fn lod_tops_keep_each_cells_block_across_merging() {
+        use vox_core::registry::{GRASS, SAND};
+        let n = LOD_CELLS as i32;
+        let tops: Vec<BlockId> = (0..n * n)
+            .map(|i| if (i % n) < 13 { SAND } else { GRASS })
+            .collect();
+        let layer = |b: BlockId, face: usize| u32::from(b.0) * 6 + face as u32;
+        let mesh = mesh_lod_surface(&flat(30), &tops, 4, 0, layer, 4, true);
+        let tri: Vec<[LodVertex; 3]> = mesh
+            .opaque_indices()
+            .chunks_exact(3)
+            .map(|t| [0, 1, 2].map(|k| mesh.vertices[t[k] as usize]))
+            .filter(|t| t[0].layer % 6 == 2)
+            .collect();
+        for cz in 0..n {
+            for cx in 0..n {
+                let (px, pz) = ((cx as f32 + 0.37) * 4.0, (cz as f32 + 0.61) * 4.0);
+                let under: Vec<_> = tri.iter().filter(|t| contains_xz(t, px, pz)).collect();
+                assert_eq!(under.len(), 1, "cell ({cx},{cz})");
+                let want = layer(tops[(cz * n + cx) as usize], 2);
+                assert_eq!(under[0][0].layer, want, "cell ({cx},{cz})");
+            }
+        }
+    }
+
+    /// A wall belongs to the cell standing above it: a sand mesa's cliff is
+    /// sand, not the grass below.
+    #[test]
+    fn lod_walls_take_the_higher_cells_block() {
+        use vox_core::registry::{GRASS, SAND};
+        let n = LOD_CELLS as i32;
+        let mut heights = flat(10);
+        let mut tops = vec![GRASS; LOD_CELLS * LOD_CELLS];
+        for cz in 10..20 {
+            for cx in 10..20 {
+                heights[(cz * n + cx) as usize] = 40;
+                tops[(cz * n + cx) as usize] = SAND;
+            }
+        }
+        let layer = |b: BlockId, face: usize| u32::from(b.0) * 6 + face as u32;
+        let mesh = mesh_lod_surface(&heights, &tops, 4, 0, layer, 4, true);
+        // Wall vertices above the low ground's top are the mesa's.
+        let walls: Vec<&LodVertex> = mesh
+            .vertices
+            .iter()
+            .filter(|v| v.layer % 6 != 2 && v.position[1] > 11.5)
+            .collect();
+        assert!(!walls.is_empty());
+        assert!(walls.iter().all(|v| v.layer / 6 == u32::from(SAND.0)));
     }
 
     // ---- Triangles submitted vs drawn (M12 task 0) ----

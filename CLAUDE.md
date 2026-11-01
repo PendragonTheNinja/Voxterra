@@ -267,12 +267,15 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   `VIEW` lines); small worlds short of mountains widen their belts (only
   when needed: default-size terrain unchanged); task 3 surface materials
   (13 new blocks, per-biome profiles, sea ice, badlands strata,
-  `GENERATOR_VERSION` 3). Next: task 4 (biome colour and LOD materials). No low-end machine exists yet —
+  `GENERATOR_VERSION` 3); task 4 biome colour (grass tinted from the
+  climate map in `climate.wgsl`, ADR-0018 proposed) and LOD materials
+  (`lod_surface`, `mesh_lod_surface`). Next: the owner's walk (task 5) —
+  play, `--bench`, the hole census, then the retro. No low-end machine exists yet —
   M12's spec says how to judge low-end performance by proxy.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 288, vox-mesh 67, vox-worldgen 52, vox-render 17, vox-app 9
-  passing as of M13 task 3), then start the first unchecked item.
+  vox-core 288, vox-mesh 69, vox-worldgen 53, vox-render 19, vox-app 9
+  passing as of M13 task 4), then start the first unchecked item.
 - **Instruments (from M11):** the P key logs a `VIEW` line (exact position,
   angles, window, settings) and a `hole_census` — the frame re-rendered six
   ways on the player's GPU with pinholes counted per variant. In the cloud

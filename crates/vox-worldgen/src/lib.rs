@@ -322,6 +322,61 @@ impl Generator {
         }
         out
     }
+    /// [`Self::lod_heightfield`] with each cell's top block (M13), for
+    /// `vox_mesh::mesh_lod_surface`: what full resolution shows at the column
+    /// that sets the cell's height — its lowest sample — classified exactly
+    /// as the chunk generator classifies it, so a distant desert is sand, an
+    /// ice cap snow, a seabed mud, sand or gravel.
+    ///
+    /// A polar sea's cell rises to sea level as ice: ice is the solid top
+    /// there (ADR-0011's `solid` is the terrain top the LOD draws), and with
+    /// it the LOD sea surface stops at the ice edge as the near sea does.
+    pub fn lod_surface(
+        &self,
+        origin_x: i64,
+        origin_z: i64,
+        h_stride: i64,
+        sampling: LodSampling,
+    ) -> (Vec<i32>, Vec<BlockId>) {
+        debug_assert!(h_stride >= 1);
+        let n = CHUNK_SIZE as i64;
+        let probes = match sampling {
+            LodSampling::Exact => h_stride,
+            LodSampling::Sparse => h_stride.min(LOD_SPARSE_PROBES),
+        };
+        let step = h_stride / probes;
+        let mut heights = vec![0i32; (n * n) as usize];
+        let mut tops = vec![blocks::AIR; (n * n) as usize];
+        for cz in 0..n {
+            for cx in 0..n {
+                let bx = origin_x + cx * h_stride;
+                let bz = origin_z + cz * h_stride;
+                // The lowest sample, kept with its surface so the column is
+                // classified without computing it twice.
+                let mut lowest = (i64::MAX, 0, 0, None);
+                for pz in 0..probes {
+                    for px in 0..probes {
+                        let (x, z) = (bx + px * step, bz + pz * step);
+                        let s = self.elevation.surface(x, z);
+                        if s.height < lowest.0 {
+                            lowest = (s.height, x, z, Some(s));
+                        }
+                    }
+                }
+                let (h, x, z, s) = lowest;
+                let col = self.column_with(x, z, s.expect("at least one sample"));
+                let at = (cz * n + cx) as usize;
+                if col.biome == biome::Biome::PolarSea {
+                    heights[at] = SEA_LEVEL_BLOCKS as i32;
+                    tops[at] = vox_core::registry::ICE;
+                } else {
+                    heights[at] = h as i32;
+                    tops[at] = self.block_in(&col, h);
+                }
+            }
+        }
+        (heights, tops)
+    }
 }
 
 #[cfg(test)]
@@ -523,6 +578,54 @@ mod tests {
                         g.block_at(wx, wy, wz),
                         "{biome:?}: chunk {pos:?} disagrees at ({wx}, {wy}, {wz})"
                     );
+                }
+            }
+        }
+    }
+
+    /// M13 criterion 7, near and far agree: at stride 1 a LOD cell is one
+    /// column, and its height and top block are exactly the solid top full
+    /// resolution generates there — in every biome, polar sea ice included.
+    /// At coarser strides the cell's top is the block at its lowest sample.
+    #[test]
+    fn lod_surface_matches_full_resolution_in_every_biome() {
+        use crate::biome::Biome;
+        let g = Generator::new(0xB10_3E5, WorldShape::new(65_536, 65_536).unwrap());
+        let mut found = std::collections::BTreeMap::new();
+        for j in 0..120i64 {
+            for i in 0..120i64 {
+                let (x, z) = (i * 541 + 3, j * 541 + 11);
+                found.entry(g.column(x, z).biome).or_insert((x, z));
+            }
+        }
+        assert!(found.contains_key(&Biome::PolarSea) && found.contains_key(&Biome::HotDesert));
+        for (biome, (x, z)) in found {
+            let (ox, oz) = (x - 16, z - 16);
+            let (heights, tops) = g.lod_surface(ox, oz, 1, LodSampling::Exact);
+            for cz in 0..32i64 {
+                for cx in 0..32i64 {
+                    let at = (cz * 32 + cx) as usize;
+                    let (wx, wz) = (ox + cx, oz + cz);
+                    let h = i64::from(heights[at]);
+                    assert_eq!(tops[at], g.block_at(wx, h, wz), "{biome:?} at ({wx}, {wz})");
+                    // The solid top: nothing solid above it, and it is solid.
+                    assert_ne!(g.block_at(wx, h + 1, wz), vox_core::registry::ICE);
+                    assert!(
+                        ![blocks::AIR, blocks::WATER].contains(&tops[at]),
+                        "{biome:?}: LOD top {:?} at ({wx}, {wz})",
+                        tops[at]
+                    );
+                }
+            }
+            // Coarser: heights are the plain heightfield's, except polar
+            // seas, raised to their ice.
+            let (h8, t8) = g.lod_surface(ox, oz, 8, LodSampling::Sparse);
+            let plain = g.lod_heightfield(ox, oz, 8, LodSampling::Sparse);
+            for k in 0..h8.len() {
+                if t8[k] == vox_core::registry::ICE && h8[k] == SEA_LEVEL_BLOCKS as i32 {
+                    assert!(plain[k] <= h8[k]);
+                } else {
+                    assert_eq!(h8[k], plain[k], "{biome:?}");
                 }
             }
         }

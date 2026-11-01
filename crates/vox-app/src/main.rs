@@ -277,6 +277,21 @@ fn relight_chunks_parallel(
         .collect()
 }
 
+/// The world's climate map as texels for `Renderer::set_climate` (M13,
+/// ADR-0018): a cell's sea-level temperature and precipitation, row by row.
+fn climate_texels(generator: &Generator) -> (Vec<u8>, (u32, u32)) {
+    let climate = generator.climate();
+    let (nx, nz) = climate.cells();
+    let mut texels = Vec::with_capacity(nx * nz * 4);
+    for j in 0..nz {
+        for i in 0..nx {
+            let (sea_level_c, precip, _, _) = climate.cell(i, j);
+            texels.extend_from_slice(&vox_render::encode_climate(sea_level_c, precip));
+        }
+    }
+    (texels, (nx as u32, nz as u32))
+}
+
 /// `jobs` pairs each chunk with its SEALED faces: a bit per entry of
 /// `NEIGHBOR_OFFSETS`, set where that face neighbour is absent and never
 /// coming (M10 A3). The mesher continues the chunk's own edge there: no face
@@ -2100,14 +2115,14 @@ impl App {
 
         // Spawn up to the budget from the pending queue. Coarse gen + mesh run
         // on rayon (pure CPU); only the upload above is on the main thread.
-        let grass = vox_core::registry::GRASS;
-        let stone = vox_core::registry::STONE;
-        let grass_layers: [u32; 6] = std::array::from_fn(|f| self.registry.face_layer(grass, f));
-        let stone_layers: [u32; 6] = std::array::from_fn(|f| self.registry.face_layer(stone, f));
-        // The LOD's sea surface is the same translucent water as up close
-        // (ADR-0011 decision 1c).
-        let water = vox_core::registry::WATER;
-        let water_layers: [u32; 6] = std::array::from_fn(|f| self.registry.face_layer(water, f));
+        // Every block's face layers, by id, for the LOD workers: distant
+        // terrain wears each biome's own top block (M13), and the sea surface
+        // is the same translucent water as up close (ADR-0011 decision 1c).
+        let layers: Arc<Vec<[u32; 6]>> = Arc::new(
+            (0..self.registry.len())
+                .map(|id| std::array::from_fn(|f| self.registry.face_layer(BlockId(id as u16), f)))
+                .collect(),
+        );
 
         let mut spawned = 0;
         if !self.lod_pending_set.is_empty() {
@@ -2160,26 +2175,20 @@ impl App {
                 };
                 let edits = Arc::clone(&self.edited_columns);
                 let merge = self.lod_merge;
+                let layers = Arc::clone(&layers);
                 rayon::spawn(move || {
-                    let mut heights =
-                        generator.lod_heightfield(origin.x, origin.z, stride, sampling);
+                    let (mut heights, tops) =
+                        generator.lod_surface(origin.x, origin.z, stride, sampling);
                     // Fold in player edits. The seed always reads higher than
                     // dug ground, so without this the coarse surface floats
                     // above the hole and shows through it (the "ghost block").
                     edits.apply_to_node(&mut heights, origin.x, origin.z, stride, origin_y);
-                    let mesh = vox_mesh::mesh_lod_heightfield_with(
+                    let mesh = vox_mesh::mesh_lod_surface(
                         &heights,
+                        &tops,
                         stride as i32,
                         origin_y,
-                        |b, face| {
-                            if b == grass {
-                                grass_layers[face]
-                            } else if b == water {
-                                water_layers[face]
-                            } else {
-                                stone_layers[face]
-                            }
-                        },
+                        |b, face| layers.get(b.0 as usize).map_or(0, |l| l[face]),
                         skirt,
                         merge,
                     );
@@ -2355,7 +2364,17 @@ impl ApplicationHandler for App {
                 .expect("failed to create window"),
         );
 
-        let renderer = Renderer::new(window.clone());
+        let mut renderer = Renderer::new(window.clone());
+        // Biome colour (M13, ADR-0018): the world's climate map, for the
+        // terrain shaders to tint grass by, near and far alike.
+        let (texels, cells) = climate_texels(&self.generator);
+        let shape = self.store.shape();
+        renderer.set_climate(
+            &texels,
+            cells,
+            (shape.size_x(), shape.size_z()),
+            vox_worldgen::climate::LAPSE_PER_BLOCK,
+        );
 
         // The world is no longer pre-built: chunks stream in around the
         // camera each frame via stream_tick (M02). resumed() just stands up
@@ -2909,7 +2928,8 @@ mod specks_scratch {
     /// isolated magenta pixels (holes). Env: SPECK_EXTRA, SPECK_X, SPECK_Y
     /// (or SPECK_UP above ground), SPECK_Z, SPECK_YAW, SPECK_PITCH, SPECK_W,
     /// SPECK_H, SPECK_FOV, SPECK_MORPH, SPECK_CURVE, SPECK_OUT — the P key's
-    /// VIEW line has them all — and SPECK_FRAMES (time that many frames).
+    /// VIEW line has them all — and SPECK_FRAMES (time that many frames),
+    /// SPECK_NOCLIMATE (no biome colour).
     #[test]
     #[ignore]
     fn specks() {
@@ -2943,15 +2963,17 @@ mod specks_scratch {
         );
         let update = ring.update(cam_chunk);
 
-        let grass = vox_core::registry::GRASS;
-        let stone = vox_core::registry::STONE;
-        let water = vox_core::registry::WATER;
-        let gl: [u32; 6] = std::array::from_fn(|f| registry.face_layer(grass, f));
-        let sl: [u32; 6] = std::array::from_fn(|f| registry.face_layer(stone, f));
-        let wl: [u32; 6] = std::array::from_fn(|f| registry.face_layer(water, f));
-
         let mut r = vox_render::Renderer::new_headless(w, h);
         r.set_render_origin(cam_chunk);
+        if std::env::var("SPECK_NOCLIMATE").is_err() {
+            let (texels, cells) = climate_texels(&generator);
+            r.set_climate(
+                &texels,
+                cells,
+                (shape.size_x(), shape.size_z()),
+                vox_worldgen::climate::LAPSE_PER_BLOCK,
+            );
+        }
         r.set_debug_holes(std::env::var("SPECK_NOH").is_err());
         let unload = 8 + 2; // default radius 8 + streamer slack, roughly
         use rayon::prelude::*;
@@ -2967,21 +2989,15 @@ mod specks_scratch {
                 } else {
                     LodSampling::Sparse
                 };
-                let heights = generator.lod_heightfield(bx, bz, stride, sampling);
-                let mesh = vox_mesh::mesh_lod_heightfield(
+                let (heights, tops) = generator.lod_surface(bx, bz, stride, sampling);
+                let mesh = vox_mesh::mesh_lod_surface(
                     &heights,
+                    &tops,
                     stride as i32,
                     by as i32,
-                    |b, f| {
-                        if b == grass {
-                            gl[f]
-                        } else if b == water {
-                            wl[f]
-                        } else {
-                            sl[f]
-                        }
-                    },
+                    |b, f| registry.face_layer(b, f),
                     LOD_SKIRT_DEPTH_CELLS * stride as i32,
+                    true,
                 );
                 (*n, mesh)
             })

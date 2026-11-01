@@ -81,6 +81,8 @@ struct SkyChunk {
     fog_range: vec4<f32>,
     morph: vec4<f32>,
     fullres: vec4<f32>,
+    climate_a: vec4<f32>,
+    climate_b: vec4<f32>,
 };
 @group(3) @binding(0)
 var<uniform> sky: SkyChunk;
@@ -198,7 +200,7 @@ fn fs_lod(in: VsOut) -> @location(0) vec4<f32> {
     if (under_fullres(in.world_rel)) {
         discard;
     }
-    return vec4<f32>(lod_lit(in, tex.rgb), 1.0);
+    return vec4<f32>(lod_lit(in, biome_albedo(tex.rgb, in.layer, in.world_rel)), 1.0);
 }
 
 // The LOD's sea surface (ADR-0011 decision 1c): the same translucent water as

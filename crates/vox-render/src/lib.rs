@@ -46,12 +46,14 @@ const DEPTH_NEARER_OR_EQUAL: wgpu::CompareFunction = wgpu::CompareFunction::Grea
 const TERRAIN_SHADER: &str = concat!(
     include_str!("shader.wgsl"),
     include_str!("curvature.wgsl"),
-    include_str!("atmosphere.wgsl")
+    include_str!("atmosphere.wgsl"),
+    include_str!("climate.wgsl")
 );
 const LOD_SHADER: &str = concat!(
     include_str!("lod.wgsl"),
     include_str!("curvature.wgsl"),
-    include_str!("atmosphere.wgsl")
+    include_str!("atmosphere.wgsl"),
+    include_str!("climate.wgsl")
 );
 
 /// The perspective projection for this renderer's depth convention.
@@ -323,6 +325,13 @@ pub struct Renderer {
     /// for the sky-pass additions (sun direction, moon) in task 3b.
     sky_buffer: wgpu::Buffer,
     sky_bind_group: wgpu::BindGroup,
+    /// Kept to rebuild `sky_bind_group` when a world's climate map arrives.
+    sky_bgl: wgpu::BindGroupLayout,
+    fullres_mask_view: wgpu::TextureView,
+    climate_sampler: wgpu::Sampler,
+    /// The world's climate map placement, once set (`set_climate`): world
+    /// size in blocks and the lapse rate; `None` leaves grass untinted.
+    climate: Option<ClimatePlacement>,
     /// Which chunk columns around the render origin full resolution draws:
     /// 1 = drawn, so the LOD shader discards there (see `set_fullres_columns`).
     fullres_mask: wgpu::Texture,
@@ -669,11 +678,13 @@ impl Renderer {
         // these flags is a pipeline-creation panic, not a compile error. ---
         let sky_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sky uniform"),
-            // 5 vec4s: camera+sky_scale, fog colour, fog range, morph params
-            // (ADR-0009), full-res mask placement. Must match `SkyChunk` in
-            // both shader.wgsl and lod.wgsl. Two writers, disjoint ranges:
-            // `set_sky` owns vec4s 0-3, `set_fullres_columns` owns vec4 4.
-            size: std::mem::size_of::<[f32; 20]>() as u64,
+            // 7 vec4s: camera+sky_scale, fog colour, fog range, morph params
+            // (ADR-0009), full-res mask placement, and the climate map's
+            // placement (two, M13). Must match `SkyChunk` in both shader.wgsl
+            // and lod.wgsl. Three writers, disjoint ranges: `set_sky` owns
+            // vec4s 0-3, `set_fullres_columns` vec4 4, `write_climate_placement`
+            // vec4s 5-6.
+            size: std::mem::size_of::<[f32; 28]>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -720,22 +731,47 @@ impl Renderer {
                     },
                     count: None,
                 },
+                // The climate map and its sampler (M13, ADR-0018): biome
+                // colour, interpolated between cells as the generator
+                // interpolates, wrapping as the world does.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
-        let sky_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("sky bind group"),
-            layout: &sky_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: sky_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&fullres_mask_view),
-                },
-            ],
+        let climate_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("climate sampler"),
+            // The torus: the map repeats exactly as the world does.
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
         });
+        // A 1x1 placeholder until a world's map arrives (`set_climate`);
+        // the shader leaves grass untinted until then.
+        let climate_texture = climate_texture(&device, &queue, 1, 1, &[128, 128, 0, 255]);
+        let sky_bind_group = sky_bind_group(
+            &device,
+            &sky_bgl,
+            &sky_buffer,
+            &fullres_mask_view,
+            &climate_texture,
+            &climate_sampler,
+        );
 
         // --- Per-chunk offset uniform layout (group 1), for floating
         // origin. One small uniform per chunk, rebound per draw. ---
@@ -1202,6 +1238,10 @@ impl Renderer {
             highlight_target: None,
             sky_buffer,
             sky_bind_group,
+            sky_bgl,
+            fullres_mask_view,
+            climate_sampler,
+            climate: None,
             fullres_mask,
             fullres_texels: Vec::new(),
             fullres_center: ChunkPos::new(0, 0, 0),
@@ -1485,6 +1525,67 @@ impl Renderer {
         self.buffer_bytes
     }
 
+    /// Give the renderer a world's climate map (M13, ADR-0018): `texels` is
+    /// `nx × nz` RGBA8 from [`encode_climate`], cell `(i, j)` at row `j`,
+    /// covering one lap of a world `size_x × size_z` blocks; `lapse` is the
+    /// generator's °C per block. Grass is tinted by it near and far from the
+    /// next frame. Call once per world.
+    pub fn set_climate(
+        &mut self,
+        texels: &[u8],
+        (nx, nz): (u32, u32),
+        (size_x, size_z): (i64, i64),
+        lapse: f32,
+    ) {
+        let texture = climate_texture(&self.device, &self.queue, nx, nz, texels);
+        self.sky_bind_group = sky_bind_group(
+            &self.device,
+            &self.sky_bgl,
+            &self.sky_buffer,
+            &self.fullres_mask_view,
+            &texture,
+            &self.climate_sampler,
+        );
+        self.climate = Some(ClimatePlacement {
+            size_x,
+            size_z,
+            lapse,
+        });
+        self.write_climate_placement();
+    }
+
+    /// Where the render origin sits on the climate map. The map's
+    /// coordinates are the world's content address, wrapped to one lap —
+    /// the climate map is terrain generation's content, read here (ADR-0018
+    /// on why this is not a fourth place the seam lives). Computed in f64
+    /// and narrowed to f32 only as a fraction of the world, so it stays
+    /// exact however far the unwrapped origin has travelled.
+    fn write_climate_placement(&mut self) {
+        let data: [f32; 8] = match self.climate {
+            Some(c) => {
+                let s = CHUNK_SIZE as f64;
+                let u = (self.render_origin.x as f64 * s / c.size_x as f64).rem_euclid(1.0);
+                let v = (self.render_origin.z as f64 * s / c.size_z as f64).rem_euclid(1.0);
+                [
+                    u as f32,
+                    v as f32,
+                    (1.0 / c.size_x as f64) as f32,
+                    (1.0 / c.size_z as f64) as f32,
+                    (self.render_origin.y as f64 * s) as f32,
+                    1.0,
+                    c.lapse,
+                    0.0,
+                ]
+            }
+            None => [0.0; 8],
+        };
+        self.queue.write_buffer(
+            &self.sky_buffer,
+            CLIMATE_UNIFORM_OFFSET,
+            bytemuck::cast_slice(&data),
+        );
+    }
+
     /// Move the render origin (ADR-0002) and recompute every chunk's offset
     /// uniform and render-relative AABB. Call when the camera crosses into a
     /// new chunk; cheap relative to how often that happens. No-op if the
@@ -1494,6 +1595,7 @@ impl Renderer {
             return;
         }
         self.render_origin = origin;
+        self.write_climate_placement();
         for (&pos, mesh) in self.meshes.iter_mut() {
             let offset = chunk_offset(pos, origin);
             mesh.aabb_min = offset;
@@ -2189,6 +2291,90 @@ const _: () = assert!(
 const FULLRES_MASK_SIDE: u32 = (2 * FULLRES_MASK_RADIUS + 1) as u32;
 /// Byte offset of the mask placement (vec4 4) in the chunk uniform.
 const FULLRES_MASK_UNIFORM_OFFSET: wgpu::BufferAddress = 4 * 16;
+/// Where the climate map's placement starts in the sky uniform (vec4s 5-6).
+const CLIMATE_UNIFORM_OFFSET: wgpu::BufferAddress = 5 * 16;
+
+/// A world's climate map, as the renderer places it (`set_climate`).
+#[derive(Clone, Copy, Debug)]
+struct ClimatePlacement {
+    size_x: i64,
+    size_z: i64,
+    lapse: f32,
+}
+
+/// One climate-map cell as a texel (M13, ADR-0018): sea-level temperature
+/// linear over -50..50 °C in red, precipitation as the square root of its
+/// share of 9 000 mm in green — fine where rain is scarce, where grass colour
+/// changes fastest. climate.wgsl decodes it.
+pub fn encode_climate(sea_level_c: f32, precip_mm: f32) -> [u8; 4] {
+    let t = ((sea_level_c + 50.0) / 100.0).clamp(0.0, 1.0);
+    let p = (precip_mm / 9_000.0).clamp(0.0, 1.0).sqrt();
+    [(t * 255.0).round() as u8, (p * 255.0).round() as u8, 0, 255]
+}
+
+/// The climate map as a filterable texture, uploaded once.
+fn climate_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    nx: u32,
+    nz: u32,
+    texels: &[u8],
+) -> wgpu::TextureView {
+    assert_eq!(texels.len(), (nx * nz * 4) as usize, "climate texels");
+    let texture = device.create_texture_with_data(
+        queue,
+        &wgpu::TextureDescriptor {
+            label: Some("climate map"),
+            size: wgpu::Extent3d {
+                width: nx,
+                height: nz,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        texels,
+    );
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// The group-3 bind group: sky uniform, full-res mask, climate map.
+fn sky_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    buffer: &wgpu::Buffer,
+    fullres_mask: &wgpu::TextureView,
+    climate: &wgpu::TextureView,
+    climate_sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("sky bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(fullres_mask),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(climate),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::Sampler(climate_sampler),
+            },
+        ],
+    })
+}
 
 /// The mask's texels: 255 where `covered(cx, cz)`, row-major from the
 /// corner column `(center.x - R, center.z - R)`.
@@ -2632,16 +2818,70 @@ mod tests {
         }
     }
 
+    /// The climate map's texels read back, through climate.wgsl's decoding,
+    /// as the climate they encode (M13, ADR-0018).
+    #[test]
+    fn climate_texels_round_trip_as_the_shader_decodes_them() {
+        for (t, p) in [
+            (-45.0f32, 0.0f32),
+            (-3.0, 120.0),
+            (12.0, 900.0),
+            (27.0, 2_500.0),
+            (30.0, 8_800.0),
+        ] {
+            let [r, g, _, _] = encode_climate(t, p);
+            // climate.wgsl: r * 100 - 50, g² * 9000.
+            let (rt, rp) = (
+                f32::from(r) / 255.0 * 100.0 - 50.0,
+                (f32::from(g) / 255.0).powi(2) * 9_000.0,
+            );
+            assert!((rt - t).abs() < 0.25, "{t} °C read back as {rt}");
+            assert!((rp - p).abs() < 0.02 * p + 40.0, "{p} mm read back as {rp}");
+        }
+    }
+
+    /// climate.wgsl's constants are copies; pin them to their sources. The
+    /// grass layers are the registry's, and the tint is relative to the
+    /// grass tile's own colour — so mild, wet grass looks as it did before
+    /// biomes, and only climate moves it.
+    #[test]
+    fn climate_shader_constants_match_their_sources() {
+        use vox_core::registry::{L_GRASS_SIDE, L_GRASS_TOP};
+        let shader = include_str!("climate.wgsl");
+        assert!(shader.contains(&format!("const GRASS_TOP_LAYER: u32 = {L_GRASS_TOP}u;")));
+        assert!(shader.contains(&format!("const GRASS_SIDE_LAYER: u32 = {L_GRASS_SIDE}u;")));
+        let tile = tile_pixels(L_GRASS_TOP, 1);
+        // The tile's base colour, before its per-texel grain: average a
+        // large tile so the grain cancels.
+        let big = tile_pixels(L_GRASS_TOP, 64);
+        let mean: Vec<f32> = (0..3)
+            .map(|c| {
+                big.chunks_exact(4).map(|px| f32::from(px[c])).sum::<f32>() / (64.0 * 64.0) / 255.0
+            })
+            .collect();
+        let reference = [0.3137f32, 0.5882, 0.2510];
+        assert!(shader.contains("vec3<f32>(0.3137, 0.5882, 0.2510)"));
+        for c in 0..3 {
+            assert!(
+                (mean[c] - reference[c]).abs() < 0.02,
+                "grass tile {mean:?} vs {reference:?}"
+            );
+        }
+        assert_eq!(tile.len(), 4);
+    }
+
     /// Full resolution and LOD must curve identically and see through the
     /// same air, or the boundary between them shows: both carry the one
     /// appended curvature and atmosphere, neither has its own, and both use
     /// them.
     #[test]
     fn both_terrain_shaders_share_curvature_and_atmosphere() {
+        // And biome colour (climate.wgsl, M13): grass the same near and far.
         let shared = format!(
-            "{}{}",
+            "{}{}{}",
             include_str!("curvature.wgsl"),
-            include_str!("atmosphere.wgsl")
+            include_str!("atmosphere.wgsl"),
+            include_str!("climate.wgsl")
         );
         for (name, own, composed) in [
             ("terrain", include_str!("shader.wgsl"), TERRAIN_SHADER),
