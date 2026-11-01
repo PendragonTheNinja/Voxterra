@@ -14,3 +14,4 @@ milestone is kept here, with the commit it shows.
 | `rivers.png` | `688a5ab` | After valley erosion and the budget's fixes: 32% of land drains to closed basins, in the dry subtropical belts; lake districts on the ice-scoured bands; tarns in the ranges |
 | `valleys.png` | `688a5ab` | The eroded ground, hill-shaded so the valleys read |
 | `view-gorge.jpg` | `688a5ab` | A river-cut valley at about (143 300, 106 100), looking downstream (south-east) from 250 blocks up: V-shaped sides cut ~470 blocks deep at the deepest, opening to the lowland. No river water yet (task 3) |
+| `view-first-river.jpg` | task 3 | The first river in the chunks (~10 m³/s, ~25 blocks wide) near (153 280, 36 800), looking upstream (north) from 60 blocks up: settled water in its channel, a tributary joining from the right. Past full resolution its bed shows dry (silt) — the LOD's water is task 5 |

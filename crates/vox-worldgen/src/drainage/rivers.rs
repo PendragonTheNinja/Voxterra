@@ -26,6 +26,10 @@
 //! water is never held by air, and the shaping ends continuously however
 //! far the river is cut below its surroundings.
 //!
+//! **Alluvium** fills the hollows a river's grade runs above — those its rim
+//! cut could not drain — to that grade: flat floors, as sediment fills them
+//! over geological time.
+//!
 //! **Lakes** fill every column of their cells whose ground is below the lake's
 //! level — the shore follows the ground's own contours — and the low ground
 //! of their neighbours, so a dip at a cell's edge is part of the lake rather
@@ -224,7 +228,32 @@ impl DrainageMap {
         // two reaches disagree — a steep one stepping down past its own
         // lower water — the levee wins, so no water is ever held by air.
         let h = h.min(ceiling).max(floor).round() as i64;
+        let h = self.alluvium(ci, cj, h);
         (h, self.still_water(ci, cj, h))
+    }
+
+    /// The ground of a column of cell `(ci, cj)` (unwrapped) after the
+    /// sediment that fills hollows below a river's grade: raised to the
+    /// level of its own cell's fill, or of a neighbour's — the floor's edge
+    /// follows the ground's contours, as a lake's shore does.
+    fn alluvium(&self, ci: i64, cj: i64, h: i64) -> i64 {
+        let here = self.wrap(ci, cj);
+        let fill = |c: usize| {
+            let level = i64::from(self.lvl(c));
+            (self.cover_at(c) == Cover::Land && level > i64::from(self.h(c))).then_some(level)
+        };
+        let mut level = fill(here);
+        if level.is_none() {
+            for nb in neighbours(here, self.nx, self.nz) {
+                if let Some(l) = fill(nb)
+                    && h < l
+                    && level.is_none_or(|m| l < m)
+                {
+                    level = Some(l);
+                }
+            }
+        }
+        level.map_or(h, |l| h.max(l))
     }
 
     /// A lake or salt flat at a column of cell `(ci, cj)` (unwrapped) whose

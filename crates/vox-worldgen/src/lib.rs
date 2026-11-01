@@ -772,7 +772,9 @@ mod tests {
                 (last.patch - first.patch).abs() < 0.2,
                 "patch jumps at the seam, z = {z}"
             );
-            assert!((last.surface.height - first.surface.height).abs() <= 3);
+            // What stands there — ground, or the water of a lake or river.
+            let top = |c: &Column| c.surface.height.max(wet_top(&c.water));
+            assert!((top(&last) - top(&first)).abs() <= 3, "z = {z}");
         }
     }
 
@@ -1059,7 +1061,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (4, 0xd26d_b663_abd4_13bf);
+        const PINNED: (u32, u64) = (4, 0x6845_14bc_0518_b11c);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),
