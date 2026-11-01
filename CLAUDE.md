@@ -264,14 +264,16 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   (in game: µs/chunk −49%, sprint backlog 1 040 → ~430) and a bitwise
   prefilter skips cells that cannot show a face (in game: µs/chunk
   ~1 640 → ~570, sprint fps ~115 → ~600, backlog ~385 against ≤ ~350).
-  Next: the owner's `--bench` with the new backlog split (ready / relight /
-  neighbours), which decides the next fix. No low-end
+  The backlog split showed it is still meshing (2/3 ready, 1/3 relight, 0
+  waiting on neighbours); so the snapshot now fills by rows and air or
+  hidden uniform chunks skip it (headless: −92% mesh CPU per chunk against
+  the baseline). Next: the owner's `--bench`. No low-end
   machine exists yet — the spec says how to judge low-end performance by
   proxy.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 287, vox-mesh 65, vox-worldgen 31, vox-render 17, vox-app 9
-  passing as of M12 task 1's backlog split), then start the first unchecked item.
+  vox-core 288, vox-mesh 67, vox-worldgen 31, vox-render 17, vox-app 9
+  passing as of M12 task 1's snapshot fixes), then start the first unchecked item.
 - **Instruments (from M11):** the P key logs a `VIEW` line (exact position,
   angles, window, settings) and a `hole_census` — the frame re-rendered six
   ways on the player's GPU with pinholes counted per variant. In the cloud

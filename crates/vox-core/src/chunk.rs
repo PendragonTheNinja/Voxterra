@@ -191,6 +191,45 @@ impl Chunk {
         arr[i] = (arr[i] & 0x0F) | (level << 4);
     }
 
+    /// The 32 blocks of one X row — `x` 0..32 at (`y`, `z`) — into `out`, in
+    /// one pass. The mesher's snapshot (`vox_mesh::MeshInput`) reads every
+    /// cell of a chunk it meshes; through [`Chunk::get`] each cell paid a
+    /// runtime division and modulo by the bit width, a third of the
+    /// snapshot's cost (M12 task 1). A row is contiguous in [`LocalPos::index`]
+    /// order, so its values sit in consecutive packed slots.
+    pub fn decode_row(&self, y: usize, z: usize, out: &mut [BlockId; 32]) {
+        match &self.indices {
+            None => out.fill(self.palette[0]),
+            Some(packed) => {
+                let start = LocalPos::new(0, y as u8, z as u8).index();
+                // Widths are powers of two dividing 64, so slots per word and
+                // the bit offset within a word are shifts and masks.
+                let per_word_log2 = (64 / packed.bits).trailing_zeros();
+                let bits_log2 = packed.bits.trailing_zeros();
+                for (k, slot) in out.iter_mut().enumerate() {
+                    let i = start + k;
+                    let word = packed.data[i >> per_word_log2];
+                    let shift = ((i as u32) & (packed.per_word - 1)) << bits_log2;
+                    *slot = self.palette[((word >> shift) & packed.mask) as usize];
+                }
+            }
+        }
+    }
+
+    /// Sky and block light of one X row, as [`Chunk::decode_row`] does for
+    /// blocks. Returns `false`, writing nothing, when the chunk is fully dark.
+    pub fn light_row(&self, y: usize, z: usize, sky: &mut [u8; 32], block: &mut [u8; 32]) -> bool {
+        let Some(arr) = &self.light else {
+            return false;
+        };
+        let start = LocalPos::new(0, y as u8, z as u8).index();
+        for (k, &b) in arr[start..start + 32].iter().enumerate() {
+            sky[k] = b >> 4;
+            block[k] = b & 0x0F;
+        }
+        true
+    }
+
     /// Whether any light storage is allocated (i.e. the chunk may be lit).
     /// A `false` result guarantees the chunk is fully dark (both channels).
     #[inline]
@@ -662,6 +701,47 @@ mod tests {
     }
 
     /// Minimal deterministic RNG for tests — no external crates in vox-core.
+    /// Every palette width (1, 2, 4, 8 and 16 bits), and the uniform case:
+    /// a decoded row is exactly what `get` reads cell by cell, and a light
+    /// row exactly `sky_light` / `block_light`.
+    #[test]
+    fn rows_decode_exactly_what_get_reads() {
+        let mut rng = SplitMix64::new(0x5EED_8088);
+        for kinds in [1u64, 2, 3, 9, 200, 600] {
+            let mut chunk = Chunk::new_air();
+            for pos in LocalPos::iter() {
+                chunk.set(pos, BlockId((rng.next() % kinds) as u16));
+                if rng.next().is_multiple_of(5) {
+                    chunk.set_sky_light(pos, (rng.next() % 16) as u8);
+                    chunk.set_block_light(pos, (rng.next() % 16) as u8);
+                }
+            }
+            let (mut row, mut sky, mut block) = ([BlockId::AIR; 32], [0u8; 32], [0u8; 32]);
+            for y in 0..32 {
+                for z in 0..32 {
+                    chunk.decode_row(y, z, &mut row);
+                    let lit = chunk.light_row(y, z, &mut sky, &mut block);
+                    assert_eq!(lit, chunk.has_light());
+                    for x in 0..32 {
+                        let p = LocalPos::new(x as u8, y as u8, z as u8);
+                        assert_eq!(row[x], chunk.get(p), "{kinds} kinds at {p:?}");
+                        if lit {
+                            assert_eq!(sky[x], chunk.sky_light(p));
+                            assert_eq!(block[x], chunk.block_light(p));
+                        }
+                    }
+                }
+            }
+        }
+        let mut row = [BlockId::AIR; 32];
+        let (mut sky, mut block) = ([9u8; 32], [9u8; 32]);
+        let stone = Chunk::filled(BlockId(1));
+        stone.decode_row(5, 7, &mut row);
+        assert_eq!(row, [BlockId(1); 32]);
+        assert!(!stone.light_row(5, 7, &mut sky, &mut block));
+        assert_eq!((sky, block), ([9u8; 32], [9u8; 32]), "dark writes nothing");
+    }
+
     struct SplitMix64(u64);
 
     impl SplitMix64 {

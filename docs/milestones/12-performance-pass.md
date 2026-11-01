@@ -249,9 +249,52 @@ Pillar 1 is performance on low-end hardware, and M11's benchmark (RTX 4060,
      for a neighbour that is still being generated (the first-mesh gate),
      which no mesher speed drains. The benchmark now splits the backlog on
      each phase's last frame — ready / relight / neighbours — to say which.
-   - [ ] The owner's bench with the backlog split, then the next fix chosen
-     by it: `MeshInput::build` if chunks are ready and waiting; relight or
-     generation if not.
+   - [x] **The backlog split (owner's `--bench`, 2026-11-01).** Sprint
+     phases otherwise as the prefilter run (fps 584–761, µs/chunk 545–586,
+     backlog end 327–396). What the end-of-sprint backlog waits on:
+
+     | Phase | Ready | Relight | Neighbours |
+     |---|---|---|---|
+     | 6 levels, land | 300 | 96 | 0 |
+     | 8 levels, land | 242 | 138 | 0 |
+     | 6 levels, ocean | 276 | 96 | 0 |
+     | 8 levels, ocean | 184 | 143 | 0 |
+
+     Two thirds are ready to mesh, a third waiting for relight, none for a
+     neighbour (the first-mesh gate is not a bottleneck). So meshing is
+     still the limit — in bursts: the pass averages ~0.6 ms a frame but
+     hits its 4 ms cap whenever terrain arrives, leaving ready chunks for
+     later frames. Cheaper chunks still drain it; the next fix stays in the
+     mesher.
+   - [x] **`MeshInput::build` row by row, and no snapshot where no face can
+     be** (2026-11-01). Callgrind on the snapshot alone: a third of it was
+     `Chunk::get` per cell — a runtime division and modulo by the palette
+     width each time — plus a per-cell light copy and a walk over all 34³
+     cells to find the shell. Now:
+     - `Chunk::decode_row` / `Chunk::light_row` (vox-core) unpack an X row
+       with shifts and masks; the snapshot copies rows, skips light for a
+       dark chunk, and visits only the shell's cells
+       (`rows_decode_exactly_what_get_reads`, every palette width;
+       `snapshot_matches_per_cell_reads`, faces, edges and corners of the
+       shell from all 26 neighbours, some absent);
+     - an all-air chunk returns before the snapshot (it has no faces — they
+       belong to the block they are on), and so does a uniform chunk its
+       face neighbours hide: each touching layer all occluding or all the
+       same block, a sealed side hiding, an absent one not
+       (`uniform_chunk_is_hidden`; a mixed neighbour's layer is scanned —
+       `a_mixed_neighbours_touching_layer_decides_whether_a_uniform_chunk_is_hidden`
+       fails if the wrong layer is read or sealing is ignored).
+
+     | µs per chunk (same 1 296 chunks) | Dev before | Dev after | Release after |
+     |---|---|---|---|
+     | Snapshot alone | ~356 | ~197 | — |
+     | Uniform rock / sea / air | ~320 / ~320 / ~230 | **~2 / ~2 / ~0** | ~2 |
+     | Mixed | ~1 120 | ~874 | ~773 |
+     | Mean | 554 | **258** | 228 |
+
+     Against the M12 baseline headlessly: 3 350 → 258 µs mean (−92%). The
+     sample has every neighbour present; in game, chunks on the edge of the
+     loaded region still build a snapshot. Next: the owner's bench.
 2. **LOD as true triangles** (criterion 4).
 3. **Draw-call measurement, then batching if warranted** (criterion 5).
 4. **Retro.**

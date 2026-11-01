@@ -450,17 +450,27 @@ impl MeshInput {
                 }
             }
         } else {
-            for pos in LocalPos::iter() {
-                block[Self::cidx(pos.x() as i32, pos.y() as i32, pos.z() as i32)] = chunk.get(pos);
+            // A row at a time: X runs are contiguous here and in the chunk,
+            // and `decode_row` unpacks without a division per cell (M12).
+            let mut row = [BlockId::AIR; CHUNK_SIZE];
+            for z in 0..n {
+                for y in 0..n {
+                    chunk.decode_row(y, z, &mut row);
+                    let at = Self::idx(1, y + 1, z + 1);
+                    block[at..at + n].copy_from_slice(&row);
+                }
             }
         }
-        for pos in LocalPos::iter() {
-            let s = chunk.sky_light(pos);
-            let b = chunk.block_light(pos);
-            if s > 0 || b > 0 {
-                let i = Self::cidx(pos.x() as i32, pos.y() as i32, pos.z() as i32);
-                sky[i] = s;
-                block_light[i] = b;
+        // Light likewise; a dark chunk (buried rock, the deep sea) has none.
+        if chunk.has_light() {
+            let (mut s_row, mut b_row) = ([0u8; CHUNK_SIZE], [0u8; CHUNK_SIZE]);
+            for z in 0..n {
+                for y in 0..n {
+                    chunk.light_row(y, z, &mut s_row, &mut b_row);
+                    let at = Self::idx(1, y + 1, z + 1);
+                    sky[at..at + n].copy_from_slice(&s_row);
+                    block_light[at..at + n].copy_from_slice(&b_row);
+                }
             }
         }
 
@@ -483,10 +493,10 @@ impl MeshInput {
         };
         for z in -1..=sz {
             for y in -1..=sz {
-                for x in -1..=sz {
-                    if (0..sz).contains(&x) && (0..sz).contains(&y) && (0..sz).contains(&z) {
-                        continue; // interior already filled
-                    }
+                // Where y and z are inside, only the row's two ends are shell.
+                let inside = (0..sz).contains(&y) && (0..sz).contains(&z);
+                let xs = if inside { 1 + sz } else { 1 };
+                for x in (-1..=sz).step_by(xs as usize) {
                     let (dx, lx) = wrap(x);
                     let (dy, ly) = wrap(y);
                     let (dz, lz) = wrap(z);
@@ -1091,6 +1101,70 @@ pub fn mesh_chunk(
     )
 }
 
+/// Can a uniform chunk show no face at all? Only its outermost layers can
+/// (see `boundary_only` below), each against the face neighbour's touching
+/// layer, and `shows_face` hides a face whose neighbour occludes or is the
+/// same block. An absent neighbour is air, so shows faces; a SEALED one
+/// continues this chunk's own edge, so hides them. Exact; answered from the
+/// neighbours alone, before any snapshot — buried rock beside buried rock is
+/// the commonest chunk in the stream and costs a few comparisons.
+fn uniform_chunk_is_hidden(
+    chunk: &Chunk,
+    neighbors: &ChunkNeighbors,
+    occludes: &mut impl FnMut(BlockId) -> bool,
+) -> bool {
+    let b = chunk.get(LocalPos::new(0, 0, 0));
+    let mut hides = |c: BlockId| c == b || occludes(c);
+    let n = CHUNK_SIZE;
+    for (dx, dy, dz) in [
+        (-1, 0, 0),
+        (1, 0, 0),
+        (0, -1, 0),
+        (0, 1, 0),
+        (0, 0, -1),
+        (0, 0, 1),
+    ] {
+        let slot = neighbor_slot(dx, dy, dz);
+        let Some(nb) = neighbors.slots[slot] else {
+            if neighbors.sealed[slot] {
+                continue;
+            }
+            return false;
+        };
+        if nb.is_uniform() {
+            if !hides(nb.get(LocalPos::new(0, 0, 0))) {
+                return false;
+            }
+            continue;
+        }
+        // The neighbour's layer touching this chunk.
+        let layer = |d: i64| if d < 0 { n - 1 } else { 0 };
+        let mut row = [BlockId::AIR; CHUNK_SIZE];
+        for a in 0..n {
+            if dx != 0 {
+                // A plane of constant x: one cell from each (y, z) row.
+                for z in 0..n {
+                    let p = LocalPos::new(layer(dx) as u8, a as u8, z as u8);
+                    if !hides(nb.get(p)) {
+                        return false;
+                    }
+                }
+            } else {
+                let (y, z) = if dy != 0 {
+                    (layer(dy), a)
+                } else {
+                    (a, layer(dz))
+                };
+                nb.decode_row(y, z, &mut row);
+                if !row.iter().all(|&c| hides(c)) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 /// [`mesh_chunk`], with its two shortcuts parameters so tests can compare
 /// each against the full sweep.
 ///
@@ -1114,6 +1188,14 @@ fn mesh_chunk_greedy(
 ) -> MeshData {
     let mut mesh = MeshData::default();
     let mut transparent = MeshData::default();
+    // Faces belong to the block they are on, so air has none — decided before
+    // paying for the snapshot, as is a uniform chunk its neighbours hide.
+    let mut occludes = occludes;
+    if chunk.is_all_air()
+        || (boundary_only && uniform_chunk_is_hidden(chunk, neighbors, &mut occludes))
+    {
+        return mesh;
+    }
     let input = MeshInput::build(chunk, neighbors, occludes);
     if input.all_air {
         return mesh;
@@ -2207,6 +2289,154 @@ mod tests {
             }
         }
         chunk
+    }
+
+    /// A uniform chunk beside a MIXED neighbour is hidden exactly when that
+    /// neighbour's touching layer hides it: all occluding or all the same
+    /// block. One hole in that layer — and only in that layer — shows a face.
+    /// Every direction, compared with the full sweep.
+    #[test]
+    fn a_mixed_neighbours_touching_layer_decides_whether_a_uniform_chunk_is_hidden() {
+        let offsets = [
+            (-1, 0, 0),
+            (1, 0, 0),
+            (0, -1, 0),
+            (0, 1, 0),
+            (0, 0, -1),
+            (0, 0, 1),
+        ];
+        let rock = Chunk::filled(STONE);
+        for (fill, occludes) in [
+            (STONE, &water_passes as &dyn Fn(BlockId) -> bool),
+            (WATER, &water_passes),
+        ] {
+            let chunk = Chunk::filled(fill);
+            for (k, &(dx, dy, dz)) in offsets.iter().enumerate() {
+                // The touching layer of the neighbour at (dx, dy, dz), and a
+                // layer just behind it.
+                let touching = |p: LocalPos, layer: u8| {
+                    let c = [p.x(), p.y(), p.z()];
+                    let (axis, d) = [(0, dx), (1, dy), (2, dz)][k / 2];
+                    c[axis] == if d < 0 { 31 - layer } else { layer }
+                };
+                for (hole_layer, hidden) in [(None, true), (Some(1), true), (Some(0), false)] {
+                    let mut nb = Chunk::new_air();
+                    for p in LocalPos::iter() {
+                        // Mixed: the touching layer is this chunk's block or
+                        // rock, the rest air and rock.
+                        let b = if touching(p, 0) {
+                            if (p.x() + p.y() + p.z()) % 2 == 0 {
+                                fill
+                            } else {
+                                STONE
+                            }
+                        } else if p.y() % 3 == 0 {
+                            BlockId::AIR
+                        } else {
+                            STONE
+                        };
+                        nb.set(p, b);
+                    }
+                    if let Some(layer) = hole_layer {
+                        let p = LocalPos::iter().find(|&p| touching(p, layer)).unwrap();
+                        nb.set(p, BlockId::AIR);
+                    }
+                    assert!(!nb.is_uniform());
+                    let mut n = ChunkNeighbors::NONE;
+                    for (j, &(ox, oy, oz)) in offsets.iter().enumerate() {
+                        n = n.with(ox, oy, oz, if j == k { &nb } else { &rock });
+                    }
+                    let full = mesh_chunk_greedy(&chunk, &n, WHITE, occludes, false, false);
+                    let fast = mesh_chunk_greedy(&chunk, &n, WHITE, occludes, true, true);
+                    let at = format!("{fill:?}, neighbour {k}, hole {hole_layer:?}");
+                    assert_eq!(full.vertices, fast.vertices, "{at}");
+                    assert_eq!(full.indices, fast.indices, "{at}");
+                    assert_eq!(full.is_empty(), hidden, "{at}");
+                    assert_eq!(
+                        uniform_chunk_is_hidden(&chunk, &n, &mut |b| occludes(b)),
+                        hidden,
+                        "{at}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The snapshot's row-wise fill (M12 task 1) reads exactly what per-cell
+    /// reads do: every interior cell from the chunk, every shell cell — faces,
+    /// edges and corners — from the neighbour that owns it, absent ones air
+    /// and dark. Chunks of every palette width, lit and dark.
+    #[test]
+    fn snapshot_matches_per_cell_reads() {
+        let mut rng = SplitMix64::new(0x5A4E);
+        let lit_random = |rng: &mut SplitMix64, kinds: u16, lit: bool| {
+            let mut c = random_chunk(rng, 60, kinds);
+            if lit {
+                for pos in LocalPos::iter() {
+                    if rng.next().is_multiple_of(3) {
+                        c.set_sky_light(pos, (rng.next() % 16) as u8);
+                        c.set_block_light(pos, (rng.next() % 16) as u8);
+                    }
+                }
+            }
+            c
+        };
+        for (kinds, lit) in [(1, true), (3, false), (12, true), (200, true), (600, false)] {
+            let chunk = lit_random(&mut rng, kinds, lit);
+            let mut offsets = Vec::new();
+            for dz in -1..=1i64 {
+                for dy in -1..=1i64 {
+                    for dx in -1..=1i64 {
+                        if (dx, dy, dz) != (0, 0, 0) {
+                            offsets.push((dx, dy, dz));
+                        }
+                    }
+                }
+            }
+            let nbrs: Vec<Chunk> = offsets
+                .iter()
+                .map(|_| {
+                    let lit = rng.next().is_multiple_of(2);
+                    lit_random(&mut rng, 5, lit)
+                })
+                .collect();
+            let mut n = ChunkNeighbors::NONE;
+            for (k, &(dx, dy, dz)) in offsets.iter().enumerate() {
+                if k % 4 != 3 {
+                    n = n.with(dx, dy, dz, &nbrs[k]);
+                }
+            }
+            let input = MeshInput::build(&chunk, &n, |b| !b.is_air());
+            let owner = |c: i32| -> (i64, u8) {
+                match c {
+                    -1 => (-1, 31),
+                    32 => (1, 0),
+                    _ => (0, c as u8),
+                }
+            };
+            for z in -1..=32 {
+                for y in -1..=32 {
+                    for x in -1..=32 {
+                        let ((dx, lx), (dy, ly), (dz, lz)) = (owner(x), owner(y), owner(z));
+                        let lp = LocalPos::new(lx, ly, lz);
+                        let src = if (dx, dy, dz) == (0, 0, 0) {
+                            Some(&chunk)
+                        } else {
+                            n.at(dx, dy, dz)
+                        };
+                        let want = src.map_or((BlockId::AIR, 0, 0), |c| {
+                            (c.get(lp), c.sky_light(lp), c.block_light(lp))
+                        });
+                        let got = (
+                            input.block(x, y, z),
+                            input.sky(x, y, z),
+                            input.block_light(x, y, z),
+                        );
+                        assert_eq!(got, want, "{kinds} kinds, lit {lit}, at {x},{y},{z}");
+                    }
+                }
+            }
+        }
     }
 
     /// The prefilter (`FaceCandidates`, M12 task 1) must change nothing:
