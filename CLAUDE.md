@@ -260,14 +260,10 @@ The owner's ideas for all of them, and a proposed order, are recorded in
 - **Active milestone:** 12 — Performance Pass
   (`docs/milestones/12-performance-pass.md`, spec written 2026-10-31).
   Task 0 done (instruments + the owner's baseline, recorded in the spec).
-  Task 1 under way: uniform chunks mesh only their boundary slices
-  (in game: µs/chunk −49%, sprint backlog 1 040 → ~430) and a bitwise
-  prefilter skips cells that cannot show a face (in game: µs/chunk
-  ~1 640 → ~570, sprint fps ~115 → ~600, backlog ~385 against ≤ ~350).
-  The backlog split showed it is still meshing (2/3 ready, 1/3 relight, 0
-  waiting on neighbours); so the snapshot now fills by rows and air or
-  hidden uniform chunks skip it (headless: −92% mesh CPU per chunk against
-  the baseline). Next: the owner's `--bench`. No low-end
+  Task 1 done (2026-11-01): mesh CPU per chunk −88% in game (~1 640 →
+  ~190 µs), sprint backlog ~1 040 → ~200 (criterion 3 met), sprint fps
+  ~115 → ~720. Next: task 2, LOD as true triangles (24–26% of submitted
+  triangles are zero-area). No low-end
   machine exists yet — the spec says how to judge low-end performance by
   proxy.
 - **Starting a new session:** clone fresh, confirm `git log` matches the

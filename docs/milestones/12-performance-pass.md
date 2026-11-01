@@ -147,7 +147,8 @@ Pillar 1 is performance on low-end hardware, and M11's benchmark (RTX 4060,
        in the algorithm, not the profile.
    - [ ] Lavapipe worst case: one fixed headless frame's time in the cloud
      container (see "Low-end hardware" below).
-1. **Profile meshing under streaming.** Where does `mesh_chunk` spend its
+1. ✅ **Profile meshing under streaming** (done 2026-11-01; see task 0's
+   notes). Where does `mesh_chunk` spend its
    time: building `MeshInput`, the per-slice masks, AO and light corners, the
    sealed-rectangle pass, allocation? Fix in order of measured share. Likely
    candidates, to be confirmed by the profile, not assumed:
@@ -294,7 +295,30 @@ Pillar 1 is performance on low-end hardware, and M11's benchmark (RTX 4060,
 
      Against the M12 baseline headlessly: 3 350 → 258 µs mean (−92%). The
      sample has every neighbour present; in game, chunks on the edge of the
-     loaded region still build a snapshot. Next: the owner's bench.
+     loaded region still build a snapshot.
+   - [x] **Task 1 closed (owner's `--bench`, 2026-11-01).** Sprint phases:
+
+     | | Baseline | Boundary slices | Prefilter | Snapshot fixes |
+     |---|---|---|---|---|
+     | Mesh µs per chunk (CPU) | ~1 640 | ~820 | ~570 | **188–195 (−88%)** |
+     | Chunks meshed per second | ~1 630 | ~2 170 | ~2 500 | 2 782–2 870 |
+     | Mesh ms/s (main thread) | ~575 | ~550 | ~385 | **251–262 (−56%)** |
+     | Backlog end, 6 / 8 levels | ~1 000 / ~1 040 | ~450 / ~430 | ~385 | **183–184 / 208–210** |
+     | Ready / relight at the end | — | — | ~250 / ~120 | 35–210 / 0–148 |
+     | fps median, 6 / 8 levels | ~117 / ~113 | ~121 / ~118 | ~700 / ~600 | **735–796 / 698–705** |
+     | 1% low | 51–53 | 52–55 | 57–61 | 61–64 |
+
+     **Criterion 3 met by both its measures:** the backlog ends at ~20% of
+     the baseline (a third was asked), and mesh ms/s fell by more than half
+     — though, as noted above, that one measures the budget more than the
+     work. Sprint-flight now runs at ~90% of standing fps. In game the
+     per-chunk saving (−88%) nearly matches the headless one (−92%).
+     Relight ms/s is unchanged at ~180 and is now ~40% of the main thread's
+     streaming time; what remains of the backlog splits between it and
+     meshing bursts. Standing phases, encode, draws and triangles are
+     unchanged within noise. One standing phase (8 levels, land) has
+     shown a 44–64 ms worst frame in two of four runs; the others stay
+     under ~20 ms — a one-off at the phase start, to watch.
 2. **LOD as true triangles** (criterion 4).
 3. **Draw-call measurement, then batching if warranted** (criterion 5).
 4. **Retro.**
