@@ -369,6 +369,20 @@ becomes an ADR; the simulation itself remains its own milestone.
      the open sea's included. Now still water takes one, a river two,
      falling water one (`textureSampleGrad`, derivatives taken first; the
      image is unchanged — 1 pixel of 921 600). Re-bench to confirm.
+     **Correction:** both runs above were made by a pre-M14 build (the
+     owner's world was still version 3, which a version-4 build refuses),
+     so they measured no M14 change at all.
+   - **First real M14 bench (owner, 2026-11-01, flow on):** sprint at 8
+     levels 553 / 552 (−27% on M13's close), standing at 6 levels 680 /
+     620 (−24%); encode, draws, triangles, GPU memory unchanged. Standing
+     still with nothing streaming was slower too, so the cost was per
+     frame on the main thread: `fullres_columns` asked ~300 columns' spans
+     every frame, uncached, and a span now reads rivers and wetlands —
+     0.78 ms a frame in release against 0.41 for elevation alone. Fixed:
+     every per-frame judge of residency reads the streamer's span cache
+     (`SpanCache::peek`, `App::span`), ~0.01 ms. Water phases (new): rivers
+     standing 630, sprint 591; waterfall standing 509 (3.5 M triangles).
+     Re-bench, flow on and off (`VOX_NO_FLOW=1`).
    - [x] `--bench` gains three water phases at 8 levels, appended so the
      eight rows since M11 stay comparable (owner's request): rivers
      standing and sprint (the start near spawn whose sprint path crosses

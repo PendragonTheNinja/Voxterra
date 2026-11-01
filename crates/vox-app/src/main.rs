@@ -1275,8 +1275,20 @@ impl App {
     /// truth — anything judging it independently gets it wrong the moment the
     /// margins or the clamping change.
     fn surface_window_chunks(&self, cx: i64, cz: i64) -> vox_core::ColumnWindow {
-        self.streamer
-            .surface_window(self.generator.surface_span_chunks(cx, cz))
+        self.streamer.surface_window(self.span(cx, cz))
+    }
+
+    /// A column's surface span, from the streamer's cache when it holds it.
+    /// Every judge of residency must take the same span, and here they do:
+    /// the cache holds exactly what `surface_span_chunks` returns. It
+    /// matters for cost (M14 bench): the span now reads rivers, lakes and
+    /// wetlands (`Generator::ground`, several times dearer than elevation
+    /// alone), and `fullres_columns` asks for ~300 columns every frame —
+    /// uncached, that cost a quarter of the frame rate standing still.
+    fn span(&self, cx: i64, cz: i64) -> (i64, i64) {
+        self.spans
+            .peek(cx, cz)
+            .unwrap_or_else(|| self.generator.surface_span_chunks(cx, cz))
     }
 
     /// The streaming configuration for a load radius. The one place it is
@@ -1300,12 +1312,8 @@ impl App {
     /// this column" must cover both, or it misses what the player built
     /// above the terrain window.
     fn column_window_chunks(&self, cx: i64, cz: i64) -> vox_core::ColumnWindow {
-        self.streamer.column_window(
-            self.camera.block_pos().chunk(),
-            cx,
-            cz,
-            self.generator.surface_span_chunks(cx, cz),
-        )
+        self.streamer
+            .column_window(self.camera.block_pos().chunk(), cx, cz, self.span(cx, cz))
     }
 
     /// One streaming step, run every frame. Keeps the resident chunk set
@@ -1649,11 +1657,7 @@ impl App {
     /// not) both ask exactly this, so both ask here: two independent answers
     /// drifting apart is how a gate deadlocks or an edge opens onto the void.
     fn neighbor_coming(&self, n: ChunkPos, camera_chunk: ChunkPos) -> bool {
-        self.streamer.wants(
-            n,
-            camera_chunk,
-            self.generator.surface_span_chunks(n.x, n.z),
-        )
+        self.streamer.wants(n, camera_chunk, self.span(n.x, n.z))
     }
 
     /// The faces of `p` to seal for meshing: a bit per `NEIGHBOR_OFFSETS`
