@@ -709,6 +709,15 @@ mod tests {
                 }
             }
         }
+        // Biomes and surfaces (M13), at enough scattered columns to land on
+        // biome edges: a change to classification or materials shows here
+        // even where it moves no height and misses the chunks above.
+        for i in 0..4_096i64 {
+            let (x, z) = (i * 5_003 - 77_777, i * 70_001 + 19);
+            let col = g.column(x, z);
+            eat(&[col.biome as u8]);
+            eat(&g.block_at(x, col.surface.height, z).0.to_le_bytes());
+        }
         h
     }
 
@@ -724,7 +733,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (3, 0xda6d_f4df_d413_00ce);
+        const PINNED: (u32, u64) = (3, 0x2aa0_d40d_66be_1ede);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),

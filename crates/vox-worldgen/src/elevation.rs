@@ -242,7 +242,7 @@ pub struct Elevation {
     detail: [Octave; 3],
     /// Not part of the height: noise that lets biome boundaries wander
     /// (M13), kept here so it tiles with the world like every other field.
-    boundary: [Octave; 2],
+    boundary: [Octave; 3],
     /// Small-scale patches of a biome's surface (M13): sand through a
     /// steppe, gravel through tundra, outcrops on a meadow.
     patch: [Octave; 2],
@@ -264,9 +264,11 @@ pub struct Surface {
 }
 
 /// Wavelengths of the biome-boundary noise, blocks: edges wander over a
-/// kilometre or so, with finer fraying.
-const BOUNDARY_WAVELENGTHS: [i64; 2] = [1_400, 350];
-const BOUNDARY_WEIGHTS: [f32; 2] = [1.0, 0.4];
+/// kilometre or so, and the finest octave frays them over tens of blocks —
+/// an ecotone, tongues and islands of each biome in the other, not a line
+/// (M13 criterion 6).
+const BOUNDARY_WAVELENGTHS: [i64; 3] = [1_400, 350, 24];
+const BOUNDARY_WEIGHTS: [f32; 3] = [1.0, 0.4, 0.35];
 
 /// Wavelengths of the surface-patch noise, blocks.
 const PATCH_WAVELENGTHS: [i64; 2] = [40, 11];

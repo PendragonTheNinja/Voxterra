@@ -326,6 +326,21 @@ horizon.
    - **Found:** shallow seas over pale sand read grey through water of
      constant opacity (the old grass seabed hid it). Water that absorbs
      with depth would fix it — `docs/vision.md` §10, not M13's.
+   - **Cost**: a LOD node takes 4–16% longer to generate with its top
+     blocks (+0.1–0.2 ms; stride 2 exact 0.87 → 1.01 ms, stride 128 sparse
+     3.09 → 3.28 ms, release). The climate map builds in 0.5 s at the
+     default size and 1.0 s at the largest in a dev build.
+   - **Ecotones** (criterion 6): seen at one block per pixel, a biome edge
+     was a single crisp, wavy line. The boundary noise gained a third,
+     24-block octave, so edges fray into lobes and inlets over tens of
+     blocks. Boundaries partly follow terrain contours (temperature falls
+     with height), so a stronger fine octave would speckle rather than
+     blend; left for the owner's walk to judge.
+   - **The fingerprint now sees biomes**: the fraying changed no height and
+     none of the 24 sampled chunk columns, so the fingerprint stayed the
+     same — a terrain change that would have slipped through unversioned.
+     It now also hashes the biome and top block of 4 096 scattered columns,
+     and differs with and without the fraying.
 5. **Owner's walk.** A play session on foot and in flight, judged at walking
    speed, with fixes; `--bench` (criterion 9).
 6. **Retro.**

@@ -84,6 +84,11 @@ and every vertex keep their unwrapped coordinates.
   copies them, and a test pins the copies and the tint's reference colour to
   their sources.
 - Leaves and other foliage will use the same tint when vegetation arrives.
+- **Geomorph at the sea-ice edge is not exact.** A LOD cell's height is the
+  solid top at its lowest sample, raised to sea level where that column is
+  polar sea; a coarse cell is then not always the minimum of its four fine
+  cells (ADR-0009) where ice meets open water, so a cell there can pop as
+  the level changes. Only at the ice edge, far off; exact elsewhere.
 - **Seen in headless renders, not yet in play:** a shallow sea over a pale
   sand seabed now reads grey, not green, through translucent water of
   constant opacity. Water that absorbs with depth (`docs/vision.md` §10)
