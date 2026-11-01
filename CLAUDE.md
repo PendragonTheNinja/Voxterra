@@ -257,22 +257,14 @@ The owner's ideas for all of them, and a proposed order, are recorded in
 
 ## Current status
 
-- **Active milestone:** 12 — Performance Pass
-  (`docs/milestones/12-performance-pass.md`, spec written 2026-10-31).
-  Task 0 done (instruments + the owner's baseline, recorded in the spec).
-  Task 1 done (2026-11-01): mesh CPU per chunk −88% in game (~1 640 →
-  ~190 µs), sprint backlog ~1 040 → ~200 (criterion 3 met), sprint fps
-  ~115 → ~720. Task 2 done: LOD fans and walls are true triangles over
-  shared vertices (in game: 0% zero-area, triangles −20%, GPU MB −28% at 8
-  levels; lavapipe frame −17%, pixel-identical). Task 3 measured: encode
-  ~0.7 ms at 8 levels, under the ~1 ms line, so batching deferred. Next:
-  the owner's in-game look and hole census (criterion 6), then the retro. No low-end
-  machine exists yet — the spec says how to judge low-end performance by
-  proxy.
+- **Active milestone:** none — M12 closed 2026-11-01. Next is 13 —
+  Climate & Biomes, whose spec is not yet written: write it first (see
+  "Roadmap after M12" below). No low-end machine exists yet — M12's spec
+  says how to judge low-end performance by proxy.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
   vox-core 288, vox-mesh 67, vox-worldgen 31, vox-render 17, vox-app 9
-  passing as of M12 task 2), then start the first unchecked item.
+  passing as of the M12 close), then start the first unchecked item.
 - **Instruments (from M11):** the P key logs a `VIEW` line (exact position,
   angles, window, settings) and a `hole_census` — the frame re-rendered six
   ways on the player's GPU with pinholes counted per variant. In the cloud
@@ -293,16 +285,25 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   are separate counters. ADRs number decisions in the order they are made;
   milestones number work in the order it is built. Matching numbers are
   coincidence — ADR-0011 (transparency) belongs to milestone M10.
-- **Last completed milestone:** 11 — The Horizon (2026-10-31); retrospective
+- **Last completed milestone:** 12 — Performance Pass (2026-11-01);
+  retrospective with numbers at the end of
+  `docs/milestones/12-performance-pass.md`. Meshing −88% CPU per chunk in
+  game (uniform chunks sweep only their boundary, a bitwise face prefilter,
+  the snapshot filled by rows, air and hidden uniform chunks skip it);
+  sprint fps ~115 → ~740 and the sprint backlog ~1 040 → ~200; LOD as true
+  triangles (no zero-area padding, −20% triangles, −28% GPU memory at 8
+  levels); draw calls measured (~0.7 ms encode at 8 levels) and batching
+  deferred. Carried into M13: relight is now the larger streaming cost
+  (~180 ms/s, its M11→M12 doubling unexplained); encode on a weak CPU;
+  modest defaults. Benchmarks so far are dev builds (`opt-level = 1`).
+- **Milestone 11 — The Horizon** (2026-10-31); retrospective
   with numbers at the end of `docs/milestones/11-the-horizon.md`. Shipped:
   relight back under M10's cost (task 0); per-level ring centring (ADR-0014)
   and eight levels to 64 km; flat-cell LOD merging; Earth curvature and
   horizon culling (ADR-0015); aerial perspective (ADR-0016); `--bench`; the
   headless renderer and the hole census. The white specks were T-junctions in
   the full-resolution greedy mesh (`emit_sealed_rect`); census 84 → 2.
-  Carried into M12: the sprint backlog does not drain (meshing-bound) and LOD
-  pads triangles with zero-area halves.
-- **Prior milestone:** 10 — Terrain & the Deep Vertical
+- Milestone 10 — Terrain & the Deep Vertical
   (2026-10-01); retrospective with numbers at the end of
   `docs/milestones/10-terrain-and-deep-vertical.md`. Shipped: the elevation
   field tuned to walking time (ADR-0010); surface- and camera-following

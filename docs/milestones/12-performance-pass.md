@@ -396,7 +396,7 @@ Pillar 1 is performance on low-end hardware, and M11's benchmark (RTX 4060,
      **Recorded for later:** a CPU four times slower would spend ~3 ms
      encoding — a real share of a 60 fps frame. That is when to revisit,
      with a low-end machine to measure on.
-4. **Retro.**
+4. ✅ **Retro** — below (2026-11-01).
 
 ## Non-goals
 
@@ -425,3 +425,116 @@ judged by proxy until one is:
 - **Defaults stay modest.** The default view distance and load radius are
   chosen for an ordinary machine, not the development one (M11's open
   question).
+
+# Retrospective (2026-11-01)
+
+## What shipped
+
+- **Instruments first (task 0).** `--bench` gained a second table — chunks
+  meshed per second, worker CPU per chunk, frame encode time (median and
+  p99), draw calls, triangles submitted against triangles with area — and,
+  once meshing kept up, a split of the end-of-sprint backlog into ready /
+  waiting for relight / waiting for neighbours. `SPECK_FRAMES` times
+  headless frames on lavapipe.
+- **Meshing, −88% CPU per chunk in game (task 1)**, in four measured steps,
+  each exact and each pinned by a test against the slower path it replaces:
+  1. uniform chunks sweep only their six boundary slices;
+  2. `FaceCandidates`, a bitwise prefilter: rows of 32 cells answer "could
+     this show a face?" at once, and only those cells ask `shows_face`;
+  3. the snapshot (`MeshInput::build`) fills by rows through the new
+     `Chunk::decode_row` / `light_row`, skips light for dark chunks and
+     walks only the shell;
+  4. air chunks, and uniform chunks their neighbours hide, skip the snapshot
+     altogether (`uniform_chunk_is_hidden`) — buried rock and deep sea, the
+     commonest chunks in the stream, now cost ~2 µs each.
+- **LOD as true triangles (task 2).** Fans and zipped walls share vertices,
+  three indices per triangle. No zero-area padding; −20% triangles and −28%
+  GPU memory at 8 levels; pixel-identical frames.
+- **Draw calls measured, batching deferred (task 3)**: encode ~0.7 ms at 8
+  levels, under the ~1 ms line the spec set.
+
+## Criteria
+
+| # | Criterion | Result |
+|---|---|---|
+| 1 | Measured first | Met — two baseline runs on the M11 code |
+| 2 | Benchmark reports what M12 changes | Met — plus the backlog split |
+| 3 | Sprint keeps up | **Met** — backlog ends 165–237 (≤ ~350 asked; ~20% of the baseline); mesh ms/s −56% |
+| 4 | No zero-area triangles in LOD | **Met** — 0% in every phase; every LOD test passes |
+| 5 | Draw-call cost known, cut if it matters | Met — 0.66–0.79 ms median at 8 levels, under ~1 ms: recorded, deferred |
+| 6 | Nothing looks different | Met — owner's census 2 pinholes as drawn (2 at M11's close); lavapipe frames pixel-identical before and after task 2 |
+| 7 | Bookkeeping | No ADR needed (nothing changed how geometry reaches the GPU); this retro |
+
+## Numbers (owner's RTX 4060, `--bench`, 800×600, dev build)
+
+| | Baseline (2026-10-31) | M12 close (2026-11-01) |
+|---|---|---|
+| Sprint fps median, 6 / 8 levels, land | 120 / 114 | **828 / 744** |
+| Sprint fps median, 6 / 8 levels, ocean | 115 / 113 | **790 / 735** |
+| Sprint 1% low | 51–53 | 62–65 |
+| Sprint backlog at the end | 973–1 046 | **165–237** |
+| Mesh µs per chunk (worker CPU) | 1 595–1 690 | **186–195** |
+| Chunks meshed per second, sprinting | 1 591–1 684 | 2 786–2 879 |
+| Mesh ms/s (main thread), sprinting | 574–589 | 246–259 |
+| Relight ms/s, sprinting | 173–179 | 180–188 |
+| Standing fps, 6 / 8 levels, land | 926 / 817 | 886 / 791 (within run-to-run noise) |
+| Encode ms median, 8 levels sprint | 1.02–1.03 | 0.69–0.70 |
+| Triangles submitted, 8 levels standing, land | 2.24 M | **1.79 M** |
+| Zero-area triangles | 23–27% | **0%** |
+| GPU MB, 8 levels standing, land | 957 | **689** |
+
+Lavapipe (cloud container, 800×600, the bench's land view with full
+resolution): 309 → 257 ms a frame at 8 levels from task 2 alone.
+
+## Found along the way
+
+- **Mesh ms/s measured the budget, not the work.** The mesh pass stops at
+  4 ms a frame and sprinting always filled it, so the figure sat at ~580
+  however cheap a chunk became; criterion 3's alternative "or mesh ms/s
+  halves" could not see a faster mesher until the pass stopped filling.
+- **Every benchmark so far is a dev build.** `cargo run` builds the
+  workspace's crates at `opt-level = 1`. Runs compare with each other; a
+  player's release build is faster still (headlessly ~10–15% on meshing).
+- **Not every zero-area triangle was waste.** Walls between cells level at
+  rest but not once morphed have zero height until the morph opens them
+  (ADR-0009). The area counter counts a triangle with area at rest or at
+  full morph; the baseline's 24–26% "zero-area" was ~19% padding and ~7%
+  such walls.
+- **Relight nearly doubled between M11's run (2026-10-17) and M12's
+  baseline** (~95 → ~177 ms/s) with no lighting or streaming change between
+  them, reproducibly. Unexplained; the likeliest suspect is contention for
+  the shared rayon pool with generation and LOD jobs.
+
+## Known, carried forward
+
+- **Relight is now the larger streaming cost**: ~180 ms/s against meshing's
+  ~255, and up to ~140 of the sprint backlog's end waits on it. The rise
+  above is unexplained.
+- **Encode on a weak CPU.** ~0.7 ms here would be ~3 ms on a CPU four times
+  slower. Shared buffers and indirect draws (criterion 5's remedy) are the
+  next step when a low-end machine can measure it.
+- **Defaults for an ordinary machine** (M11's open question, restated in
+  this spec): the default radius and levels were not revisited.
+- **One standing phase (8 levels, land) has shown a 44–64 ms worst frame**
+  in two of six runs; every other standing phase stays under ~31 ms.
+- **Two far-horizon pinholes** in the owner's census, as at M11's close.
+
+## Lessons
+
+1. **Split a queue before optimising what drains it.** "The backlog does not
+   drain" had three possible owners — meshing, relight, the first-mesh gate
+   — and one instrumented run (ready / relight / neighbours) named the right
+   one instead of a guess.
+2. **A capped measure reports its cap.** Anything time-budgeted per frame
+   will read its budget while saturated; measure the work (per-item cost,
+   items per second) beside the wall time.
+3. **Most of meshing was answering "no".** Every fix in task 1 was a cheaper
+   way to rule a cell, a slice or a whole chunk out; the visible faces were
+   never the cost. Look for where a hot loop rejects, not where it produces.
+4. **Profile the stream, not a test chunk.** The headless sample was 1 296
+   real chunks off the benchmark's own path, so its mix of buried rock, sea
+   and surface matched the game's — and its prediction (−92%) matched the
+   game (−88%).
+5. **Every fast path ships with its slow path as the test oracle**, and the
+   test is checked by breaking the fast path on purpose. Each of task 1's
+   shortcuts was mutated at least once to prove its test would catch it.
