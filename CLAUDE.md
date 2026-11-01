@@ -266,7 +266,10 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   physics: the hybrid** (owner, 2026-11-01; `docs/design/water.md`):
   settled worldgen water, local finite water later, reservoirs. Rivers
   differ by slope, discharge and sediment, and visibly flow (a flow map in
-  the shader). Next: task 1, the stage-1 drainage network. No
+  the shader). In progress: task 1, the stage-1 drainage
+  network (`vox_worldgen::drainage`; network, lakes and map layer done —
+  closed basins, flow speed, the cache and its ADR next; vox-worldgen
+  now 58 tests). No
   low-end machine exists yet — M12's spec says how to judge low-end
   performance by proxy.
 - **Starting a new session:** clone fresh, confirm `git log` matches the

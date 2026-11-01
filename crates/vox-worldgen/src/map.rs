@@ -111,6 +111,9 @@ pub(crate) fn elevation_colour(h: i64) -> [u8; 3] {
     )
 }
 
+/// Discharge from which the rivers map draws a river, m³/s.
+const RIVER_FROM_M3S: f32 = 0.5;
+
 /// A colour per biome, chosen to read like an atlas: greens for forest,
 /// yellows and tans for grass and dry land, white for ice, blues for sea.
 pub(crate) fn biome_colour(b: Biome) -> [u8; 3] {
@@ -376,6 +379,50 @@ mod tests {
                 if b.is_sea() { "the world" } else { "land" }
             );
         }
+        // Drainage (M14): rivers by discharge and lakes, at the network's
+        // own resolution, over the elevation.
+        let t = std::time::Instant::now();
+        let drainage = crate::drainage::DrainageMap::build(g.elevation(), &climate, shape);
+        println!(
+            "drainage: {:?}, built in {:.0} ms",
+            drainage,
+            t.elapsed().as_secs_f64() * 1000.0
+        );
+        let (dx, dz) = drainage.cells();
+        let mut rivers = vec![0u8; dx * dz * 3];
+        let (mut lake_cells, mut land_cells, mut biggest) = (0u32, 0u32, 0.0f32);
+        for j in 0..dz {
+            for i in 0..dx {
+                let (h, spill, q, _) = drainage.cell(i, j);
+                let sea = drainage.is_sea(i, j);
+                // Inland pits below sea level are land: draw them as lowland.
+                let mut c = elevation_colour(i64::from(if sea { h } else { h.max(1) }));
+                if !sea {
+                    land_cells += 1;
+                    biggest = biggest.max(q);
+                    if drainage.is_lake(i, j) {
+                        let _ = spill;
+                        lake_cells += 1;
+                        c = [90, 200, 230];
+                    } else if q >= RIVER_FROM_M3S {
+                        // Brighter and bluer with discharge, log scale.
+                        let k = ((q / RIVER_FROM_M3S).log10() / 3.0).clamp(0.0, 1.0);
+                        c = ramp(&[(0.0, [70, 120, 200]), (1.0, [10, 30, 140])], k);
+                    }
+                }
+                let at = (j * dx + i) * 3;
+                rivers[at..at + 3].copy_from_slice(&c);
+            }
+        }
+        println!(
+            "lakes cover {:.1}% of land cells; the largest discharge is {:.1} m³/s",
+            100.0 * f64::from(lake_cells) / f64::from(land_cells),
+            biggest
+        );
+        let path = dir.join(format!("rivers-{:x}-{}.png", g.seed(), shape.size_x()));
+        write_png(&path, dx as u32, dz as u32, &rivers).unwrap();
+        println!("wrote {}", path.display());
+
         for (name, img) in [
             ("temperature", &temp),
             ("precipitation", &rain),

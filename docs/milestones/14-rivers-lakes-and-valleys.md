@@ -232,11 +232,11 @@ becomes an ADR; the simulation itself remains its own milestone.
 9. **Sound and fast**: per-chunk independence and determinism hold;
    `GENERATOR_VERSION` bumped with the fingerprint re-pinned; world creation
    within its budget; `--bench` within ~10% of M13's close.
-11. **Rivers differ as Earth's do**: torrents, meandering, braided and
+10. **Rivers differ as Earth's do**: torrents, meandering, braided and
     slow reaches each appear where their slope, discharge and sediment put
     them, measured over many worlds; river water visibly drifts downstream
     at its speed, lakes and the sea do not.
-10. **The owner's walk**: on foot, following a river from a mountain spring
+11. **The owner's walk**: on foot, following a river from a mountain spring
     to the sea; retro with maps before and after.
 
 ## Tasks (proposed order)
@@ -252,9 +252,28 @@ becomes an ADR; the simulation itself remains its own milestone.
      (flooding mines, draining and damming, irrigation, water power, wells).
      **Decided (owner, 2026-11-01): the hybrid.** The ADR is written with
      task 3, where the storage it constrains is built.
-   - [ ] Drainage and water layers on the world map — with task 1's network.
+   - [x] Drainage and water layers on the world map — with task 1's network
+     (`rivers-<seed>-<size>.png`: rivers by discharge, lakes).
 1. Stage-1 drainage: depression filling, flow routing, discharge, lakes and
    closed basins (ADR). Network tests (criteria 3, 4).
+   - [x] The network (`vox_worldgen::drainage`): 128-block cells over the
+     torus (1 600² on the default world, ~2 s); sea is ocean-connected
+     ground below sea level, inland pits are land; runoff from M13's
+     climate less Köppen's evaporation; a merge tree of the hollows decides
+     lakes (deep basins anywhere, small hollows on ice-scoured ground) and
+     breaches the rest; routing by priority flood over the water surface,
+     channels cut so water never runs uphill; discharge accumulated.
+     Tests: downhill to the sea, conservation, determinism, lakes commonest
+     where ice-scoured.
+   - [ ] Closed basins by water budget: lakes in dry climates that cannot
+     fill become salt lakes and salt flats.
+   - [ ] Flow speed and direction per reach; reservoir or finite.
+   - [ ] Cached in the world folder; the ADR for the drainage stage.
+   - [ ] Network tests over many seeds against Earth (criterion 4).
+   - Measured before erosion: lakes cover ~27% of ice-scoured land, ~6%
+     elsewhere (Earth: ~3.7% of unglaciated land). The excess is the flat,
+     noise-pitted continental interior (`LOWLAND_RISE`), deranged until task
+     2's erosion cuts it; re-measure then.
 2. Valley erosion on the stage-1 grid, fed back as the elevation field's
    erosion stage (criterion 6).
 3. Stage-2 channels: polylines, meanders, banks, depth, water levels; the
@@ -308,4 +327,4 @@ becomes an ADR; the simulation itself remains its own milestone.
    worldgen water, local finite water where disturbed (a later milestone),
    seas, rivers and large lakes as reservoirs.
 6. **Rivers differ by terrain, and look like they flow** (owner's question,
-   2026-11-01; see "Kinds of river" and criterion 11).
+   2026-11-01; see "Kinds of river" and criterion 10).

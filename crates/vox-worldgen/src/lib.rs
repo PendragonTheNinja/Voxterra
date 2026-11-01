@@ -20,6 +20,7 @@
 
 pub mod biome;
 pub mod climate;
+pub mod drainage;
 pub mod elevation;
 #[cfg(test)]
 mod map;
