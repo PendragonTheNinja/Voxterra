@@ -377,7 +377,21 @@ horizon.
      real fix: thicker water darker and bluer, shallows clearer over sand.
      It needs the depth of the seabed behind each water pixel — the
      transparent pass reading the depth buffer — so it is a rendering
-     change with its own ADR, not part of M13 unless the owner pulls it in. A play session on foot and in flight, judged at walking
+     change with its own ADR, not part of M13 unless the owner pulls it in.
+   - [x] **`--bench` (owner, 2026-11-01): criterion 9 met.** Against M12's
+     close, sprint at 8 levels 754 / 745 fps (land / ocean; was 744 / 735),
+     backlog at the end 190–232 (185–237), mesh ~197 µs per chunk (~192),
+     GPU 741 MB and 1.55 M triangles (747, 1.55 M), relight 184–190 ms/s
+     (180–188); standing 894 / 811 fps (886 / 791). Biomes cost nothing
+     measurable in play.
+   - **Census (owner, 2026-11-01): 9 pinholes as drawn, 8 with LOD alone**,
+     in the new world near spawn (hot steppe, 24.5°) — M12 closed on 2 at a
+     different view. At the benchmark's start view (1920×1080) the headless
+     census reads 1, LOD-only, **identically before and after the LOD
+     materials** (commit `4e70906` against now): not an M13 regression
+     there — M11's far-horizon LOD pinholes (0–11 per frame on lavapipe).
+     The owner's exact `VIEW` line is needed to compare the two commits on
+     the owner's own frame. A play session on foot and in flight, judged at walking
    speed, with fixes; `--bench` (criterion 9).
 6. **Retro.**
 
