@@ -145,8 +145,8 @@ Pillar 1 is performance on low-end hardware, and M11's benchmark (RTX 4060,
        runs. Headlessly (cloud container, real chunks off the land sprint
        path) a release build meshes only ~13% faster, so the mesher's cost is
        in the algorithm, not the profile.
-   - [ ] Lavapipe worst case: one fixed headless frame's time in the cloud
-     container (see "Low-end hardware" below).
+   - [x] Lavapipe worst case (2026-11-01): see task 2's notes — taken
+     after tasks 1 and 2, with the commit before task 2 as its "before".
 1. ✅ **Profile meshing under streaming** (done 2026-11-01; see task 0's
    notes). Where does `mesh_chunk` spend its
    time: building `MeshInput`, the per-slice masks, AO and light corners, the
@@ -350,9 +350,52 @@ Pillar 1 is performance on low-end hardware, and M11's benchmark (RTX 4060,
      | Vertices | 8.53 M | **6.00 M (−30%)** |
      | Vertex + index bytes | 324 MB | **231 MB (−29%)** |
 
-   - [ ] The owner's bench: tris submitted should fall ~24% and the
-     zero-area column read ~0; GPU MB should fall with it.
+   - [x] **Confirmed (owner's `--bench`, 2026-11-01).** Zero-area 0% in
+     every phase; drawn equals submitted. Against the task 1 run:
+
+     | | Before | After |
+     |---|---|---|
+     | Tris submitted, 6 / 8 levels standing (land) | 1.82 / 2.24 M | **1.51 / 1.79 M (−17% / −20%)** |
+     | GPU MB, 6 / 8 levels standing (land) | 599 / 957 | **469 / 689 (−22% / −28%)** |
+     | Standing fps, land 6 / 8 levels | 875 / 774 | 886 / 791 |
+     | Sprint fps, 8 levels land / ocean | 705 / 698 | 744 / 735 |
+     | Encode ms median, 8 levels sprint | 0.72–0.73 | 0.69–0.70 |
+
+     Submitted fell less than headlessly (−24%) because full-resolution
+     triangles, unchanged, are in the total. "Drawn" rose (1.66 → 1.79 M at
+     8 levels) only because it now counts morph-only walls (above); the
+     earlier runs' 24–26% "zero-area" was ~19% padding and ~7% morph walls.
+     Sprint backlog 165–237 at the end, criterion 3 still met.
+   - [x] **Lavapipe, the software worst case** (cloud container,
+     2026-11-01). `specks_scratch::specks` with `SPECK_FRAMES=10` renders
+     the benchmark's land view at 800×600 with full resolution (radius 8)
+     and times each frame including its readback, so the GPU's work is in
+     it. The commit before task 2 with the same harness is the "before":
+
+     | lavapipe, 800×600 | Before task 2 | After |
+     |---|---|---|
+     | Frame, 6 levels | 240 ms | **229 ms (−5%)** |
+     | Frame, 8 levels | 309 ms | **257 ms (−17%)** |
+     | Encode, 6 / 8 levels | 2.76 / 4.11 ms | 2.64 / 2.81 ms |
+     | Triangles, 6 / 8 levels | 1.88 / 2.29 M | 1.56 / 1.84 M |
+     | Draws, 6 / 8 levels | 639 / 708 | 639 / 708 |
+
+     **Pixel-identical**: the before and after frames match in every pixel
+     at both level counts, and neither has a pinhole (`hole_census`: 0) —
+     criterion 6's headless half. On a software rasteriser the frame is
+     ~4 fps and almost all raster: triangles, not draws, are its cost.
 3. **Draw-call measurement, then batching if warranted** (criterion 5).
+   - [x] **Measured; batching deferred, as the criterion says** (2026-11-01).
+     At 8 levels on the owner's machine a frame's encode — culling,
+     recording every pass, `submit` — is 0.66–0.79 ms median (p99
+     1.2–2.0 ms) after tasks 1–2, below the ~1 ms line, for 613–735 draws.
+     It was 1.03 ms median sprinting at the baseline, and fell with fewer
+     index bytes and less main-thread contention, not fewer draws. On
+     lavapipe the frame is ~99% raster (encode 2.8 of 257 ms). So shared
+     buffers and indirect draws are not built in M12, and no ADR is needed.
+     **Recorded for later:** a CPU four times slower would spend ~3 ms
+     encoding — a real share of a 60 fps frame. That is when to revisit,
+     with a low-end machine to measure on.
 4. **Retro.**
 
 ## Non-goals

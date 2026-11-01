@@ -2872,7 +2872,7 @@ mod specks_scratch {
     /// isolated magenta pixels (holes). Env: SPECK_EXTRA, SPECK_X, SPECK_Y
     /// (or SPECK_UP above ground), SPECK_Z, SPECK_YAW, SPECK_PITCH, SPECK_W,
     /// SPECK_H, SPECK_FOV, SPECK_MORPH, SPECK_CURVE, SPECK_OUT — the P key's
-    /// VIEW line has them all.
+    /// VIEW line has them all — and SPECK_FRAMES (time that many frames).
     #[test]
     #[ignore]
     fn specks() {
@@ -3048,6 +3048,29 @@ mod specks_scratch {
         }
         r.render(view_proj.to_cols_array_2d(), None);
         let px = r.read_frame();
+        // SPECK_FRAMES=n: time n more frames, each rendered and read back so
+        // the GPU's work is inside the measurement — on lavapipe, M12's
+        // stand-in for weak graphics (CPU-only Vulkan).
+        let frames = env("SPECK_FRAMES", 0.0) as usize;
+        if frames > 0 {
+            let (mut total, mut encode) = (Vec::new(), Vec::new());
+            for _ in 0..frames {
+                let t = std::time::Instant::now();
+                r.render(view_proj.to_cols_array_2d(), None);
+                let _ = r.read_frame();
+                total.push(t.elapsed().as_secs_f64() * 1000.0);
+                encode.push(f64::from(r.encode_ms_last_frame()));
+            }
+            total.sort_by(f64::total_cmp);
+            encode.sort_by(f64::total_cmp);
+            println!(
+                "FRAMES {frames} at {w}x{h}: median {:.1} ms (encode {:.2} ms), {} draws, {} tris",
+                total[frames / 2],
+                encode[frames / 2],
+                r.draws_last_frame(),
+                r.tris_last_frame()
+            );
+        }
 
         let magenta = |i: usize| px[i * 4] > 240 && px[i * 4 + 1] < 20 && px[i * 4 + 2] > 240;
         let (wi, hi) = (w as usize, h as usize);

@@ -262,9 +262,11 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   Task 0 done (instruments + the owner's baseline, recorded in the spec).
   Task 1 done (2026-11-01): mesh CPU per chunk −88% in game (~1 640 →
   ~190 µs), sprint backlog ~1 040 → ~200 (criterion 3 met), sprint fps
-  ~115 → ~720. Task 2 in: LOD fans and walls are true triangles over
-  shared vertices (headless: −24% LOD triangles, −29% LOD bytes); next, the
-  owner's `--bench` to confirm, then task 3 (draw calls). No low-end
+  ~115 → ~720. Task 2 done: LOD fans and walls are true triangles over
+  shared vertices (in game: 0% zero-area, triangles −20%, GPU MB −28% at 8
+  levels; lavapipe frame −17%, pixel-identical). Task 3 measured: encode
+  ~0.7 ms at 8 levels, under the ~1 ms line, so batching deferred. Next:
+  the owner's in-game look and hole census (criterion 6), then the retro. No low-end
   machine exists yet — the spec says how to judge low-end performance by
   proxy.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
