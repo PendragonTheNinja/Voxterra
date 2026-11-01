@@ -214,6 +214,14 @@ becomes an ADR; the simulation itself remains its own milestone.
 0. Catalogue additions (approved 2026-11-01) into `docs/biomes.md`; the
    water-physics design document for the owner's decision; instruments
    (maps of drainage and water).
+   - [x] Catalogue additions in `docs/biomes.md` (2026-11-01).
+   - [x] `docs/design/water.md` (2026-11-01): why Minecraft-style games keep
+     water simple, the three models, and the recommendation — the hybrid
+     (settled worldgen water; local finite water in eighths where disturbed;
+     seas, rivers and large lakes as reservoirs) with the gameplay it buys
+     (flooding mines, draining and damming, irrigation, water power, wells).
+     Awaiting the owner's decision; the owner leans hybrid.
+   - [ ] Drainage and water layers on the world map — with task 1's network.
 1. Stage-1 drainage: depression filling, flow routing, discharge, lakes and
    closed basins (ADR). Network tests (criteria 3, 4).
 2. Valley erosion on the stage-1 grid, fed back as the elevation field's
