@@ -116,6 +116,32 @@ so chunks, LOD and every reader agree:
 - **Materials**: river gravel and sand in channels, silt on floodplains, mud
   in deltas, salt on salt flats, peat in bogs (new blocks — open question 2).
 
+### Kinds of river
+
+Earth's rivers differ because their slope, discharge, sediment and climate
+differ — and the network knows all four for every reach, so the kinds fall
+out of the same numbers rather than being placed:
+
+| Kind | When (per reach) | Earth | What it means here |
+|---|---|---|---|
+| Mountain torrent | steep, small | Alpine streams | narrow, shallow, fast; rapids where it steps, waterfalls at cliffs |
+| Meandering | gentle slope, cohesive banks, lowland | Mississippi, Amazon | sinuous loops ~10–14× its width, oxbow lakes, floodplain |
+| Braided | steep-ish, much coarse sediment, weak banks — glacial, arid, tundra | Rakaia (NZ), Alaskan rivers | many channels splitting and rejoining over a wide gravel bed |
+| Slow, lake-like reach | almost flat — behind a natural dam (a landslide, a moraine, a tributary's fan, a beaver dam in the boreal), or a river widening into a lake | Lake Pepin on the Mississippi, the Lake District | wide, deep, nearly still water that keeps draining at its outlet |
+| Exotic / wadi | crossing or within a desert | Nile; dry wadis | shrinking as it evaporates; dry channels of sand and gravel |
+
+Speed comes from slope and depth (Manning's relation, roughly speed ∝
+depth^⅔ × slope^½): a torrent runs fast and shallow, a lowland giant deep and
+slow. Depth and width come from discharge. The network stores speed and
+direction per reach — the hybrid needs them anyway.
+
+**Water that looks like it flows**: the water surface's texture drifts along
+the river's direction at its speed — a slow lowland river barely moving, a
+torrent racing, foam where it is fast or steps — read in the shader from a
+flow map of the network, the way grass reads the climate map (ADR-0018), so
+it costs one texture sample per water pixel, re-meshes nothing, and is the
+same near and far. Still lakes and the sea stay still.
+
 ### Wetlands and water biomes
 
 Hydrology makes the biomes M13's catalogue deferred possible. Proposed
@@ -206,6 +232,10 @@ becomes an ADR; the simulation itself remains its own milestone.
 9. **Sound and fast**: per-chunk independence and determinism hold;
    `GENERATOR_VERSION` bumped with the fingerprint re-pinned; world creation
    within its budget; `--bench` within ~10% of M13's close.
+11. **Rivers differ as Earth's do**: torrents, meandering, braided and
+    slow reaches each appear where their slope, discharge and sediment put
+    them, measured over many worlds; river water visibly drifts downstream
+    at its speed, lakes and the sea do not.
 10. **The owner's walk**: on foot, following a river from a mountain spring
     to the sea; retro with maps before and after.
 
@@ -220,7 +250,8 @@ becomes an ADR; the simulation itself remains its own milestone.
      (settled worldgen water; local finite water in eighths where disturbed;
      seas, rivers and large lakes as reservoirs) with the gameplay it buys
      (flooding mines, draining and damming, irrigation, water power, wells).
-     Awaiting the owner's decision; the owner leans hybrid.
+     **Decided (owner, 2026-11-01): the hybrid.** The ADR is written with
+     task 3, where the storage it constrains is built.
    - [ ] Drainage and water layers on the world map — with task 1's network.
 1. Stage-1 drainage: depression filling, flow routing, discharge, lakes and
    closed basins (ADR). Network tests (criteria 3, 4).
@@ -273,5 +304,8 @@ becomes an ADR; the simulation itself remains its own milestone.
 3. **The drainage network is cached in the world folder** — derived from the
    seed and size, versioned, rebuilt automatically if missing or stale.
 4. **Currents later, with boats**; flow is recorded now.
-5. **Water physics is undecided** and important: a design document in task
-   0, the owner's decision before task 3 (see "Water physics").
+5. **Water physics: the hybrid** (`docs/design/water.md`) — settled
+   worldgen water, local finite water where disturbed (a later milestone),
+   seas, rivers and large lakes as reservoirs.
+6. **Rivers differ by terrain, and look like they flow** (owner's question,
+   2026-11-01; see "Kinds of river" and criterion 11).

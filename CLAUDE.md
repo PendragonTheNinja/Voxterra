@@ -263,8 +263,10 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   climate zone with Earth's own kind of water at our scale; M15 will be
   landforms by climate. Nine water biomes added to `docs/biomes.md`; the
   drainage network cached in the world folder; currents later. **Water
-  physics is undecided**: task 0 writes `docs/design/water.md` for the
-  owner to decide before task 3 fixes how water is stored. No
+  physics: the hybrid** (owner, 2026-11-01; `docs/design/water.md`):
+  settled worldgen water, local finite water later, reservoirs. Rivers
+  differ by slope, discharge and sediment, and visibly flow (a flow map in
+  the shader). Next: task 1, the stage-1 drainage network. No
   low-end machine exists yet — M12's spec says how to judge low-end
   performance by proxy.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
