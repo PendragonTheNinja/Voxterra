@@ -176,11 +176,11 @@ holds or the river nearest it (`Generator::ground`, ADRs 0019–0020):
 | River | in a channel | bed of river gravel (steep, slope > 0.02), sand, or silt (slow, < 0.004), 2; gravel |
 | Freshwater lake | under a lake (frozen at its surface below −2 °C) | silt 2, clay 3 |
 | Salt lake / salt flat | a closed basin's lake or dry floor | salt 1, silt 3 |
-| Floodplain | flat ground within 4 widths (≥ 16 blocks) of a river whose slope is under 0.003, up to 3 blocks above it, where it is not wet: flattened a block above the river | grass, silt 3, river gravel 2 |
+| Floodplain | (oxbow lakes on those of rivers 6+ blocks wide: crescents of lake, 2 deep) flat ground within 4 widths (≥ 16 blocks) of a river whose slope is under 0.003, up to 3 blocks above it, where it is not wet: flattened a block above the river | grass, silt 3, river gravel 2 |
 | Marsh | the same ground where precipitation ≥ potential evaporation: waterlogged at the river's level, with shallow pools (patch noise) | grass and mud patches, mud 3; pools floored with mud |
 | Swamp | a wetland at 18 °C or warmer | mud, grass patches, mud 3 |
 | Bog | a wetland below 3 °C | peat (grass patches), peat 3; pools floored with peat |
-| Delta | low ground (within 3 of sea level) at the mouth of a river large for its world (0.5 m³/s at the default size, less in proportion to area in smaller worlds): flats a block above the sea, sea in their pools | sand and mud, silt 3 |
+| Delta | low ground (within 3 of sea level) at the mouth of a river large for its world (0.5 m³/s at the default size, less in proportion to area in smaller worlds): flats a block above the sea, sea in their pools and in distributary channels winding across them | sand and mud, silt 3 |
 | Mangrove coast | a delta on a sea of 20 °C or warmer | mud 3, silt 2 |
 
 New block: **peat** (with silt, salt and river gravel from task 3). Every

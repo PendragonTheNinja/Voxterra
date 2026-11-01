@@ -99,6 +99,18 @@ const LOWLAND_MIN_REACH: f32 = 16.0;
 const WETLAND_HUMIDITY: f32 = 1.0;
 /// Patch noise below which a wetland column holds a pool.
 const POOL_BELOW: f32 = -0.3;
+/// A delta's distributaries: the wavelength of the noise whose zero line
+/// they follow, blocks, and how far from zero counts as channel (~4 blocks
+/// wide).
+const DISTRIBUTARY_WAVELENGTH: f32 = 128.0;
+const DISTRIBUTARY_WIDTH: f32 = 0.06;
+/// Oxbow lakes: on floodplains of rivers at least this wide (blocks); how
+/// thick the crescent is, as noise; and the share of the zero line that is
+/// lake (above this on a second noise).
+const OXBOW_FROM_WIDTH: f32 = 6.0;
+const OXBOW_THICKNESS: f32 = 0.05;
+const OXBOW_ARCS: f32 = 0.35;
+
 /// The least discharge that builds a delta at its mouth, m³/s, in a world
 /// of the default size or larger ([`Generator::delta_from`]).
 const DELTA_FROM_M3S: f32 = 0.5;
@@ -265,7 +277,18 @@ impl Generator {
         // however steeply its last reach fell: flats at sea level, the sea
         // in their pools.
         if n.mouth && n.discharge >= self.delta_from() && n.out < 2.0 * reach && h.abs() <= 3 {
-            return (if pool { -1 } else { 1 }, with(Body::Delta));
+            // Distributaries: the river splits across its delta in winding
+            // channels — where a smooth noise crosses zero, lines that wind
+            // and branch — cut below the sea, which fills them.
+            let (braid, _) = self.elevation.meander_warp(wx, wz, DISTRIBUTARY_WAVELENGTH);
+            let ground = if braid.abs() < DISTRIBUTARY_WIDTH {
+                -2
+            } else if pool {
+                -1
+            } else {
+                1
+            };
+            return (ground, with(Body::Delta));
         }
         if n.slope >= LOWLAND_SLOPE || n.out >= reach || h > n.level + 3 {
             return (h, water);
@@ -289,6 +312,26 @@ impl Generator {
                 return (n.level - 1, w);
             }
             return (n.level, with(Body::Wetland));
+        }
+        // Oxbow lakes: on a wide meandering river's floodplain, crescents
+        // of water where old bends were cut off — short arcs of a
+        // meander-scale noise's zero line — each only where every side
+        // holds it, as a wetland's pool.
+        if pools && n.width >= OXBOW_FROM_WIDTH {
+            let (arc, cut) = self.elevation.meander_warp(wx, wz, 12.0 * n.width);
+            if arc.abs() < OXBOW_THICKNESS
+                && cut > OXBOW_ARCS
+                && [(1, 0), (-1, 0), (0, 1), (0, -1)]
+                    .iter()
+                    .all(|&(dx, dz)| self.ground_without_pools(wx + dx, wz + dz) >= n.level)
+            {
+                let w = Water {
+                    level: n.level,
+                    body: Body::Lake,
+                    near: water.near,
+                };
+                return (n.level - 2, w);
+            }
         }
         (n.level + 1, with(Body::Floodplain))
     }
@@ -1240,10 +1283,18 @@ mod tests {
         let (nx, nz) = d.cells();
         let (cw, ch) = d.cell_blocks();
         let mut sites: Vec<(usize, usize)> = Vec::new();
-        let mut wanted = [8usize; 7]; // four kinds, waterfalls, lakes, sinks
-        for j in (0..nz).step_by(13) {
-            for i in (0..nx).step_by(11) {
-                let slot = if d.waterfall_at(i, j) {
+        // Four kinds, waterfalls, lakes, sinks, large mouths (deltas), wide
+        // lowland rivers (floodplains, oxbows).
+        let mut wanted = [8, 8, 8, 8, 8, 8, 8, 8, 32usize]; // oxbows are patchy
+        for j in (0..nz).step_by(3) {
+            for i in (0..nx).step_by(3) {
+                let (_, _, q, (ri, rj)) = d.cell(i, j);
+                let slot = if !d.is_sea(i, j) && d.is_sea(ri, rj) && q >= 0.5 {
+                    Some(7)
+                } else if q >= 1.0 && d.river_kind_at(i, j) == Some(drainage::RiverKind::Meandering)
+                {
+                    Some(8)
+                } else if d.waterfall_at(i, j) {
                     Some(4)
                 } else if let Some(k) = d.river_kind_at(i, j) {
                     Some(k as usize)
@@ -1287,7 +1338,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (4, 0x54c2_4f2f_37bc_8f7a);
+        const PINNED: (u32, u64) = (4, 0xff87_3091_89fa_aa2b);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),

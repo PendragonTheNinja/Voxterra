@@ -284,8 +284,9 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   all, every one in every world); the LOD draws rivers and lakes at their
   own levels; river water visibly flows (the flow map, `flow.wgsl`).
   River kinds (wadi, braided, torrent, meandering) differ by slope,
-  discharge and climate (criterion 10). Open: waterfalls, distributaries
-  and oxbows, `--bench`, and the owner's walk. vox-worldgen now 66 tests. No
+  discharge and climate (criterion 10). Waterfalls (static sheets at steps
+  in a river's profile, owner's decision), delta distributaries and oxbow
+  lakes built. Open: `--bench`, the owner's walk, and the retrospective. vox-worldgen now 66 tests. No
   low-end machine exists yet — M12's spec says how to judge low-end
   performance by proxy.
 - **Starting a new session:** clone fresh, confirm `git log` matches the

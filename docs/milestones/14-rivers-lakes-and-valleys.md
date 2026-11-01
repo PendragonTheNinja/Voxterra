@@ -378,7 +378,11 @@ becomes an ADR; the simulation itself remains its own milestone.
      faces run down in the shader, white. ~1 900 on the default world.
      Rapids are the whole-block steps elsewhere. The fingerprint now
      samples water.
-   - [ ] Deltas' distributary channels; oxbow lakes.
+   - [x] Deltas' distributaries: winding channels cut below the sea along
+     a 128-block noise's zero line across the delta flats (~6 blocks wide).
+   - [x] Oxbow lakes: crescents on floodplains of rivers 6+ blocks wide,
+     arcs of a meander-scale noise's zero line, 2 deep at the river's
+     level, only where every side holds them (frozen where cold).
 5. Distant water in the LOD (criterion 8).
    - [x] The LOD's water at each cell's own level (`mesh_lod_cells`,
      `LodCells`; `lod_surface` returns the water of the column it sampled):
