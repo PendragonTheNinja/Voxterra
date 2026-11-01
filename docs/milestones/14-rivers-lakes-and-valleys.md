@@ -369,6 +369,11 @@ becomes an ADR; the simulation itself remains its own milestone.
      the open sea's included. Now still water takes one, a river two,
      falling water one (`textureSampleGrad`, derivatives taken first; the
      image is unchanged — 1 pixel of 921 600). Re-bench to confirm.
+   - [x] `--bench` gains three water phases at 8 levels, appended so the
+     eight rows since M11 stay comparable (owner's request): rivers
+     standing and sprint (the start near spawn whose sprint path crosses
+     the most river and lake cells) and a waterfall, standing, facing its
+     sheet. Found from the drainage network, the same every run.
 4. Lakes, salt flats, floodplains, wetlands, deltas, waterfalls; the new
    biomes.
    - [x] The nine water biomes (`docs/biomes.md`, "Water biomes as

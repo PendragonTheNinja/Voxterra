@@ -7,7 +7,10 @@
 //! flight path, the same light, every time, then writes a table and quits.
 //!
 //! The script is eight phases: {6, 8 LOD levels} × {land, ocean} × {standing
-//! 20 s, sprint-flight 30 s}. Before each phase the world is allowed to settle
+//! 20 s, sprint-flight 30 s} — then, appended in M14 so those eight stay
+//! comparable across versions, three over water at 8 levels: rivers
+//! standing and sprint (the start near spawn whose path crosses the most
+//! rivers and lakes) and a waterfall, standing, looking at its sheet. Before each phase the world is allowed to settle
 //! — every streaming queue empty for a second, or 60 s at most — so a phase
 //! measures that phase, not the previous one's backlog. The settle time is
 //! reported too: it is how long the world took to catch up.
@@ -28,6 +31,21 @@ pub enum Place {
     /// The nearest deep water around spawn that stays deep along the whole
     /// sprint path.
     Ocean,
+    /// Near spawn, where the sprint path crosses the most river and lake
+    /// cells of the drainage network (M14).
+    Rivers,
+    /// Downstream of the largest waterfall near spawn that falls toward −X,
+    /// so the camera, looking +X, faces its sheet (M14).
+    Waterfall,
+}
+
+/// Eye positions where each place's phases start.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Starts {
+    pub land: [f64; 3],
+    pub ocean: [f64; 3],
+    pub rivers: [f64; 3],
+    pub waterfall: [f64; 3],
 }
 
 /// What the camera does during a phase.
@@ -55,6 +73,8 @@ impl Phase {
             match self.place {
                 Place::Land => "land",
                 Place::Ocean => "ocean",
+                Place::Rivers => "rivers",
+                Place::Waterfall => "waterfall",
             },
             match self.motion {
                 Motion::Still => "standing",
@@ -93,6 +113,20 @@ pub fn script() -> Vec<Phase> {
                 });
             }
         }
+    }
+    // M14, appended so the eight above keep their rows across versions:
+    // water at the default 8 levels.
+    for (place, motion, secs) in [
+        (Place::Rivers, Motion::Still, STILL_SECS),
+        (Place::Rivers, Motion::Sprint, SPRINT_SECS),
+        (Place::Waterfall, Motion::Still, STILL_SECS),
+    ] {
+        phases.push(Phase {
+            extra_levels: 5,
+            place,
+            motion,
+            secs,
+        });
     }
     phases
 }
@@ -348,23 +382,20 @@ pub struct Bench {
     state: State,
     samples: Vec<Sample>,
     results: Vec<PhaseStats>,
-    /// Eye positions where each place's phases start.
-    land: [f64; 3],
-    ocean: [f64; 3],
+    starts: Starts,
     header: Vec<String>,
     levels_applied: Option<i32>,
 }
 
 impl Bench {
-    pub fn new(land: [f64; 3], ocean: [f64; 3], header: Vec<String>) -> Self {
+    pub fn new(starts: Starts, header: Vec<String>) -> Self {
         Self {
             phases: script(),
             index: 0,
             state: State::Enter,
             samples: Vec::new(),
             results: Vec::new(),
-            land,
-            ocean,
+            starts,
             header,
             levels_applied: None,
         }
@@ -381,8 +412,10 @@ impl Bench {
 
     fn start_of(&self, place: Place) -> [f64; 3] {
         match place {
-            Place::Land => self.land,
-            Place::Ocean => self.ocean,
+            Place::Land => self.starts.land,
+            Place::Ocean => self.starts.ocean,
+            Place::Rivers => self.starts.rivers,
+            Place::Waterfall => self.starts.waterfall,
         }
     }
 
@@ -487,11 +520,15 @@ mod tests {
     #[test]
     fn the_script_covers_both_levels_places_and_motions_in_order() {
         let s = script();
-        assert_eq!(s.len(), 8);
+        assert_eq!(s.len(), 11);
+        // The first eight unchanged since M11, for comparison across versions.
         assert_eq!(s[0].label(), "6 levels, land, standing");
         assert_eq!(s[1].label(), "6 levels, land, sprint");
         assert_eq!(s[3].label(), "8 levels, land, sprint");
         assert_eq!(s[7].label(), "8 levels, ocean, sprint");
+        assert_eq!(s[8].label(), "8 levels, rivers, standing");
+        assert_eq!(s[9].label(), "8 levels, rivers, sprint");
+        assert_eq!(s[10].label(), "8 levels, waterfall, standing");
         assert!(s.iter().all(|p| match p.motion {
             Motion::Still => p.secs == STILL_SECS,
             Motion::Sprint => p.secs == SPRINT_SECS,
@@ -567,10 +604,19 @@ mod tests {
         );
     }
 
+    fn test_starts() -> Starts {
+        Starts {
+            land: [0.0, 50.0, 0.0],
+            ocean: [9000.0, 40.0, 0.0],
+            rivers: [-5000.0, 70.0, 0.0],
+            waterfall: [-8000.0, 90.0, 0.0],
+        }
+    }
+
     /// Run the whole script against a world that settles after `busy_for`
     /// seconds of every phase, at 100 fps.
     fn run(busy_for: f64) -> (Bench, Vec<Tick>) {
-        let mut b = Bench::new([0.0, 50.0, 0.0], [9000.0, 40.0, 0.0], vec!["test".into()]);
+        let mut b = Bench::new(test_starts(), vec!["test".into()]);
         let mut ticks = Vec::new();
         let mut entered = 0.0;
         for frame in 0..200_000 {
@@ -597,12 +643,13 @@ mod tests {
             .last()
             .and_then(|t| t.done.clone())
             .expect("the run ended");
-        assert_eq!(b.results.len(), 8);
+        assert_eq!(b.results.len(), 11);
         // Once in each table.
         for phase in script() {
             assert_eq!(report.matches(&format!("| {} |", phase.label())).count(), 2);
         }
-        // Levels are applied only when they change: 6, 8, 6, 8.
+        // Levels are applied only when they change: 6, 8, 6, 8 — and the
+        // water phases stay at 8.
         let applied: Vec<i32> = ticks.iter().filter_map(|t| t.apply_levels).collect();
         assert_eq!(applied, vec![3, 5, 3, 5]);
         // Each phase waited for the world: 2 s busy + 1 s quiet.
@@ -614,7 +661,7 @@ mod tests {
 
     #[test]
     fn the_dirty_split_is_asked_for_once_per_phase_and_reported_from_the_last_frame() {
-        let mut b = Bench::new([0.0, 50.0, 0.0], [9000.0, 40.0, 0.0], vec![]);
+        let mut b = Bench::new(test_starts(), vec![]);
         let mut asked = 0;
         let mut report = None;
         for frame in 0..200_000 {
@@ -633,10 +680,10 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(asked, 8, "once per phase");
+        assert_eq!(asked, 11, "once per phase");
         let report = report.expect("the run ended");
         assert!(report.contains("| 1 / 2 / 1 |"), "{report}");
-        assert!(report.contains("| 1 / 2 / 8 |"), "{report}");
+        assert!(report.contains("| 1 / 2 / 11 |"), "{report}");
         assert!(b.results.iter().all(|r| r.dirty_split_end.is_some()));
     }
 

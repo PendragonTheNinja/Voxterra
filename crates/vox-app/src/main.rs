@@ -292,6 +292,89 @@ fn climate_texels(generator: &Generator) -> (Vec<u8>, (u32, u32)) {
     (texels, (nx as u32, nz as u32))
 }
 
+/// Where the benchmark's water phases start (M14), from the drainage
+/// network alone, so a given world always benchmarks the same water:
+/// the rivers phase where the sprint path, along +X, crosses the most river
+/// and lake cells within ~15 km of spawn; the waterfall phase downstream of
+/// the largest waterfall there that falls toward −X, so the camera, looking
+/// +X, faces its sheet. Positions in the spawn's frame (no wrapping).
+fn bench_water_starts(
+    generator: &Generator,
+    sx: i64,
+    sz: i64,
+    path: i64,
+    above: f64,
+) -> (Option<[f64; 3]>, Option<[f64; 3]>) {
+    let d = generator.drainage();
+    let (nx, nz) = d.cells();
+    let (cw, ch) = d.cell_blocks();
+    let (si, sj) = d.cell_of(sx, sz);
+    let wrap = |i: i64, j: i64| {
+        (
+            i.rem_euclid(nx as i64) as usize,
+            j.rem_euclid(nz as i64) as usize,
+        )
+    };
+    // Unwrapped cell (si + di, sj + dj) to a world position near spawn.
+    let at = |di: i64, dj: i64| {
+        (
+            sx - sx.rem_euclid(cw as i64) + di * cw as i64 + (cw / 2.0) as i64,
+            sz - sz.rem_euclid(ch as i64) + dj * ch as i64 + (ch / 2.0) as i64,
+        )
+    };
+    const REACH: i64 = 120;
+    let path_cells = (path as f64 / cw).ceil() as i64;
+    let mut best_rivers: Option<(usize, i64, i64, i64)> = None; // (score, -dist, di, dj)
+    let mut best_fall: Option<(f32, i64, i64)> = None;
+    for dj in -REACH..=REACH {
+        for di in -REACH..=REACH {
+            let (i, j) = wrap(si as i64 + di, sj as i64 + dj);
+            if di % 3 == 0 && dj % 3 == 0 && !d.is_sea(i, j) {
+                let score = (0..path_cells)
+                    .filter(|&k| {
+                        let (ci, cj) = wrap(si as i64 + di + k, sj as i64 + dj);
+                        d.river_kind_at(ci, cj).is_some() || d.is_lake(ci, cj)
+                    })
+                    .count();
+                let key = (score, -(di * di + dj * dj), di, dj);
+                if best_rivers.is_none_or(|b| key > b) {
+                    best_rivers = Some(key);
+                }
+            }
+            if d.waterfall_at(i, j) {
+                let (_, _, q, (ri, _)) = d.cell(i, j);
+                let west = (ri as i64 - i as i64).rem_euclid(nx as i64) == nx as i64 - 1;
+                if west && best_fall.is_none_or(|b| q > b.0) {
+                    best_fall = Some((q, di, dj));
+                }
+            }
+        }
+    }
+    let rivers = best_rivers.filter(|b| b.0 > 0).map(|(_, _, di, dj)| {
+        let (x, z) = at(di, dj);
+        let highest = (0..=path)
+            .step_by(64)
+            .map(|k| generator.surface_height(x + k, z))
+            .max()
+            .unwrap_or(0);
+        [x as f64 + 0.5, highest as f64 + above, z as f64 + 0.5]
+    });
+    let waterfall = best_fall.map(|(_, di, dj)| {
+        let (x, z) = at(di, dj);
+        let (i, j) = wrap(si as i64 + di, sj as i64 + dj);
+        let (_, upper, _, _) = d.cell(i, j);
+        // The lip is halfway to the receiver, half a cell west; stand
+        // ~100 blocks downstream of it, a little above the pool's level.
+        let lip_x = x - (cw / 2.0) as i64;
+        [
+            (lip_x - 100) as f64 + 0.5,
+            f64::from(upper) + 12.0,
+            z as f64 + 0.5,
+        ]
+    });
+    (rivers, waterfall)
+}
+
 /// The drainage network's flow as texels for `Renderer::set_flow` (M14):
 /// each cell's water velocity, row by row.
 fn flow_texels(generator: &Generator) -> (Vec<u8>, (u32, u32)) {
@@ -1649,13 +1732,31 @@ impl App {
                 land
             }
         };
+        let (rivers, waterfall) = bench_water_starts(&generator, sx, sz, path, ABOVE);
+        let rivers = rivers.unwrap_or_else(|| {
+            header.push("No rivers found near spawn: river phases ran on land".into());
+            land
+        });
+        let waterfall = waterfall.unwrap_or_else(|| {
+            header.push("No waterfall facing the camera near spawn: its phase ran on land".into());
+            land
+        });
         self.settings = vox_core::Settings::default();
         self.camera.mode = MoveMode::Spectator;
         self.time_paused = true;
         self.time_accum = 0.5 * vox_core::TICKS_PER_DAY as f64;
         self.world_time = vox_core::WorldTime::from_ticks(self.time_accum as u64);
         log::info!("bench: starting — land at {land:?}, ocean at {ocean:?}");
-        self.bench = Some(bench::Bench::new(land, ocean, header));
+        log::info!("bench: rivers at {rivers:?}, waterfall at {waterfall:?}");
+        self.bench = Some(bench::Bench::new(
+            bench::Starts {
+                land,
+                ocean,
+                rivers,
+                waterfall,
+            },
+            header,
+        ));
         self.bench_started = Some(Instant::now());
     }
 
@@ -2965,6 +3066,20 @@ fn main() {
 #[cfg(test)]
 mod specks_scratch {
     use super::*;
+
+    /// The benchmark's water starts on the default world, printed: run with
+    /// `--ignored --nocapture` to see where the rivers and waterfall phases
+    /// stand (and feed them to `specks` to look).
+    #[test]
+    #[ignore]
+    fn bench_water_starts_on_the_default_world() {
+        let g = vox_worldgen::Generator::new(0x7e22ac0de, WorldShape::default());
+        let (sx, sz) = (-19712, 20480);
+        let path = (bench::SPRINT_SPEED * bench::SPRINT_SECS) as i64;
+        let (rivers, fall) = bench_water_starts(&g, sx, sz, path, 40.0);
+        println!("rivers {rivers:?}\nwaterfall {fall:?}");
+        assert!(rivers.is_some() && fall.is_some());
+    }
 
     /// Scratch: render the LOD ring headlessly with a magenta sky and count
     /// isolated magenta pixels (holes). Env: SPECK_EXTRA, SPECK_X, SPECK_Y
