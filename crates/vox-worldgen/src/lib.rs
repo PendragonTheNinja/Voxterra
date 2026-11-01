@@ -18,7 +18,10 @@
 //!   forever. This is what makes a world reproducible from a seed and lets
 //!   the streamer regenerate instead of always loading from disk.
 
+pub mod climate;
 pub mod elevation;
+#[cfg(test)]
+mod map;
 
 use elevation::Elevation;
 use vox_core::{BlockId, CHUNK_SIZE, Chunk, ChunkPos, LocalPos, SEA_LEVEL_BLOCKS, WorldShape};

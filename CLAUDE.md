@@ -258,15 +258,16 @@ The owner's ideas for all of them, and a proposed order, are recorded in
 ## Current status
 
 - **Active milestone:** 13 — Climate & Biomes
-  (`docs/milestones/13-climate-and-biomes.md`, **draft** spec 2026-11-01,
-  with the biome catalogue in `docs/biomes.md`). Nothing is built until the
-  owner approves the catalogue and answers the spec's open questions. No
-  low-end machine exists yet — M12's spec says how to judge low-end
-  performance by proxy.
+  (`docs/milestones/13-climate-and-biomes.md`; catalogue `docs/biomes.md`,
+  approved 2026-11-01). Done: the world map writer (`world_map`, PNGs to
+  `target/world-map/`) and stage-1 climate maps (`climate.rs`, ADR-0017
+  proposed: winds, rain shadows, exaggerated lapse rate, deterministic
+  maths). Next: task 2, classification. No low-end machine exists yet —
+  M12's spec says how to judge low-end performance by proxy.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 288, vox-mesh 67, vox-worldgen 31, vox-render 17, vox-app 9
-  passing as of the M12 close), then start the first unchecked item.
+  vox-core 288, vox-mesh 67, vox-worldgen 41, vox-render 17, vox-app 9
+  passing as of M13 task 1), then start the first unchecked item.
 - **Instruments (from M11):** the P key logs a `VIEW` line (exact position,
   angles, window, settings) and a `hole_census` — the frame re-rendered six
   ways on the player's GPU with pinholes counted per variant. In the cloud

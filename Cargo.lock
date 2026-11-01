@@ -2091,6 +2091,7 @@ dependencies = [
 name = "vox-worldgen"
 version = "0.1.0"
 dependencies = [
+ "rayon",
  "vox-core",
 ]
 

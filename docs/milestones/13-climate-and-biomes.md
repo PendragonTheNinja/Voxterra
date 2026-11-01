@@ -13,9 +13,9 @@ horizon, so climate belts are visible tens of kilometres off) and M12
 2026-11-01 from `docs/vision.md` §1.1 and §10.1, with the biome catalogue in
 `docs/biomes.md`.
 
-**Status: draft.** The owner answered four of the five open questions
-(2026-11-01; recorded at the end). Nothing is built until the catalogue
-(`docs/biomes.md`) is approved.
+**Status: in progress.** Spec and catalogue approved by the owner
+(2026-11-01; decisions recorded at the end). Tasks 0 (map writer) and 1
+(climate maps) done headlessly; next, task 2 (classification).
 
 ## Why this milestone exists
 
@@ -186,9 +186,36 @@ horizon.
 0. **Catalogue and instruments.** Owner approves `docs/biomes.md`. The world
    map writer (biomes, temperature, precipitation, plus today's elevation),
    and the in-game readouts. Run the map on today's generator as the "before".
+   - [x] Catalogue approved as drafted (owner, 2026-11-01): "a really
+     awesome list … we can decide as we go if we want to add more biomes
+     at any point or drop any."
+   - [x] World map writer (2026-11-01): `vox-worldgen/src/map.rs`, test-only;
+     `cargo test -p vox-worldgen --release world_map -- --ignored
+     --nocapture` writes elevation, temperature and precipitation PNGs to
+     `target/world-map/` (env: `WORLD_MAP_SEED`, `WORLD_MAP_SIZE`,
+     `WORLD_MAP_PX`, `WORLD_MAP_DIR`), with the equators, tropics and polar
+     circles marked, and prints land shares by rainfall and temperature and
+     mean land rainfall per 10° of latitude. A dependency-free PNG writer
+     (stored deflate). The elevation map is the "before".
+   - [ ] In-game readouts (biome, temperature, rainfall, latitude on the
+     telemetry and `VIEW` lines) — with task 2, once the generator carries
+     the climate.
 1. **Climate maps (stage 1).** ADR-0017. The grid, temperature, winds,
    moisture advection, rain shadow, ocean moderation. Tests for criterion 4's
    physical causes. Tune against the world map, many seeds, every size.
+   - [x] **Done headlessly (2026-11-01)** — `vox-worldgen/src/climate.rs`,
+     ADR-0017 (proposed). 800×800 cells of 256 blocks at the default size,
+     built in ~0.5 s (4 cores). Deterministic to the bit on every machine:
+     basic arithmetic only, with its own `exp`. Tuned on the world map over
+     four seeds — first runs were far too dry (40% of land under 250 mm) and
+     streaked along the winds; fixed by continent-scaled drying with
+     recycling, sideways mixing between rows, and orographic rain as a
+     capped multiplier. Mean land rainfall per 10° of latitude now within
+     ~10–20% of Earth's, same shape. Tests: determinism, wrapping across
+     the seam, **rain shadows** (windward 3.3× the lee over 817 ridges;
+     1.02× and failing with orographic lift disabled), latitude belts,
+     continental cooling, snowlines. Not yet read by chunks:
+     `GENERATOR_VERSION` unchanged until task 3.
 2. **Classification.** Climate + terrain → biome, with boundary noise. Tests
    for criteria 3, 5 and 6.
 3. **Surface materials.** The new blocks and their tiles; per-biome
