@@ -186,6 +186,12 @@ The division of labour:
 - **At the start of a session, verify the remote before trusting it.** Check
   `git log` on a fresh clone; if the work under discussion isn't there, stop and
   say so before auditing or editing anything.
+- **Keep every image.** Every map, render and screenshot made during a
+  milestone goes into `docs/gallery/<milestone>/` with a line in its README
+  (what it shows, the commit it shows) — before/after pairs especially.
+  `target/` is gitignored and the container is wiped, so an image left
+  there is lost. Palette-reduce maps and save renders as JPEG to keep the
+  repository small. (Owner, 2026-11-01.)
 - **Judge terrain at ground speed.** Survival sprint is 5.612 m/s; spectator
   sprint-flight is 120 m/s, **21× faster**. One minute of flight is twenty-one
   minutes on foot. Every walking-time figure in the docs is ground sprint.
