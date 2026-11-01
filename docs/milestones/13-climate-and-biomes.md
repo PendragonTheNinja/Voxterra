@@ -355,7 +355,29 @@ horizon.
      islands. At 32 km: 2.6 and 9.8 minutes.
    - Gallery: `docs/gallery/m13/` — the planet's maps before and after, and
      headless views of five places.
-5. **Owner's walk.** A play session on foot and in flight, judged at walking
+5. **Owner's walk.**
+   **Before playing:** version 3 refuses version-2 worlds — move the old
+   `world` folder aside (`Rename-Item world world-v2`) and let a fresh one
+   generate. **Look for:**
+   - the telemetry line's biome readout as you walk (and the **P** key's
+     `VIEW` line) — does what you see match the name?
+   - grass colour shifting smoothly across the planet, and no colour step
+     where full resolution meets the LOD;
+   - distant terrain wearing its biomes: sand, snow, ice caps, badlands red;
+   - snow on peaks above ~530 blocks at mid-latitudes, alpine meadow below;
+   - sea ice on polar seas (walkable), the LOD sea stopping at its edge;
+   - biome edges fraying, not lines; badlands cliffs banded;
+   - the hole census (**P**) as at M12's close, and `--bench` against M12.
+   **Two calls only play can make:**
+   - **Hot deserts are about half Earth's share** (6.6% of land against
+     ~12%) and temperate forest ~1.5×. Stronger subtropical drying would
+     move it — worth it only if the world feels too green.
+   - **Shallow seas over sand read grey**, through water of constant
+     opacity. Water that absorbs with depth (`docs/vision.md` §10) is the
+     real fix: thicker water darker and bluer, shallows clearer over sand.
+     It needs the depth of the seabed behind each water pixel — the
+     transparent pass reading the depth buffer — so it is a rendering
+     change with its own ADR, not part of M13 unless the owner pulls it in. A play session on foot and in flight, judged at walking
    speed, with fixes; `--bench` (criterion 9).
 6. **Retro.**
 
