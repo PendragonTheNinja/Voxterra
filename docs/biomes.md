@@ -94,3 +94,53 @@ ice sheets; opaque and solid, unlike water), **gravel**, **red sand**,
 **sandstone**, **red sandstone** and two or three **banded badlands rock**
 colours, **coarse dirt**, **podzol**, **clay**, **mud**. Around twelve — palette
 storage makes them free in memory (CLAUDE.md).
+
+## As built (M13, 2026-11-01)
+
+How the catalogue is generated (`vox_worldgen::biome`, `vox_worldgen::materials`;
+ADRs 0017 and 0018). Climate is the annual mean — there are no seasons.
+
+**Classification, in order:** sea by depth and sea temperature; land within
+3 blocks of sea level is shore; mountains (uplift a real share of the height)
+are rock and snow below −5 °C and alpine meadow below +1 °C — unless colder
+than −14 °C, where ice sheet covers them, as in Antarctica; then ice sheet
+(< −14 °C), tundra (< −5 °C); dry land by Köppen's threshold (`20·T + 140`
+mm: desert under half of it, steppe under all of it; badlands where also
+warm, rough and desert-dry); boreal forest (< 3 °C); tropical (≥ 20 °C:
+rainforest from 2 000 mm, dry forest from 1 200, else savanna); Mediterranean
+(≥ 14 °C and humid by less than 1.3× the threshold); temperate rainforest
+(< 16 °C and at least 4× the threshold, never under 1 300 mm); temperate
+forest. Boundaries wander with noise at 1 400, 350 and 24 blocks.
+
+**Ground, top down** (stone beneath; no profile deeper than 12 blocks):
+
+| Biome | Ground |
+|---|---|
+| Tropical rainforest | grass, dirt 3, clay 3 |
+| Tropical dry forest | grass, dirt 3 |
+| Savanna | grass (coarse-dirt patches), coarse dirt 3 |
+| Hot desert | sand 4, sandstone 6; where rough, bare sandstone with sand in hollows (hamada) |
+| Hot steppe | grass with sand and coarse-dirt patches, dirt 3 |
+| Mediterranean scrub | grass with coarse-dirt patches, coarse dirt 2 |
+| Temperate grassland | grass, dirt 5 |
+| Cold desert | gravel with sand patches, gravel 2 |
+| Temperate forest | grass, dirt 3 |
+| Temperate rainforest | grass, dirt 4 |
+| Boreal forest | podzol (grass patches), dirt 3 |
+| Tundra | grass with gravel patches, dirt 1 |
+| Ice sheet | snow 3, ice to the profile's end |
+| Alpine meadow | grass with stone outcrops, dirt 1 |
+| Alpine rock and snow | snow (well below the snowline, or in patches), stone, scree |
+| Badlands | red sand 2, then horizontal strata of four banded rocks |
+| Sand beach | sand 4, sandstone 3 |
+| Shingle beach (cold or rough shores) | gravel 3 |
+| Rocky coast | stone (gravel patches) |
+| Warm shallow sea | seabed sand 3, sandstone 3 |
+| Temperate sea | seabed sand or gravel 3 |
+| Polar sea | seabed gravel 2; **ice on the sea surface** |
+| Deep ocean | seabed mud 1, clay 3 |
+
+**Grass colour** follows climate rather than the biome's name — deep green
+where hot and wet, yellowed where hot and dry, fresh green where mild and
+wet, olive and brown toward the cold — so it shifts smoothly across a
+boundary, near and far alike (ADR-0018).

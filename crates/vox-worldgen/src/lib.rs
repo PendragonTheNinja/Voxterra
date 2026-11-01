@@ -631,6 +631,36 @@ mod tests {
         }
     }
 
+    /// The torus (ADR-0012) for M13's content: a column's biome, climate,
+    /// patch and every block of its profile are the same on every lap, and
+    /// columns either side of the seam are neighbours like any others —
+    /// boundary and patch noise tile with the world as the terrain does.
+    #[test]
+    fn columns_and_their_blocks_wrap_with_the_world() {
+        let shape = WorldShape::new(65_536, 65_536).unwrap();
+        let g = Generator::new(0x51D_E5EA, shape);
+        let (sx, sz) = (shape.size_x(), shape.size_z());
+        for k in 0..200i64 {
+            let (x, z) = (k * 3_331 - 50_000, k * 7_919 + 13);
+            let a = g.column(x, z);
+            for (dx, dz) in [(sx, 0), (0, sz), (-2 * sx, 3 * sz)] {
+                let b = g.column(x + dx, z + dz);
+                assert_eq!(a, b, "({x}, {z}) and its copy {dx}, {dz} away");
+                let h = a.surface.height;
+                for y in [h - 5, h, h + 1, SEA_LEVEL_BLOCKS] {
+                    assert_eq!(g.block_at(x, y, z), g.block_at(x + dx, y, z + dz));
+                }
+            }
+        }
+        // Across the seam itself: the last column and the first are
+        // neighbours, so their patch noise is as close as any neighbours'.
+        for z in (0..sz).step_by(1_009) {
+            let (last, first) = (g.column(sx - 1, z), g.column(sx, z));
+            assert!((last.patch - first.patch).abs() < 0.2, "patch jumps at the seam, z = {z}");
+            assert!((last.surface.height - first.surface.height).abs() <= 3);
+        }
+    }
+
     /// Chunks far above any surface are all air and stored uniformly.
     #[test]
     fn high_chunks_are_uniform_air() {
