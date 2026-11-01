@@ -945,7 +945,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (4, 0xfcaf_3b0e_762e_bac1);
+        const PINNED: (u32, u64) = (4, 0x55cc_bdb4_6add_da9d);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),

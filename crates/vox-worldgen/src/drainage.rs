@@ -525,7 +525,7 @@ fn flood(
         if sea[c] || sink[c] {
             let key = if sea[c] { 0 } else { surface[c] };
             receiver[c] = c as u32;
-            heap.push(Reverse((key, surface[c], c as u32)));
+            heap.push(Reverse((key, surface[c], c as u32, c as u32)));
         }
     }
     if heap.is_empty() {
@@ -533,17 +533,33 @@ fn flood(
         // cell is the outlet.
         let lowest = (0..n).min_by_key(|&c| (surface[c], c)).unwrap();
         receiver[lowest] = lowest as u32;
-        heap.push(Reverse((surface[lowest], surface[lowest], lowest as u32)));
+        heap.push(Reverse((
+            surface[lowest],
+            surface[lowest],
+            0,
+            lowest as u32,
+        )));
     }
-    while let Some(Reverse((level, _, c))) = heap.pop() {
+    // Ties — a lake, a dead-flat floor — go first in, first out (the third
+    // key counts pushes), so water crosses them by the shortest way rather
+    // than snaking along rows in index order.
+    let mut pushed = n as u32;
+    let mut filled = vec![i32::MIN; n];
+    while let Some(Reverse((level, _, _, c))) = heap.pop() {
         order.push(c);
+        filled[c as usize] = level;
         for nb in neighbours(c as usize, nx, nz) {
             if receiver[nb] != u32::MAX {
                 continue;
             }
             receiver[nb] = c;
-            let low = if lake[nb] { i32::MAX } else { surface[nb] };
-            heap.push(Reverse((surface[nb].max(level), low, nb as u32)));
+            // A lake, or a hollow the flood is filling: crossed first in,
+            // first out — the shortest way to its outlet — not down to its
+            // bottom and back up.
+            let still = lake[nb] || level > surface[nb];
+            let low = if still { i32::MAX } else { surface[nb] };
+            pushed += 1;
+            heap.push(Reverse((surface[nb].max(level), low, pushed, nb as u32)));
         }
     }
     // The flood says which way water leaves a hollow; where the ground
@@ -558,7 +574,7 @@ fn flood(
     }
     for &c in &order {
         let c = c as usize;
-        if receiver[c] as usize == c || lake[c] {
+        if receiver[c] as usize == c || lake[c] || filled[c] > surface[c] {
             continue;
         }
         let mut best = receiver[c] as usize;
@@ -570,6 +586,124 @@ fn flood(
         receiver[c] = best as u32;
     }
     (receiver, order)
+}
+
+/// What a network looks like against Earth (criterion 4), for tests and the
+/// survey.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct NetworkStats {
+    /// Share of land draining to closed basins (Earth ~0.18).
+    pub endorheic: f64,
+    /// Lake share of ice-scoured land and of the rest.
+    pub lakes_cold: f64,
+    pub lakes_warm: f64,
+    /// The longest flow path, divide to mouth, km.
+    pub longest_km: f64,
+    /// Hack's exponent: length ∝ area^h over every catchment of 64+ cells
+    /// (Earth 0.5–0.6).
+    pub hack: f64,
+    /// Cells carrying a stream (0.05+ m³/s) per land cell, by aridity
+    /// index: under 0.5, 0.5 to 1, over 1.
+    pub density: [f64; 3],
+    /// The largest discharge, m³/s.
+    pub largest: f64,
+}
+
+#[cfg(test)]
+impl DrainageMap {
+    pub(crate) fn stats(&self, climate: &ClimateMap) -> NetworkStats {
+        let (nx, nz) = (self.nx, self.nz);
+        let n = nx * nz;
+        let diagonal = self.cell_x.hypot(self.cell_z);
+        // Area and longest path, donors first (Kahn's order on receivers).
+        let mut donors = vec![0u32; n];
+        for c in 0..n {
+            let r = self.receiver_of(c);
+            if r != c {
+                donors[r] += 1;
+            }
+        }
+        let mut ready: Vec<usize> = (0..n).filter(|&c| donors[c] == 0).collect();
+        let (mut area, mut length) = (vec![1u32; n], vec![0.0f64; n]);
+        while let Some(c) = ready.pop() {
+            let r = self.receiver_of(c);
+            if r == c {
+                continue;
+            }
+            let step = if c % nx == r % nx {
+                self.cell_z
+            } else if c / nx == r / nx {
+                self.cell_x
+            } else {
+                diagonal
+            };
+            area[r] += area[c];
+            length[r] = length[r].max(length[c] + step);
+            donors[r] -= 1;
+            if donors[r] == 0 {
+                ready.push(r);
+            }
+        }
+        let endo = self.endorheic();
+        let (mut land, mut closed, mut longest, mut largest) = (0u32, 0u32, 0.0f64, 0.0f64);
+        let (mut cold, mut warm) = ((0u32, 0u32), (0u32, 0u32));
+        let mut density = [(0u32, 0u32); 3];
+        let (mut sx, mut sy, mut sxx, mut sxy, mut k) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        for c in 0..n {
+            if self.sea_at(c) {
+                continue;
+            }
+            land += 1;
+            closed += u32::from(endo[c]);
+            let r = self.receiver_of(c);
+            if r == c || self.sea_at(r) || self.sink_at(r) {
+                longest = longest.max(length[c]);
+            }
+            let q = f64::from(self.discharge[c]);
+            largest = largest.max(q);
+            let x = ((c % nx) as f64 + 0.5) * self.cell_x;
+            let z = ((c / nx) as f64 + 0.5) * self.cell_z;
+            let (sea_level_c, precip) = climate.sample(x as i64, z as i64);
+            let t = temperature_at(sea_level_c, i64::from(self.h(c).max(0)));
+            let lake = u32::from(matches!(self.cover_at(c), Cover::Lake | Cover::SaltLake));
+            let tally = if t < GLACIATED_BELOW_C {
+                &mut cold
+            } else {
+                &mut warm
+            };
+            tally.0 += lake;
+            tally.1 += 1;
+            let pet = potential_evaporation(t);
+            let zone = if pet <= 0.0 || precip >= pet {
+                2
+            } else if precip >= 0.5 * pet {
+                1
+            } else {
+                0
+            };
+            density[zone].0 += u32::from(q >= 0.05);
+            density[zone].1 += 1;
+            if area[c] >= 64 && length[c] > 0.0 {
+                let (lx, ly) = ((f64::from(area[c])).ln(), length[c].ln());
+                sx += lx;
+                sy += ly;
+                sxx += lx * lx;
+                sxy += lx * ly;
+                k += 1.0;
+            }
+        }
+        let share = |(a, b): (u32, u32)| f64::from(a) / f64::from(b.max(1));
+        NetworkStats {
+            endorheic: f64::from(closed) / f64::from(land),
+            lakes_cold: share(cold),
+            lakes_warm: share(warm),
+            longest_km: longest / 1000.0,
+            hack: (k * sxy - sx * sy) / (k * sxx - sx * sx),
+            density: density.map(share),
+            largest,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -653,44 +787,19 @@ mod tests {
         );
     }
 
-    /// Criterion 4, in part: lakes are most common on ice-scoured ground,
-    /// as on Earth (the boreal and tundra lake districts).
+    /// Criterion 4, on one world (the survey, `drainage_survey`, runs many):
+    /// Hack's law holds, lakes are commonest on ice-scoured ground, streams
+    /// densest where it is wet, and closed basins a minority of the land.
     #[test]
-    fn lakes_are_commonest_where_ice_scoured() {
+    fn the_network_is_earth_like() {
         let shape = WorldShape::new(65_536, 65_536).unwrap();
         let e = Elevation::new(3, shape);
         let climate = ClimateMap::build(&e, shape);
-        let d = DrainageMap::build(&e, &climate, shape);
-        let (nx, nz) = d.cells();
-        let (cw, ch) = d.cell_blocks();
-        let (mut cold, mut cold_lake, mut warm, mut warm_lake) = (0u32, 0u32, 0u32, 0u32);
-        for j in 0..nz {
-            for i in 0..nx {
-                let c = j * nx + i;
-                if d.sea_at(c) {
-                    continue;
-                }
-                let x = ((i as f64 + 0.5) * cw) as i64;
-                let z = ((j as f64 + 0.5) * ch) as i64;
-                let (t0, _) = climate.sample(x, z);
-                let lake = u32::from(d.is_lake(i, j));
-                if temperature_at(t0, i64::from(d.h(c).max(0))) < GLACIATED_BELOW_C {
-                    cold += 1;
-                    cold_lake += lake;
-                } else {
-                    warm += 1;
-                    warm_lake += lake;
-                }
-            }
-        }
-        let (fc, fw) = (
-            f64::from(cold_lake) / f64::from(cold),
-            f64::from(warm_lake) / f64::from(warm),
-        );
-        assert!(
-            fc > 1.5 * fw,
-            "glaciated lakes {fc:.3} vs elsewhere {fw:.3}"
-        );
+        let s = DrainageMap::build(&e, &climate, shape).stats(&climate);
+        assert!((0.45..0.7).contains(&s.hack), "{s:?}");
+        assert!(s.lakes_cold > 1.5 * s.lakes_warm, "{s:?}");
+        assert!(s.density[0] < s.density[2], "{s:?}");
+        assert!(s.endorheic < 0.5, "{s:?}");
     }
 
     /// Criterion 6: rivers sit in valleys that deepen downstream — the

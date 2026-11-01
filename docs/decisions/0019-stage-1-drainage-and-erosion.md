@@ -44,15 +44,19 @@ at exactly the same fractions.
    sibling, their shared pool, or — at the top — downhill from its saddle
    into whatever lower hollow lies there; one that cannot pay settles where
    evaporation meets inflow, as a **salt lake or salt flat**, a closed
-   basin. A hollow on ground whose aridity index (P/PET) is 0.5 or more
-   never closes: Earth's endorheic basins are almost all arid, wetter ones
-   were cut through long ago. Full hollows hold fresh lakes only if deep
+   basin. A hollow on ground whose aridity index (P/PET) is 0.3 or more
+   never closes: Earth's endorheic basins lie almost all in arid land
+   (the Great Basin ~0.2–0.3, the Aral ~0.1); wetter ones were cut through
+   long ago. Full hollows hold fresh lakes only if deep
    basins (mean depth ≥ 60 blocks over ≥ 60 cells) or small ice-scoured
    hollows (below 2 °C, 3–200 cells, 10+ deep); the rest are breached.
 5. **Routing**: one priority flood (Barnes et al., 2014) from the sea and
-   the closed basins over the water surface, lakes entered last; then each
-   cell takes its lowest neighbour among the cells reached before it, so
-   water runs the steepest way down and still forms a tree to an outlet.
+   the closed basins over the water surface. Lakes are entered last, and
+   lakes and the hollows the flood fills are crossed first in, first out —
+   the shortest way to their outlet, not down to a hollow's bottom and back
+   up, nor snaking along rows in index order. Everywhere else each cell
+   takes its lowest neighbour among the cells reached before it, so water
+   runs the steepest way down and still forms a tree to an outlet.
 6. **Channel levels** are cut down along the flow so water never runs
    uphill; a cut ending below a lake is its backwater.
 7. **Discharge** accumulated down the tree, lakes losing their
@@ -107,17 +111,34 @@ so a crash never leaves half a cache); one that cannot be written is
 logged and costs the next load a rebuild. Never trusted over the
 generator: it can only ever hold what the generator would build.
 
-## Measured (seed 0x7e22ac0de, default size, before the owner's walk)
+## Measured (default size, before the owner's walk)
+
+Seed 0x7e22ac0de:
 
 | | |
 |---|---|
 | Deepest cut | 496 blocks |
-| Land cut 10+ / 50+ blocks | 23% / 4% |
-| Valley depth by discharge (0.001 / 0.01 / 0.1 / 1+ m³/s) | 4 / 17 / 29 / 48 blocks |
-| Steepest slope erosion adds (16-block step) | 0.83 |
-| Land draining to closed basins | 27% (Earth ~18%) |
-| Lakes / salt lakes and flats | 9.1% / 1.4% of land |
-| Largest river | 24.5 m³/s |
+| Land cut 10+ / 50+ blocks | 20% / 4% |
+| Valley depth by discharge (0.001 / 0.01 / 0.1 / 1+ m³/s) | 5 / 17 / 29 / 50 blocks |
+| Steepest slope erosion adds (16-block step) | 0.82 |
+| Lakes / salt lakes and flats | 11.4% / 0.8% of land |
+| Largest river | 16.7 m³/s |
+
+Six seeds (`drainage_survey`), against Earth (criterion 4):
+
+| | Here | Earth |
+|---|---|---|
+| Hack's exponent | 0.54–0.55 | 0.5–0.6 |
+| Lakes on ice-scoured land / elsewhere | 14–20% / 2–6% | Finland ~10%, the Shield more / a few % |
+| Stream cells, arid / subhumid / humid | 0.6–1.0% / 2.4–3.1% / 3.3–3.9% | densest where wet |
+| Land draining to closed basins | 16–36%, mean ~29% | ~18% |
+| Longest flow path (straight source to mouth) | 95–204 km (31–93 km) | — |
+
+The closed share is high because arid land is closed more often than
+Earth's (62–72% of it here, about half on Earth) while being as common
+(27–29% of land): the base terrain's continental interiors are enclosed.
+The longest rivers exceed the spec's 40–70 km because this world's main
+continents are ~100 km across, not the 34 km the estimate assumed.
 
 ## Consequences
 

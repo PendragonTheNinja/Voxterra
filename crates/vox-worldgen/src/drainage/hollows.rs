@@ -35,7 +35,7 @@ const NONE: u32 = u32::MAX;
 /// lie almost all in arid and semi-arid land — UNEP's index under 0.5;
 /// wetter hollows were cut through long ago, in the wetter climates of the
 /// past and over geological time, so here they are breached as if full.
-const ARID_INDEX: f64 = 0.5;
+const ARID_INDEX: f64 = 0.3;
 
 /// A closed basin's floor this far (blocks) above its lake is salt flat: the
 /// playa its lake floods and leaves.

@@ -280,14 +280,27 @@ becomes an ADR; the simulation itself remains its own milestone.
      erosion (task 2) comes next, before flow speed, the cache and the
      network's Earth comparison, all of which are measured on the eroded
      terrain.
-   - [ ] Flow speed and direction per reach; reservoir or finite.
    - [x] Cached in the world folder (`drainage.cache`, ADR-0019 §6):
      ~28 MB at the default size, loaded in ~50 ms against a ~6.7 s build
      (dev); rebuilt when stale, damaged or another world's. The network is
      packed to ~11 bytes a cell in memory too.
    - [x] ADR-0019 (drainage and the erosion stage) proposed; accepted after
      the owner's walk.
-   - [ ] Network tests over many seeds against Earth (criterion 4).
+   - [x] Network tests over many seeds against Earth (criterion 4):
+     `drainage_survey` (ignored; six seeds) and `the_network_is_earth_like`.
+     Hack's exponent 0.54–0.55; lakes 14–20% of ice-scoured land against
+     2–6% elsewhere; stream density rising from arid to humid. **Closed
+     basins 16–36% of land, mean ~29%** (Earth ~18%): arid land is as
+     common as Earth's but closed more often (62–72% of it, Earth about
+     half) — the base terrain's enclosed interiors; carried to M15
+     (landforms by climate). **Longest rivers 95–204 km**, not 40–70: the
+     main continents are ~100 km across (source to mouth 31–93 km straight).
+     Routing crosses lakes and filled hollows first in, first out (it had
+     snaked: paths were 2–3× their straight length); the closure threshold
+     is an aridity index of 0.3.
+   - [ ] Flow speed and direction per reach, reservoir or finite: derived
+     from the network on demand with the channel geometry of task 3, not
+     stored.
    - Measured before erosion: lakes cover ~27% of ice-scoured land, ~6%
      elsewhere (Earth: ~3.7% of unglaciated land). The excess is the flat,
      noise-pitted continental interior (`LOWLAND_RISE`), deranged until task
@@ -309,13 +322,13 @@ becomes an ADR; the simulation itself remains its own milestone.
      from its saddle into lower hollows (it had been assumed to reach the
      sea); hollows on ground with an aridity index ≥ 0.5 never close; the
      routing takes the steepest way down among cells reached before.
-   - Measured, default world: deepest cut 496 blocks; 23% of land cut 10+
+   - Measured, default world: deepest cut 496 blocks; 20% of land cut 10+
      blocks, 4% 50+; valley depth (ground three cells around less the
-     river) 4 / 17 / 29 / 48 blocks for 0.001 / 0.01 / 0.1 / 1+ m³/s; the
-     steepest slope erosion adds 0.83 over 16 blocks. **27% of land drains
-     to closed basins** (was 78%; Earth ~18%), almost all of it arid. Lakes
-     9.1% of land, salt lakes and flats 1.4%; the largest river 24.5 m³/s.
-     Built in ~5 s at world load (dev build) the first time; cached after.
+     river) 5 / 17 / 29 / 50 blocks for 0.001 / 0.01 / 0.1 / 1+ m³/s; the
+     steepest slope erosion adds 0.82 over 16 blocks. 32% of land drains to
+     closed basins (78% before erosion and the budget's fixes); lakes 11.4%
+     of land, salt lakes and flats 0.8%; the largest river 16.7 m³/s.
+     Built in ~5–7 s at world load the first time; cached after.
    - [ ] Criterion 6 at ground speed: the owner's walk.
 3. Stage-2 channels: polylines, meanders, banks, depth, water levels; the
    fill rule above sea level (ADR); materials.

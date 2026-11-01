@@ -495,6 +495,55 @@ mod tests {
     }
 }
 
+/// The drainage network over many worlds (M14 criterion 4), against Earth:
+/// closed basins, lakes by ground, the longest river, Hack's law, drainage
+/// density by climate.
+///
+/// `cargo test -p vox-worldgen --release drainage_survey -- --ignored
+/// --nocapture`; env `SURVEY_SEEDS` (default 6) and `SURVEY_SIZES`.
+#[cfg(test)]
+mod drainage_survey {
+    use crate::Generator;
+    use vox_core::WorldShape;
+
+    #[test]
+    #[ignore]
+    fn drainage_survey() {
+        let seeds: u64 = std::env::var("SURVEY_SEEDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(6);
+        let sizes: Vec<i64> = std::env::var("SURVEY_SIZES").ok().map_or_else(
+            || vec![WorldShape::DEFAULT.size_x()],
+            |s| s.split(',').filter_map(|v| v.trim().parse().ok()).collect(),
+        );
+        for size in sizes {
+            let shape = WorldShape::new(size, size).expect("a legal size");
+            println!("world {} km:", size / 1000);
+            println!(
+                "  seed           closed  lakes ice/other  longest  Hack  streams arid/sub/humid  largest"
+            );
+            for seed in 0..seeds {
+                let g = Generator::new(seed.wrapping_mul(0x9E37_79B9) ^ 0x7e22ac0de, shape);
+                let s = g.drainage().stats(g.climate());
+                println!(
+                    "  {:#013x}  {:5.1}%  {:5.1}% / {:4.1}%  {:5.0} km  {:.2}  {:4.1}% / {:4.1}% / {:4.1}%  {:5.1} m³/s",
+                    g.seed(),
+                    100.0 * s.endorheic,
+                    100.0 * s.lakes_cold,
+                    100.0 * s.lakes_warm,
+                    s.longest_km,
+                    s.hack,
+                    100.0 * s.density[0],
+                    100.0 * s.density[1],
+                    100.0 * s.density[2],
+                    s.largest
+                );
+            }
+        }
+    }
+}
+
 /// Biome shares over many worlds (M13 criteria 3 and 5): every biome in
 /// every world, in Earth-like proportions.
 ///

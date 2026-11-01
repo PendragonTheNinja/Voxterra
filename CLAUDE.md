@@ -268,17 +268,18 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   differ by slope, discharge and sediment, and visibly flow (a flow map in
   the shader). In progress: tasks 1–2 (`vox_worldgen::drainage`;
   ADR-0019 proposed): the network, lakes, closed basins by water budget and
-  valley erosion are built, and chunks read eroded ground
-  (`Generator::surface`, `GENERATOR_VERSION` 4); the network is cached in the
-  world folder (`drainage.cache`). Next: flow speed per reach, criterion 4
-  over many seeds, then the owner's walk of the eroded terrain. vox-worldgen
-  now 63 tests. No
+  valley erosion are built; chunks read eroded ground (`Generator::surface`,
+  `GENERATOR_VERSION` 4); the network is cached in the world folder
+  (`drainage.cache`); criterion 4 surveyed over six seeds
+  (`drainage_survey`: closed basins high, ~29% vs Earth's 18%, carried to
+  M15). Next: the owner's walk of the eroded terrain, then task 3 (stage-2
+  channels). vox-worldgen now 63 tests. No
   low-end machine exists yet — M12's spec says how to judge low-end
   performance by proxy.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 288, vox-mesh 69, vox-worldgen 54, vox-render 19, vox-app 9
-  passing as of the M13 close, plus the ignored `every_biome_in_every_world`
+  vox-core 288, vox-mesh 69, vox-worldgen 63, vox-render 19, vox-app 9
+  passing (vox-worldgen was 54 at the M13 close), plus the ignored `every_biome_in_every_world`
   and `biome_survey`, run in release), then start the first unchecked item.
 - **Instruments (from M11):** the P key logs a `VIEW` line (exact position,
   angles, window, settings) and a `hole_census` — the frame re-rendered six
