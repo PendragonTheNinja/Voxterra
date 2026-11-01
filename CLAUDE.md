@@ -269,13 +269,18 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   (13 new blocks, per-biome profiles, sea ice, badlands strata,
   `GENERATOR_VERSION` 3); task 4 biome colour (grass tinted from the
   climate map in `climate.wgsl`, ADR-0018 proposed) and LOD materials
-  (`lod_surface`, `mesh_lod_surface`). Next: the owner's walk (task 5) —
-  play, `--bench`, the hole census, then the retro. No low-end machine exists yet —
+  (`lod_surface`, `mesh_lod_surface`); biome edges fray over tens of
+  blocks. Next: the owner's walk (task 5) — a fresh world (version 3
+  refuses version-2 worlds), play on foot and in flight, `--bench`, the
+  hole census — then the retro. Headless renders of biomes come from
+  `specks_scratch::specks` (`SPECK_FULLRES=1 SPECK_LIT=1` for lit full
+  resolution), world maps from `world_map`. No low-end machine exists yet —
   M12's spec says how to judge low-end performance by proxy.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 288, vox-mesh 69, vox-worldgen 53, vox-render 19, vox-app 9
-  passing as of M13 task 4), then start the first unchecked item.
+  vox-core 288, vox-mesh 69, vox-worldgen 54, vox-render 19, vox-app 9
+  passing as of M13 task 4, plus the ignored `every_biome_in_every_world`
+  and `biome_survey`, run in release), then start the first unchecked item.
 - **Instruments (from M11):** the P key logs a `VIEW` line (exact position,
   angles, window, settings) and a `hole_census` — the frame re-rendered six
   ways on the player's GPU with pinholes counted per variant. In the cloud
