@@ -346,6 +346,15 @@ horizon.
      same — a terrain change that would have slipped through unversioned.
      It now also hashes the biome and top block of 4 096 scattered columns,
      and differs with and without the fraying.
+   - **Survey after tasks 3–4 and the fraying (2026-11-01, 24 seeds per
+     size):** every biome in every seed at 32 km and at the default size;
+     shares at the default size as recorded under task 2 (hot desert 6.6%,
+     temperate forest 14.9%, ice sheet 12.1%, …). Walking scale at the
+     default size: ~11 minutes north–south, ~21 east–west; 3–4% of land
+     now lies in stretches under 100 blocks — the fraying's tongues and
+     islands. At 32 km: 2.6 and 9.8 minutes.
+   - Gallery: `docs/gallery/m13/` — the planet's maps before and after, and
+     headless views of five places.
 5. **Owner's walk.** A play session on foot and in flight, judged at walking
    speed, with fixes; `--bench` (criterion 9).
 6. **Retro.**
