@@ -43,6 +43,7 @@ const SALT_FLAT_RISE: i32 = 3;
 
 /// What covers a cell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub enum Cover {
     /// Dry land (rivers run on land).
     Land,
@@ -54,6 +55,19 @@ pub enum Cover {
     SaltLake,
     /// The dry floor of a closed basin, crusted with salt.
     SaltFlat,
+}
+
+impl Cover {
+    /// From its `u8` representation; anything unknown reads as land.
+    pub(super) fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Cover::Sea,
+            2 => Cover::Lake,
+            3 => Cover::SaltLake,
+            4 => Cover::SaltFlat,
+            _ => Cover::Land,
+        }
+    }
 }
 
 /// The water held in the hollows.

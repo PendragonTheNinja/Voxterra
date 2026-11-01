@@ -35,8 +35,10 @@ use vox_core::WorldShape;
 use crate::climate::{ClimateMap, potential_evaporation, runoff, temperature_at};
 use crate::elevation::Elevation;
 
+mod cache;
 mod erosion;
 mod hollows;
+pub use cache::{CacheKey, FORMAT_VERSION as CACHE_FORMAT_VERSION};
 use erosion::Erosion;
 pub use hollows::Cover;
 
@@ -91,26 +93,31 @@ const LAKE_MAX_CELLS_GLACIATED: usize = 200;
 /// as ice-scoured.
 const GLACIATED_BELOW_C: f32 = 2.0;
 
+/// A cell that drains into itself: the sea, a closed basin.
+const HERE: u8 = 8;
+/// The bit of a cell's cover marking a closed basin's sink.
+const SINK: u8 = 0x80;
+
 /// The world's drainage, on a grid of cells, row-major (`j * nx + i`).
 pub struct DrainageMap {
     nx: usize,
     nz: usize,
     cell_x: f64,
     cell_z: f64,
+    // Packed, ~11 bytes a cell (ADR-0019): heights fit the world's vertical
+    // range in an `i16`, a receiver is one of eight directions.
     /// Ground at the cell's centre, blocks.
-    height: Vec<i32>,
+    height: Vec<i16>,
     /// The water surface here if it is a lake, else the river bed: the
     /// ground, cut down where a river breaches a hollow's rim. Never rises
     /// downstream.
-    spill: Vec<i32>,
-    /// Whether the cell is sea: below sea level and part of an ocean.
-    sea: Vec<bool>,
-    /// What covers the cell.
-    cover: Vec<Cover>,
-    /// Whether water ends here without reaching the sea: a closed basin.
-    sink: Vec<bool>,
-    /// The cell this one drains into; itself for the sea.
-    receiver: Vec<u32>,
+    level: Vec<i16>,
+    /// What covers the cell (`Cover as u8`), with [`SINK`] set where water
+    /// ends without reaching the sea: a closed basin.
+    cover: Vec<u8>,
+    /// The way the cell drains: an index into [`neighbours`], or [`HERE`]
+    /// for the sea and closed basins.
+    flow: Vec<u8>,
     /// Water leaving the cell, m³/s.
     discharge: Vec<f32>,
     /// The elevation's erosion stage (task 2).
@@ -133,8 +140,7 @@ impl std::fmt::Debug for DrainageMap {
 impl DrainageMap {
     /// Build the network for one world from its elevation and climate.
     pub fn build(elevation: &Elevation, climate: &ClimateMap, shape: WorldShape) -> Self {
-        let cells = |size: i64| (size / CELL_TARGET).clamp(MIN_CELLS, MAX_CELLS) as usize;
-        let (nx, nz) = (cells(shape.size_x()), cells(shape.size_z()));
+        let (nx, nz) = grid(shape);
         let cell_x = shape.size_x() as f64 / nx as f64;
         let cell_z = shape.size_z() as f64 / nz as f64;
         let centre = |c: usize| {
@@ -261,17 +267,30 @@ impl DrainageMap {
             q[r] += if leaving { q[c].max(0.0) } else { q[c] };
         }
         let discharge: Vec<f32> = q.iter().map(|&v| v.max(0.0) as f32).collect();
+        let narrow = |v: i32| i16::try_from(v).expect("heights fit the world's vertical range");
         Self {
             nx,
             nz,
             cell_x,
             cell_z,
-            height,
-            spill,
-            sea,
-            cover,
-            sink,
-            receiver,
+            height: height.iter().map(|&h| narrow(h)).collect(),
+            level: spill.iter().map(|&h| narrow(h)).collect(),
+            cover: (0..nx * nz)
+                .map(|c| cover[c] as u8 | if sink[c] { SINK } else { 0 })
+                .collect(),
+            flow: (0..nx * nz)
+                .map(|c| {
+                    let r = receiver[c] as usize;
+                    if r == c {
+                        HERE
+                    } else {
+                        neighbours(c, nx, nz)
+                            .iter()
+                            .position(|&nb| nb == r)
+                            .unwrap() as u8
+                    }
+                })
+                .collect(),
             discharge,
             erosion,
             #[cfg(test)]
@@ -300,13 +319,40 @@ impl DrainageMap {
     /// a cell.
     pub fn cell(&self, i: usize, j: usize) -> (i32, i32, f32, (usize, usize)) {
         let c = j * self.nx + i;
-        let r = self.receiver[c] as usize;
+        let r = self.receiver_of(c);
         (
-            self.height[c],
-            self.spill[c],
+            self.h(c),
+            self.lvl(c),
             self.discharge[c],
             (r % self.nx, r / self.nx),
         )
+    }
+
+    fn h(&self, c: usize) -> i32 {
+        i32::from(self.height[c])
+    }
+
+    fn lvl(&self, c: usize) -> i32 {
+        i32::from(self.level[c])
+    }
+
+    fn receiver_of(&self, c: usize) -> usize {
+        match self.flow[c] {
+            HERE => c,
+            d => neighbours(c, self.nx, self.nz)[d as usize],
+        }
+    }
+
+    fn cover_at(&self, c: usize) -> Cover {
+        Cover::from_u8(self.cover[c] & !SINK)
+    }
+
+    fn sea_at(&self, c: usize) -> bool {
+        self.cover_at(c) == Cover::Sea
+    }
+
+    fn sink_at(&self, c: usize) -> bool {
+        self.cover[c] & SINK != 0
     }
 
     /// What erosion took from the base elevation at the cell's centre,
@@ -325,7 +371,7 @@ impl DrainageMap {
 
     /// Whether the cell is sea.
     pub fn is_sea(&self, i: usize, j: usize) -> bool {
-        self.sea[j * self.nx + i]
+        self.sea_at(j * self.nx + i)
     }
 
     /// Whether the cell is under a lake, fresh or salt.
@@ -335,12 +381,12 @@ impl DrainageMap {
 
     /// What covers the cell.
     pub fn cover(&self, i: usize, j: usize) -> Cover {
-        self.cover[j * self.nx + i]
+        self.cover_at(j * self.nx + i)
     }
 
     /// Whether water ends in the cell without reaching the sea.
     pub fn is_sink(&self, i: usize, j: usize) -> bool {
-        self.sink[j * self.nx + i]
+        self.sink_at(j * self.nx + i)
     }
 
     /// For every cell, row-major: whether its water ends in a closed basin
@@ -353,9 +399,9 @@ impl DrainageMap {
         for start in 0..n {
             let mut at = start;
             while end[at] == 0 {
-                let r = self.receiver[at] as usize;
+                let r = self.receiver_of(at);
                 if r == at {
-                    end[at] = if self.sink[at] { 2 } else { 1 };
+                    end[at] = if self.sink_at(at) { 2 } else { 1 };
                     break;
                 }
                 path.push(at);
@@ -368,6 +414,12 @@ impl DrainageMap {
         }
         end.into_iter().map(|e| e == 2).collect()
     }
+}
+
+/// Cells per axis of a world's drainage grid.
+fn grid(shape: WorldShape) -> (usize, usize) {
+    let cells = |size: i64| (size / CELL_TARGET).clamp(MIN_CELLS, MAX_CELLS) as usize;
+    (cells(shape.size_x()), cells(shape.size_z()))
 }
 
 /// The level of the water in every cell: a lake's surface, and elsewhere
@@ -542,32 +594,32 @@ mod tests {
         for j in 0..nz {
             for i in 0..nx {
                 let c = j * nx + i;
-                let r = d.receiver[c] as usize;
-                if d.sea[c] {
+                let r = d.receiver_of(c);
+                if d.sea_at(c) {
                     assert_eq!(r, c, "the sea is its own outlet");
                     continue;
                 }
-                if d.sink[c] {
+                if d.sink_at(c) {
                     assert_eq!(r, c, "a closed basin is its own outlet");
-                    assert!(d.spill[c] >= d.height[c], "a closed basin above its ground");
+                    assert!(d.lvl(c) >= d.h(c), "a closed basin above its ground");
                     continue;
                 }
                 assert!(neighbours(c, nx, nz).contains(&r), "receiver not adjacent");
-                assert!(d.spill[r] <= d.spill[c], "water runs uphill at ({i}, {j})");
+                assert!(d.lvl(r) <= d.lvl(c), "water runs uphill at ({i}, {j})");
                 if d.is_lake(i, j) {
-                    assert!(d.spill[c] > d.height[c], "a lake with no depth");
+                    assert!(d.lvl(c) > d.h(c), "a lake with no depth");
                 } else {
-                    assert!(d.spill[c] <= d.height[c], "a river bed above its ground");
+                    assert!(d.lvl(c) <= d.h(c), "a river bed above its ground");
                 }
                 let mut at = c;
                 for _ in 0..nx * nz {
-                    if d.sea[at] || d.sink[at] {
+                    if d.sea_at(at) || d.sink_at(at) {
                         break;
                     }
-                    at = d.receiver[at] as usize;
+                    at = d.receiver_of(at);
                 }
                 assert!(
-                    d.sea[at] || d.sink[at],
+                    d.sea_at(at) || d.sink_at(at),
                     "({i}, {j}) never reaches the sea or a closed basin"
                 );
             }
@@ -583,14 +635,14 @@ mod tests {
         let (runoff, demand) = &d.budget;
         let arrives: f64 = (0..n)
             .filter(|&c| {
-                let r = d.receiver[c] as usize;
-                !d.sea[c] && (d.sea[r] && r != c || d.sink[c])
+                let r = d.receiver_of(c);
+                !d.sea_at(c) && (d.sea_at(r) && r != c || d.sink_at(c))
             })
             .map(|c| f64::from(d.discharge[c]))
             .sum();
         let shed: f64 = runoff.iter().sum();
         let lakes: f64 = (0..n)
-            .filter(|&c| d.cover[c] == Cover::Lake)
+            .filter(|&c| d.cover_at(c) == Cover::Lake)
             .map(|c| demand[c])
             .sum();
         assert!(shed > 0.0);
@@ -615,14 +667,14 @@ mod tests {
         for j in 0..nz {
             for i in 0..nx {
                 let c = j * nx + i;
-                if d.sea[c] {
+                if d.sea_at(c) {
                     continue;
                 }
                 let x = ((i as f64 + 0.5) * cw) as i64;
                 let z = ((j as f64 + 0.5) * ch) as i64;
                 let (t0, _) = climate.sample(x, z);
                 let lake = u32::from(d.is_lake(i, j));
-                if temperature_at(t0, i64::from(d.height[c].max(0))) < GLACIATED_BELOW_C {
+                if temperature_at(t0, i64::from(d.h(c).max(0))) < GLACIATED_BELOW_C {
                     cold += 1;
                     cold_lake += lake;
                 } else {
@@ -641,11 +693,85 @@ mod tests {
         );
     }
 
+    /// Criterion 6: rivers sit in valleys that deepen downstream — the
+    /// more water, the deeper the cut — and the valley sides erosion makes
+    /// stay walkable.
+    #[test]
+    fn valleys_deepen_downstream_and_stay_walkable() {
+        let d = small(11);
+        let (nx, nz) = d.cells();
+        // Valley depth: the ground three cells around, less the river's
+        // own level — by discharge, a decade at a time, where water runs.
+        let mut bins = [(0.0f64, 0u32); 4];
+        for j in 0..nz {
+            for i in 0..nx {
+                let c = j * nx + i;
+                let q = d.discharge[c];
+                if d.sea_at(c) || d.cover_at(c) != Cover::Land || q < 0.001 {
+                    continue;
+                }
+                let mut around = 0.0f64;
+                for (di, dj) in [
+                    (3, 0),
+                    (-3, 0),
+                    (0, 3),
+                    (0, -3),
+                    (2, 2),
+                    (-2, 2),
+                    (2, -2),
+                    (-2, -2),
+                ] {
+                    let ii = (i as isize + di).rem_euclid(nx as isize) as usize;
+                    let jj = (j as isize + dj).rem_euclid(nz as isize) as usize;
+                    around += f64::from(d.h(jj * nx + ii).max(0));
+                }
+                let b = if q < 0.01 {
+                    0
+                } else if q < 0.1 {
+                    1
+                } else if q < 1.0 {
+                    2
+                } else {
+                    3
+                };
+                bins[b].0 += around / 8.0 - f64::from(d.lvl(c));
+                bins[b].1 += 1;
+            }
+        }
+        let mean: Vec<f64> = bins
+            .iter()
+            .map(|(s, k)| s / f64::from((*k).max(1)))
+            .collect();
+        eprintln!("valley depth by discharge decade: {mean:?} over {bins:?}");
+        for w in mean.windows(2) {
+            assert!(
+                w[1] > w[0],
+                "a larger river's valley is no deeper: {mean:?}"
+            );
+        }
+        // The steepest slope the cutting adds, along both axes, over one
+        // 16-block step: no worse than a steep hillside.
+        let (cw, _) = d.cell_blocks();
+        let span = (nx as f64 * cw) as i64;
+        let mut steepest = 0.0f32;
+        for z in (0..span).step_by(173) {
+            for x in (0..span).step_by(16) {
+                let (xf, zf) = (x as f64, z as f64);
+                let here = d.erosion_at(xf, zf);
+                steepest = steepest
+                    .max((d.erosion_at(xf + 16.0, zf) - here).abs() / 16.0)
+                    .max((d.erosion_at(xf, zf + 16.0) - here).abs() / 16.0);
+            }
+        }
+        eprintln!("steepest slope erosion adds: {steepest:.2}");
+        assert!(steepest < 1.0, "erosion adds a slope of {steepest:.2}");
+    }
+
     #[test]
     fn the_network_is_deterministic() {
         let (a, b) = (small(9), small(9));
-        assert_eq!(a.receiver, b.receiver);
-        assert_eq!(a.spill, b.spill);
+        assert_eq!(a.flow, b.flow);
+        assert_eq!(a.level, b.level);
         assert!(
             a.discharge
                 .iter()

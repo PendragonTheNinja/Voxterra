@@ -725,6 +725,21 @@ impl Default for App {
             climate,
             started.elapsed().as_secs_f64() * 1000.0
         );
+        // Stage-1 drainage and the erosion stage (M14, ADR-0019): every
+        // surface query reads them, so they too are made ready here, before
+        // the first chunk — from the world folder's cache when it holds this
+        // world's network, else built and cached for next time.
+        let started = Instant::now();
+        let (drainage, source) = generator.drainage_cached(store.root());
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        match source {
+            vox_worldgen::DrainageSource::BuiltUnsaved(e) => {
+                log::warn!(
+                    "drainage network: {drainage:?} built in {ms:.0} ms; cache not written: {e}"
+                )
+            }
+            source => log::info!("drainage network: {drainage:?} ({source:?}) in {ms:.0} ms"),
+        }
         let (spawn_x, spawn_z) = vox_core::find_spawn(
             shape,
             0,

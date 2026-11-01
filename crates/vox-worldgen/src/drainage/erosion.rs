@@ -45,12 +45,12 @@ const MAX_WALL_SLOPE: f64 = 0.6;
 
 /// The erosion stage: the change erosion made, on its own grid.
 pub(super) struct Erosion {
-    nx: usize,
-    nz: usize,
-    cell_x: f64,
-    cell_z: f64,
+    pub(super) nx: usize,
+    pub(super) nz: usize,
+    pub(super) cell_x: f64,
+    pub(super) cell_z: f64,
     /// Blocks, never positive, at each cell's centre.
-    delta: Vec<f32>,
+    pub(super) delta: Vec<f32>,
 }
 
 impl Erosion {

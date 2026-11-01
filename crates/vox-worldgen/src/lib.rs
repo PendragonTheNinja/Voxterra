@@ -26,10 +26,12 @@ pub mod elevation;
 mod map;
 pub mod materials;
 
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use biome::Column;
 use climate::ClimateMap;
+use drainage::DrainageMap;
 use elevation::Elevation;
 use vox_core::{BlockId, CHUNK_SIZE, Chunk, ChunkPos, LocalPos, SEA_LEVEL_BLOCKS, WorldShape};
 
@@ -69,6 +71,23 @@ pub struct Generator {
     shape: WorldShape,
     elevation: Elevation,
     climate: Arc<OnceLock<ClimateMap>>,
+    drainage: Arc<OnceLock<DrainageMap>>,
+}
+
+/// The drainage network's cache, in the world folder (ADR-0019 §6).
+pub const DRAINAGE_CACHE_FILE: &str = "drainage.cache";
+
+/// Where [`Generator::drainage_cached`] got the network.
+#[derive(Debug)]
+pub enum DrainageSource {
+    /// Read from the world folder's cache.
+    Cache,
+    /// Built, and the cache written.
+    Built,
+    /// Built, but the cache could not be written.
+    BuiltUnsaved(std::io::Error),
+    /// This generator already had it.
+    AlreadyBuilt,
 }
 
 /// Version of the terrain this generator produces for a given seed and world
@@ -89,7 +108,9 @@ pub struct Generator {
 /// worlds short of mountain ranges widen their belts (elevation's
 /// `calibrate_ranges`; worlds of the default size and larger keep their
 /// heights exactly).
-pub const GENERATOR_VERSION: u32 = 3;
+/// 4 — valleys (M14 task 2): the surface is cut by the erosion stage, river
+/// valleys carved by stream power from the drainage network.
+pub const GENERATOR_VERSION: u32 = 4;
 
 impl Generator {
     /// A generator for one world: its seed and its size. The size is part of
@@ -101,6 +122,7 @@ impl Generator {
             shape,
             elevation: Elevation::new(seed, shape),
             climate: Arc::new(OnceLock::new()),
+            drainage: Arc::new(OnceLock::new()),
         }
     }
 
@@ -112,11 +134,63 @@ impl Generator {
             .get_or_init(|| ClimateMap::build(&self.elevation, self.shape))
     }
 
+    /// The world's drainage network and erosion stage (M14), built on first
+    /// use after the climate it needs (a few seconds at the default size)
+    /// and shared by every clone. Call it once at world load, with
+    /// [`Self::climate`], so the cost is paid there.
+    pub fn drainage(&self) -> &DrainageMap {
+        self.drainage
+            .get_or_init(|| DrainageMap::build(&self.elevation, self.climate(), self.shape))
+    }
+
+    /// [`Self::drainage`], read from the world folder's cache when it holds
+    /// this world's network (ADR-0019 §6), else built and written there for
+    /// next time. A cache that is missing, stale or damaged costs a rebuild,
+    /// never wrong terrain; one that cannot be written costs the next load a
+    /// rebuild, nothing more.
+    pub fn drainage_cached(&self, folder: &Path) -> (&DrainageMap, DrainageSource) {
+        let path = folder.join(DRAINAGE_CACHE_FILE);
+        let key = drainage::CacheKey {
+            seed: self.seed,
+            shape: self.shape,
+            generator_version: GENERATOR_VERSION,
+        };
+        let mut source = DrainageSource::AlreadyBuilt;
+        let map = self.drainage.get_or_init(|| {
+            if let Ok(bytes) = std::fs::read(&path)
+                && let Some(map) = DrainageMap::from_cache_bytes(&bytes, key)
+            {
+                source = DrainageSource::Cache;
+                return map;
+            }
+            let map = DrainageMap::build(&self.elevation, self.climate(), self.shape);
+            let tmp = path.with_extension("tmp");
+            source = match std::fs::write(&tmp, map.to_cache_bytes(key))
+                .and_then(|()| std::fs::rename(&tmp, &path))
+            {
+                Ok(()) => DrainageSource::Built,
+                Err(e) => DrainageSource::BuiltUnsaved(e),
+            };
+            map
+        });
+        (map, source)
+    }
+
+    /// The surface at a column: the elevation field's, cut by the erosion
+    /// stage (M14). THE surface: chunks, the LOD and every readout take it
+    /// from here; climate alone reads the uneroded base (ADR-0017).
+    pub fn surface(&self, wx: i64, wz: i64) -> elevation::Surface {
+        let mut s = self.elevation.surface(wx, wz);
+        let cut = self.drainage().erosion_at(wx as f64, wz as f64);
+        s.height += cut.round() as i64;
+        s
+    }
+
     /// A column's surface, climate and biome (M13): the single place they
     /// are put together, so the chunk generator, the LOD sampler and the
     /// player's readout agree on every column.
     pub fn column(&self, wx: i64, wz: i64) -> Column {
-        self.column_with(wx, wz, self.elevation.surface(wx, wz))
+        self.column_with(wx, wz, self.surface(wx, wz))
     }
 
     /// [`Self::column`] for a surface already computed.
@@ -148,9 +222,10 @@ impl Generator {
         self.shape
     }
 
-    /// The elevation field backing [`Self::surface_height`]. Exposed so callers
-    /// can query individual stages (debug views, tuning) without duplicating
-    /// the composition.
+    /// The base elevation field, before the erosion stage
+    /// [`Self::surface`] adds. Exposed so callers can query individual
+    /// stages (debug views, tuning, climate) without duplicating the
+    /// composition.
     pub fn elevation(&self) -> &Elevation {
         &self.elevation
     }
@@ -161,13 +236,13 @@ impl Generator {
 
     /// Surface height (the Y of the topmost solid/grass block) at world
     /// column (wx, wz), which may be on any lap of the world. See
-    /// [`Elevation::height`].
+    /// [`Self::surface`].
     ///
     /// Independent of Y and of chunk boundaries — two chunks stacked
     /// vertically compute the same surface for the same column, which is
     /// what keeps cubic chunks seamless.
     pub fn surface_height(&self, wx: i64, wz: i64) -> i64 {
-        self.elevation.height(wx, wz)
+        self.surface(wx, wz).height
     }
 
     /// The inclusive chunk-Y span of the terrain surface across one chunk
@@ -212,7 +287,7 @@ impl Generator {
         let mut max_surface = i64::MIN;
         for lz in 0..n {
             for lx in 0..n {
-                let s = self.elevation.surface(origin.x + lx, origin.z + lz);
+                let s = self.surface(origin.x + lx, origin.z + lz);
                 min_surface = min_surface.min(s.height);
                 max_surface = max_surface.max(s.height);
                 surfaces.push(s);
@@ -358,7 +433,7 @@ impl Generator {
                 for pz in 0..probes {
                     for px in 0..probes {
                         let (x, z) = (bx + px * step, bz + pz * step);
-                        let s = self.elevation.surface(x, z);
+                        let s = self.surface(x, z);
                         if s.height < lowest.0 {
                             lowest = (s.height, x, z, Some(s));
                         }
@@ -665,6 +740,109 @@ mod tests {
         }
     }
 
+    /// The erosion stage (M14 task 2) is part of the torus: the same on
+    /// every lap, continuous across the seam — and the drainage network's
+    /// ground is the generator's own surface, so the rivers it routes run
+    /// on the ground the chunks are made of.
+    #[test]
+    fn the_erosion_stage_wraps_and_is_the_networks_ground() {
+        let shape = WorldShape::new(65_536, 65_536).unwrap();
+        let g = Generator::new(0xE20_5104, shape);
+        let d = g.drainage();
+        let (sx, sz) = (shape.size_x(), shape.size_z());
+        let (nx, nz) = d.cells();
+        let (cw, ch) = d.cell_blocks();
+        for j in (0..nz).step_by(7) {
+            for i in (0..nx).step_by(5) {
+                let x = ((i as f64 + 0.5) * cw).floor() as i64;
+                let z = ((j as f64 + 0.5) * ch).floor() as i64;
+                assert_eq!(i64::from(d.cell(i, j).0), g.surface_height(x, z));
+            }
+        }
+        let mut cut_somewhere = false;
+        for z in (0..sz).step_by(97) {
+            let zf = z as f64;
+            let (last, first) = (
+                d.erosion_at((sx - 1) as f64, zf),
+                d.erosion_at(sx as f64, zf),
+            );
+            assert!(
+                (last - first).abs() < 2.0,
+                "the cut jumps at the seam, z = {z}"
+            );
+            for x in [5, 20_000, 40_001] {
+                let here = d.erosion_at(x as f64, zf);
+                assert!(here <= 0.0, "erosion only lowers");
+                cut_somewhere |= here < -10.0;
+                assert_eq!(here, d.erosion_at((x + sx) as f64, zf + sz as f64));
+                assert_eq!(here, d.erosion_at((x - 3 * sx) as f64, zf));
+            }
+        }
+        assert!(cut_somewhere, "no valleys at all");
+    }
+
+    /// The world folder's drainage cache (ADR-0019 §6): the first load
+    /// builds and writes it, the next reads it, and the terrain is the same
+    /// either way.
+    #[test]
+    fn the_drainage_cache_is_written_then_read() {
+        let dir = std::env::temp_dir().join(format!("voxterra-drainage-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shape = WorldShape::new(32_768, 32_768).unwrap();
+        let first = Generator::new(0xCAC4E, shape);
+        assert!(matches!(
+            first.drainage_cached(&dir).1,
+            DrainageSource::Built
+        ));
+        assert!(dir.join(DRAINAGE_CACHE_FILE).exists());
+        assert!(matches!(
+            first.drainage_cached(&dir).1,
+            DrainageSource::AlreadyBuilt
+        ));
+        let second = Generator::new(0xCAC4E, shape);
+        assert!(matches!(
+            second.drainage_cached(&dir).1,
+            DrainageSource::Cache
+        ));
+        for k in 0..64i64 {
+            let (x, z) = (k * 257 - 3_000, k * 911 + 17);
+            assert_eq!(first.surface(x, z), second.surface(x, z));
+        }
+        // Another world in the same folder does not take it.
+        let other = Generator::new(0xCAC4F, shape);
+        assert!(matches!(
+            other.drainage_cached(&dir).1,
+            DrainageSource::Built
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Measures the cache at the default size: run with `--ignored
+    /// --nocapture` (release) for its file size and load time.
+    #[test]
+    #[ignore]
+    fn drainage_cache_cost() {
+        let dir = std::env::temp_dir().join(format!("voxterra-cost-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let g = Generator::new(0x0007_E22A_C0DE, WorldShape::DEFAULT);
+        g.climate();
+        let t = std::time::Instant::now();
+        let (_, s) = g.drainage_cached(&dir);
+        println!("{s:?} in {:.0} ms", t.elapsed().as_secs_f64() * 1000.0);
+        let bytes = std::fs::metadata(dir.join(DRAINAGE_CACHE_FILE))
+            .unwrap()
+            .len();
+        let h = Generator::new(0x0007_E22A_C0DE, WorldShape::DEFAULT);
+        let t = std::time::Instant::now();
+        let (_, s) = h.drainage_cached(&dir);
+        println!(
+            "{s:?} in {:.0} ms; file {:.1} MB",
+            t.elapsed().as_secs_f64() * 1000.0,
+            bytes as f64 / 1e6
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Chunks far above any surface are all air and stored uniformly.
     #[test]
     fn high_chunks_are_uniform_air() {
@@ -767,7 +945,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (3, 0x2aa0_d40d_66be_1ede);
+        const PINNED: (u32, u64) = (4, 0xfcaf_3b0e_762e_bac1);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),

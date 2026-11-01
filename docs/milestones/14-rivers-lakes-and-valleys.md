@@ -281,7 +281,12 @@ becomes an ADR; the simulation itself remains its own milestone.
      network's Earth comparison, all of which are measured on the eroded
      terrain.
    - [ ] Flow speed and direction per reach; reservoir or finite.
-   - [ ] Cached in the world folder; the ADR for the drainage stage.
+   - [x] Cached in the world folder (`drainage.cache`, ADR-0019 §6):
+     ~28 MB at the default size, loaded in ~50 ms against a ~6.7 s build
+     (dev); rebuilt when stale, damaged or another world's. The network is
+     packed to ~11 bytes a cell in memory too.
+   - [x] ADR-0019 (drainage and the erosion stage) proposed; accepted after
+     the owner's walk.
    - [ ] Network tests over many seeds against Earth (criterion 4).
    - Measured before erosion: lakes cover ~27% of ice-scoured land, ~6%
      elsewhere (Earth: ~3.7% of unglaciated land). The excess is the flat,
@@ -289,6 +294,29 @@ becomes an ADR; the simulation itself remains its own milestone.
      2's erosion cuts it; re-measure then.
 2. Valley erosion on the stage-1 grid, fed back as the elevation field's
    erosion stage (criterion 6).
+   - [x] Erosion (`drainage::erosion`): implicit stream power (Braun &
+     Willett, 2013; `m = ½`) on a grid of 2×2 drainage cells (256 blocks),
+     8 passes of route-then-incise, driven by discharge with a paleo floor
+     of 100 mm/yr (valleys are older than today's climate); valley sides
+     erosion leaves steeper than 0.6 retreat to it, slopes it did not make
+     are untouched. `Generator::surface` adds the cut, bilinear, to the
+     base: chunks, the LOD and readouts read eroded ground; climate reads
+     the base. `GENERATOR_VERSION` 4.
+   - [x] The water balance it needed: potential evaporation from
+     temperature (0 below −6 °C, ~720 mm at 10 °C, ~1 400 at 25 °C), runoff
+     by the Budyko curve (Pike, 1964), lake evaporation 1.2× potential.
+   - [x] The budget fixed: overflow onto draining ground runs on downhill
+     from its saddle into lower hollows (it had been assumed to reach the
+     sea); hollows on ground with an aridity index ≥ 0.5 never close; the
+     routing takes the steepest way down among cells reached before.
+   - Measured, default world: deepest cut 496 blocks; 23% of land cut 10+
+     blocks, 4% 50+; valley depth (ground three cells around less the
+     river) 4 / 17 / 29 / 48 blocks for 0.001 / 0.01 / 0.1 / 1+ m³/s; the
+     steepest slope erosion adds 0.83 over 16 blocks. **27% of land drains
+     to closed basins** (was 78%; Earth ~18%), almost all of it arid. Lakes
+     9.1% of land, salt lakes and flats 1.4%; the largest river 24.5 m³/s.
+     Built in ~5 s at world load (dev build) the first time; cached after.
+   - [ ] Criterion 6 at ground speed: the owner's walk.
 3. Stage-2 channels: polylines, meanders, banks, depth, water levels; the
    fill rule above sea level (ADR); materials.
 4. Lakes, salt flats, floodplains, wetlands, deltas, waterfalls; the new
