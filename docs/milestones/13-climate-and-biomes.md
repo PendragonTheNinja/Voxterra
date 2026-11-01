@@ -13,8 +13,9 @@ horizon, so climate belts are visible tens of kilometres off) and M12
 2026-11-01 from `docs/vision.md` §1.1 and §10.1, with the biome catalogue in
 `docs/biomes.md`.
 
-**Status: draft, for the owner's review.** Nothing is built until the owner
-approves the catalogue and answers the open questions at the end.
+**Status: draft.** The owner answered four of the five open questions
+(2026-11-01; recorded at the end). Nothing is built until the catalogue
+(`docs/biomes.md`) is approved.
 
 ## Why this milestone exists
 
@@ -58,6 +59,33 @@ and altitude, relief and the coast pick the terrain-shaped biomes (alpine,
 badlands, beaches) that share a climate with their neighbours but not their
 ground (§10.1). A biome sets the column's **surface materials** — top block,
 the layer beneath and its depth, the seabed, sea ice — and its **colour**.
+
+## Biomes and the shape of the land
+
+The owner's point (2026-11-01): two different biomes should not differ only
+in soil and colour — the land itself has a different shape in a desert, a
+rainforest or a glaciated range. That is true of Earth, and the causation is
+worth stating, because it decides what M13 builds and what comes after:
+
+- **The land comes first, and makes the climate.** Mountains, coasts and
+  continental interiors (the M10 elevation field) decide where it rains and
+  where it is cold — the rain shadow behind a range, the dry interior of a
+  continent. M13 builds this direction.
+- **Then the climate reshapes the land, through erosion.** Under a dry
+  climate rock weathers into mesas, buttes, canyons and dune seas; under a
+  wet one hills wear round and valleys branch densely; under ice, glaciers
+  carve U-shaped valleys, fjords, cirques and sharp horns. Earth's biomes
+  look different largely *because* of this. It is the **hydrology & erosion**
+  milestone that follows M13, and it reads M13's climate maps — temperature
+  and precipitation are exactly its inputs.
+- So **M13 paints biomes on today's terrain**; the next milestone lets each
+  climate carve its own landforms. Biome-specific landforms are therefore a
+  non-goal here by the owner's choice, not an omission — and the climate
+  maps are built so erosion can read them.
+
+As close to real life as possible while still making sense as a game
+(the owner's standing rule; ADR-0010): mechanisms real, dimensions chosen for
+play.
 
 ## The architecture this needs
 
@@ -174,8 +202,9 @@ horizon.
 
 ## Non-goals
 
-- **Vegetation** — trees, plants, crops — unless the owner pulls it in (open
-  question 4). The catalogue records what will grow where.
+- **Vegetation** — trees, plants, crops — its own milestone after block
+  shapes, as proposed (owner, 2026-11-01). The catalogue records what will
+  grow where.
 - **Rivers, lakes above sea level, erosion, wetlands** — hydrology is the
   next step and needs this milestone's precipitation.
 - **Strata, caves, ores** — geology.
@@ -185,7 +214,9 @@ horizon.
 - **World-creation sliders** — any climate constant stays a constant; the
   settings screen comes once its systems exist (§1.2).
 - **Block shapes and slopes** — their own milestone, after surfaces settle.
-- **Biome landforms** beyond the one the owner may choose (open question 5).
+- **Biome landforms** — dunes, mesas, canyons, glacial valleys — come with
+  hydrology & erosion, shaped by this milestone's climate (owner,
+  2026-11-01; see "Biomes and the shape of the land").
 
 ## Notes for whoever builds this
 
@@ -203,21 +234,15 @@ horizon.
 - Measure chunk generation under streaming (lesson 6): uniform chunks must
   stay O(1) — a buried-rock chunk should not classify 1 024 columns.
 
-## Open questions for the owner
+## Decisions (owner, 2026-11-01)
 
-1. **The catalogue** (`docs/biomes.md`): 16 land biomes, 3 coasts, 4 seas.
-   Add, remove or rename before it is fixed?
-2. **How cold mountains get.** Exaggerating altitude cooling puts snow on
-   peaks and alpine meadows below them; the cost is that a 300-block hill in
-   the temperate belt is noticeably cooler — taiga on high plateaus. The
-   recommendation is the snowline targets in criterion 4.
-3. **Biome colour:** a smooth climate tint in the shader (recommended), or
-   distinct grass blocks per biome group?
-4. **Trees.** Without vegetation a rainforest and a savanna differ only in
-   soil and grass colour; forests are where biomes look most different.
-   Keep vegetation for its own milestone after block shapes, as proposed in
-   §9, or bring simple trees forward into M13 (and with them a question for
-   the LOD, which draws heights and cannot show a canopy yet)?
-5. **One signature landform** to prove "biomes blended as heights" (§10.1) —
-   desert dunes, say — in M13, or all landforms with hydrology and erosion,
-   which reshapes the terrain anyway?
+1. **The catalogue** (`docs/biomes.md`) — *open*: awaiting the owner's
+   approval or changes.
+2. **Mountains are cold enough for snow:** altitude cooling exaggerated to
+   criterion 4's snowline targets, accepting cooler high plateaus.
+3. **Biome colour is a smooth climate tint in the shader** — option (a) of
+   "The architecture this needs"; ADR-0018 settles how the shader addresses
+   the periodic map.
+4. **Vegetation stays its own milestone**, after block shapes.
+5. **No landforms in M13**: they come from erosion under each climate in the
+   hydrology & erosion milestone.
