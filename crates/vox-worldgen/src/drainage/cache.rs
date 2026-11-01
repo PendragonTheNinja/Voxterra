@@ -104,6 +104,7 @@ impl DrainageMap {
             return None;
         }
         Some(Self {
+            id: super::next_id(),
             nx,
             nz,
             cell_x,

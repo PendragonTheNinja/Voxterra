@@ -88,7 +88,7 @@ impl Erosion {
         }
         let start = h.clone();
         let (cell_x, cell_z) = (cell.0 * 2.0, cell.1 * 2.0);
-        let diagonal = cell_x.hypot(cell_z);
+        let diagonal = (cell_x * cell_x + cell_z * cell_z).sqrt(); // sqrt, not hypot: exact everywhere
         let step = |a: usize, b: usize| {
             if a % nx == b % nx {
                 cell_z

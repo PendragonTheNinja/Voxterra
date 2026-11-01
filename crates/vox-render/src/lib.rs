@@ -2226,6 +2226,9 @@ fn tile_pixels(layer: u32, tile: u32) -> Vec<u8> {
         r::L_PODZOL => ([106, 80, 52], Grain::Clumped(18)),
         r::L_CLAY => ([158, 162, 176], Grain::Fine(6)),
         r::L_MUD => ([82, 70, 62], Grain::Fine(8)),
+        r::L_SILT => ([140, 128, 106], Grain::Fine(7)),
+        r::L_SALT => ([236, 234, 226], Grain::Fine(6)),
+        r::L_RIVER_GRAVEL => ([122, 118, 112], Grain::Clumped(26)),
         _ => ([255, 0, 255], Grain::Fine(0)), // magenta = missing
     };
     // Only water is see-through.

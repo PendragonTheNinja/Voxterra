@@ -31,7 +31,7 @@ use std::sync::{Arc, OnceLock};
 
 use biome::Column;
 use climate::ClimateMap;
-use drainage::DrainageMap;
+use drainage::{Body, DrainageMap, Water};
 use elevation::Elevation;
 use vox_core::{BlockId, CHUNK_SIZE, Chunk, ChunkPos, LocalPos, SEA_LEVEL_BLOCKS, WorldShape};
 
@@ -72,6 +72,14 @@ pub struct Generator {
     elevation: Elevation,
     climate: Arc<OnceLock<ClimateMap>>,
     drainage: Arc<OnceLock<DrainageMap>>,
+}
+
+/// The top of a column's standing water, or `i64::MIN` where it has none.
+fn wet_top(w: &Water) -> i64 {
+    match w.body {
+        Body::River(_) | Body::Lake | Body::SaltLake => w.level,
+        Body::Dry | Body::SaltFlat => i64::MIN,
+    }
 }
 
 /// The drainage network's cache, in the world folder (ADR-0019 §6).
@@ -180,6 +188,24 @@ impl Generator {
     /// stage (M14). THE surface: chunks, the LOD and every readout take it
     /// from here; climate alone reads the uneroded base (ADR-0017).
     pub fn surface(&self, wx: i64, wz: i64) -> elevation::Surface {
+        self.ground(wx, wz).0
+    }
+
+    /// The surface and the water on it (M14): the eroded ground, its river
+    /// channels cut and their banks shaped, and the river, lake or salt
+    /// flat the column holds.
+    pub fn ground(&self, wx: i64, wz: i64) -> (elevation::Surface, Water) {
+        let mut s = self.eroded_surface(wx, wz);
+        let (h, water) = self.drainage().shape_column(wx, wz, s.height, |x, z, l| {
+            self.elevation.meander_warp(x, z, l)
+        });
+        s.height = h;
+        (s, water)
+    }
+
+    /// The elevation field cut by the erosion stage, before rivers shape
+    /// it: the ground the drainage network was built on.
+    pub fn eroded_surface(&self, wx: i64, wz: i64) -> elevation::Surface {
         let mut s = self.elevation.surface(wx, wz);
         let cut = self.drainage().erosion_at(wx as f64, wz as f64);
         s.height += cut.round() as i64;
@@ -190,11 +216,16 @@ impl Generator {
     /// are put together, so the chunk generator, the LOD sampler and the
     /// player's readout agree on every column.
     pub fn column(&self, wx: i64, wz: i64) -> Column {
-        self.column_with(wx, wz, self.surface(wx, wz))
+        self.column_with(wx, wz, self.ground(wx, wz))
     }
 
-    /// [`Self::column`] for a surface already computed.
-    fn column_with(&self, wx: i64, wz: i64, surface: elevation::Surface) -> Column {
+    /// [`Self::column`] for a surface and water already computed.
+    fn column_with(
+        &self,
+        wx: i64,
+        wz: i64,
+        (surface, water): (elevation::Surface, Water),
+    ) -> Column {
         let (sea_level_c, precip) = self.climate().sample(wx, wz);
         let mut col = biome::classify(
             surface,
@@ -203,6 +234,7 @@ impl Generator {
             self.elevation.boundary_noise(wx, wz),
         );
         col.patch = self.elevation.patch_noise(wx, wz);
+        col.water = water;
         col
     }
 
@@ -287,10 +319,12 @@ impl Generator {
         let mut max_surface = i64::MIN;
         for lz in 0..n {
             for lx in 0..n {
-                let s = self.surface(origin.x + lx, origin.z + lz);
-                min_surface = min_surface.min(s.height);
-                max_surface = max_surface.max(s.height);
-                surfaces.push(s);
+                let g = self.ground(origin.x + lx, origin.z + lz);
+                min_surface = min_surface.min(g.0.height);
+                // Rivers and lakes stand above the ground: the chunk is not
+                // all air below their surface.
+                max_surface = max_surface.max(g.0.height).max(wet_top(&g.1));
+                surfaces.push(g);
             }
         }
 
@@ -317,15 +351,17 @@ impl Generator {
         let mut chunk = Chunk::new_air();
         for lz in 0..CHUNK_SIZE as u8 {
             for lx in 0..CHUNK_SIZE as u8 {
-                let s = surfaces[lz as usize * CHUNK_SIZE + lx as usize];
+                let g = surfaces[lz as usize * CHUNK_SIZE + lx as usize];
                 let (wx, wz) = (origin.x + lx as i64, origin.z + lz as i64);
-                let h = s.height;
+                let h = g.0.height;
                 let profile_lo = h - materials::MAX_PROFILE_DEPTH + 1;
                 let touches_profile = chunk_max_y >= profile_lo && chunk_min_y <= h;
                 let touches_sea_surface =
                     h < SEA_LEVEL_BLOCKS && (chunk_min_y..=chunk_max_y).contains(&SEA_LEVEL_BLOCKS);
-                let col =
-                    (touches_profile || touches_sea_surface).then(|| self.column_with(wx, wz, s));
+                let touches_water =
+                    wet_top(&g.1) > h && chunk_max_y > h && chunk_min_y <= g.1.level;
+                let col = (touches_profile || touches_sea_surface || touches_water)
+                    .then(|| self.column_with(wx, wz, g));
                 for ly in 0..CHUNK_SIZE as u8 {
                     let wy = chunk_min_y + ly as i64;
                     let block = match &col {
@@ -433,9 +469,9 @@ impl Generator {
                 for pz in 0..probes {
                     for px in 0..probes {
                         let (x, z) = (bx + px * step, bz + pz * step);
-                        let s = self.surface(x, z);
-                        if s.height < lowest.0 {
-                            lowest = (s.height, x, z, Some(s));
+                        let g = self.ground(x, z);
+                        if g.0.height < lowest.0 {
+                            lowest = (g.0.height, x, z, Some(g));
                         }
                     }
                 }
@@ -756,7 +792,7 @@ mod tests {
             for i in (0..nx).step_by(5) {
                 let x = ((i as f64 + 0.5) * cw).floor() as i64;
                 let z = ((j as f64 + 0.5) * ch).floor() as i64;
-                assert_eq!(i64::from(d.cell(i, j).0), g.surface_height(x, z));
+                assert_eq!(i64::from(d.cell(i, j).0), g.eroded_surface(x, z).height);
             }
         }
         let mut cut_somewhere = false;
@@ -841,6 +877,84 @@ mod tests {
             bytes as f64 / 1e6
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Rivers and lakes (M14 task 3): standing water is never held by air.
+    /// Around rivers and lakes of every size, each column's water is met at
+    /// each side by ground as high or by water — the same body, or a river
+    /// stepping down its long profile in whole blocks.
+    #[test]
+    fn water_is_never_held_by_air() {
+        let shape = WorldShape::new(65_536, 65_536).unwrap();
+        let g = Generator::new(0x41_7E45, shape);
+        let d = g.drainage();
+        let (nx, nz) = d.cells();
+        let (cw, ch) = d.cell_blocks();
+        // Places to look: cells of every size of river, and lakes.
+        let mut sites = Vec::new();
+        for j in (0..nz).step_by(3) {
+            for i in (0..nx).step_by(3) {
+                let (_, _, q, _) = d.cell(i, j);
+                let bucket = if d.is_lake(i, j) {
+                    Some(4)
+                } else if q >= 1.0 {
+                    Some(3)
+                } else if q >= 0.1 {
+                    Some(2)
+                } else if q >= drainage::STREAM_FROM_M3S {
+                    Some(1)
+                } else {
+                    None
+                };
+                if let Some(b) = bucket
+                    && sites.iter().filter(|&&(k, _, _)| k == b).count() < 6
+                {
+                    sites.push((b, i, j));
+                }
+            }
+        }
+        assert!(
+            sites.len() >= 20,
+            "too few rivers and lakes: {}",
+            sites.len()
+        );
+        let top = |x: i64, z: i64| {
+            let (s, w) = g.ground(x, z);
+            (s.height, wet_top(&w))
+        };
+        let (mut wet, mut falls, mut held_by_air) = (0u32, 0u32, Vec::new());
+        for &(_, i, j) in &sites {
+            let (x0, z0) = ((i as f64 * cw) as i64, (j as f64 * ch) as i64);
+            for z in (z0..z0 + 128).step_by(2) {
+                for x in (x0..x0 + 128).step_by(2) {
+                    let (h, level) = top(x, z);
+                    if level <= h {
+                        continue;
+                    }
+                    wet += 1;
+                    for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                        // Ground as high holds it; lower water beside it is
+                        // the river stepping down its long profile — a block
+                        // (rapids) or more (a waterfall).
+                        let (nh, nl) = top(x + dx, z + dz);
+                        if nl > nh && nl < level - 1 {
+                            falls += 1;
+                        }
+                        if nh < level && nl <= nh {
+                            held_by_air.push((x, z, level, nh, nl));
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("{wet} wet columns, {falls} sides stepping down 2+ blocks");
+        assert!(wet > 1_000, "only {wet} wet columns");
+        assert!(
+            held_by_air.is_empty(),
+            "{} of {wet} wet columns held by air, e.g. {:?}",
+            held_by_air.len(),
+            &held_by_air[..held_by_air.len().min(8)]
+        );
     }
 
     /// Chunks far above any surface are all air and stored uniformly.
@@ -945,7 +1059,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (4, 0x55cc_bdb4_6add_da9d);
+        const PINNED: (u32, u64) = (4, 0xd26d_b663_abd4_13bf);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),

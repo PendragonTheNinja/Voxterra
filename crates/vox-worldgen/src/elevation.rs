@@ -246,6 +246,9 @@ pub struct Elevation {
     /// Small-scale patches of a biome's surface (M13): sand through a
     /// steppe, gravel through tundra, outcrops on a meadow.
     patch: [Octave; 2],
+    /// The meander warp (M14), an octave apart: rivers bend at a
+    /// wavelength set by their width.
+    meander: [Octave; 6],
 }
 
 /// What a column's surface is made of, as the elevation field knows it — the
@@ -270,6 +273,10 @@ pub struct Surface {
 const BOUNDARY_WAVELENGTHS: [i64; 3] = [1_400, 350, 24];
 const BOUNDARY_WEIGHTS: [f32; 3] = [1.0, 0.4, 0.35];
 
+/// Wavelengths of the meander warp, blocks, each twice the last: a river
+/// picks its own between them (`Elevation::meander_warp`).
+pub const MEANDER_WAVELENGTHS: [i64; 6] = [32, 64, 128, 256, 512, 1_024];
+
 /// Wavelengths of the surface-patch noise, blocks.
 const PATCH_WAVELENGTHS: [i64; 2] = [40, 11];
 const PATCH_WEIGHTS: [f32; 2] = [1.0, 0.45];
@@ -291,6 +298,7 @@ impl Elevation {
             detail: DETAIL_WAVELENGTHS.map(oct),
             boundary: BOUNDARY_WAVELENGTHS.map(oct),
             patch: PATCH_WAVELENGTHS.map(oct),
+            meander: MEANDER_WAVELENGTHS.map(oct),
         };
         e.continent_offset = e.calibrate_coastline();
         e.gate_shift = e.calibrate_ranges();
@@ -426,6 +434,41 @@ impl Elevation {
         let a = self.value_noise(x, z, &o(&self.patch[0]));
         let b = self.value_noise(x, z, &o(&self.patch[1]));
         (a * PATCH_WEIGHTS[0] + b * PATCH_WEIGHTS[1]) / (PATCH_WEIGHTS[0] + PATCH_WEIGHTS[1])
+    }
+
+    /// The meander warp at a column (M14): a smooth displacement, each
+    /// component in `[-1, 1]`, varying at `wavelength` blocks — blended
+    /// between the two octaves either side of it, so a river widening
+    /// downstream lengthens its bends smoothly. Not part of the height;
+    /// salted apart from every terrain octave, and tiled with the world.
+    pub fn meander_warp(&self, x: i64, z: i64, wavelength: f32) -> (f32, f32) {
+        let (x, z) = (self.shape.canonical_x(x), self.shape.canonical_z(z));
+        let w = wavelength.clamp(
+            MEANDER_WAVELENGTHS[0] as f32,
+            MEANDER_WAVELENGTHS[MEANDER_WAVELENGTHS.len() - 1] as f32,
+        );
+        let k = MEANDER_WAVELENGTHS[..MEANDER_WAVELENGTHS.len() - 1]
+            .iter()
+            .rposition(|&m| m as f32 <= w)
+            .unwrap_or(0);
+        let lo = MEANDER_WAVELENGTHS[k] as f32;
+        let t = ((w - lo) / lo).clamp(0.0, 1.0);
+        let pair = |oct: &Octave| {
+            let o = |salt: u64| Octave {
+                salt: oct.salt ^ salt,
+                ..*oct
+            };
+            (
+                self.value_noise(x, z, &o(0x3EA2_0001)),
+                self.value_noise(x, z, &o(0x3EA2_0002)),
+            )
+        };
+        let a = pair(&self.meander[k]);
+        if t == 0.0 {
+            return a; // on an octave: the other weighs nothing
+        }
+        let b = pair(&self.meander[k + 1]);
+        (lerp(a.0, b.0, t), lerp(a.1, b.1, t))
     }
 
     /// The single composition point. Every stage feeds in here and nowhere

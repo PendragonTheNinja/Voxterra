@@ -17,6 +17,7 @@ use vox_core::{BlockId, SEA_LEVEL_BLOCKS};
 
 use crate::biome::{Biome, Column};
 use crate::climate::SNOW_LINE_C;
+use crate::drainage::{Bed, Body};
 
 /// No profile reaches deeper than this below the surface: below it every
 /// column is stone. Kept shallow on purpose — every block of it turns a
@@ -24,6 +25,10 @@ use crate::climate::SNOW_LINE_C;
 /// tenth of all chunks their fast path, M13 task 3). Deep strata are
 /// geology's.
 pub const MAX_PROFILE_DEPTH: i64 = 12;
+
+/// A lake's surface freezes below this mean annual temperature, °C (the
+/// sea's own threshold, `SEA_ICE_BELOW_C`).
+const LAKE_ICE_BELOW_C: f32 = -2.0;
 
 /// Thickness of one badlands stratum, blocks.
 const STRATUM_BLOCKS: i64 = 3;
@@ -36,6 +41,33 @@ const SNOW_CAP_BELOW_C: f32 = SNOW_LINE_C - 3.0;
 /// for a height (per world: [`crate::Generator`] picks the band sequence).
 pub fn block_in(col: &Column, wy: i64, strata: impl Fn(i64) -> BlockId) -> BlockId {
     let h = col.surface.height;
+    let w = col.water;
+    // Rivers and lakes (M14): settled, full water blocks up to their own
+    // level — the hybrid's layer 1 (`docs/design/water.md`). A lake freezes
+    // at its surface where the sea would.
+    if wy > h && wy <= w.level && matches!(w.body, Body::River(_) | Body::Lake | Body::SaltLake) {
+        return if wy == w.level && w.body == Body::Lake && col.temperature < LAKE_ICE_BELOW_C {
+            r::ICE
+        } else {
+            r::WATER
+        };
+    }
+    if wy <= h {
+        // What water lays on the ground under it.
+        let d = h - wy;
+        let bed = match w.body {
+            Body::River(Bed::Gravel) => Some((r::RIVER_GRAVEL, 2)),
+            Body::River(Bed::Sand) => Some((r::SAND, 2)),
+            Body::River(Bed::Silt) | Body::Lake => Some((r::SILT, 2)),
+            Body::SaltLake | Body::SaltFlat => Some((if d == 0 { r::SALT } else { r::SILT }, 2)),
+            Body::Dry => None,
+        };
+        if let Some((block, thick)) = bed
+            && d < thick
+        {
+            return block;
+        }
+    }
     if wy > h {
         // Above the ground: the sea fills up to sea level (ADR-0011), and
         // freezes at the surface in polar seas.
@@ -182,6 +214,7 @@ mod tests {
             precipitation: 800.0,
             biome,
             patch,
+            water: crate::drainage::Water::DRY,
         }
     }
 

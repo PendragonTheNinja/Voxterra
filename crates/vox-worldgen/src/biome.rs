@@ -187,6 +187,8 @@ const BADLANDS_RELIEF: f32 = 0.45;
 const TEMPERATURE_JITTER_C: f32 = 1.5;
 const PRECIPITATION_JITTER: f32 = 0.22;
 
+use crate::drainage::Water;
+
 /// A column's climate and biome.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Column {
@@ -203,6 +205,9 @@ pub struct Column {
     /// column takes (`materials`). 0 from [`classify`] alone; the generator
     /// sets it.
     pub patch: f32,
+    /// The river, lake or salt flat here (M14), if any. Dry from
+    /// [`classify`] alone; the generator sets it.
+    pub water: Water,
 }
 
 /// Köppen's aridity threshold, mm/yr: the annual precipitation below which a
@@ -225,6 +230,7 @@ pub fn classify(surface: Surface, sea_level_c: f32, precip: f32, noise: (f32, f3
         precipitation,
         biome,
         patch: 0.0,
+        water: Water::DRY,
     }
 }
 

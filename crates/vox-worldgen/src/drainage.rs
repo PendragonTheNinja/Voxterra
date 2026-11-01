@@ -38,9 +38,11 @@ use crate::elevation::Elevation;
 mod cache;
 mod erosion;
 mod hollows;
+mod rivers;
 pub use cache::{CacheKey, FORMAT_VERSION as CACHE_FORMAT_VERSION};
 use erosion::Erosion;
 pub use hollows::Cover;
+pub use rivers::{Bed, Body, STREAM_FROM_M3S, Water};
 
 /// Target size of a drainage cell, in blocks. Rivers need finer cells than
 /// climate (ADR-0017's 256); the grid is capped so the largest worlds stay
@@ -100,6 +102,9 @@ const SINK: u8 = 0x80;
 
 /// The world's drainage, on a grid of cells, row-major (`j * nx + i`).
 pub struct DrainageMap {
+    /// Unique to this map in the process: keys stage 2's per-thread cache
+    /// of nearby reaches, so no map ever reads another's.
+    id: u64,
     nx: usize,
     nz: usize,
     cell_x: f64,
@@ -269,6 +274,7 @@ impl DrainageMap {
         let discharge: Vec<f32> = q.iter().map(|&v| v.max(0.0) as f32).collect();
         let narrow = |v: i32| i16::try_from(v).expect("heights fit the world's vertical range");
         Self {
+            id: next_id(),
             nx,
             nz,
             cell_x,
@@ -414,6 +420,22 @@ impl DrainageMap {
         }
         end.into_iter().map(|e| e == 2).collect()
     }
+}
+
+/// A fresh map id.
+fn next_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// A 64-bit mix (splitmix64's finaliser): per-cell jitter that is the same
+/// whoever asks.
+fn mix(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
 }
 
 /// Cells per axis of a world's drainage grid.
