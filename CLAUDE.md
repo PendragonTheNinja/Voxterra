@@ -257,10 +257,12 @@ The owner's ideas for all of them, and a proposed order, are recorded in
 
 ## Current status
 
-- **Active milestone:** none — M12 closed 2026-11-01. Next is 13 —
-  Climate & Biomes, whose spec is not yet written: write it first (see
-  "Roadmap after M12" below). No low-end machine exists yet — M12's spec
-  says how to judge low-end performance by proxy.
+- **Active milestone:** 13 — Climate & Biomes
+  (`docs/milestones/13-climate-and-biomes.md`, **draft** spec 2026-11-01,
+  with the biome catalogue in `docs/biomes.md`). Nothing is built until the
+  owner approves the catalogue and answers the spec's open questions. No
+  low-end machine exists yet — M12's spec says how to judge low-end
+  performance by proxy.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
   vox-core 288, vox-mesh 67, vox-worldgen 31, vox-render 17, vox-app 9
