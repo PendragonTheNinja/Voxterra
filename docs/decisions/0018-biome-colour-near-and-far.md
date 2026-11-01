@@ -1,7 +1,6 @@
 # ADR-0018: Biome colour, near and far
 
-- **Status:** Proposed (2026-11-01, M13 task 4). To be accepted at the M13
-  close, after the owner has seen it in play.
+- **Status:** Accepted (2026-11-01, M13 close). Proposed (2026-11-01, M13 task 4); confirmed in the owner's walk.
 - **Context:** M13 paints biomes onto the world. Two things decide how a
   biome looks from a distance: what its ground is made of (sand, snow,
   podzol…), and the colour of its grass, which on Earth runs from the deep

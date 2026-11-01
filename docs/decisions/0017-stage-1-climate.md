@@ -1,7 +1,6 @@
 # ADR-0017: Stage-1 climate — a planetary grid built at world creation
 
-- **Status:** Proposed (2026-11-01, M13 task 1). To be accepted at the M13
-  close, after the owner's walk.
+- **Status:** Accepted (2026-11-01, M13 close). Proposed (2026-11-01, M13 task 1); confirmed in the owner's walk.
 - **Context:** M13 needs a climate for every column: temperature and
   precipitation, from which biomes are classified (`docs/biomes.md`).
   Temperature is nearly local (latitude, altitude). **Precipitation is not**:

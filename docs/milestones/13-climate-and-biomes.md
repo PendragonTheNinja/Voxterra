@@ -13,7 +13,7 @@ horizon, so climate belts are visible tens of kilometres off) and M12
 2026-11-01 from `docs/vision.md` §1.1 and §10.1, with the biome catalogue in
 `docs/biomes.md`.
 
-**Status: in progress.** Spec and catalogue approved by the owner
+**Status: complete (2026-11-01)** — retrospective at the end. Was: in progress. Spec and catalogue approved by the owner
 (2026-11-01; decisions recorded at the end). Tasks 0 (map writer) and 1
 (climate maps) done headlessly; next, task 2 (classification).
 
@@ -390,8 +390,16 @@ horizon.
      census reads 1, LOD-only, **identically before and after the LOD
      materials** (commit `4e70906` against now): not an M13 regression
      there — M11's far-horizon LOD pinholes (0–11 per frame on lavapipe).
-     The owner's exact `VIEW` line is needed to compare the two commits on
-     the owner's own frame. A play session on foot and in flight, judged at walking
+     On the owner's own frame (their `VIEW` line, rendered headlessly with
+     full resolution) the census reads 10, the same pixels as in play, and
+     **identically before and after the LOD materials** — M11's
+     far-horizon LOD pinholes, not M13's; and now an exact, reproducible
+     case for whoever fixes them.
+   - [x] **The owner's walk (2026-11-01):** biomes look right; grass colour
+     shows no step where full resolution meets the LOD; snow on the peaks
+     (crossing the world on foot to see more is not yet practical). Hot
+     deserts at ~half Earth's share are fine as they are; grey shallow seas
+     are fine until water absorbs with depth. A play session on foot and in flight, judged at walking
    speed, with fixes; `--bench` (criterion 9).
 6. **Retro.**
 
@@ -464,3 +472,101 @@ passing). Tested: `every_world_has_mountain_ranges_and_only_small_ones_are_chang
 4. **Vegetation stays its own milestone**, after block shapes.
 5. **No landforms in M13**: they come from erosion under each climate in the
    hydrology & erosion milestone.
+
+
+# Retrospective (2026-11-01)
+
+## What shipped
+
+- **Instruments first:** the world map writer (`world_map`: elevation,
+  temperature, precipitation and biome PNGs of the whole planet, with land
+  statistics), the biome survey and every-biome tests (ignored, release),
+  the biome readout on the telemetry and `VIEW` lines, and headless biome
+  renders (`SPECK_LIT`).
+- **Stage-1 climate (ADR-0017):** a planetary grid built at world creation
+  in ~0.5 s — latitude, an exaggerated lapse rate (snow on peaks), the
+  three-cell winds carrying moisture from the sea, rising and sinking air,
+  rain shadows (windward 3.3× the lee), sideways mixing; distances "into a
+  continent" scaled to each world's continents. Basic arithmetic only, its
+  own `exp`, so every machine builds the same world.
+- **Classification:** the 23 biomes of `docs/biomes.md` from climate and
+  terrain — Köppen's aridity threshold, tree- and snowlines, ice-covered
+  polar mountains, shores, seas — with edges that wander and fray.
+- **Ground:** 13 new blocks and a profile per biome; badlands strata; sea
+  ice; patches. `GENERATOR_VERSION` 3.
+- **Near and far (ADR-0018):** the LOD wears each cell's top block; grass
+  is tinted from the climate map in one shared shader file, near and far
+  alike.
+- **Every biome in every world, from the smallest:** small worlds short of
+  mountains widen their belts, only when needed.
+
+## Criteria
+
+| # | Criterion | Result |
+|---|---|---|
+| 1 | Catalogue first | Met — approved before code |
+| 2 | Instruments before tuning | Met — maps, survey, readouts |
+| 3 | Every biome in every world | **Met at every legal size** (32 worlds asserted; 48 more surveyed) |
+| 4 | Physical causes, as tests | Met — belts, rain shadow, lapse and snowlines, interiors |
+| 5 | Earth-like proportions | Met by group; hot desert ~half Earth's (owner: fine) |
+| 6 | Biomes at walking scale | Met — ~11 min north–south, ~21 east–west; fraying edges |
+| 7 | Near and far agree | Met — tested per biome; no seam in play |
+| 8 | Generation stays sound | Met — determinism, seams, fingerprint (now sees biomes); +0.5 s load |
+| 9 | No performance regression | Met — within noise of M12's close |
+| 10 | Bookkeeping | ADRs 0017 and 0018 accepted; this retro |
+
+## Numbers
+
+- Climate map: 800×800 cells, 0.5 s to build (1.0 s at the largest world,
+  dev build).
+- Chunk generation 375 → 364 µs; LOD node +4–16%; meshing unchanged
+  (+0.3% triangles).
+- Biome shares at the default size (24 seeds), % of land: rainforest 7.4,
+  dry forest 6.2, savanna 9.2, hot desert 6.6, hot steppe 7.0,
+  Mediterranean 0.5, temperate grassland 5.1, cold desert 7.0, temperate
+  forest 14.9, temperate rainforest 1.9, boreal 8.5, tundra 6.8, ice sheet
+  12.1, alpine 4.2, badlands 2.2.
+- `--bench` sprint at 8 levels: 754 / 745 fps, backlog 190–232.
+
+## Found along the way
+
+- **The first climate was a desert world** (40% of land under 250 mm) with
+  streaks downwind of every peak: moisture must reach continent-scaled
+  distances, rows of wind must mix, and windward rain is a capped
+  multiplier, not a conversion of everything the air loses.
+- **Small worlds had no deserts**, then no mountains in some seeds:
+  distances "into a continent" scale with the continents; mountain belts
+  widen only where a world has too few.
+- **The grass tint barely showed:** a ratio of sRGB colours applied to a
+  texture sampled in linear light. A headless render caught it.
+- **The fingerprint could not see biomes**: a change to every biome edge
+  left it unchanged. It now hashes 4 096 columns' biomes and tops.
+- **Shallow seas over sand read grey** through constant-opacity water —
+  for water that absorbs with depth, later.
+
+## Known, carried forward
+
+- **Far-horizon LOD pinholes** (M11): 9–10 at the owner's view near spawn,
+  reproduced exactly headlessly — a ready test case.
+- **Water absorbing with depth** (`docs/vision.md` §10).
+- **No seasons**: the Mediterranean band is thin, Rome reads as forest.
+- **Sea-ice edge geomorph is not exact** (ADR-0018).
+- **Relight cost** (~185 ms/s while sprinting) and encode on a weak CPU,
+  from M12.
+- Trees and plants (vegetation), landforms shaped by climate (hydrology &
+  erosion — next), seasons.
+
+## Lessons
+
+1. **Look at the whole planet before walking on it.** The world map found
+   the desert world, the streaks and the empty small worlds in minutes; no
+   amount of walking would have shown them as clearly.
+2. **Calibrate only where needed.** The coastline lesson (ADR-0012)
+   generalised: a per-world correction that is a no-op where nothing is
+   wrong fixes small worlds without touching anyone's default world.
+3. **Render it before handing it over.** Two rendering mistakes (the weak
+   tint, and the question of the near/far seam) were settled headlessly on
+   lavapipe before the owner ran anything.
+4. **A pinned fingerprint is only as good as what it samples.** It must
+   cover every kind of output a change can make — heights, fills, and now
+   biomes.

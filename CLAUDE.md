@@ -257,29 +257,16 @@ The owner's ideas for all of them, and a proposed order, are recorded in
 
 ## Current status
 
-- **Active milestone:** 13 — Climate & Biomes
-  (`docs/milestones/13-climate-and-biomes.md`; catalogue `docs/biomes.md`,
-  approved 2026-11-01). Done: the world map writer (`world_map`, PNGs to
-  `target/world-map/`) and stage-1 climate maps (`climate.rs`, ADR-0017
-  proposed: winds, rain shadows, exaggerated lapse rate, deterministic
-  maths), and classification (`biome.rs`, `Generator::column`; criteria 5
-  and 6 met, criterion 3 met from 64 km up; readouts on the telemetry and
-  `VIEW` lines); small worlds short of mountains widen their belts (only
-  when needed: default-size terrain unchanged); task 3 surface materials
-  (13 new blocks, per-biome profiles, sea ice, badlands strata,
-  `GENERATOR_VERSION` 3); task 4 biome colour (grass tinted from the
-  climate map in `climate.wgsl`, ADR-0018 proposed) and LOD materials
-  (`lod_surface`, `mesh_lod_surface`); biome edges fray over tens of
-  blocks. Next: the owner's walk (task 5) — a fresh world (version 3
-  refuses version-2 worlds), play on foot and in flight, `--bench`, the
-  hole census — then the retro. Headless renders of biomes come from
-  `specks_scratch::specks` (`SPECK_FULLRES=1 SPECK_LIT=1` for lit full
-  resolution), world maps from `world_map`. No low-end machine exists yet —
-  M12's spec says how to judge low-end performance by proxy.
+- **Active milestone:** none — M13 closed 2026-11-01. Next on the roadmap
+  (`docs/vision.md` §9): **Hydrology & erosion** — drainage, rivers with
+  current, lakes, valleys, and landforms shaped by each climate; it reads
+  M13's climate maps. Its spec is not yet written: write it first. No
+  low-end machine exists yet — M12's spec says how to judge low-end
+  performance by proxy.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
   vox-core 288, vox-mesh 69, vox-worldgen 54, vox-render 19, vox-app 9
-  passing as of M13 task 4, plus the ignored `every_biome_in_every_world`
+  passing as of the M13 close, plus the ignored `every_biome_in_every_world`
   and `biome_survey`, run in release), then start the first unchecked item.
 - **Instruments (from M11):** the P key logs a `VIEW` line (exact position,
   angles, window, settings) and a `hole_census` — the frame re-rendered six
@@ -301,7 +288,19 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   are separate counters. ADRs number decisions in the order they are made;
   milestones number work in the order it is built. Matching numbers are
   coincidence — ADR-0011 (transparency) belongs to milestone M10.
-- **Last completed milestone:** 12 — Performance Pass (2026-11-01);
+- **Last completed milestone:** 13 — Climate & Biomes (2026-11-01);
+  retrospective at the end of `docs/milestones/13-climate-and-biomes.md`,
+  catalogue `docs/biomes.md`, gallery `docs/gallery/m13/`. Stage-1 climate
+  (ADR-0017: winds, rain shadows, exaggerated lapse rate, deterministic
+  maths, built at world load); 23 biomes classified from climate and
+  terrain (`Generator::column`); 13 new ground blocks with per-biome
+  profiles, sea ice, badlands strata (`GENERATOR_VERSION` 3); the LOD wears
+  each biome's ground and grass is tinted from the climate map near and far
+  (ADR-0018); every biome in every legal world size. Tools: `world_map`,
+  `biome_survey`, `every_biome_in_every_world`, `SPECK_LIT`. Carried: the
+  far-horizon LOD pinholes (reproduced at the owner's M13 view), water
+  absorbing with depth, seasons.
+- Milestone 12 — Performance Pass (2026-11-01);
   retrospective with numbers at the end of
   `docs/milestones/12-performance-pass.md`. Meshing −88% CPU per chunk in
   game (uniform chunks sweep only their boundary, a bitwise face prefilter,
