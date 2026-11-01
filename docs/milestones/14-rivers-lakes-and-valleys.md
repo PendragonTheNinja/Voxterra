@@ -359,7 +359,17 @@ becomes an ADR; the simulation itself remains its own milestone.
      against 42 blocks, `rivers_differ_by_slope_discharge_and_sediment`).
    - [ ] Reservoir or finite per body — for the simulation (layer 2) when
      it is built; the network has what it needs (discharge, cover).
-   - [ ] Cost (criterion 9). **`--bench` (owner, 2026-11-01, RTX 4060,
+   - [x] Cost (criterion 9) — **met** (owner's benches, 2026-11-01, after the
+     span-cache fix below): standing 850 / 727 at 6 levels (M13 894 / 811),
+     sprint at 8 levels 684 / 664 (754 / 745); streaming (relight, mesh,
+     backlog) and drawing (draws, triangles, GPU memory) unchanged. With
+     flowing water off (`VOX_NO_FLOW=1`) the same within noise (ocean
+     standing 725 against 727, sprint 672 against 664; waterfall 570
+     against 598): the flow shader costs nothing measurable. The same code
+     varies up to ~14% between runs on this machine (6-level land sprint
+     805 / 705), so the remaining 5–11% is within noise. Water phases'
+     baselines: rivers standing 716, sprint 709; waterfall standing 598.
+   - History of the measurement: **`--bench` (owner, 2026-11-01, RTX 4060,
      800×600), against M13's close:** sprint at 8 levels 677 / 664 fps
      (land / ocean; was 754 / 745, −10 / −11%); standing 880 / 770 at 6
      levels, 774 / 718 at 8; mesh 205–214 µs per chunk (~197); relight
