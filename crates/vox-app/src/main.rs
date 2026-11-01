@@ -375,6 +375,12 @@ fn bench_water_starts(
     (rivers, waterfall)
 }
 
+/// Whether flowing water is switched off (`VOX_NO_FLOW=1`): all water still,
+/// for measuring what the flow shader costs.
+fn no_flow() -> bool {
+    std::env::var("VOX_NO_FLOW").is_ok_and(|v| v == "1")
+}
+
 /// The drainage network's flow as texels for `Renderer::set_flow` (M14):
 /// each cell's water velocity, row by row.
 fn flow_texels(generator: &Generator) -> (Vec<u8>, (u32, u32)) {
@@ -1724,6 +1730,14 @@ impl App {
             "Settings: defaults (full-res radius 8, curvature on, air density 1), \
              spectator, noon, time frozen"
                 .to_string(),
+            format!(
+                "Flowing water: {}",
+                if no_flow() {
+                    "off (VOX_NO_FLOW=1)"
+                } else {
+                    "on"
+                }
+            ),
         ];
         let ocean = match ocean_xz {
             Some((x, z)) => [x as f64 + 0.5, (sea + 1) as f64 + ABOVE, z as f64 + 0.5],
@@ -2516,8 +2530,12 @@ impl ApplicationHandler for App {
             vox_worldgen::climate::LAPSE_PER_BLOCK,
         );
         // Rivers drift with their flow (M14), placed as the climate map is.
-        let (flow, cells) = flow_texels(&self.generator);
-        renderer.set_flow(&flow, cells);
+        // VOX_NO_FLOW=1 leaves all water still: an A/B switch for measuring
+        // what flowing water costs (`--bench` notes it in its header).
+        if !no_flow() {
+            let (flow, cells) = flow_texels(&self.generator);
+            renderer.set_flow(&flow, cells);
+        }
 
         // The world is no longer pre-built: chunks stream in around the
         // camera each frame via stream_tick (M02). resumed() just stands up
