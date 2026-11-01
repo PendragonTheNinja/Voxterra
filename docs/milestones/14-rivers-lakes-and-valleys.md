@@ -298,9 +298,6 @@ becomes an ADR; the simulation itself remains its own milestone.
      Routing crosses lakes and filled hollows first in, first out (it had
      snaked: paths were 2–3× their straight length); the closure threshold
      is an aridity index of 0.3.
-   - [ ] Flow speed and direction per reach, reservoir or finite: derived
-     from the network on demand with the channel geometry of task 3, not
-     stored.
    - Measured before erosion: lakes cover ~27% of ice-scoured land, ~6%
      elsewhere (Earth: ~3.7% of unglaciated land). The excess is the flat,
      noise-pitted continental interior (`LOWLAND_RISE`), deranged until task
@@ -332,6 +329,27 @@ becomes an ADR; the simulation itself remains its own milestone.
    - [ ] Criterion 6 at ground speed: the owner's walk.
 3. Stage-2 channels: polylines, meanders, banks, depth, water levels; the
    fill rule above sea level (ADR); materials.
+   - [x] Channels (`drainage::rivers`, ADR-0020 proposed): reaches from
+     jittered cell centres, meander warp at ~12× width, width `8·√Q`, depth
+     `2.8·Q^⅜`; settled water floored to whole blocks down the long
+     profile; beds of river gravel, sand or silt by slope; banks and levees
+     (water never held by air, tested); lakes filling to their level along
+     the ground's contours, freezing below −2 °C; salt flats; new blocks
+     silt, salt, river gravel.
+   - [x] The network's levels fixed for it: the sea's surface is level 0
+     and never cut (rivers had been graded to inland pits' floors, 50–100
+     blocks under the land); rim cuts at most 8 blocks; hollows below a
+     river's grade filled with sediment (flat floors) unless backed up from
+     a lake. Lakes on unglaciated land back to 1–4% (they rose to ~12% in
+     between). Honest valley depth: ~3 blocks for rills, 11–13 for larger
+     rivers — criterion 6's "deepen downstream" is only partly met.
+   - [x] Streaming spans standing water (`surface_span_chunks`): a lake's
+     surface had stood in layers never loaded. Found in a render; a test
+     that failed first.
+   - [ ] Flow speed and direction per reach, reservoir or finite — with the
+     flow map (task 5's distant water and criterion 10).
+   - [ ] Cost: `ground` ~2× the eroded surface per column; measure with
+     `--bench` (owner).
 4. Lakes, salt flats, floodplains, wetlands, deltas, waterfalls; the new
    biomes.
 5. Distant water in the LOD (criterion 8).

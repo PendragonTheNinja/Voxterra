@@ -278,13 +278,15 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   `GENERATOR_VERSION` 4); the network is cached in the world folder
   (`drainage.cache`); criterion 4 surveyed over six seeds
   (`drainage_survey`: closed basins high, ~29% vs Earth's 18%, carried to
-  M15). Next: the owner's walk of the eroded terrain, then task 3 (stage-2
-  channels). vox-worldgen now 63 tests. No
+  M15). Task 3 (stage-2 channels, ADR-0020 proposed) is
+  mostly built: rivers, lakes, salt flats in the chunks (`Generator::ground`,
+  `drainage::rivers`). Next: task 5's distant water (the LOD shows beds
+  only), then task 4. vox-worldgen now 65 tests. No
   low-end machine exists yet — M12's spec says how to judge low-end
   performance by proxy.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 288, vox-mesh 69, vox-worldgen 63, vox-render 19, vox-app 9
+  vox-core 288, vox-mesh 69, vox-worldgen 65, vox-render 19, vox-app 9
   passing (vox-worldgen was 54 at the M13 close), plus the ignored `every_biome_in_every_world`
   and `biome_survey`, run in release), then start the first unchecked item.
 - **Instruments (from M11):** the P key logs a `VIEW` line (exact position,

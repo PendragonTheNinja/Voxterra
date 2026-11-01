@@ -57,8 +57,12 @@ at exactly the same fractions.
    up, nor snaking along rows in index order. Everywhere else each cell
    takes its lowest neighbour among the cells reached before it, so water
    runs the steepest way down and still forms a tree to an outlet.
-6. **Channel levels** are cut down along the flow so water never runs
-   uphill; a cut ending below a lake is its backwater.
+6. **Channel levels** never rise downstream: a river cuts through a
+   hollow's rim by at most 8 blocks (erosion did the deep cutting), and is
+   graded to the sea's surface, level 0, never below it. Ground below the
+   grade that results is filled — with a lake's backwater where it backs
+   up from a lake, else with sediment to the grade, a flat alluvial floor
+   (ADR-0020).
 7. **Discharge** accumulated down the tree, lakes losing their
    evaporation, closed basins keeping what reaches them.
 
