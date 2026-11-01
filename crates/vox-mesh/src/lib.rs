@@ -114,17 +114,19 @@ impl MeshData {
 pub fn area_triangles(indices: &[u32], position: impl Fn(u32) -> [f32; 3]) -> usize {
     indices
         .chunks_exact(3)
-        .filter(|t| {
-            let (a, b, c) = (position(t[0]), position(t[1]), position(t[2]));
-            let (u, v) = (
-                [b[0] - a[0], b[1] - a[1], b[2] - a[2]],
-                [c[0] - a[0], c[1] - a[1], c[2] - a[2]],
-            );
-            u[1] * v[2] - u[2] * v[1] != 0.0
-                || u[2] * v[0] - u[0] * v[2] != 0.0
-                || u[0] * v[1] - u[1] * v[0] != 0.0
-        })
+        .filter(|t| has_area(position(t[0]), position(t[1]), position(t[2])))
         .count()
+}
+
+/// Are the three corners not collinear? Exact (see [`area_triangles`]).
+fn has_area(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> bool {
+    let (u, v) = (
+        [b[0] - a[0], b[1] - a[1], b[2] - a[2]],
+        [c[0] - a[0], c[1] - a[1], c[2] - a[2]],
+    );
+    u[1] * v[2] - u[2] * v[1] != 0.0
+        || u[2] * v[0] - u[0] * v[2] != 0.0
+        || u[0] * v[1] - u[1] * v[0] != 0.0
 }
 
 /// Vertex format for coarse LOD terrain (ADR-0009).
@@ -197,13 +199,31 @@ impl LodMeshData {
         &self.indices[self.opaque_index_count as usize..]
     }
 
-    pub fn quad_count(&self) -> usize {
-        self.indices.len() / 6
+    /// Triangles, three indices each. LOD is not made of quads: fans and
+    /// zipped walls share vertices between triangles (M12 task 2).
+    pub fn triangle_count(&self) -> usize {
+        self.indices.len() / 3
     }
 
-    /// As [`MeshData::area_triangles`].
+    /// As [`MeshData::area_triangles`], counting a triangle with area at
+    /// rest OR at full morph (ADR-0009). A wall between two cells level now
+    /// but not once morphed has zero height at rest and opens as the camera
+    /// nears its ring's edge; it is geometry the morph needs, not padding,
+    /// and dropping it is the see-through hole `mesh_lod_heightfield_with`
+    /// documents. Morph moves only Y, to `morph_y`.
     pub fn area_triangles(&self, indices: &[u32]) -> usize {
-        area_triangles(indices, |i| self.vertices[i as usize].position)
+        let rest = |i: u32| self.vertices[i as usize].position;
+        let morphed = |i: u32| {
+            let v = &self.vertices[i as usize];
+            [v.position[0], v.morph_y, v.position[2]]
+        };
+        indices
+            .chunks_exact(3)
+            .filter(|t| {
+                has_area(rest(t[0]), rest(t[1]), rest(t[2]))
+                    || has_area(morphed(t[0]), morphed(t[1]), morphed(t[2]))
+            })
+            .count()
     }
 }
 
@@ -3068,9 +3088,11 @@ fn emit_lod_rect(
 /// its centre, with a vertex at every cell corner along its border (`step`
 /// apart), so every neighbouring wall or cell meets it at a shared vertex —
 /// no T-junctions, which rasterization does not promise to close (the white
-/// specks of 2026-10-16). Each triangle is stored as a quad whose last corner
-/// repeats, keeping every LOD piece four vertices; the repeat makes the
-/// second triangle zero-area, which the GPU discards. Winding matches
+/// specks of 2026-10-16). The centre and the border vertices are stored once
+/// and shared by every triangle, three indices each — until M12 each triangle
+/// was a quad with a repeated corner, whose zero-area half the GPU fetched,
+/// transformed and discarded (a quarter of all submitted triangles). Winding
+/// matches
 /// `emit_lod_rect`'s tops (+Z first, then +X), so back-face culling keeps it.
 /// Only for rectangles that do not move under morph: `morph_y` is `y`.
 #[allow(clippy::too_many_arguments)]
@@ -3105,14 +3127,13 @@ fn emit_lod_fan(
         morph_y: y,
         shade,
     };
-    let centre = vert(((x0 + x1) * 0.5, (z0 + z1) * 0.5));
-    for i in 0..border.len() {
-        let (a, b) = (border[i], border[(i + 1) % border.len()]);
-        let base = mesh.vertices.len() as u32;
-        mesh.vertices
-            .extend_from_slice(&[centre, vert(a), vert(b), vert(b)]);
+    let c = mesh.vertices.len() as u32;
+    mesh.vertices.push(vert(((x0 + x1) * 0.5, (z0 + z1) * 0.5)));
+    mesh.vertices.extend(border.iter().map(|&p| vert(p)));
+    let m = border.len() as u32;
+    for i in 0..m {
         mesh.indices
-            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+            .extend_from_slice(&[c, c + 1 + i, c + 1 + (i + 1) % m]);
     }
 }
 
@@ -3122,8 +3143,8 @@ fn emit_lod_fan(
 /// side in one plane meet along a vertical corner line, and each stops at its
 /// own cells' heights; without a vertex wherever the other has one, the line
 /// is a T-junction and leaks single pixels of sky (the white specks,
-/// 2026-10-17). Triangles are stored as quads with a repeated corner, like
-/// [`emit_lod_fan`]. Morph targets interpolate linearly up the wall, so every
+/// 2026-10-17). Each edge's vertices are stored once and shared, three
+/// indices per triangle, like [`emit_lod_fan`]. Morph targets interpolate linearly up the wall, so every
 /// added vertex stays on its own wall's edge throughout the morph.
 #[allow(clippy::too_many_arguments)]
 fn emit_lod_wall(
@@ -3192,6 +3213,10 @@ fn emit_lod_wall(
         c
     };
     let (l, r) = (chain(left), chain(right));
+    let lb = mesh.vertices.len() as u32;
+    mesh.vertices.extend(l.iter().map(|&y| vert(0.0, y)));
+    let rb = mesh.vertices.len() as u32;
+    mesh.vertices.extend(r.iter().map(|&y| vert(width, y)));
     // Zip the two edges bottom to top. Each triangle is counter-clockwise in
     // (s, y); emit_lod_rect's quads are counter-clockwise in (u, v), which is
     // (s, y) mirrored when u runs up — so those triangles reverse.
@@ -3200,20 +3225,17 @@ fn emit_lod_wall(
         let up_left = j + 1 == r.len() || (i + 1 < l.len() && l[i + 1] <= r[j + 1]);
         let tri = if up_left {
             i += 1;
-            [vert(0.0, l[i - 1]), vert(width, r[j]), vert(0.0, l[i])]
+            [lb + i as u32 - 1, rb + j as u32, lb + i as u32]
         } else {
             j += 1;
-            [vert(0.0, l[i]), vert(width, r[j - 1]), vert(width, r[j])]
+            [lb + i as u32, rb + j as u32 - 1, rb + j as u32]
         };
         let [a, b, c] = if u_vertical {
             [tri[2], tri[1], tri[0]]
         } else {
             tri
         };
-        let at = mesh.vertices.len() as u32;
-        mesh.vertices.extend_from_slice(&[a, b, c, c]);
-        mesh.indices
-            .extend_from_slice(&[at, at + 1, at + 2, at, at + 2, at + 3]);
+        mesh.indices.extend_from_slice(&[a, b, c]);
     }
 }
 
@@ -3683,9 +3705,15 @@ mod heightfield_tests {
     #[test]
     fn flat_field_is_one_fan_plus_border_skirts() {
         let mesh = mesh_lod_heightfield(&flat(20), 4, 0, |_, _| 0, 8);
-        // 4 x 32 fan pieces + 4 borders x 32 skirt walls, against 32 x 32
-        // tops unmerged.
-        assert_eq!(mesh.quad_count(), 4 * LOD_CELLS + 4 * LOD_CELLS);
+        // 4 x 32 fan triangles + 4 borders x 32 skirt walls of two, against
+        // 2 x 32 x 32 tops unmerged.
+        assert_eq!(mesh.triangle_count(), 4 * LOD_CELLS + 2 * 4 * LOD_CELLS);
+        // The fan's centre and 128 border vertices, stored once each.
+        assert_eq!(
+            mesh.vertices.len(),
+            1 + 4 * LOD_CELLS + 4 * 4 * LOD_CELLS,
+            "fan vertices are shared"
+        );
     }
 
     // ---- Triangles submitted vs drawn (M12 task 0) ----
@@ -3706,18 +3734,33 @@ mod heightfield_tests {
         assert_eq!(area_triangles(&[0, 1, 2, 0, 2, 3, 1, 2, 0], at), 2);
     }
 
-    /// Pins today's padding so M12 task 2's removal of it shows as a
-    /// changed number, not a silent one: every fan and zipped-wall triangle
-    /// is stored as a quad, so a merged flat node submits about twice what
-    /// it draws.
+    /// Criterion 4 (M12 task 2): LOD submits no zero-area triangles — fans
+    /// and zipped walls are true triangles over shared vertices, not quads
+    /// padded with a repeated corner. Land, sea, terraces and noise, every
+    /// stride, both passes.
     #[test]
-    fn lod_fans_and_walls_pad_with_zero_area_halves() {
-        for heights in [flat(5), plateaus()] {
-            let mesh = faces_as_layers(&heights, 4, 0);
-            let submitted = mesh.indices.len() / 3;
-            let drawn = mesh.area_triangles(&mesh.indices);
-            assert!(drawn < submitted, "{drawn} of {submitted}");
-            assert!(2 * drawn >= submitted, "{drawn} of {submitted}");
+    fn lod_submits_only_triangles_with_area() {
+        let sea = vox_core::SEA_LEVEL_BLOCKS as i32;
+        for (label, heights) in [
+            ("flat", flat(5)),
+            ("plateaus", plateaus()),
+            ("varied", varied()),
+            ("seabed", flat(sea - 300)),
+            ("coast", heights_where_the_neighbour_sinks_below()),
+        ] {
+            for stride in [1, 2, 4, 8, 64] {
+                let mesh = mesh_lod_heightfield(&heights, stride, 0, sea_or_land, 4);
+                for (pass, ix) in [
+                    ("opaque", mesh.opaque_indices()),
+                    ("sea", mesh.transparent_indices()),
+                ] {
+                    assert_eq!(
+                        mesh.area_triangles(ix),
+                        ix.len() / 3,
+                        "{label}, stride {stride}, {pass}: zero-area triangles submitted"
+                    );
+                }
+            }
         }
     }
 
@@ -3753,13 +3796,18 @@ mod heightfield_tests {
         h
     }
 
-    /// The opaque range's top quads (face 2), as (x0, x1, z0, z1, y, morph_y)
-    /// in node-local blocks.
+    /// The triangles of an index range, as their three vertices.
+    fn lod_triangles(mesh: &LodMeshData, ix: &[u32]) -> Vec<[LodVertex; 3]> {
+        ix.chunks_exact(3)
+            .map(|t| [0, 1, 2].map(|k| mesh.vertices[t[k] as usize]))
+            .collect()
+    }
+
+    /// The opaque range's top triangles (face 2), each as its bounding box
+    /// (x0, x1, z0, z1, y, morph_y) in node-local blocks.
     fn top_rects(mesh: &LodMeshData) -> Vec<(f32, f32, f32, f32, f32, f32)> {
-        let opaque = mesh.opaque_index_count as usize / 6;
-        mesh.vertices
-            .chunks(4)
-            .take(opaque)
+        lod_triangles(mesh, mesh.opaque_indices())
+            .into_iter()
             .filter(|q| q[0].layer == 2)
             .map(|q| {
                 let xs = q.iter().map(|v| v.position[0]);
@@ -3767,11 +3815,11 @@ mod heightfield_tests {
                 let y = q[0].position[1];
                 assert!(
                     q.iter().all(|v| v.position[1] == y),
-                    "a top quad is not level"
+                    "a top triangle is not level"
                 );
                 assert!(
                     q.iter().all(|v| v.morph_y == q[0].morph_y),
-                    "a top quad morphs unevenly"
+                    "a top triangle morphs unevenly"
                 );
                 (
                     xs.clone().fold(f32::MAX, f32::min),
@@ -4103,10 +4151,11 @@ mod heightfield_tests {
                 v.morph_y
             );
         }
-        // Every quad is therefore zero-height once morphed: no wall survives.
-        for quad in mesh.vertices.chunks(4) {
-            let lo = quad.iter().map(|v| v.morph_y).fold(f32::MAX, f32::min);
-            let hi = quad.iter().map(|v| v.morph_y).fold(f32::MIN, f32::max);
+        // Every triangle is therefore zero-height once morphed: no wall
+        // survives.
+        for tri in lod_triangles(&mesh, &mesh.indices) {
+            let lo = tri.iter().map(|v| v.morph_y).fold(f32::MAX, f32::min);
+            let hi = tri.iter().map(|v| v.morph_y).fold(f32::MIN, f32::max);
             assert!((hi - lo).abs() < 1e-4, "a wall survived full morph");
         }
     }
@@ -4244,9 +4293,10 @@ mod heightfield_tests {
         ] {
             for stride in [2, 4, 8] {
                 let mesh = mesh_lod_heightfield(&heights, stride, 0, |_, _| 0, 4);
-                for (q, quad) in mesh.vertices.chunks(4).enumerate() {
-                    for a in 0..4 {
-                        for b in 0..4 {
+                let quads = lod_triangles(&mesh, &mesh.indices);
+                for (q, quad) in quads.iter().enumerate() {
+                    for a in 0..3 {
+                        for b in 0..3 {
                             if quad[a].position[1] < quad[b].position[1] - 1e-4 {
                                 assert!(
                                     quad[a].morph_y <= quad[b].morph_y + 1e-4,

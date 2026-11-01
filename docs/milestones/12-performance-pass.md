@@ -320,6 +320,38 @@ Pillar 1 is performance on low-end hardware, and M11's benchmark (RTX 4060,
      shown a 44–64 ms worst frame in two of four runs; the others stay
      under ~20 ms — a one-off at the phase start, to watch.
 2. **LOD as true triangles** (criterion 4).
+   - [x] **Fans and zipped walls share vertices, three indices per triangle**
+     (2026-11-01). Each fan triangle and each zipped-wall triangle was a
+     quad with a repeated corner — four vertices, six indices, half of it
+     zero-area. Now a fan stores its centre and border once, a wall each
+     edge's vertices once, and each triangle is three indices into them;
+     plain rectangles stay two-triangle quads. Every vertex attribute is a
+     function of position alone, so sharing changes nothing drawn.
+     `LodMeshData::quad_count` became `triangle_count`; the tests that
+     walked the mesh in groups of four (`top_rects`, the full-morph wall
+     check, `the_morph_never_inverts_a_quad`) now walk triangles through the
+     index buffer. Every watertightness, morph and coverage test passes
+     unchanged otherwise.
+   - **Not all zero-area triangles were padding.** A wall between two cells
+     level at rest but not once morphed has zero height at rest and opens
+     as the camera nears its ring's edge (ADR-0009) — geometry the morph
+     needs. `LodMeshData::area_triangles` (which the benchmark's "drawn"
+     uses) now counts a triangle with area at rest **or** at full morph; the
+     earlier runs counted these walls as zero-area, so their "drawn" and
+     "zero-area %" slightly overstate the padding. The criterion's test,
+     `lod_submits_only_triangles_with_area` (land, sea, terraces, noise, a
+     coast; strides 1–64; both passes), fails on the old emitters.
+   - Headless, 576 real LOD nodes around the benchmark's start (strides
+     2–256, land and sea, release build):
+
+     | | Before | After |
+     |---|---|---|
+     | Triangles submitted | 4.26 M | **3.23 M (−24%)** |
+     | Vertices | 8.53 M | **6.00 M (−30%)** |
+     | Vertex + index bytes | 324 MB | **231 MB (−29%)** |
+
+   - [ ] The owner's bench: tris submitted should fall ~24% and the
+     zero-area column read ~0; GPU MB should fall with it.
 3. **Draw-call measurement, then batching if warranted** (criterion 5).
 4. **Retro.**
 

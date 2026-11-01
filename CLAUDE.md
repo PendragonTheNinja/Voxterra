@@ -262,14 +262,15 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   Task 0 done (instruments + the owner's baseline, recorded in the spec).
   Task 1 done (2026-11-01): mesh CPU per chunk −88% in game (~1 640 →
   ~190 µs), sprint backlog ~1 040 → ~200 (criterion 3 met), sprint fps
-  ~115 → ~720. Next: task 2, LOD as true triangles (24–26% of submitted
-  triangles are zero-area). No low-end
+  ~115 → ~720. Task 2 in: LOD fans and walls are true triangles over
+  shared vertices (headless: −24% LOD triangles, −29% LOD bytes); next, the
+  owner's `--bench` to confirm, then task 3 (draw calls). No low-end
   machine exists yet — the spec says how to judge low-end performance by
   proxy.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
   vox-core 288, vox-mesh 67, vox-worldgen 31, vox-render 17, vox-app 9
-  passing as of M12 task 1's snapshot fixes), then start the first unchecked item.
+  passing as of M12 task 2), then start the first unchecked item.
 - **Instruments (from M11):** the P key logs a `VIEW` line (exact position,
   angles, window, settings) and a `hole_census` — the frame re-rendered six
   ways on the player's GPU with pinholes counted per variant. In the cloud
