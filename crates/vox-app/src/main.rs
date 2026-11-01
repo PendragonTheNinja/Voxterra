@@ -461,7 +461,8 @@ fn mesh_one_chunk(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MoveMode {
     /// Free-fly noclip (the original behavior): WASD relative to yaw,
-    /// Space/Shift for vertical, Ctrl to sprint. Passes through blocks.
+    /// Space/Shift for vertical, Ctrl to sprint, the scroll wheel sets the
+    /// speed. Passes through blocks.
     Spectator,
     /// Grounded survival movement: gravity, jumping, AABB collision against
     /// solid blocks, Minecraft-style auto-step over single-block ledges.
@@ -490,11 +491,19 @@ struct FlyCamera {
     /// Whether the player is standing on solid ground (survival).
     on_ground: bool,
     mode: MoveMode,
+    /// Spectator speed, in quarter-octave steps from [`Self::SPEED`]: the
+    /// scroll wheel moves it, sprint multiplies whatever it is. Survival
+    /// ignores it (the wheel picks blocks there), and the bench sets the
+    /// camera's position itself, so neither depends on it.
+    fly_step: i32,
 }
 
 impl FlyCamera {
     const SPEED: f64 = 30.0; // m/s (spectator)
     const SPRINT_MULTIPLIER: f64 = 4.0; // hold Ctrl (spectator)
+    /// Scroll-wheel range: 2^(±12/4) = ⅛× to 8× — 3.75 to 240 m/s, sprint
+    /// 15 to 960. Each notch is ×1.19, four notches double it.
+    const FLY_STEPS: std::ops::RangeInclusive<i32> = -12..=12;
     const SENSITIVITY: f64 = 0.0022; // radians per mouse count
     const PITCH_LIMIT: f64 = 1.55; // just under PI/2
 
@@ -579,12 +588,24 @@ impl FlyCamera {
 
         if dir != DVec3::ZERO {
             let speed = if keys.contains(&KeyCode::ControlLeft) {
-                Self::SPEED * Self::SPRINT_MULTIPLIER
+                self.fly_speed() * Self::SPRINT_MULTIPLIER
             } else {
-                Self::SPEED
+                self.fly_speed()
             };
             self.position += dir.normalize() * speed * dt;
         }
+    }
+
+    /// Spectator speed before sprint, m/s, at the wheel's setting.
+    fn fly_speed(&self) -> f64 {
+        Self::SPEED * 2f64.powf(f64::from(self.fly_step) / 4.0)
+    }
+
+    /// Move the wheel's speed setting `notches` up (positive) or down,
+    /// within [`Self::FLY_STEPS`].
+    fn adjust_fly_speed(&mut self, notches: i32) {
+        self.fly_step =
+            (self.fly_step + notches).clamp(*Self::FLY_STEPS.start(), *Self::FLY_STEPS.end());
     }
 
     /// The player AABB (min, max) in world blocks, derived from the eye.
@@ -877,6 +898,7 @@ impl Default for App {
                 velocity: DVec3::ZERO,
                 on_ground: false,
                 mode: MoveMode::Spectator,
+                fly_step: 0,
             },
             keys: HashSet::new(),
             cursor_captured: false,
@@ -1006,6 +1028,7 @@ impl App {
             velocity: self.camera.velocity,
             on_ground: self.camera.on_ground,
             mode: self.camera.mode,
+            fly_step: self.camera.fly_step,
         };
 
         // Horizontal velocity from input (yaw-relative).
@@ -2769,7 +2792,8 @@ impl ApplicationHandler for App {
                 _ => {}
             },
 
-            // Scroll wheel cycles the selected block.
+            // Scroll wheel: flight speed in spectator (number keys still
+            // pick blocks there), the selected block in survival.
             WindowEvent::MouseWheel { delta, .. } => {
                 if self.cursor_captured {
                     let dir = match delta {
@@ -2777,7 +2801,18 @@ impl ApplicationHandler for App {
                         winit::event::MouseScrollDelta::PixelDelta(p) => -(p.y.signum() as i32),
                     };
                     if dir != 0 {
-                        self.cycle_selection(dir);
+                        match self.camera.mode {
+                            MoveMode::Spectator => {
+                                // Wheel up (away from you) is faster.
+                                self.camera.adjust_fly_speed(-dir);
+                                let speed = self.camera.fly_speed();
+                                log::info!(
+                                    "fly speed: {speed:.1} m/s (sprint {:.0})",
+                                    speed * FlyCamera::SPRINT_MULTIPLIER
+                                );
+                            }
+                            MoveMode::Survival => self.cycle_selection(dir),
+                        }
                     }
                 }
             }
@@ -3349,5 +3384,50 @@ mod specks_scratch {
         );
         let out = std::env::var("SPECK_OUT").unwrap_or("/tmp/specks.rgba".into());
         std::fs::write(&out, &px).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod fly_speed {
+    use super::*;
+
+    fn camera() -> FlyCamera {
+        FlyCamera {
+            position: DVec3::ZERO,
+            yaw: 0.0,
+            pitch: 0.0,
+            velocity: DVec3::ZERO,
+            on_ground: false,
+            mode: MoveMode::Spectator,
+            fly_step: 0,
+        }
+    }
+
+    /// The wheel starts at the speed the bench is tied to, four notches
+    /// double or halve it, and it stops at ⅛× and 8×.
+    #[test]
+    fn the_wheel_scales_flight_speed_within_bounds() {
+        let mut cam = camera();
+        assert_eq!(cam.fly_speed(), FlyCamera::SPEED);
+        cam.adjust_fly_speed(4);
+        assert!((cam.fly_speed() - 2.0 * FlyCamera::SPEED).abs() < 1e-9);
+        cam.adjust_fly_speed(100);
+        assert!((cam.fly_speed() - 8.0 * FlyCamera::SPEED).abs() < 1e-9);
+        cam.adjust_fly_speed(-100);
+        assert!((cam.fly_speed() - FlyCamera::SPEED / 8.0).abs() < 1e-9);
+    }
+
+    /// Flying covers distance at the wheel's speed, sprint on top.
+    #[test]
+    fn spectator_moves_at_the_wheel_speed() {
+        let mut cam = camera();
+        cam.adjust_fly_speed(4);
+        let mut keys = HashSet::new();
+        keys.insert(KeyCode::KeyW);
+        cam.update_spectator(&keys, 1.0);
+        assert!((cam.position.x - 60.0).abs() < 1e-9);
+        keys.insert(KeyCode::ControlLeft);
+        cam.update_spectator(&keys, 1.0);
+        assert!((cam.position.x - 300.0).abs() < 1e-9);
     }
 }

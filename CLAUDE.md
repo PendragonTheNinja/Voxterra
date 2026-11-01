@@ -293,7 +293,7 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   performance by proxy.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 288, vox-mesh 70, vox-worldgen 67, vox-render 21, vox-app 9
+  vox-core 288, vox-mesh 70, vox-worldgen 67, vox-render 21, vox-app 11
   passing (vox-worldgen was 54 at the M13 close), plus the ignored `every_biome_in_every_world`
   and `biome_survey`, run in release), then start the first unchecked item.
 - **Instruments (from M11):** the P key logs a `VIEW` line (exact position,
