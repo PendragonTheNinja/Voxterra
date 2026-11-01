@@ -13,9 +13,9 @@ Depends on M10 (the elevation field, ranges), M13 (precipitation and
 temperature per column, the stage-1 pattern of ADR-0017). Written 2026-11-01
 from `docs/vision.md` §1.3 and §9, at the owner's request.
 
-**Status: draft, for the owner's review** — the open questions are at the
-end. Nothing is built until they are answered and the biome additions are
-approved.
+**Status: spec approved (2026-11-01)** — decisions at the end. Task 0
+includes a water-physics design document, which the owner decides before
+task 3 (see "Water physics: decided later, constrained now").
 
 ## Why this milestone exists
 
@@ -140,6 +140,42 @@ surfaces at their own level (the LOD sea surface generalised to a per-cell
 water level), large rivers visible as ribbons for kilometres, small streams
 fading out with distance as they do on Earth.
 
+## Water physics: decided later, constrained now
+
+How water *behaves* — whether it flows when a dam is broken, how far, whether
+it is finite — is a game-defining choice the project has not made (owner,
+2026-11-01: "as simple as Minecraft's, or something much more complex").
+It is a simulation (`vox-sim`, later), so M14 builds none of it. But M14
+fixes how worldgen water is **stored**, and that must not close any door:
+
+- **Minecraft-like:** each water block is a source or a flowing level
+  (0–7); sources are infinite; a river is a staircase of sources. Simple,
+  cheap, familiar; water never runs out, a bucket can drain nothing.
+- **Finite volume** (cellular automaton): each cell holds an amount of
+  water that moves to neighbours by pressure and gravity; water is
+  conserved, levels are fractional, a breached lake drains into the valley
+  below. Realistic and spectacular, costly, and hard at 64 km of view.
+- **Hybrid** (the likely answer, `docs/vision.md` §1.3): worldgen water
+  sleeps until disturbed; near a disturbance a local finite simulation
+  runs; seas, rivers and large lakes act as reservoirs that refill from the
+  network (a river keeps flowing because the drainage network says so).
+
+What M14 must do so any of them stays possible:
+
+- store worldgen water as **full, settled blocks** (no partial levels yet),
+  with surfaces stepping down a river's long profile in whole blocks —
+  small rapids where it steps;
+- keep, for every river and lake, its **water level, flow direction,
+  speed and discharge** in the drainage network (stage 1), so a later
+  simulation knows which water is a reservoir and where it is going;
+- add no per-block water state that one model would need to undo.
+
+**Task 0 therefore includes a design document, `docs/design/water.md`,**
+comparing the three models on realism, fun, cost at our view distance,
+interaction with lighting, meshing and the LOD, and the work each implies —
+for the owner to decide before task 3 fixes the fill rule. The decision
+becomes an ADR; the simulation itself remains its own milestone.
+
 ## Acceptance criteria
 
 1. **Spec, catalogue additions and ADRs first**: the biome additions
@@ -175,7 +211,9 @@ fading out with distance as they do on Earth.
 
 ## Tasks (proposed order)
 
-0. Catalogue additions approved; instruments (maps of drainage and water).
+0. Catalogue additions (approved 2026-11-01) into `docs/biomes.md`; the
+   water-physics design document for the owner's decision; instruments
+   (maps of drainage and water).
 1. Stage-1 drainage: depression filling, flow routing, discharge, lakes and
    closed basins (ADR). Network tests (criteria 3, 4).
 2. Valley erosion on the stage-1 grid, fed back as the elevation field's
@@ -192,11 +230,11 @@ fading out with distance as they do on Earth.
 - **Flowing water** — water you can pour, dams that break, floods. That is a
   simulation (`vox-sim`, much later, `docs/vision.md` §1.3). Worldgen water
   is settled until disturbed.
-- **Currents that push the player** — unless the owner pulls them in (open
-  question 4); the network will carry a flow direction and speed per
-  channel either way, so they can be added without regenerating.
+- **Currents that push the player** — later, with boats (owner,
+  2026-11-01); the network carries a flow direction and speed per channel,
+  so they can be added without regenerating.
 - **Climate-shaped landforms** — dune seas, mesas and buttes, canyonlands,
-  glacial U-valleys, fjords, cirques: proposed as **M15** (open question 1).
+  glacial U-valleys, fjords, cirques: **M15** (owner, 2026-11-01).
 - **Seasons**: rivers do not rise and fall; wadis are dry.
 - **Vegetation** (gallery forests, reeds, mangroves themselves), **caves and
   groundwater** (geology), **placer gold** (geology, which will read this
@@ -217,17 +255,15 @@ fading out with distance as they do on Earth.
 - **Judge at walking speed** (5.612 m/s): following the longest river to the
   sea should take an hour or more on foot.
 
-## Open questions for the owner
+## Decisions (owner, 2026-11-01)
 
-1. **Split the milestone?** Recommended: M14 is water and the valleys it
-   carves (this spec); **M15 is landforms by climate** — dune seas, mesas and
-   canyons, glacial valleys and fjords — built on M14's network. One huge
-   milestone instead is possible but long.
-2. **The biome additions** above (river, lakes, salt flats, floodplain,
-   marsh, swamp, bog, delta, mangrove coast) and the blocks they need (silt,
-   peat, salt, river gravel). Add, drop, rename?
-3. **World-creation time.** A drainage network over 204 km at 64–128-block
-   cells may take a few seconds to build. Rebuild on every load, or cache it
-   in the world folder (derived and versioned, rebuilt if missing)?
-4. **River currents** that push swimmers and (later) boats: in this
-   milestone, or later with boats?
+1. **Two milestones**: M14 is water and the valleys it carves; **M15** is
+   landforms by climate, built on M14's network.
+2. **All nine water biomes** join the catalogue (river, freshwater lake,
+   salt lake / salt flat, floodplain, marsh, swamp, bog / fen, delta,
+   mangrove coast), with silt, peat, salt and river gravel.
+3. **The drainage network is cached in the world folder** — derived from the
+   seed and size, versioned, rebuilt automatically if missing or stale.
+4. **Currents later, with boats**; flow is recorded now.
+5. **Water physics is undecided** and important: a design document in task
+   0, the owner's decision before task 3 (see "Water physics").

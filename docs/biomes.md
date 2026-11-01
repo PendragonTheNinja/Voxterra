@@ -144,3 +144,23 @@ forest. Boundaries wander with noise at 1 400, 350 and 24 blocks.
 where hot and wet, yellowed where hot and dry, fresh green where mild and
 wet, olive and brown toward the cold — so it shifts smoothly across a
 boundary, near and far alike (ADR-0018).
+
+
+## Water biomes (approved 2026-11-01, built in M14)
+
+Hydrology (M14) makes the biomes deferred above possible. Each comes from the
+drainage network, not from climate alone.
+
+| # | Biome | Where | Earth analogues | Ground |
+|---|---|---|---|---|
+| 24 | River | the channel | Amazon, Rhine, Thames | river gravel and sand; silt in slow lowland rivers |
+| 25 | Freshwater lake | basins that fill and overflow | Great Lakes, Baikal, alpine tarns | silt, gravel at the shore |
+| 26 | Salt lake / salt flat | closed basins in dry climates | Great Salt Lake, Salar de Uyuni, Lop Nur | salt crust over silt |
+| 27 | Floodplain | flat ground beside lowland rivers | the Nile valley, Mississippi bottomlands | silt over river gravel |
+| 28 | Marsh | flat, waterlogged, open, warm or temperate | the Camargue, the Everglades' sawgrass | mud, shallow water |
+| 29 | Swamp | flat, waterlogged, wooded, warm | the Atchafalaya, the Pantanal | mud, shallow water |
+| 30 | Bog / fen | flat, waterlogged, cold | Hudson Bay lowlands, Irish bogs | peat |
+| 31 | Delta | large river mouths on gentle coasts | Nile, Mississippi, Ganges; Okavango inland | mud and sand, distributary channels |
+| 32 | Mangrove coast | tropical delta and estuary shores | the Sundarbans | mud (mangroves with vegetation) |
+
+New blocks: **silt**, **peat**, **salt**, **river gravel**.
