@@ -58,6 +58,11 @@ const BASE_WANDER_WAVELENGTH: f32 = 128.0;
 const BANK_REACH: f32 = 48.0;
 /// The steepest bank: rise per block.
 const BANK_SLOPE: f32 = 1.0;
+/// Manning's roughness of a natural channel.
+const MANNING_N: f32 = 0.035;
+/// The slowest and fastest water drawn flowing, m/s.
+const MIN_FLOW: f32 = 0.05;
+pub const MAX_FLOW: f32 = 4.0;
 /// A salt flat's crust reaches this far above its cell's floor, blocks.
 const SALT_FLAT_RISE: i64 = 2;
 
@@ -356,6 +361,42 @@ impl DrainageMap {
             (i as f64 + 0.5 + jx) * self.cell_x,
             (j as f64 + 0.5 + jz) * self.cell_z,
         )
+    }
+
+    /// The water's velocity in cell `(i, j)`, blocks per second along x and
+    /// z (M14, criterion 10): what the water's texture drifts at. A river's
+    /// speed from Manning's relation, `v = R^⅔·S^½ / n` with the channel's
+    /// depth for R and n = 0.035 (a natural channel), 0.05 to 4 m/s — a
+    /// torrent races, a lowland river barely moves — along its reach.
+    /// A cell beside a river takes the largest one's flow (its bends wander
+    /// into its neighbours); lakes and the sea are still.
+    pub fn flow(&self, i: usize, j: usize) -> (f32, f32) {
+        let c = j * self.nx + i;
+        if matches!(self.cover_at(c), Cover::Sea | Cover::Lake | Cover::SaltLake) {
+            return (0.0, 0.0);
+        }
+        let velocity = |i: i64, j: i64| {
+            let r = self.reach(i, j)?;
+            let (dx, dz) = (r.to.0 - r.from.0, r.to.1 - r.from.1);
+            let len = (dx * dx + dz * dz).sqrt().max(1.0);
+            let depth = r.depth.0.max(1.0);
+            let v = (depth.cbrt() * depth.cbrt() * r.slope.max(0.0).sqrt() / MANNING_N)
+                .clamp(MIN_FLOW, MAX_FLOW);
+            Some((r.discharge, (dx / len) as f32 * v, (dz / len) as f32 * v))
+        };
+        let (i, j) = (i as i64, j as i64);
+        if let Some((_, vx, vz)) = velocity(i, j) {
+            return (vx, vz);
+        }
+        let mut best: Option<(f32, f32, f32)> = None;
+        for (di, dj) in OFFSETS {
+            if let Some(v) = velocity(i + di, j + dj)
+                && best.is_none_or(|b| v.0 > b.0)
+            {
+                best = Some(v);
+            }
+        }
+        best.map_or((0.0, 0.0), |(_, vx, vz)| (vx, vz))
     }
 
     /// The reach leaving cell `(i, j)` (unwrapped), if it carries a stream.

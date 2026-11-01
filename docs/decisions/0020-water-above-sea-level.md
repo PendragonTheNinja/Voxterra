@@ -67,6 +67,22 @@ Water is rendered but neither solid nor opaque (ADR-0011): skylight and
 the skylight heightmap ask `opaque`, so a lake's bed is lit through it
 exactly as the seabed is, and the lighting invariants hold unchanged.
 
+### 6. Water that flows
+
+River water drifts downstream at its speed (M14 criterion 10), in the
+shader, from a **flow map**: the network's velocity per cell
+(`DrainageMap::flow` — Manning's relation, `v = R^⅔·S^½ / n` with the
+channel's depth and n = 0.035, 0.05–4 m/s; cells beside a river take its
+flow, lakes and the sea none), encoded as RG8 (`vox_render::encode_flow`)
+and bound beside the climate map, which it shares placement and sampler
+with (ADR-0018's pattern). `flow.wgsl`, appended to both terrain shaders,
+samples water's tile twice along the flow half a cycle apart and
+cross-fades them (the usual flow-map technique: no stretching, forever),
+with foam where it is fast; water's top samples by world position, so near
+and far tile alike. The water clock is real time, not world time: rivers
+keep flowing when the day stands still. Re-meshes nothing; one texture
+sample more per water pixel. Visual only, so it may use `cbrt`.
+
 ## Consequences
 
 - `ground` costs ~2× the eroded surface per column (~0.6 against ~0.3 µs in

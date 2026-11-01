@@ -346,8 +346,13 @@ becomes an ADR; the simulation itself remains its own milestone.
    - [x] Streaming spans standing water (`surface_span_chunks`): a lake's
      surface had stood in layers never loaded. Found in a render; a test
      that failed first.
-   - [ ] Flow speed and direction per reach, reservoir or finite — with the
-     flow map (task 5's distant water and criterion 10).
+   - [x] Flow speed and direction per reach (`DrainageMap::flow`,
+     Manning's relation) and **water that visibly flows** (the flow map,
+     `flow.wgsl`, ADR-0020 §6): river water drifts downstream at its speed
+     near and far, foams where fast; lakes and the sea are still. Checked
+     headlessly: between two water-clock times only water pixels change.
+   - [ ] Reservoir or finite per body — for the simulation (layer 2) when
+     it is built; the network has what it needs (discharge, cover).
    - [ ] Cost: `ground` ~2× the eroded surface per column; measure with
      `--bench` (owner).
 4. Lakes, salt flats, floodplains, wetlands, deltas, waterfalls; the new

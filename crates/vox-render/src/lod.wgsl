@@ -71,7 +71,8 @@ var block_sampler: sampler;
 //               coefficient 1/2R (0 = flat; curvature.wgsl), w = air density
 //               multiplier (0 = no aerial perspective; atmosphere.wgsl)
 //   morph     : x = morph band width in blocks (0 = morphing off), y = eye
-//               height above sea level (atmosphere.wgsl), zw reserved
+//               height above sea level (atmosphere.wgsl), z = the water
+//               clock in seconds (flow.wgsl, M14), w reserved
 //   fullres   : where the full-resolution column mask sits — xy = its corner
 //               (render-relative blocks), z = column size, w = side in
 //               columns (0 = no mask yet) — lod.wgsl only (M10 A1)
@@ -209,8 +210,9 @@ fn fs_lod(in: VsOut) -> @location(0) vec4<f32> {
 // Discards in full-res columns like the ground does — near water draws there.
 @fragment
 fn fs_lod_transparent(in: VsOut) -> @location(0) vec4<f32> {
-    let tex = textureSample(block_tex, block_sampler, in.uv, in.layer);
     let normal = normalize(cross(dpdx(in.world_rel), dpdy(in.world_rel)));
+    // Water drifting with its river's flow, as up close (flow.wgsl, M14).
+    let tex = water_sample(in.layer, in.uv, in.world_rel, normal);
     let to_eye = normalize(sky.cam_scale.xyz - in.world_rel);
     let grazing = pow(1.0 - abs(dot(normal, to_eye)), 5.0);
     if (under_fullres(in.world_rel)) {

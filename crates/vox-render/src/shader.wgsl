@@ -43,7 +43,8 @@ var block_sampler: sampler;
 //               coefficient 1/2R (0 = flat; curvature.wgsl), w = air density
 //               multiplier (0 = no aerial perspective; atmosphere.wgsl)
 //   morph     : x = geomorph band width in blocks — lod.wgsl only (ADR-0009),
-//               y = eye height above sea level (atmosphere.wgsl), zw reserved
+//               y = eye height above sea level (atmosphere.wgsl), z = the
+//               water clock in seconds (flow.wgsl, M14), w reserved
 //   fullres   : where the full-resolution column mask sits — xy = its corner
 //               (render-relative blocks), z = column size, w = side in
 //               columns (0 = no mask yet) — lod.wgsl only (M10 A1)
@@ -132,10 +133,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 // nothing: at 45 degrees the term is 0.002.
 @fragment
 fn fs_transparent(in: VsOut) -> @location(0) vec4<f32> {
-    let tex = textureSample(block_tex, block_sampler, in.uv, in.layer);
     // The face's normal from screen-space derivatives: flat per face, and
     // needs nothing from the vertex format.
     let normal = normalize(cross(dpdx(in.world_rel), dpdy(in.world_rel)));
+    // Water drifting with its river's flow (flow.wgsl, M14).
+    let tex = water_sample(in.layer, in.uv, in.world_rel, normal);
     let to_eye = normalize(sky.cam_scale.xyz - in.world_rel);
     let grazing = pow(1.0 - abs(dot(normal, to_eye)), 5.0);
     return vec4<f32>(lit(in, tex.rgb), mix(tex.a, 1.0, grazing));

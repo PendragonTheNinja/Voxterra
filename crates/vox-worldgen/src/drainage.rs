@@ -42,7 +42,7 @@ mod rivers;
 pub use cache::{CacheKey, FORMAT_VERSION as CACHE_FORMAT_VERSION};
 use erosion::Erosion;
 pub use hollows::Cover;
-pub use rivers::{Bed, Body, STREAM_FROM_M3S, Water};
+pub use rivers::{Bed, Body, MAX_FLOW, Near, STREAM_FROM_M3S, Water};
 
 /// Target size of a drainage cell, in blocks. Rivers need finer cells than
 /// climate (ADR-0017's 256); the grid is capped so the largest worlds stay

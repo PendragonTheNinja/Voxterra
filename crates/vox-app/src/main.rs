@@ -292,6 +292,21 @@ fn climate_texels(generator: &Generator) -> (Vec<u8>, (u32, u32)) {
     (texels, (nx as u32, nz as u32))
 }
 
+/// The drainage network's flow as texels for `Renderer::set_flow` (M14):
+/// each cell's water velocity, row by row.
+fn flow_texels(generator: &Generator) -> (Vec<u8>, (u32, u32)) {
+    let drainage = generator.drainage();
+    let (nx, nz) = drainage.cells();
+    let mut texels = Vec::with_capacity(nx * nz * 2);
+    for j in 0..nz {
+        for i in 0..nx {
+            let (vx, vz) = drainage.flow(i, j);
+            texels.extend_from_slice(&vox_render::encode_flow(vx, vz));
+        }
+    }
+    (texels, (nx as u32, nz as u32))
+}
+
 /// `jobs` pairs each chunk with its SEALED faces: a bit per entry of
 /// `NEIGHBOR_OFFSETS`, set where that face neighbour is absent and never
 /// coming (M10 A3). The mesher continues the chunk's own edge there: no face
@@ -2399,6 +2414,9 @@ impl ApplicationHandler for App {
             (shape.size_x(), shape.size_z()),
             vox_worldgen::climate::LAPSE_PER_BLOCK,
         );
+        // Rivers drift with their flow (M14), placed as the climate map is.
+        let (flow, cells) = flow_texels(&self.generator);
+        renderer.set_flow(&flow, cells);
 
         // The world is no longer pre-built: chunks stream in around the
         // camera each frame via stream_tick (M02). resumed() just stands up
@@ -2998,6 +3016,10 @@ mod specks_scratch {
                 (shape.size_x(), shape.size_z()),
                 vox_worldgen::climate::LAPSE_PER_BLOCK,
             );
+            let (flow, cells) = flow_texels(&generator);
+            r.set_flow(&flow, cells);
+            // SPECK_WATER_T: the water clock, seconds (a still frame of it).
+            r.set_water_time(Some(env("SPECK_WATER_T", 0.0) as f32));
         }
         r.set_debug_holes(std::env::var("SPECK_NOH").is_err());
         let unload = 8 + 2; // default radius 8 + streamer slack, roughly
