@@ -35,6 +35,9 @@ use crate::biome::aridity_threshold;
 use crate::climate::{ClimateMap, temperature_at};
 use crate::elevation::Elevation;
 
+mod hollows;
+pub use hollows::Cover;
+
 /// Target size of a drainage cell, in blocks. Rivers need finer cells than
 /// climate (ADR-0017's 256); the grid is capped so the largest worlds stay
 /// buildable.
@@ -45,6 +48,12 @@ const MAX_CELLS: i64 = 2_048;
 /// (~30 km² at 128-block cells). Smaller ones are inland pits — land
 /// hollows that fill like any other, or not, by their own water.
 const SEA_MIN_CELLS: usize = 2_048;
+/// Evaporation from open water, as a multiple of Köppen's aridity threshold
+/// (`20·T + 140` mm, the dryness the biome classifier judges land by): ~280
+/// mm a year at 0 °C, ~700 at 10 °C, ~1 300 at 25 °C — Earth's lake
+/// evaporation runs from a few hundred mm in the boreal to 1 500–2 000 over
+/// hot deserts' salt lakes (the Dead Sea, Lake Chad).
+const LAKE_EVAPORATION: f32 = 2.0;
 /// Seconds in a year, for mm/yr over an area to m³/s.
 const SECONDS_PER_YEAR: f64 = 31_557_600.0;
 
@@ -91,12 +100,17 @@ pub struct DrainageMap {
     spill: Vec<i32>,
     /// Whether the cell is sea: below sea level and part of an ocean.
     sea: Vec<bool>,
-    /// Whether the cell is under a lake.
-    lake: Vec<bool>,
+    /// What covers the cell.
+    cover: Vec<Cover>,
+    /// Whether water ends here without reaching the sea: a closed basin.
+    sink: Vec<bool>,
     /// The cell this one drains into; itself for the sea.
     receiver: Vec<u32>,
     /// Water leaving the cell, m³/s.
     discharge: Vec<f32>,
+    /// The water budget, kept for the conservation test.
+    #[cfg(test)]
+    budget: (Vec<f64>, Vec<f64>),
 }
 
 impl std::fmt::Debug for DrainageMap {
@@ -131,22 +145,28 @@ impl DrainageMap {
             })
             .collect();
         let sea = seas(nx, nz, &height);
-        // Runoff per cell, m³/s.
-        let area = cell_x * cell_z;
-        let runoff: Vec<f32> = (0..nx * nz)
+        // Runoff per cell, and what a lake over it would cost: its
+        // evaporation less the rain on it, plus the runoff it no longer
+        // sheds — always positive. Both m³/s.
+        let per_mm = cell_x * cell_z / 1000.0 / SECONDS_PER_YEAR;
+        let (runoff, demand): (Vec<f64>, Vec<f64>) = (0..nx * nz)
             .into_par_iter()
             .map(|c| {
                 if sea[c] {
-                    return 0.0;
+                    return (0.0, 0.0);
                 }
                 let (x, z) = centre(c);
                 let (sea_level_c, precip) = climate.sample(x, z);
                 let t = temperature_at(sea_level_c, i64::from(height[c].max(0)));
-                let mm = (precip - aridity_threshold(t)).max(0.0);
-                (f64::from(mm) / 1000.0 * area / SECONDS_PER_YEAR) as f32
+                let threshold = aridity_threshold(t);
+                let runoff = (precip - threshold).max(0.0);
+                let evaporation = LAKE_EVAPORATION * threshold;
+                (
+                    f64::from(runoff) * per_mm,
+                    f64::from(runoff + evaporation - precip) * per_mm,
+                )
             })
-            .collect();
-
+            .unzip();
         let cold: Vec<bool> = (0..nx * nz)
             .into_par_iter()
             .map(|c| {
@@ -155,23 +175,43 @@ impl DrainageMap {
                 temperature_at(sea_level_c, i64::from(height[c].max(0))) < GLACIATED_BELOW_C
             })
             .collect();
-        let (surface, lake) = lakes(nx, nz, &height, &sea, &cold);
-        let (receiver, order) = flood(nx, nz, &surface, &sea, &lake);
-        let spill = channel_levels(&surface, &receiver, &order, &lake);
-        let lake: Vec<bool> = (0..nx * nz)
-            .map(|c| !sea[c] && spill[c] > height[c])
-            .collect();
+        let held = hollows::settle(nx, nz, &height, &sea, &cold, &runoff, &demand);
+        let (surface, mut cover, sink) = (held.surface, held.cover, held.sink);
+        let lake: Vec<bool> = cover.iter().map(|&c| c == Cover::Lake).collect();
+        let (receiver, order) = flood(nx, nz, &surface, &sea, &sink, &lake);
+        let still: Vec<bool> = (0..nx * nz).map(|c| lake[c] || sink[c]).collect();
+        let spill = channel_levels(&surface, &receiver, &order, &still);
+        // A cut can end below a lake it flows into: that water is the
+        // lake's backwater.
+        for c in 0..nx * nz {
+            if cover[c] == Cover::Land && spill[c] > height[c] {
+                cover[c] = Cover::Lake;
+            }
+        }
 
         // Downstream accumulation in reverse flood order: every cell is
         // reached after its receiver, so reversed, every cell is summed
-        // before the water moves on.
-        let mut discharge = runoff;
+        // before the water moves on. A lake loses its evaporation; what
+        // leaves it is never less than nothing. Closed basins keep all.
+        let mut q: Vec<f64> = (0..nx * nz)
+            .map(|c| {
+                if cover[c] == Cover::Lake {
+                    runoff[c] - demand[c]
+                } else {
+                    runoff[c]
+                }
+            })
+            .collect();
         for &c in order.iter().rev() {
-            let r = receiver[c as usize] as usize;
-            if r != c as usize {
-                discharge[r] += discharge[c as usize];
+            let c = c as usize;
+            let r = receiver[c] as usize;
+            if r == c {
+                continue;
             }
+            let leaving = cover[c] == Cover::Lake && cover[r] != Cover::Lake;
+            q[r] += if leaving { q[c].max(0.0) } else { q[c] };
         }
+        let discharge: Vec<f32> = q.iter().map(|&v| v.max(0.0) as f32).collect();
         Self {
             nx,
             nz,
@@ -180,9 +220,12 @@ impl DrainageMap {
             height,
             spill,
             sea,
-            lake,
+            cover,
+            sink,
             receiver,
             discharge,
+            #[cfg(test)]
+            budget: (runoff, demand),
         }
     }
 
@@ -221,176 +264,46 @@ impl DrainageMap {
         self.sea[j * self.nx + i]
     }
 
-    /// Whether the cell is under a lake.
+    /// Whether the cell is under a lake, fresh or salt.
     pub fn is_lake(&self, i: usize, j: usize) -> bool {
-        self.lake[j * self.nx + i]
+        matches!(self.cover(i, j), Cover::Lake | Cover::SaltLake)
     }
-}
 
-/// Which hollows hold lakes, and their surfaces: returns the water surface
-/// per cell (the ground where there is no lake) and which cells are lake.
-///
-/// The hollows nest — a deep basin inside a broad shallow one inside a
-/// plain — so they are found as a merge tree (a depression hierarchy,
-/// Barnes et al., 2020): cells taken lowest first, each joining the
-/// neighbours already taken; where two undrained groups meet, both are
-/// full to that saddle, and they fill on together as one. A group that
-/// meets the sea (or anything drained) spills. Then from the outermost
-/// hollow in: a hollow kept by [`LAKE_MIN_MEAN_DEPTH`]'s rule is a lake to
-/// its spill level, everything inside it included; a breached one leaves
-/// each hollow nested in it to be judged on its own.
-fn lakes(
-    nx: usize,
-    nz: usize,
-    height: &[i32],
-    sea: &[bool],
-    cold: &[bool],
-) -> (Vec<i32>, Vec<bool>) {
-    const NONE: u32 = u32::MAX;
-    struct Hollow {
-        /// Where it spills or joins another; `i32::MAX` while it never does.
-        spill: i32,
-        cells: i64,
-        sum_height: i64,
-        deepest: i32,
-        cold: i64,
-        parent: u32,
+    /// What covers the cell.
+    pub fn cover(&self, i: usize, j: usize) -> Cover {
+        self.cover[j * self.nx + i]
     }
-    let n = nx * nz;
-    // Union-find over cells; index `n` is the sea, always drained.
-    let mut up: Vec<u32> = (0..=n as u32).collect();
-    fn root(up: &mut [u32], mut c: u32) -> u32 {
-        while up[c as usize] != c {
-            let next = up[up[c as usize] as usize];
-            up[c as usize] = next;
-            c = next;
-        }
-        c
+
+    /// Whether water ends in the cell without reaching the sea.
+    pub fn is_sink(&self, i: usize, j: usize) -> bool {
+        self.sink[j * self.nx + i]
     }
-    // Per group root: the hollow it is filling, or NONE once drained.
-    let mut filling = vec![NONE; n + 1];
-    // Per cell: the hollow it joined.
-    let mut joined = vec![NONE; n];
-    let mut hollows: Vec<Hollow> = Vec::new();
-    let mut taken = vec![false; n];
-    for c in 0..n {
-        if sea[c] {
-            up[c] = n as u32;
-            taken[c] = true;
-        }
-    }
-    let mut land: Vec<u32> = (0..n as u32).filter(|&c| !sea[c as usize]).collect();
-    land.sort_unstable_by_key(|&c| (height[c as usize], c));
-    for &c in &land {
-        let c = c as usize;
-        let h = height[c];
-        taken[c] = true;
-        let mut mine = NONE; // this cell's group root, once it has one
-        for nb in neighbours(c, nx, nz) {
-            if !taken[nb] || nb == c {
-                continue;
-            }
-            let theirs = root(&mut up, nb as u32);
-            if mine == NONE {
-                // Join the first group: extend it.
-                up[c] = theirs;
-                mine = theirs;
-                continue;
-            }
-            if theirs == mine {
-                continue;
-            }
-            // Two groups meet at this cell's height.
-            let (a, b) = (filling[mine as usize], filling[theirs as usize]);
-            for x in [a, b] {
-                if x != NONE {
-                    hollows[x as usize].spill = h;
+
+    /// For every cell, row-major: whether its water ends in a closed basin
+    /// rather than the sea — the world's endorheic land.
+    pub fn endorheic(&self) -> Vec<bool> {
+        let n = self.height.len();
+        // 0 unknown, 1 sea, 2 closed basin.
+        let mut end = vec![0u8; n];
+        let mut path = Vec::new();
+        for start in 0..n {
+            let mut at = start;
+            while end[at] == 0 {
+                let r = self.receiver[at] as usize;
+                if r == at {
+                    end[at] = if self.sink[at] { 2 } else { 1 };
+                    break;
                 }
+                path.push(at);
+                at = r;
             }
-            let merged = if a == NONE || b == NONE {
-                NONE // either drains: both now drain
-            } else {
-                let id = hollows.len() as u32;
-                let (ha, hb) = (&hollows[a as usize], &hollows[b as usize]);
-                let joined_hollow = Hollow {
-                    spill: i32::MAX,
-                    cells: ha.cells + hb.cells,
-                    sum_height: ha.sum_height + hb.sum_height,
-                    deepest: ha.deepest.min(hb.deepest),
-                    cold: ha.cold + hb.cold,
-                    parent: NONE,
-                };
-                hollows[a as usize].parent = id;
-                hollows[b as usize].parent = id;
-                hollows.push(joined_hollow);
-                id
-            };
-            // The sea's root stays the root, so it is always found drained.
-            let (keep, gone) = if theirs as usize == n {
-                (theirs, mine)
-            } else {
-                (mine, theirs)
-            };
-            up[gone as usize] = keep;
-            filling[keep as usize] = merged;
-            mine = keep;
+            let e = end[at];
+            for c in path.drain(..) {
+                end[c] = e;
+            }
         }
-        if mine == NONE {
-            // A pit: a new hollow.
-            hollows.push(Hollow {
-                spill: i32::MAX,
-                cells: 0,
-                sum_height: 0,
-                deepest: h,
-                cold: 0,
-                parent: NONE,
-            });
-            filling[c] = (hollows.len() - 1) as u32;
-            mine = c as u32;
-        }
-        let x = filling[mine as usize];
-        joined[c] = x;
-        if x != NONE {
-            let hl = &mut hollows[x as usize];
-            hl.cells += 1;
-            hl.sum_height += i64::from(h);
-            hl.cold += i64::from(cold[c]);
-        }
+        end.into_iter().map(|e| e == 2).collect()
     }
-    // Hollows are created before their parents, so walking them backwards
-    // settles every parent before its children.
-    let mut level = vec![i32::MIN; hollows.len()];
-    for id in (0..hollows.len()).rev() {
-        let hl = &hollows[id];
-        if hl.parent != NONE && level[hl.parent as usize] != i32::MIN {
-            level[id] = level[hl.parent as usize];
-            continue;
-        }
-        if hl.spill == i32::MAX {
-            continue; // never fills (a world without sea): not a lake
-        }
-        // Statistics at the spill level, over everything inside.
-        let volume = hl.cells * i64::from(hl.spill) - hl.sum_height;
-        let basin = volume >= LAKE_MIN_MEAN_DEPTH * hl.cells && hl.cells >= LAKE_MIN_CELLS as i64;
-        let glaciated = hl.cold * 2 >= hl.cells;
-        let tarn = glaciated
-            && hl.spill - hl.deepest >= LAKE_MIN_DEPTH_GLACIATED
-            && (LAKE_MIN_CELLS_GLACIATED as i64..=LAKE_MAX_CELLS_GLACIATED as i64)
-                .contains(&hl.cells);
-        if basin || tarn {
-            level[id] = hl.spill;
-        }
-    }
-    let mut surface = height.to_vec();
-    let mut lake = vec![false; n];
-    for c in 0..n {
-        let x = joined[c];
-        if x != NONE && level[x as usize] > height[c] {
-            surface[c] = level[x as usize];
-            lake[c] = true;
-        }
-    }
-    (surface, lake)
 }
 
 /// The level of the water in every cell: a lake's surface, and elsewhere
@@ -473,7 +386,7 @@ fn neighbours(c: usize, nx: usize, nz: usize) -> [usize; 8] {
     ]
 }
 
-/// Priority flood from the sea over the water surface: receivers, and the
+/// Priority flood from the sea and the closed basins over the water surface: receivers, and the
 /// order cells were reached in (outlets first). Cells are taken lowest
 /// spill level first, and among equal spill levels lowest surface first, so
 /// that across a filled flat the water still finds the low ground rather
@@ -485,6 +398,7 @@ fn flood(
     nz: usize,
     surface: &[i32],
     sea: &[bool],
+    sink: &[bool],
     lake: &[bool],
 ) -> (Vec<u32>, Vec<u32>) {
     let n = nx * nz;
@@ -492,9 +406,10 @@ fn flood(
     let mut order = Vec::with_capacity(n);
     let mut heap = BinaryHeap::with_capacity(n / 4);
     for c in 0..n {
-        if sea[c] {
+        if sea[c] || sink[c] {
+            let key = if sea[c] { 0 } else { surface[c] };
             receiver[c] = c as u32;
-            heap.push(Reverse((0i32, surface[c], c as u32)));
+            heap.push(Reverse((key, surface[c], c as u32)));
         }
     }
     if heap.is_empty() {
@@ -530,8 +445,9 @@ mod tests {
     }
 
     /// Criterion 3: water runs downhill, always — every cell's receiver is a
-    /// neighbour whose spill level is no higher, the sea drains to itself,
-    /// and following receivers from any land cell reaches the sea.
+    /// neighbour whose level is no higher, the sea and closed basins drain
+    /// to themselves, and following receivers from any land cell reaches
+    /// the sea or a closed basin.
     #[test]
     fn water_runs_downhill_to_the_sea() {
         let d = small(3);
@@ -544,51 +460,57 @@ mod tests {
                     assert_eq!(r, c, "the sea is its own outlet");
                     continue;
                 }
+                if d.sink[c] {
+                    assert_eq!(r, c, "a closed basin is its own outlet");
+                    assert!(d.spill[c] >= d.height[c], "a closed basin above its ground");
+                    continue;
+                }
                 assert!(neighbours(c, nx, nz).contains(&r), "receiver not adjacent");
                 assert!(d.spill[r] <= d.spill[c], "water runs uphill at ({i}, {j})");
-                if d.lake[c] {
+                if d.is_lake(i, j) {
                     assert!(d.spill[c] > d.height[c], "a lake with no depth");
                 } else {
                     assert!(d.spill[c] <= d.height[c], "a river bed above its ground");
                 }
                 let mut at = c;
                 for _ in 0..nx * nz {
-                    if d.sea[at] {
+                    if d.sea[at] || d.sink[at] {
                         break;
                     }
                     at = d.receiver[at] as usize;
                 }
-                assert!(d.sea[at], "({i}, {j}) never reaches the sea");
+                assert!(
+                    d.sea[at] || d.sink[at],
+                    "({i}, {j}) never reaches the sea or a closed basin"
+                );
             }
         }
     }
 
-    /// Discharge is conserved: everything the land sheds arrives at the sea.
+    /// Water is conserved: what the land sheds reaches the sea or a closed
+    /// basin, less no more than the lakes on the way evaporate.
     #[test]
-    fn every_drop_reaches_the_sea() {
+    fn every_drop_is_accounted_for() {
         let d = small(5);
         let n = d.height.len();
-        let into_sea: f64 = (0..n)
-            .filter(|&c| !d.sea[c] && d.sea[d.receiver[c] as usize])
+        let (runoff, demand) = &d.budget;
+        let arrives: f64 = (0..n)
+            .filter(|&c| {
+                let r = d.receiver[c] as usize;
+                !d.sea[c] && (d.sea[r] && r != c || d.sink[c])
+            })
             .map(|c| f64::from(d.discharge[c]))
             .sum();
-        // Runoff over all land, recomputed: discharge of land cells minus
-        // what flowed in from upstream.
-        let mut inflow = vec![0.0f64; n];
-        for c in 0..n {
-            let r = d.receiver[c] as usize;
-            if r != c {
-                inflow[r] += f64::from(d.discharge[c]);
-            }
-        }
-        let runoff: f64 = (0..n)
-            .filter(|&c| !d.sea[c])
-            .map(|c| f64::from(d.discharge[c]) - inflow[c])
+        let shed: f64 = runoff.iter().sum();
+        let lakes: f64 = (0..n)
+            .filter(|&c| d.cover[c] == Cover::Lake)
+            .map(|c| demand[c])
             .sum();
-        assert!(runoff > 0.0);
+        assert!(shed > 0.0);
+        assert!(arrives <= shed * 1.001, "{arrives} arrives of {shed} shed");
         assert!(
-            ((into_sea - runoff) / runoff).abs() < 1e-3,
-            "{into_sea} vs {runoff}"
+            arrives >= (shed - lakes) * 0.999,
+            "{arrives} arrives of {shed} shed less {lakes} evaporated"
         );
     }
 
@@ -612,7 +534,7 @@ mod tests {
                 let x = ((i as f64 + 0.5) * cw) as i64;
                 let z = ((j as f64 + 0.5) * ch) as i64;
                 let (t0, _) = climate.sample(x, z);
-                let lake = u32::from(d.lake[c]);
+                let lake = u32::from(d.is_lake(i, j));
                 if temperature_at(t0, i64::from(d.height[c].max(0))) < GLACIATED_BELOW_C {
                     cold += 1;
                     cold_lake += lake;

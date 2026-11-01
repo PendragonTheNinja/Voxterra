@@ -265,8 +265,21 @@ becomes an ADR; the simulation itself remains its own milestone.
      channels cut so water never runs uphill; discharge accumulated.
      Tests: downhill to the sea, conservation, determinism, lakes commonest
      where ice-scoured.
-   - [ ] Closed basins by water budget: lakes in dry climates that cannot
-     fill become salt lakes and salt flats.
+   - [x] Closed basins by water budget (`drainage::hollows`): the steady
+     state of Fill-Spill-Merge (Barnes et al., 2020) over the depression
+     tree — runoff runs to the hollow it ends in, a hollow full to its spill
+     overflows to its sibling or their shared pool, one that cannot fill
+     settles where lake evaporation (2× Köppen's threshold) meets inflow:
+     a salt lake, or a salt flat. Closed basins are never breached and are
+     the network's other outlets. Tests: downhill to the sea or a closed
+     basin; every drop reaches one, less what lakes evaporate.
+   - Measured before erosion: **78% of land drains to closed basins**
+     (Earth ~18%). The cause is the terrain, not the budget: the flat
+     interior plateau is pitted everywhere, every pit a tiny closed basin
+     on subhumid ground (35% of land is arid, 25% subhumid). So valley
+     erosion (task 2) comes next, before flow speed, the cache and the
+     network's Earth comparison, all of which are measured on the eroded
+     terrain.
    - [ ] Flow speed and direction per reach; reservoir or finite.
    - [ ] Cached in the world folder; the ADR for the drainage stage.
    - [ ] Network tests over many seeds against Earth (criterion 4).

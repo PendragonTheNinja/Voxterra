@@ -183,6 +183,7 @@ mod tests {
     use super::*;
     use crate::Generator;
     use crate::climate::{ClimateMap, temperature_at};
+    use crate::drainage::Cover;
     use vox_core::WorldShape;
 
     #[test]
@@ -389,34 +390,56 @@ mod tests {
             t.elapsed().as_secs_f64() * 1000.0
         );
         let (dx, dz) = drainage.cells();
+        let endorheic = drainage.endorheic();
         let mut rivers = vec![0u8; dx * dz * 3];
-        let (mut lake_cells, mut land_cells, mut biggest) = (0u32, 0u32, 0.0f32);
+        let (mut land_cells, mut biggest) = (0u32, 0.0f32);
+        let (mut lake_cells, mut salt_cells, mut closed_cells) = (0u32, 0u32, 0u32);
         for j in 0..dz {
             for i in 0..dx {
-                let (h, spill, q, _) = drainage.cell(i, j);
+                let (h, _, q, _) = drainage.cell(i, j);
                 let sea = drainage.is_sea(i, j);
                 // Inland pits below sea level are land: draw them as lowland.
                 let mut c = elevation_colour(i64::from(if sea { h } else { h.max(1) }));
                 if !sea {
                     land_cells += 1;
                     biggest = biggest.max(q);
-                    if drainage.is_lake(i, j) {
-                        let _ = spill;
-                        lake_cells += 1;
-                        c = [90, 200, 230];
-                    } else if q >= RIVER_FROM_M3S {
-                        // Brighter and bluer with discharge, log scale.
-                        let k = ((q / RIVER_FROM_M3S).log10() / 3.0).clamp(0.0, 1.0);
-                        c = ramp(&[(0.0, [70, 120, 200]), (1.0, [10, 30, 140])], k);
+                    if endorheic[j * dx + i] {
+                        // Land draining to a closed basin: tinted sand.
+                        closed_cells += 1;
+                        c = ramp(&[(0.0, c), (1.0, [220, 190, 120])], 0.45);
+                    }
+                    match drainage.cover(i, j) {
+                        Cover::Lake => {
+                            lake_cells += 1;
+                            c = [90, 200, 230];
+                        }
+                        Cover::SaltLake => {
+                            lake_cells += 1;
+                            salt_cells += 1;
+                            c = [60, 170, 160];
+                        }
+                        Cover::SaltFlat => {
+                            salt_cells += 1;
+                            c = [245, 240, 225];
+                        }
+                        _ if q >= RIVER_FROM_M3S => {
+                            // Brighter and bluer with discharge, log scale.
+                            let k = ((q / RIVER_FROM_M3S).log10() / 3.0).clamp(0.0, 1.0);
+                            c = ramp(&[(0.0, [70, 120, 200]), (1.0, [10, 30, 140])], k);
+                        }
+                        _ => {}
                     }
                 }
                 let at = (j * dx + i) * 3;
                 rivers[at..at + 3].copy_from_slice(&c);
             }
         }
+        let share = |k: u32| 100.0 * f64::from(k) / f64::from(land_cells);
         println!(
-            "lakes cover {:.1}% of land cells; the largest discharge is {:.1} m³/s",
-            100.0 * f64::from(lake_cells) / f64::from(land_cells),
+            "lakes cover {:.1}% of land, salt lakes and flats {:.1}%; {:.1}% of land drains to closed basins; the largest discharge is {:.1} m³/s",
+            share(lake_cells),
+            share(salt_cells),
+            share(closed_cells),
             biggest
         );
         let path = dir.join(format!("rivers-{:x}-{}.png", g.seed(), shape.size_x()));
