@@ -326,21 +326,35 @@ impl ClimateMap {
         self.bilinear(&self.precip, x, z)
     }
 
+    /// Sea-level temperature and precipitation together: one lookup, since
+    /// they share every index and weight — what the generator asks for per
+    /// column.
+    pub fn sample(&self, x: i64, z: i64) -> (f32, f32) {
+        let (c, t) = self.corners(x, z);
+        (lerp4(&self.sea_temp, c, t), lerp4(&self.precip, c, t))
+    }
+
+    /// The four cells around a column and its weights between them.
+    fn corners(&self, x: i64, z: i64) -> ([usize; 4], (f32, f32)) {
+        let u = x as f64 / self.cell_x - 0.5;
+        let v = z as f64 / self.cell_z - 0.5;
+        let (fu, fv) = (u.floor(), v.floor());
+        let i0 = (fu as i64).rem_euclid(self.nx as i64) as usize;
+        let j0 = (fv as i64).rem_euclid(self.nz as i64) as usize;
+        let (i1, j1) = ((i0 + 1) % self.nx, (j0 + 1) % self.nz);
+        let at = |i: usize, j: usize| j * self.nx + i;
+        (
+            [at(i0, j0), at(i1, j0), at(i0, j1), at(i1, j1)],
+            ((u - fu) as f32, (v - fv) as f32),
+        )
+    }
+
     /// Bilinear between cell centres, wrapping with the torus. This is
     /// content addressing — the grid tiles the world as the noise does
     /// (CLAUDE.md: terrain generation is a canonicalising site).
     fn bilinear(&self, field: &[f32], x: i64, z: i64) -> f32 {
-        let u = x as f64 / self.cell_x - 0.5;
-        let v = z as f64 / self.cell_z - 0.5;
-        let (fu, fv) = (u.floor(), v.floor());
-        let (tu, tv) = ((u - fu) as f32, (v - fv) as f32);
-        let i0 = (fu as i64).rem_euclid(self.nx as i64) as usize;
-        let j0 = (fv as i64).rem_euclid(self.nz as i64) as usize;
-        let (i1, j1) = ((i0 + 1) % self.nx, (j0 + 1) % self.nz);
-        let at = |i: usize, j: usize| field[j * self.nx + i];
-        let top = at(i0, j0) + (at(i1, j0) - at(i0, j0)) * tu;
-        let bottom = at(i0, j1) + (at(i1, j1) - at(i0, j1)) * tu;
-        top + (bottom - top) * tv
+        let (c, t) = self.corners(x, z);
+        lerp4(field, c, t)
     }
 }
 
@@ -369,7 +383,10 @@ fn sweep(g: &Grid, east: bool) -> (Vec<f32>, Vec<f32>) {
             1.0 - exp(-cell * rate * (1.0 - RECYCLING) / (DRYING_LENGTH * g.continents))
         })
         .collect();
-    let ocean_uptake = 1.0 - exp(-cell / OCEAN_UPTAKE_LENGTH);
+    // Ocean basins shrink with the continents in small worlds; air crossing
+    // a narrow sea must still arrive saturated, or no small world has a
+    // wet windward coast (ADR-0017 §5).
+    let ocean_uptake = 1.0 - exp(-cell / (OCEAN_UPTAKE_LENGTH * g.continents));
     let orographic = 1.0 - exp(-cell / OROGRAPHIC_LENGTH);
 
     let mut q: Vec<f32> = t0.iter().map(|&t| moisture_capacity(t)).collect();
@@ -444,6 +461,13 @@ fn blur(field: &mut [f32], nx: usize, nz: usize) {
             }
         }
     }
+}
+
+/// Bilinear blend of `field` at four corners `[00, 10, 01, 11]`.
+fn lerp4(field: &[f32], c: [usize; 4], (tu, tv): (f32, f32)) -> f32 {
+    let top = field[c[0]] + (field[c[1]] - field[c[0]]) * tu;
+    let bottom = field[c[2]] + (field[c[3]] - field[c[2]]) * tu;
+    top + (bottom - top) * tv
 }
 
 /// `e^x`, from basic arithmetic only, so it is bit-identical on every

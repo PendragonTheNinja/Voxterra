@@ -270,6 +270,36 @@ horizon.
 3. **Surface materials.** The new blocks and their tiles; per-biome
    profiles (top, beneath, depth); beaches and rocky coasts; seabeds; sea
    ice; snow and ice sheets. `GENERATOR_VERSION` bump and re-pin.
+   - [x] **Done headlessly (2026-11-01).** Thirteen blocks (ids 9–21, all
+     opaque solid cubes): snow, ice, gravel, red sand, sandstone, red
+     sandstone, three banded badlands rocks, coarse dirt, podzol, clay, mud
+     — each with a procedural tile and a grain that reads as the material
+     (pebbly gravel, banded sandstone, smooth snow and clay). Profiles in
+     `vox_worldgen::materials`: every biome's top block and layers
+     (rainforest over clay, sand over sandstone in deserts and on beaches,
+     hamada in rough desert, podzol under taiga, gravel through tundra,
+     snow over ice on ice sheets, snow caps on alpine rock, red sand over
+     strata in badlands, mud and clay on the deep seabed, gravel on polar
+     seabeds) with small-scale patches (`Elevation::patch_noise`, 40 and
+     11 blocks) for sand through steppe, gravel through tundra, outcrops
+     on meadows. **Badlands strata** are banded by world height in a
+     per-world order, so cliffs read as layered rock. **Polar seas freeze**:
+     ice on the sea surface. Profiles end within 12 blocks
+     (`MAX_PROFILE_DEPTH`), stone beneath, so deep chunks stay uniform
+     without classifying anything; chunk generation classifies a column
+     only where a chunk meets its profile or its sea surface.
+     `GENERATOR_VERSION` 3, fingerprint re-pinned (no version-3 world
+     exists yet, so later M13 re-pins before the owner plays are allowed).
+   - Tests: every profile ends in stone within the maximum depth; the sea
+     fills and freezes; surfaces read as their biomes; strata are
+     horizontal; **every block of the chunks through the surface, in every
+     biome, equals the per-block profile** (fails if the lazy path's stone
+     or the sea-ice path is broken).
+   - **Cost**: chunk generation along the benchmark's sprint path, dev
+     build, 1 800 chunks: 375 µs per chunk before, **364 after** —
+     classification paid for by computing each chunk's surfaces once. A
+     24-block profile first cost a tenth of all chunks their uniform fast
+     path; 12 keeps all but 4%.
 4. **Biome colour and the LOD.** ADR-0018; the chosen colouring; surface
    material per LOD cell; criterion 7's tests.
 5. **Owner's walk.** A play session on foot and in flight, judged at walking
@@ -310,22 +340,28 @@ horizon.
 - Measure chunk generation under streaming (lesson 6): uniform chunks must
   stay O(1) — a buried-rock chunk should not classify 1 024 columns.
 
-## Open question (2026-11-01)
+## The smallest world (decided 2026-11-01)
 
-**The smallest legal world (32 km across) cannot promise every biome.** In
-24 seeds, 5 have no temperate rainforest and 1 no alpine rock and snow. Both
-need landforms — a wet windward coast in the westerlies, a range above the
-snowline — and a 32 km world has room for very few: its continents are
-~10 km, and mountain belts keep their walking-scale size (ADR-0010). Three
-ways forward:
+The smallest legal world (32 km) lacked a biome in some seeds: temperate
+rainforest in 5 of 24, alpine rock and snow in 1. The owner chose (b) —
+shrink landforms in small worlds, **but only when needed**. Done as two
+calibrations, each a no-op wherever it is not needed:
 
-- **(a)** accept it, and state the guarantee from 64 km up (the smallest
-  world becomes "may lack the rarest biomes");
-- **(b)** shrink landforms in small worlds, as `docs/vision.md` §1.1
-  foresaw ("in the smallest worlds landform scale has to shrink enough that
-  a few ranges still fit") — an elevation change, so a `GENERATOR_VERSION`
-  bump in task 3 anyway;
-- **(c)** raise the smallest legal size to 64 km.
+- **Mountain ranges**: two of those worlds had no point above ~360 blocks —
+  their mountain-belt field, a few lattice cells around a tiny world, had
+  missed the land. Each world now checks, at creation, that at least 2.5%
+  of its land lies under ranges (uplift ≥ 400); one that falls short lowers
+  its belt gate until it does (`Elevation::calibrate_ranges`, bisection, like
+  the coastline). Worlds of the default size and larger always have ≥ 4.6%
+  over 48 seeds, so **their terrain is unchanged** (the fingerprint test
+  passed untouched).
+- **Ocean uptake** now scales with the continents like the drying length
+  (ADR-0017 §5): a small world's narrow seas left its westerly coasts just
+  short of rainforest wetness (1 220–1 320 mm).
+
+Result: every biome in every one of 24 seeds at 32 and 64 km;
+`every_biome_in_every_world` now asserts it from 32 km up (32 worlds, all
+passing). Tested: `every_world_has_mountain_ranges_and_only_small_ones_are_changed`.
 
 ## Decisions (owner, 2026-11-01)
 

@@ -144,6 +144,20 @@ const OROGENY_FLOOR: f32 = 0.42;
 const OROGENY_GATE_WAVELENGTH: i64 = 13_000;
 const OROGENY_GATE_LO: f32 = 0.10;
 const OROGENY_GATE_HI: f32 = 0.52;
+
+/// Every world has mountains (M13, the owner's choice, 2026-11-01): at
+/// least this share of its land under ranges with [`RANGE_UPLIFT`] blocks of
+/// uplift or more, or its alpine biomes — and the rain shadows behind them —
+/// would be missing. Worlds of the default size and larger always have it
+/// (≥ 4.6% over 48 seeds), so they are untouched; a small world, whose
+/// mountain-belt field has only a few lattice cells around it, can miss its
+/// land entirely, and widens its belts until it has this much
+/// ([`Elevation::calibrate_ranges`]) — shrinking the room between ranges
+/// only where it is needed (`docs/vision.md` §1.1).
+const MIN_RANGE_SHARE: f32 = 0.025;
+const RANGE_UPLIFT: f32 = 400.0;
+/// The most the belt gate may be lowered by.
+const MAX_GATE_SHIFT: f32 = 0.6;
 /// Uplift at full orogeny, in blocks. The ceiling a summit can reach, and only
 /// where the field saturates across a very wide region.
 pub(crate) const MAX_UPLIFT: f32 = 1_150.0;
@@ -216,6 +230,9 @@ pub struct Elevation {
     /// Subtracted from the continent field so this world's land fraction lands
     /// on [`TARGET_LAND_FRACTION`]. See [`Elevation::calibrate_coastline`].
     continent_offset: f32,
+    /// Lowers the mountain-belt gate in a world that would otherwise have
+    /// too few ranges; 0 in almost every world. See [`MIN_RANGE_SHARE`].
+    gate_shift: f32,
     continent: [Octave; 3],
     relief: [Octave; 2],
     orogeny: [Octave; 2],
@@ -226,6 +243,9 @@ pub struct Elevation {
     /// Not part of the height: noise that lets biome boundaries wander
     /// (M13), kept here so it tiles with the world like every other field.
     boundary: [Octave; 2],
+    /// Small-scale patches of a biome's surface (M13): sand through a
+    /// steppe, gravel through tundra, outcrops on a meadow.
+    patch: [Octave; 2],
 }
 
 /// What a column's surface is made of, as the elevation field knows it — the
@@ -248,6 +268,10 @@ pub struct Surface {
 const BOUNDARY_WAVELENGTHS: [i64; 2] = [1_400, 350];
 const BOUNDARY_WEIGHTS: [f32; 2] = [1.0, 0.4];
 
+/// Wavelengths of the surface-patch noise, blocks.
+const PATCH_WAVELENGTHS: [i64; 2] = [40, 11];
+const PATCH_WEIGHTS: [f32; 2] = [1.0, 0.45];
+
 impl Elevation {
     pub fn new(seed: u64, shape: WorldShape) -> Self {
         let oct = |w: i64| Octave::new(shape, w);
@@ -255,6 +279,7 @@ impl Elevation {
             seed,
             shape,
             continent_offset: 0.0,
+            gate_shift: 0.0,
             continent: CONTINENT_WAVELENGTHS.map(oct),
             relief: RELIEF_WAVELENGTHS.map(oct),
             orogeny: OROGENY_WAVELENGTHS.map(oct),
@@ -263,8 +288,10 @@ impl Elevation {
             trench_gate: oct(TRENCH_GATE_WAVELENGTH),
             detail: DETAIL_WAVELENGTHS.map(oct),
             boundary: BOUNDARY_WAVELENGTHS.map(oct),
+            patch: PATCH_WAVELENGTHS.map(oct),
         };
         e.continent_offset = e.calibrate_coastline();
+        e.gate_shift = e.calibrate_ranges();
         e
     }
 
@@ -292,6 +319,46 @@ impl Elevation {
         let sea_share = 1.0 - TARGET_LAND_FRACTION;
         let at = ((samples.len() as f32 * sea_share) as usize).min(samples.len() - 1);
         samples[at] - shoreline_continent_value()
+    }
+
+    /// The mountain-belt gate shift that gives this world at least
+    /// [`MIN_RANGE_SHARE`] of its land under ranges — 0 if it already has
+    /// that, which is almost every world, so their terrain is unchanged.
+    /// Bisection on a coarse grid, like the coastline; deterministic from
+    /// the seed and size.
+    fn calibrate_ranges(&self) -> f32 {
+        let (sx, sz) = (self.shape.size_x(), self.shape.size_z());
+        let share = |shift: f32| {
+            let e = Self {
+                gate_shift: shift,
+                ..*self
+            };
+            let (mut land, mut ranges) = (0u32, 0u32);
+            for j in 0..CALIBRATION_GRID {
+                for i in 0..CALIBRATION_GRID {
+                    let s =
+                        e.surface_canonical(i * sx / CALIBRATION_GRID, j * sz / CALIBRATION_GRID);
+                    if s.height > 0 {
+                        land += 1;
+                        ranges += u32::from(s.uplift >= RANGE_UPLIFT);
+                    }
+                }
+            }
+            ranges as f32 / land.max(1) as f32
+        };
+        if share(0.0) >= MIN_RANGE_SHARE {
+            return 0.0;
+        }
+        let (mut lo, mut hi) = (0.0f32, MAX_GATE_SHIFT);
+        for _ in 0..12 {
+            let mid = 0.5 * (lo + hi);
+            if share(mid) >= MIN_RANGE_SHARE {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        hi
     }
 
     /// Surface height in blocks at world column `(x, z)`. Sea level is 0.
@@ -346,6 +413,19 @@ impl Elevation {
         (pair(0x7E3D_0001), pair(0x9A1F_0002))
     }
 
+    /// Surface-patch noise in `[-1, 1]` (M13): decides, within a biome,
+    /// which columns take its secondary surface — tens of blocks across.
+    pub fn patch_noise(&self, x: i64, z: i64) -> f32 {
+        let (x, z) = (self.shape.canonical_x(x), self.shape.canonical_z(z));
+        let o = |oct: &Octave| Octave {
+            salt: oct.salt ^ 0x5A7C_0003,
+            ..*oct
+        };
+        let a = self.value_noise(x, z, &o(&self.patch[0]));
+        let b = self.value_noise(x, z, &o(&self.patch[1]));
+        (a * PATCH_WEIGHTS[0] + b * PATCH_WEIGHTS[1]) / (PATCH_WEIGHTS[0] + PATCH_WEIGHTS[1])
+    }
+
     /// The single composition point. Every stage feeds in here and nowhere
     /// else, so a future erosion pass has one place to attach.
     fn surface_canonical(&self, x: i64, z: i64) -> Surface {
@@ -374,7 +454,8 @@ impl Elevation {
         let massif = if land > 0.0 {
             let raw = self.orogeny_c(x, z);
             let g = self.value_noise(x, z, &self.orogeny_gate);
-            let belt = smoothstep01((g - OROGENY_GATE_LO) / (OROGENY_GATE_HI - OROGENY_GATE_LO));
+            let lo = OROGENY_GATE_LO - self.gate_shift;
+            let belt = smoothstep01((g - lo) / (OROGENY_GATE_HI - OROGENY_GATE_LO));
             let u = ((raw - OROGENY_FLOOR) / (1.0 - OROGENY_FLOOR)).clamp(0.0, 1.0) * land * belt;
             // Squared smoothstep, not a raw cube. Both make high uplift rare,
             // but a cube's slope keeps CLIMBING to the summit, so the crest
@@ -632,6 +713,49 @@ fn mix64(mut z: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every world has ranges (M13): a small world short of them widens its
+    /// belts to the minimum, and a default-size world — which always has
+    /// enough — is untouched, so its terrain is exactly as before.
+    #[test]
+    fn every_world_has_mountain_ranges_and_only_small_ones_are_changed() {
+        let range_share = |e: &Elevation| {
+            let size = e.shape.size_x();
+            let (mut land, mut ranges) = (0u32, 0u32);
+            for j in 0..128 {
+                for i in 0..128 {
+                    let s = e.surface(i * size / 128, j * size / 128);
+                    if s.height > 0 {
+                        land += 1;
+                        ranges += u32::from(s.uplift >= RANGE_UPLIFT);
+                    }
+                }
+            }
+            ranges as f32 / land as f32
+        };
+        let small = WorldShape::new(32_768, 32_768).unwrap();
+        let mut widened = 0;
+        for seed in 0..12u64 {
+            let e = Elevation::new(seed.wrapping_mul(0x9E37_79B9) ^ 0x7e22ac0de, small);
+            widened += u32::from(e.gate_shift > 0.0);
+            assert!(
+                range_share(&e) >= 0.6 * MIN_RANGE_SHARE,
+                "seed {seed}: {:.3} of land under ranges",
+                range_share(&e)
+            );
+        }
+        assert!(
+            widened > 0,
+            "no small world needed widening: the test proves nothing"
+        );
+        for seed in [0x7e22ac0de, 1, 2, 3] {
+            let e = Elevation::new(seed, WorldShape::DEFAULT);
+            assert_eq!(
+                e.gate_shift, 0.0,
+                "seed {seed:#x} at the default size was changed"
+            );
+        }
+    }
 
     const SEED: u64 = 0x0007_E22A_C0DE;
 

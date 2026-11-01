@@ -82,6 +82,10 @@ never dried out and had no deserts at all (`docs/vision.md` §1.1: climate
 scale grows with the world, landform scale does not; small worlds must
 still hold every biome).
 
+Ocean uptake scales the same way: a small world's narrow seas must still
+saturate the air that crosses them, or no small world has a wet windward
+coast.
+
 ### 6. Stage 2 reads the grid, then applies local detail
 
 A column reads sea-level temperature and precipitation by bilinear

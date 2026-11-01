@@ -154,6 +154,25 @@ pub const LAMP: BlockId = BlockId(7);
 /// Sea water (M10 A1, ADR-0011). Rendered, not solid, not opaque.
 pub const WATER: BlockId = BlockId(8);
 
+// --- Natural surfaces (M13 task 3, `docs/biomes.md`). Every one an opaque,
+// solid cube until block shapes exist. Ice is solid and opaque — sea ice is
+// walked on, and the water beneath it is dark — unlike water. ---
+pub const SNOW: BlockId = BlockId(9);
+pub const ICE: BlockId = BlockId(10);
+pub const GRAVEL: BlockId = BlockId(11);
+pub const RED_SAND: BlockId = BlockId(12);
+pub const SANDSTONE: BlockId = BlockId(13);
+pub const RED_SANDSTONE: BlockId = BlockId(14);
+/// The banded rock of badlands, laid down in horizontal strata.
+pub const BADLANDS_ORANGE: BlockId = BlockId(15);
+pub const BADLANDS_RED: BlockId = BlockId(16);
+pub const BADLANDS_TAN: BlockId = BlockId(17);
+pub const COARSE_DIRT: BlockId = BlockId(18);
+/// The ash-grey, needle-strewn soil of the boreal forest.
+pub const PODZOL: BlockId = BlockId(19);
+pub const CLAY: BlockId = BlockId(20);
+pub const MUD: BlockId = BlockId(21);
+
 // --- Texture-array layer assignment (one layer per distinct tile). Used by
 // the texture pipeline in task 2; declared here so the registry is the
 // single source of truth. ---
@@ -168,10 +187,23 @@ const L_LAMP: u32 = 7;
 /// Water: translucent (the tile carries alpha), near and far alike — the LOD
 /// draws the same surface over its own seabed (ADR-0011 decision 1c).
 pub const L_WATER: u32 = 8;
+pub const L_SNOW: u32 = 9;
+pub const L_ICE: u32 = 10;
+pub const L_GRAVEL: u32 = 11;
+pub const L_RED_SAND: u32 = 12;
+pub const L_SANDSTONE: u32 = 13;
+pub const L_RED_SANDSTONE: u32 = 14;
+pub const L_BADLANDS_ORANGE: u32 = 15;
+pub const L_BADLANDS_RED: u32 = 16;
+pub const L_BADLANDS_TAN: u32 = 17;
+pub const L_COARSE_DIRT: u32 = 18;
+pub const L_PODZOL: u32 = 19;
+pub const L_CLAY: u32 = 20;
+pub const L_MUD: u32 = 21;
 /// Number of texture-array layers the default registry references. The
 /// renderer builds exactly this many, so a new layer is one change here and
 /// one tile in `vox-render`'s `tile_pixels`.
-pub const DEFAULT_LAYER_COUNT: u32 = 9;
+pub const DEFAULT_LAYER_COUNT: u32 = 22;
 
 /// Block-light level emitted by the lamp block.
 pub const LAMP_EMISSION: u8 = 14;
@@ -185,7 +217,7 @@ impl BlockRegistry {
     /// Build the default starter registry. Indices are dense and match the
     /// `BlockId` numeric values, so lookup is O(1) indexing.
     pub fn default_set() -> Self {
-        // Order MUST match the BlockId values (0..=8).
+        // Order MUST match the BlockId values (0..=21).
         let types = vec![
             BlockType::air(),                                         // 0 AIR
             BlockType::uniform("stone", L_STONE, [0.55, 0.55, 0.58]), // 1
@@ -202,6 +234,19 @@ impl BlockRegistry {
             BlockType::uniform("planks", L_PLANKS, [0.62, 0.46, 0.28]), // 6
             BlockType::emitter("lamp", L_LAMP, [1.0, 0.93, 0.70], LAMP_EMISSION), // 7
             BlockType::water(),                                       // 8
+            BlockType::uniform("snow", L_SNOW, [0.95, 0.97, 1.0]),    // 9
+            BlockType::uniform("ice", L_ICE, [0.70, 0.82, 0.95]),     // 10
+            BlockType::uniform("gravel", L_GRAVEL, [0.52, 0.50, 0.48]), // 11
+            BlockType::uniform("red sand", L_RED_SAND, [0.74, 0.42, 0.22]), // 12
+            BlockType::uniform("sandstone", L_SANDSTONE, [0.84, 0.77, 0.58]), // 13
+            BlockType::uniform("red sandstone", L_RED_SANDSTONE, [0.68, 0.36, 0.20]), // 14
+            BlockType::uniform("badlands orange", L_BADLANDS_ORANGE, [0.78, 0.48, 0.26]), // 15
+            BlockType::uniform("badlands red", L_BADLANDS_RED, [0.58, 0.27, 0.20]), // 16
+            BlockType::uniform("badlands tan", L_BADLANDS_TAN, [0.80, 0.66, 0.52]), // 17
+            BlockType::uniform("coarse dirt", L_COARSE_DIRT, [0.50, 0.38, 0.27]), // 18
+            BlockType::uniform("podzol", L_PODZOL, [0.42, 0.31, 0.20]), // 19
+            BlockType::uniform("clay", L_CLAY, [0.62, 0.64, 0.70]),   // 20
+            BlockType::uniform("mud", L_MUD, [0.32, 0.27, 0.24]),     // 21
         ];
         Self { types }
     }
@@ -304,6 +349,18 @@ mod tests {
         assert_eq!(reg.get(SAND).name, "sand");
         assert_eq!(reg.get(COBBLESTONE).name, "cobblestone");
         assert_eq!(reg.get(PLANKS).name, "planks");
+        assert_eq!(reg.get(SNOW).name, "snow");
+        assert_eq!(reg.get(MUD).name, "mud");
+        assert_eq!(reg.len(), 22);
+        // Every natural surface is an opaque solid cube (ADR-0011's three
+        // properties): ice above all, which unlike water is walked on.
+        for id in 9..=21 {
+            let b = BlockId(id);
+            assert!(
+                reg.is_solid(b) && reg.is_opaque(b) && reg.renders(b),
+                "{id}"
+            );
+        }
     }
 
     #[test]
@@ -399,7 +456,7 @@ mod tests {
         let placeable: Vec<BlockId> = reg.placeable().collect();
         assert!(!placeable.contains(&AIR));
         assert!(placeable.contains(&STONE));
-        assert_eq!(placeable.len(), 7); // stone..lamp
+        assert_eq!(placeable.len(), 20); // stone..lamp, then snow..mud (M13)
     }
 
     #[test]

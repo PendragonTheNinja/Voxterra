@@ -2085,36 +2085,70 @@ fn create_block_texture(
     })
 }
 
-/// Procedural RGBA pixels for one tile layer. A simple per-layer base color
-/// plus a cheap deterministic per-texel variation so surfaces read as
-/// textured rather than flat. Placeholder until real art drops in.
+/// How a tile's texels vary around its base colour — enough that each
+/// material reads as itself at a glance. Placeholder until real art drops
+/// in; deterministic per texel.
+#[derive(Clone, Copy)]
+enum Grain {
+    /// Even speckle of this amplitude (the original dither at 16).
+    Fine(i32),
+    /// 2×2 clumps of strong variation: pebbles.
+    Clumped(i32),
+    /// Horizontal bands (rows vary together) plus a light speckle: strata.
+    Banded(i32),
+}
+
+/// Procedural RGBA pixels for one tile layer: a base colour and a grain.
 fn tile_pixels(layer: u32, tile: u32) -> Vec<u8> {
-    use vox_core::registry::L_WATER;
-    // Base colors keyed to the registry's layer assignment.
-    let base: [u8; 3] = match layer {
-        0 => [128, 128, 134], // stone
-        1 => [134, 96, 64],   // dirt
-        2 => [80, 150, 64],   // grass top
-        3 => [96, 132, 70],   // grass side (dirt-with-green-ish)
-        4 => [206, 192, 138], // sand
-        5 => [120, 120, 126], // cobblestone
-        6 => [156, 116, 70],  // planks
-        7 => [255, 236, 170], // lamp (warm, bright)
-        L_WATER => WATER_RGB,
-        _ => [255, 0, 255], // magenta = missing
+    use vox_core::registry as r;
+    let (base, grain): ([u8; 3], Grain) = match layer {
+        0 => ([128, 128, 134], Grain::Fine(16)),    // stone
+        1 => ([134, 96, 64], Grain::Fine(16)),      // dirt
+        2 => ([80, 150, 64], Grain::Fine(16)),      // grass top
+        3 => ([96, 132, 70], Grain::Fine(16)),      // grass side
+        4 => ([206, 192, 138], Grain::Fine(10)),    // sand
+        5 => ([120, 120, 126], Grain::Clumped(22)), // cobblestone
+        6 => ([156, 116, 70], Grain::Banded(10)),   // planks
+        7 => ([255, 236, 170], Grain::Fine(16)),    // lamp (warm, bright)
+        r::L_WATER => (WATER_RGB, Grain::Fine(16)),
+        r::L_SNOW => ([236, 242, 250], Grain::Fine(5)),
+        r::L_ICE => ([168, 200, 232], Grain::Banded(8)),
+        r::L_GRAVEL => ([128, 124, 120], Grain::Clumped(34)),
+        r::L_RED_SAND => ([190, 108, 58], Grain::Fine(12)),
+        r::L_SANDSTONE => ([214, 196, 148], Grain::Banded(10)),
+        r::L_RED_SANDSTONE => ([172, 92, 52], Grain::Banded(12)),
+        r::L_BADLANDS_ORANGE => ([198, 122, 66], Grain::Banded(8)),
+        r::L_BADLANDS_RED => ([148, 70, 52], Grain::Banded(8)),
+        r::L_BADLANDS_TAN => ([204, 170, 132], Grain::Banded(8)),
+        r::L_COARSE_DIRT => ([128, 98, 70], Grain::Clumped(24)),
+        r::L_PODZOL => ([106, 80, 52], Grain::Clumped(18)),
+        r::L_CLAY => ([158, 162, 176], Grain::Fine(6)),
+        r::L_MUD => ([82, 70, 62], Grain::Fine(8)),
+        _ => ([255, 0, 255], Grain::Fine(0)), // magenta = missing
     };
     // Only water is see-through.
-    let alpha = if layer == L_WATER { WATER_ALPHA } else { 255 };
+    let alpha = if layer == r::L_WATER {
+        WATER_ALPHA
+    } else {
+        255
+    };
+    // Cheap deterministic hash of a texel (or a clump, or a row) in -1..1.
+    let hash = |x: u32, y: u32| {
+        let h = x
+            .wrapping_mul(73)
+            .wrapping_add(y.wrapping_mul(151))
+            .wrapping_add(layer.wrapping_mul(977));
+        let h = (h ^ (h >> 7)).wrapping_mul(0x2C1B_3C6D) ^ (h >> 3);
+        ((h >> 8) & 0x3F) as i32 - 32
+    };
     let mut px = Vec::with_capacity((tile * tile * 4) as usize);
     for y in 0..tile {
         for x in 0..tile {
-            // Cheap hash-based dither, deterministic per texel.
-            let h = (x
-                .wrapping_mul(73)
-                .wrapping_add(y.wrapping_mul(151))
-                .wrapping_add(layer.wrapping_mul(977)))
-                & 0x1F;
-            let jitter = h as i32 - 16; // -16..15
+            let jitter = match grain {
+                Grain::Fine(a) => hash(x, y) * a / 32,
+                Grain::Clumped(a) => (hash(x / 2, y / 2) * a + hash(x, y) * 6) / 32,
+                Grain::Banded(a) => (hash(0, y / 2) * a + hash(x, y) * 4) / 32,
+            };
             let shade = |c: u8| -> u8 { (c as i32 + jitter).clamp(0, 255) as u8 };
             px.push(shade(base[0]));
             px.push(shade(base[1]));

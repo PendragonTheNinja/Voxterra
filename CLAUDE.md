@@ -264,13 +264,15 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   proposed: winds, rain shadows, exaggerated lapse rate, deterministic
   maths), and classification (`biome.rs`, `Generator::column`; criteria 5
   and 6 met, criterion 3 met from 64 km up; readouts on the telemetry and
-  `VIEW` lines). Next: the owner's call on the 32 km world, then task 3
-  (surface materials, the `GENERATOR_VERSION` bump). No low-end machine exists yet —
+  `VIEW` lines); small worlds short of mountains widen their belts (only
+  when needed: default-size terrain unchanged); task 3 surface materials
+  (13 new blocks, per-biome profiles, sea ice, badlands strata,
+  `GENERATOR_VERSION` 3). Next: task 4 (biome colour and LOD materials). No low-end machine exists yet —
   M12's spec says how to judge low-end performance by proxy.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 288, vox-mesh 67, vox-worldgen 46, vox-render 17, vox-app 9
-  passing as of M13 task 2), then start the first unchecked item.
+  vox-core 288, vox-mesh 67, vox-worldgen 52, vox-render 17, vox-app 9
+  passing as of M13 task 3), then start the first unchecked item.
 - **Instruments (from M11):** the P key logs a `VIEW` line (exact position,
   angles, window, settings) and a `hole_census` — the frame re-rendered six
   ways on the player's GPU with pinholes counted per variant. In the cloud

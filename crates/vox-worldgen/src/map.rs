@@ -473,13 +473,13 @@ mod survey {
     }
 
     /// M13 criterion 3: every biome in the catalogue, in every world, for
-    /// every seed tried — from 64 km up (the 32 km world is the open
-    /// question in the M13 spec). Minutes in a release build:
+    /// every seed tried, at every size from the smallest. Minutes in a
+    /// release build:
     /// `cargo test -p vox-worldgen --release every_biome -- --ignored`.
     #[test]
     #[ignore]
     fn every_biome_in_every_world() {
-        for size in [65_536, 204_800, 524_288] {
+        for size in [32_768, 65_536, 204_800, 524_288] {
             let shape = WorldShape::new(size, size).unwrap();
             for seed in 0..8u64 {
                 let g = Generator::new(seed.wrapping_mul(0x0051_7CC1_B727) ^ 0x000B_103E, shape);

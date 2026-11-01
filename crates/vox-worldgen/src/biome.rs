@@ -199,6 +199,10 @@ pub struct Column {
     /// Annual precipitation, mm, boundary noise included.
     pub precipitation: f32,
     pub biome: Biome,
+    /// Surface-patch noise in `[-1, 1]`: which of its biome's surfaces this
+    /// column takes (`materials`). 0 from [`classify`] alone; the generator
+    /// sets it.
+    pub patch: f32,
 }
 
 /// Köppen's aridity threshold, mm/yr: the annual precipitation below which a
@@ -220,6 +224,7 @@ pub fn classify(surface: Surface, sea_level_c: f32, precip: f32, noise: (f32, f3
         sea_level_temperature: sea_level_c,
         precipitation,
         biome,
+        patch: 0.0,
     }
 }
 

@@ -23,6 +23,7 @@ pub mod climate;
 pub mod elevation;
 #[cfg(test)]
 mod map;
+pub mod materials;
 
 use std::sync::{Arc, OnceLock};
 
@@ -37,9 +38,6 @@ use vox_core::{BlockId, CHUNK_SIZE, Chunk, ChunkPos, LocalPos, SEA_LEVEL_BLOCKS,
 pub mod blocks {
     pub use vox_core::registry::{AIR, DIRT, GRASS, STONE, WATER};
 }
-
-/// Number of dirt blocks below the surface grass layer.
-const DIRT_DEPTH: i64 = 4;
 
 /// How densely [`Generator::lod_heightfield`] samples each coarse cell.
 ///
@@ -85,7 +83,12 @@ pub struct Generator {
 /// 2 — sea water fills every block above the ground up to sea level (M10 A1,
 /// ADR-0011). Surface heights are unchanged; chunk contents are not, which is
 /// why the fingerprint now covers chunks as well as heights.
-pub const GENERATOR_VERSION: u32 = 2;
+/// 3 — climate and biomes (M13): every column's surface materials come from
+/// its biome (`materials`), polar seas freeze at the surface, and small
+/// worlds short of mountain ranges widen their belts (elevation's
+/// `calibrate_ranges`; worlds of the default size and larger keep their
+/// heights exactly).
+pub const GENERATOR_VERSION: u32 = 3;
 
 impl Generator {
     /// A generator for one world: its seed and its size. The size is part of
@@ -112,14 +115,31 @@ impl Generator {
     /// are put together, so the chunk generator, the LOD sampler and the
     /// player's readout agree on every column.
     pub fn column(&self, wx: i64, wz: i64) -> Column {
-        let surface = self.elevation.surface(wx, wz);
-        let climate = self.climate();
-        biome::classify(
+        self.column_with(wx, wz, self.elevation.surface(wx, wz))
+    }
+
+    /// [`Self::column`] for a surface already computed.
+    fn column_with(&self, wx: i64, wz: i64, surface: elevation::Surface) -> Column {
+        let (sea_level_c, precip) = self.climate().sample(wx, wz);
+        let mut col = biome::classify(
             surface,
-            climate.sea_level_temperature(wx, wz),
-            climate.precipitation(wx, wz),
+            sea_level_c,
+            precip,
             self.elevation.boundary_noise(wx, wz),
-        )
+        );
+        col.patch = self.elevation.patch_noise(wx, wz);
+        col
+    }
+
+    /// The block at a world position, as generated: THE per-block profile,
+    /// which every chunk path must reproduce (tests compare against it).
+    pub fn block_at(&self, wx: i64, wy: i64, wz: i64) -> BlockId {
+        self.block_in(&self.column(wx, wz), wy)
+    }
+
+    /// The block at height `wy` of a classified column.
+    fn block_in(&self, col: &Column, wy: i64) -> BlockId {
+        materials::block_in(col, wy, |y| materials::stratum_block(self.seed, y))
     }
 
     /// The size of the world this generator makes.
@@ -183,41 +203,61 @@ impl Generator {
         let chunk_max_y = origin.y + CHUNK_SIZE as i64 - 1;
 
         // Fast rejection: find the surface range over this chunk's columns.
-        // If the whole chunk is above the highest surface, it's all air; if
-        // entirely well below the lowest surface, it's all stone.
+        // If the whole chunk is above the highest surface, it's all air (or
+        // sea); if wholly below every column's surface profile, all stone.
+        let n = CHUNK_SIZE as i64;
+        let mut surfaces = Vec::with_capacity((n * n) as usize);
         let mut min_surface = i64::MAX;
         let mut max_surface = i64::MIN;
-        for lz in 0..CHUNK_SIZE as i64 {
-            for lx in 0..CHUNK_SIZE as i64 {
-                let h = self.surface_height(origin.x + lx, origin.z + lz);
-                min_surface = min_surface.min(h);
-                max_surface = max_surface.max(h);
+        for lz in 0..n {
+            for lx in 0..n {
+                let s = self.elevation.surface(origin.x + lx, origin.z + lz);
+                min_surface = min_surface.min(s.height);
+                max_surface = max_surface.max(s.height);
+                surfaces.push(s);
             }
         }
 
-        // Wholly above the ground: sky, sea, or the sea surface between them.
+        // Wholly above the ground: sky, or open sea below its surface layer
+        // (which can freeze, so the chunk holding it is never uniform).
         if chunk_min_y > max_surface {
             if chunk_min_y > SEA_LEVEL_BLOCKS {
                 return Chunk::filled(blocks::AIR);
             }
-            if chunk_max_y <= SEA_LEVEL_BLOCKS {
+            if chunk_max_y < SEA_LEVEL_BLOCKS {
                 // Open ocean between the seabed and the surface — most of an
-                // ocean's volume, generated without a single height query more.
+                // ocean's volume, generated without a single column classified.
                 return Chunk::filled(blocks::WATER);
             }
         }
-        if chunk_max_y < min_surface - DIRT_DEPTH {
+        // Wholly below every surface profile: stone (`materials`' promise).
+        if chunk_max_y < min_surface - materials::MAX_PROFILE_DEPTH {
             return Chunk::filled(blocks::STONE);
         }
 
-        // Mixed chunk: fill per column.
+        // Mixed chunk: fill per column, classifying a column only where this
+        // chunk meets its profile or its sea surface. Elsewhere it is stone
+        // below the profile and air or water above, whatever the biome.
         let mut chunk = Chunk::new_air();
         for lz in 0..CHUNK_SIZE as u8 {
             for lx in 0..CHUNK_SIZE as u8 {
-                let height = self.surface_height(origin.x + lx as i64, origin.z + lz as i64);
+                let s = surfaces[lz as usize * CHUNK_SIZE + lx as usize];
+                let (wx, wz) = (origin.x + lx as i64, origin.z + lz as i64);
+                let h = s.height;
+                let profile_lo = h - materials::MAX_PROFILE_DEPTH + 1;
+                let touches_profile = chunk_max_y >= profile_lo && chunk_min_y <= h;
+                let touches_sea_surface =
+                    h < SEA_LEVEL_BLOCKS && (chunk_min_y..=chunk_max_y).contains(&SEA_LEVEL_BLOCKS);
+                let col =
+                    (touches_profile || touches_sea_surface).then(|| self.column_with(wx, wz, s));
                 for ly in 0..CHUNK_SIZE as u8 {
                     let wy = chunk_min_y + ly as i64;
-                    let block = self.block_at(wy, height);
+                    let block = match &col {
+                        Some(c) => self.block_in(c, wy),
+                        None if wy < profile_lo => blocks::STONE,
+                        None if wy <= SEA_LEVEL_BLOCKS => blocks::WATER,
+                        None => blocks::AIR,
+                    };
                     if !block.is_air() {
                         chunk.set(LocalPos::new(lx, ly, lz), block);
                     }
@@ -282,26 +322,6 @@ impl Generator {
         }
         out
     }
-
-    /// The block at world height `wy` for a column whose surface is at
-    /// `height`. The single source of truth for the vertical profile, used
-    /// by both the per-column fill and any future queries.
-    fn block_at(&self, wy: i64, height: i64) -> BlockId {
-        if wy > height {
-            // Above the ground: the sea fills up to sea level (ADR-0011).
-            if wy <= SEA_LEVEL_BLOCKS {
-                blocks::WATER
-            } else {
-                blocks::AIR
-            }
-        } else if wy == height {
-            blocks::GRASS
-        } else if wy >= height - DIRT_DEPTH {
-            blocks::DIRT
-        } else {
-            blocks::STONE
-        }
-    }
 }
 
 #[cfg(test)]
@@ -355,10 +375,9 @@ mod tests {
         for &(lx, lz) in &[(0u8, 0u8), (7, 19), (31, 31), (15, 3)] {
             let wx = lx as i64;
             let wz = lz as i64;
-            let height = worldgen.surface_height(wx, wz);
             // Lower chunk covers wy 0..32, upper covers 32..64.
             for wy in 0..(2 * CHUNK_SIZE as i64) {
-                let expected = worldgen.block_at(wy, height);
+                let expected = worldgen.block_at(wx, wy, wz);
                 let from_world = WorldPos::new(wx, wy, wz);
                 let (chunk_pos, local) = from_world.split();
                 let chunk = if chunk_pos.y == 0 { &lower } else { &upper };
@@ -393,14 +412,15 @@ mod tests {
             g.generate_chunk(chunk).get(local)
         };
         assert_ne!(block(ground), blocks::WATER, "the seabed itself is water");
-        for y in [
-            ground + 1,
-            ground + 40,
-            SEA_LEVEL_BLOCKS - 1,
-            SEA_LEVEL_BLOCKS,
-        ] {
+        for y in [ground + 1, ground + 40, SEA_LEVEL_BLOCKS - 1] {
             assert_eq!(block(y), blocks::WATER, "no water at {y} (ground {ground})");
         }
+        // The surface layer is water, or sea ice where the sea is polar (M13).
+        let surface = block(SEA_LEVEL_BLOCKS);
+        assert!(
+            surface == blocks::WATER || surface == vox_core::registry::ICE,
+            "{surface:?} at sea level"
+        );
         assert_eq!(
             block(SEA_LEVEL_BLOCKS + 1),
             blocks::AIR,
@@ -422,7 +442,7 @@ mod tests {
         let ground = g.surface_height(x, z);
         for y in ground - 30..=ground + 30 {
             assert_ne!(
-                g.block_at(y, ground),
+                g.block_at(x, y, z),
                 blocks::WATER,
                 "water at {y} on dry land"
             );
@@ -457,9 +477,53 @@ mod tests {
                 );
                 assert_eq!(
                     chunk.get(local),
-                    g.block_at(wy, g.surface_height(wx, wz)),
+                    g.block_at(wx, wy, wz),
                     "chunk {pos:?} disagrees with the profile at ({wx}, {wy}, {wz})"
                 );
+            }
+        }
+    }
+
+    /// M13: in every biome, every block of the chunks through the surface —
+    /// the one above, the one holding it, the one below, and the one at the
+    /// bottom of the deepest profile — equals the per-block profile. Covers
+    /// the lazy path (columns classified only where a chunk meets them) and
+    /// the stacked seams together.
+    #[test]
+    fn chunks_match_the_profile_in_every_biome() {
+        use crate::biome::Biome;
+        let g = Generator::new(0xB10_3E5, WorldShape::new(65_536, 65_536).unwrap());
+        let s = CHUNK_SIZE as i64;
+        let mut found = std::collections::BTreeMap::new();
+        'search: for j in 0..160i64 {
+            for i in 0..160i64 {
+                let (x, z) = (i * 409 + 17, j * 409 + 5);
+                found.entry(g.column(x, z).biome).or_insert((x, z));
+                if found.len() == Biome::ALL.len() {
+                    break 'search;
+                }
+            }
+        }
+        assert!(found.len() >= 18, "only {} biomes found", found.len());
+        for (biome, (x, z)) in found {
+            let top = g.surface_height(x, z).max(SEA_LEVEL_BLOCKS);
+            let cy = top.div_euclid(s);
+            let deepest = (top - materials::MAX_PROFILE_DEPTH).div_euclid(s);
+            for chunk_y in [cy + 1, cy, cy - 1, deepest] {
+                let pos = ChunkPos::new(x.div_euclid(s), chunk_y, z.div_euclid(s));
+                let chunk = g.generate_chunk(pos);
+                for local in LocalPos::iter() {
+                    let (wx, wy, wz) = (
+                        pos.x * s + local.x() as i64,
+                        pos.y * s + local.y() as i64,
+                        pos.z * s + local.z() as i64,
+                    );
+                    assert_eq!(
+                        chunk.get(local),
+                        g.block_at(wx, wy, wz),
+                        "{biome:?}: chunk {pos:?} disagrees at ({wx}, {wy}, {wz})"
+                    );
+                }
             }
         }
     }
@@ -557,7 +621,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (2, 0x14c7_a1a5_93b3_debf);
+        const PINNED: (u32, u64) = (3, 0xda6d_f4df_d413_00ce);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),
