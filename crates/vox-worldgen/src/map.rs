@@ -434,7 +434,44 @@ mod tests {
                 rivers[at..at + 3].copy_from_slice(&c);
             }
         }
+        // Valleys (task 2): the eroded ground, hill-shaded so valleys read,
+        // and how deep erosion cut.
+        let mut valleys = vec![0u8; dx * dz * 3];
+        let (mut deepest, mut cut10, mut cut50) = (0.0f32, 0u32, 0u32);
+        for j in 0..dz {
+            for i in 0..dx {
+                let h = |di: isize, dj: isize| {
+                    let ii = (i as isize + di).rem_euclid(dx as isize) as usize;
+                    let jj = (j as isize + dj).rem_euclid(dz as isize) as usize;
+                    drainage.cell(ii, jj).0 as f32
+                };
+                let (here, cut) = (drainage.cell(i, j).0, drainage.erosion(i, j));
+                if !drainage.is_sea(i, j) {
+                    deepest = deepest.min(cut);
+                    cut10 += u32::from(cut <= -10.0);
+                    cut50 += u32::from(cut <= -50.0);
+                }
+                let shade = (1.0 + (h(-1, -1) - h(1, 1)) / 60.0).clamp(0.45, 1.5);
+                let c = elevation_colour(i64::from(if drainage.is_sea(i, j) {
+                    here
+                } else {
+                    here.max(1)
+                }));
+                let at = (j * dx + i) * 3;
+                for k in 0..3 {
+                    valleys[at + k] = (f32::from(c[k]) * shade).min(255.0) as u8;
+                }
+            }
+        }
+        let path = dir.join(format!("valleys-{:x}-{}.png", g.seed(), shape.size_x()));
+        write_png(&path, dx as u32, dz as u32, &valleys).unwrap();
         let share = |k: u32| 100.0 * f64::from(k) / f64::from(land_cells);
+        println!(
+            "erosion: deepest cut {:.0} blocks; {:.1}% of land cut 10+ blocks, {:.1}% 50+",
+            -deepest,
+            share(cut10),
+            share(cut50)
+        );
         println!(
             "lakes cover {:.1}% of land, salt lakes and flats {:.1}%; {:.1}% of land drains to closed basins; the largest discharge is {:.1} m³/s",
             share(lake_cells),

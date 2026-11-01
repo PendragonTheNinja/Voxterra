@@ -126,6 +126,33 @@ pub fn temperature_at(sea_level_c: f32, height: i64) -> f32 {
     sea_level_c - LAPSE_PER_BLOCK * height.max(0) as f32
 }
 
+/// Potential evaporation (mm/yr) at a mean annual temperature: what open
+/// water or a well-watered field would lose. Linear through Earth's annual
+/// values — ~0 at −6 °C (the tundra and ice sheets lose almost nothing,
+/// which is why a polar desert still runs with meltwater), ~720 mm at
+/// 10 °C (western Europe), ~1 400 at 25 °C (the tropics, the Sahel). Used
+/// by the water balance (M14), not by biome classification, which keeps
+/// Köppen's own threshold.
+pub fn potential_evaporation(temp_c: f32) -> f32 {
+    (45.0 * (temp_c + 6.0)).max(0.0)
+}
+
+/// Runoff (mm/yr): what precipitation `precip` leaves after the land's
+/// actual evaporation, by the Budyko curve in Pike's (1964) form,
+/// `AET = P / √(1 + (P/PET)²)` — evaporation approaches what falls where
+/// it is dry and what could evaporate where it is wet. About a third of the
+/// rain runs off in western Europe, almost none in a desert, nearly all of
+/// it on the ice. A square root is exact on every machine.
+pub fn runoff(temp_c: f32, precip: f32) -> f32 {
+    let pet = potential_evaporation(temp_c);
+    if pet <= 0.0 || precip <= 0.0 {
+        return precip.max(0.0);
+    }
+    let ratio = precip / pet;
+    let actual = precip / (1.0 + ratio * ratio).sqrt();
+    (precip - actual).max(0.0)
+}
+
 /// How much moisture air at `temp_c` can carry, as the precipitation it
 /// would give (mm/yr). Over the open sea air carries this much.
 fn moisture_capacity(temp_c: f32) -> f32 {

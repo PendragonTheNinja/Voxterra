@@ -15,11 +15,12 @@
 //!    the sea over the water surface: each cell's *receiver* — the neighbour
 //!    its water flows to — is the one it was reached from. The channel level
 //!    is cut down along the flow so water never runs uphill; a breached rim
-//!    becomes a gorge. Every land cell drains, in the end, to the sea.
+//!    becomes a gorge. Every land cell drains, in the end, to the sea or a
+//!    closed basin.
 //! 4. **Accumulate discharge**: each cell's runoff — precipitation less
-//!    evaporation (ADR-0017's climate; evaporation estimated by Köppen's
-//!    aridity threshold, as the biome classifier judges dryness) — summed
-//!    down the receiver tree. Discharge is in m³/s, honestly from our areas
+//!    evaporation (ADR-0017's climate; the Budyko curve,
+//!    [`crate::climate::runoff`]) — summed down the receiver tree, less
+//!    what lakes evaporate; closed basins keep what reaches them. Discharge is in m³/s, honestly from our areas
 //!    and Earth's rainfall; widths and depths are scaled from it for play.
 //!
 //! Deterministic on every machine: integer heights, ties broken by cell
@@ -31,11 +32,12 @@ use std::collections::BinaryHeap;
 use rayon::prelude::*;
 use vox_core::WorldShape;
 
-use crate::biome::aridity_threshold;
-use crate::climate::{ClimateMap, temperature_at};
+use crate::climate::{ClimateMap, potential_evaporation, runoff, temperature_at};
 use crate::elevation::Elevation;
 
+mod erosion;
 mod hollows;
+use erosion::Erosion;
 pub use hollows::Cover;
 
 /// Target size of a drainage cell, in blocks. Rivers need finer cells than
@@ -48,12 +50,15 @@ const MAX_CELLS: i64 = 2_048;
 /// (~30 km² at 128-block cells). Smaller ones are inland pits — land
 /// hollows that fill like any other, or not, by their own water.
 const SEA_MIN_CELLS: usize = 2_048;
-/// Evaporation from open water, as a multiple of Köppen's aridity threshold
-/// (`20·T + 140` mm, the dryness the biome classifier judges land by): ~280
-/// mm a year at 0 °C, ~700 at 10 °C, ~1 300 at 25 °C — Earth's lake
-/// evaporation runs from a few hundred mm in the boreal to 1 500–2 000 over
-/// hot deserts' salt lakes (the Dead Sea, Lake Chad).
-const LAKE_EVAPORATION: f32 = 2.0;
+/// Evaporation from a lake, as a multiple of the potential evaporation:
+/// open water loses a little more than a well-watered field, and a salt
+/// lake in a hot desert most of all (the Dead Sea, Lake Chad: 1 500–2 000
+/// mm a year).
+const LAKE_EVAPORATION: f32 = 1.2;
+/// The least runoff valleys were carved by, mm/yr: a semi-arid
+/// steppe's, as every land was wetter at some time in the ages its valleys
+/// took to cut. Today's lakes and closed basins follow today's climate.
+const PALEO_RUNOFF_MM: f64 = 100.0;
 /// Seconds in a year, for mm/yr over an area to m³/s.
 const SECONDS_PER_YEAR: f64 = 31_557_600.0;
 
@@ -108,6 +113,8 @@ pub struct DrainageMap {
     receiver: Vec<u32>,
     /// Water leaving the cell, m³/s.
     discharge: Vec<f32>,
+    /// The elevation's erosion stage (task 2).
+    erosion: Erosion,
     /// The water budget, kept for the conservation test.
     #[cfg(test)]
     budget: (Vec<f64>, Vec<f64>),
@@ -137,18 +144,27 @@ impl DrainageMap {
                 ((j as f64 + 0.5) * cell_z).floor() as i64,
             )
         };
-        let height: Vec<i32> = (0..nx * nz)
+        let base: Vec<i32> = (0..nx * nz)
             .into_par_iter()
             .map(|c| {
                 let (x, z) = centre(c);
                 elevation.height(x, z) as i32
             })
             .collect();
-        let sea = seas(nx, nz, &height);
-        // Runoff per cell, and what a lake over it would cost: its
-        // evaporation less the rain on it, plus the runoff it no longer
-        // sheds — always positive. Both m³/s.
+        let sea = seas(nx, nz, &base);
+        // Runoff per cell (the Budyko water balance), and what a lake over
+        // it would cost: its evaporation less the rain on it, plus the
+        // runoff it no longer sheds — never negative. Both m³/s.
         let per_mm = cell_x * cell_z / 1000.0 / SECONDS_PER_YEAR;
+        let water: Vec<(f32, f32)> = (0..nx * nz)
+            .into_par_iter()
+            .map(|c| {
+                let (x, z) = centre(c);
+                let (sea_level_c, precip) = climate.sample(x, z);
+                let t = temperature_at(sea_level_c, i64::from(base[c].max(0)));
+                (precip, potential_evaporation(t))
+            })
+            .collect();
         let (runoff, demand): (Vec<f64>, Vec<f64>) = (0..nx * nz)
             .into_par_iter()
             .map(|c| {
@@ -157,13 +173,12 @@ impl DrainageMap {
                 }
                 let (x, z) = centre(c);
                 let (sea_level_c, precip) = climate.sample(x, z);
-                let t = temperature_at(sea_level_c, i64::from(height[c].max(0)));
-                let threshold = aridity_threshold(t);
-                let runoff = (precip - threshold).max(0.0);
-                let evaporation = LAKE_EVAPORATION * threshold;
+                let t = temperature_at(sea_level_c, i64::from(base[c].max(0)));
+                let runoff = runoff(t, precip);
+                let evaporation = LAKE_EVAPORATION * potential_evaporation(t);
                 (
                     f64::from(runoff) * per_mm,
-                    f64::from(runoff + evaporation - precip) * per_mm,
+                    f64::from((runoff + evaporation - precip).max(0.0)) * per_mm,
                 )
             })
             .unzip();
@@ -172,10 +187,44 @@ impl DrainageMap {
             .map(|c| {
                 let (x, z) = centre(c);
                 let (sea_level_c, _) = climate.sample(x, z);
-                temperature_at(sea_level_c, i64::from(height[c].max(0))) < GLACIATED_BELOW_C
+                temperature_at(sea_level_c, i64::from(base[c].max(0))) < GLACIATED_BELOW_C
             })
             .collect();
-        let held = hollows::settle(nx, nz, &height, &sea, &cold, &runoff, &demand);
+        // Valleys first (task 2): the hollows and the network are those of
+        // the eroded ground.
+        // The valleys are older than today's climate: carved through wetter
+        // ages too (the Sahara's wadis ran in the Holocene's green Sahara),
+        // so erosion runs on at least [`PALEO_RUNOFF_MM`] everywhere.
+        let carving: Vec<f64> = runoff
+            .iter()
+            .zip(&sea)
+            .map(|(&r, &s)| {
+                if s {
+                    0.0
+                } else {
+                    r.max(PALEO_RUNOFF_MM * per_mm)
+                }
+            })
+            .collect();
+        let erosion = Erosion::build(nx, nz, (cell_x, cell_z), &base, &sea, &carving);
+        let height: Vec<i32> = (0..nx * nz)
+            .map(|c| {
+                let (x, z) = centre(c);
+                base[c] + erosion.at(x as f64, z as f64).round() as i32
+            })
+            .collect();
+        let held = hollows::settle(
+            nx,
+            nz,
+            &hollows::Ground {
+                height: &height,
+                sea: &sea,
+                cold: &cold,
+                climate: &water,
+                runoff: &runoff,
+                demand: &demand,
+            },
+        );
         let (surface, mut cover, sink) = (held.surface, held.cover, held.sink);
         let lake: Vec<bool> = cover.iter().map(|&c| c == Cover::Lake).collect();
         let (receiver, order) = flood(nx, nz, &surface, &sea, &sink, &lake);
@@ -224,6 +273,7 @@ impl DrainageMap {
             sink,
             receiver,
             discharge,
+            erosion,
             #[cfg(test)]
             budget: (runoff, demand),
         }
@@ -257,6 +307,20 @@ impl DrainageMap {
             self.discharge[c],
             (r % self.nx, r / self.nx),
         )
+    }
+
+    /// What erosion took from the base elevation at the cell's centre,
+    /// blocks (never positive).
+    pub fn erosion(&self, i: usize, j: usize) -> f32 {
+        let x = ((i as f64 + 0.5) * self.cell_x).floor();
+        let z = ((j as f64 + 0.5) * self.cell_z).floor();
+        self.erosion_at(x, z)
+    }
+
+    /// The elevation's erosion stage at any column: what erosion took from
+    /// the base, blocks (never positive), on any lap of the world.
+    pub fn erosion_at(&self, x: f64, z: f64) -> f32 {
+        self.erosion.at(x, z)
     }
 
     /// Whether the cell is sea.
@@ -429,6 +493,29 @@ fn flood(
             let low = if lake[nb] { i32::MAX } else { surface[nb] };
             heap.push(Reverse((surface[nb].max(level), low, nb as u32)));
         }
+    }
+    // The flood says which way water leaves a hollow; where the ground
+    // slopes, water takes the steepest way down. So each cell drains to its
+    // lowest neighbour among those reached before it — still a tree toward
+    // the outlets, but the sea and a closed basin no longer race each other
+    // across a plain by index order. Lakes keep the flood's paths to their
+    // outlets.
+    let mut rank = vec![0u32; n];
+    for (k, &c) in order.iter().enumerate() {
+        rank[c as usize] = k as u32;
+    }
+    for &c in &order {
+        let c = c as usize;
+        if receiver[c] as usize == c || lake[c] {
+            continue;
+        }
+        let mut best = receiver[c] as usize;
+        for nb in neighbours(c, nx, nz) {
+            if rank[nb] < rank[c] && (surface[nb], nb) < (surface[best], best) {
+                best = nb;
+            }
+        }
+        receiver[c] = best as u32;
     }
     (receiver, order)
 }

@@ -30,6 +30,13 @@ use super::{
 
 const NONE: u32 = u32::MAX;
 
+/// The aridity index (precipitation over potential evaporation) below which
+/// a hollow that cannot fill stays a closed basin. Earth's endorheic basins
+/// lie almost all in arid and semi-arid land — UNEP's index under 0.5;
+/// wetter hollows were cut through long ago, in the wetter climates of the
+/// past and over geological time, so here they are breached as if full.
+const ARID_INDEX: f64 = 0.5;
+
 /// A closed basin's floor this far (blocks) above its lake is salt flat: the
 /// playa its lake floods and leaves.
 const SALT_FLAT_RISE: i32 = 3;
@@ -67,32 +74,49 @@ struct Hollow {
     /// A cell inside it, beside the saddle where it joined its sibling:
     /// where its sibling's overflow comes in.
     entry: u32,
+    /// For a hollow that spills onto ground that drains: the cell beyond
+    /// its saddle its overflow runs on from.
+    out: u32,
     /// Over everything inside it, at its spill level.
     cells: i64,
     sum_height: i64,
     deepest: i32,
     bottom: u32,
     cold: i64,
+    /// Precipitation and potential evaporation summed over its cells, mm.
+    precip: f64,
+    pet: f64,
+}
+
+/// Per cell of the drainage grid, what the hollows are poured from.
+pub(super) struct Ground<'a> {
+    pub height: &'a [i32],
+    pub sea: &'a [bool],
+    /// Ice-scoured: below `GLACIATED_BELOW_C`.
+    pub cold: &'a [bool],
+    /// Precipitation and potential evaporation, mm/yr.
+    pub climate: &'a [(f32, f32)],
+    /// The water the cell sheds, m³/s.
+    pub runoff: &'a [f64],
+    /// What a lake covering the cell would cost: its evaporation less the
+    /// runoff the cell no longer sheds, m³/s, never negative.
+    pub demand: &'a [f64],
 }
 
 /// Find the hollows, pour in the runoff, and decide what each holds.
-///
-/// `runoff` is the water each land cell sheds (m³/s); `demand` is what a
-/// lake covering the cell would cost, its evaporation less the runoff the
-/// cell no longer sheds (m³/s, always positive).
-pub(super) fn settle(
-    nx: usize,
-    nz: usize,
-    height: &[i32],
-    sea: &[bool],
-    cold: &[bool],
-    runoff: &[f64],
-    demand: &[f64],
-) -> Held {
+pub(super) fn settle(nx: usize, nz: usize, ground: &Ground) -> Held {
+    let Ground {
+        height,
+        sea,
+        cold,
+        climate,
+        runoff,
+        demand,
+    } = *ground;
     let n = nx * nz;
     let mut land: Vec<u32> = (0..n as u32).filter(|&c| !sea[c as usize]).collect();
     land.sort_unstable_by_key(|&c| (height[c as usize], c));
-    let (hollows, joined) = merge_tree(nx, nz, height, sea, cold, &land);
+    let (hollows, joined) = merge_tree(nx, nz, height, sea, cold, climate, &land);
     let m = hollows.len();
 
     // Each hollow's own cells — those that joined it directly, between its
@@ -148,14 +172,22 @@ pub(super) fn settle(
         }
     }
 
+    // A hollow on ground that is not arid never closes: if it cannot pay
+    // its lake's evaporation, it is breached and its water passes on.
+    let breached: Vec<bool> = hollows
+        .iter()
+        .map(|h| h.precip >= ARID_INDEX * h.pet)
+        .collect();
     // Pour, from the innermost hollows out (children are made before
     // their parents).
     let mut pour = Pour {
         hollows: &hollows,
         need: &need,
+        breached: &breached,
         term: &term,
         water: vec![0.0; m],
         full: vec![false; m],
+        lake: vec![false; m],
         pool: vec![false; m],
         excess: vec![0.0; m],
     };
@@ -164,10 +196,7 @@ pub(super) fn settle(
         if a == NONE {
             pour.pool[x] = true;
             pour.water[x] = inflow[x];
-            if pour.water[x] >= need[x] {
-                pour.full[x] = true;
-                pour.excess[x] = pour.water[x] - need[x];
-            }
+            pour.fill(x);
             continue;
         }
         let (a, b) = (a as usize, b as usize);
@@ -188,10 +217,45 @@ pub(super) fn settle(
             pour.pool[x] = true;
             pour.water[x] =
                 std::mem::take(&mut pour.excess[a]) + std::mem::take(&mut pour.excess[b]) + pending;
-            if pour.water[x] >= need[x] {
-                pour.full[x] = true;
-                pour.excess[x] = pour.water[x] - need[x];
-            }
+            pour.fill(x);
+        }
+    }
+
+    // What overflows a whole tree runs on downhill from its saddle — to the
+    // sea, or into another, lower hollow, which may fill in turn. Highest
+    // spill first, so a hollow has all it will receive before it passes
+    // its own overflow on.
+    let root = |mut x: usize| {
+        while hollows[x].parent != NONE {
+            x = hollows[x].parent as usize;
+        }
+        x
+    };
+    let mut queue: std::collections::BinaryHeap<(i32, std::cmp::Reverse<usize>)> = (0..m)
+        .filter(|&x| hollows[x].parent == NONE && hollows[x].spill != i32::MAX)
+        .map(|x| (hollows[x].spill, std::cmp::Reverse(x)))
+        .collect();
+    let mut passes = vec![0u8; m];
+    while let Some((_, std::cmp::Reverse(x))) = queue.pop() {
+        let out = hollows[x].out;
+        if !pour.full[x] || pour.excess[x] <= 0.0 || out == NONE {
+            continue;
+        }
+        let t = term[out as usize];
+        if t == NONE {
+            continue; // to the sea
+        }
+        let target = root(t as usize);
+        // Downhill only; at an equal spill, a pair could pass water back
+        // and forth — let it go to the sea instead after a few rounds.
+        passes[x] += 1;
+        if target == x || hollows[target].spill > hollows[x].spill || passes[x] > 4 {
+            continue;
+        }
+        let w = std::mem::take(&mut pour.excess[x]);
+        pour.deliver(w, out, target);
+        if pour.full[target] && pour.excess[target] > 0.0 {
+            queue.push((hollows[target].spill, std::cmp::Reverse(target)));
         }
     }
 
@@ -208,7 +272,7 @@ pub(super) fn settle(
         if h.spill == i32::MAX {
             continue;
         }
-        if pour.full[x] {
+        if pour.lake[x] {
             let volume = h.cells * i64::from(h.spill) - h.sum_height;
             let basin = volume >= LAKE_MIN_MEAN_DEPTH * h.cells && h.cells >= LAKE_MIN_CELLS as i64;
             let glaciated = h.cold * 2 >= h.cells;
@@ -219,7 +283,7 @@ pub(super) fn settle(
             if basin || tarn {
                 held[x] = Some((h.spill, false));
             }
-        } else if pour.pool[x] {
+        } else if pour.pool[x] && !pour.full[x] {
             // The level where evaporation from the lake meets the inflow:
             // the lake covers the lowest of its own cells it can pay for.
             let mut left = pour.water[x];
@@ -280,6 +344,7 @@ fn merge_tree(
     height: &[i32],
     sea: &[bool],
     cold: &[bool],
+    climate: &[(f32, f32)],
     land: &[u32],
 ) -> (Vec<Hollow>, Vec<u32>) {
     let n = nx * nz;
@@ -332,7 +397,14 @@ fn merge_tree(
                 }
             }
             let merged = if a == NONE || b == NONE {
-                NONE // either drains: both now drain
+                // Either drains: both now drain, the undrained one over
+                // this saddle onto the other's ground.
+                if a != NONE {
+                    hollows[a as usize].out = nb as u32;
+                } else if b != NONE {
+                    hollows[b as usize].out = via;
+                }
+                NONE
             } else {
                 let id = hollows.len() as u32;
                 hollows[a as usize].entry = via;
@@ -343,6 +415,7 @@ fn merge_tree(
                     parent: NONE,
                     children: [a, b],
                     entry: NONE,
+                    out: NONE,
                     cells: ha.cells + hb.cells,
                     sum_height: ha.sum_height + hb.sum_height,
                     deepest: ha.deepest.min(hb.deepest),
@@ -352,6 +425,8 @@ fn merge_tree(
                         hb.bottom
                     },
                     cold: ha.cold + hb.cold,
+                    precip: ha.precip + hb.precip,
+                    pet: ha.pet + hb.pet,
                 };
                 hollows[a as usize].parent = id;
                 hollows[b as usize].parent = id;
@@ -375,11 +450,14 @@ fn merge_tree(
                 parent: NONE,
                 children: [NONE; 2],
                 entry: NONE,
+                out: NONE,
                 cells: 0,
                 sum_height: 0,
                 deepest: h,
                 bottom: c as u32,
                 cold: 0,
+                precip: 0.0,
+                pet: 0.0,
             });
             filling[c] = (hollows.len() - 1) as u32;
             mine = c as u32;
@@ -391,6 +469,8 @@ fn merge_tree(
             hl.cells += 1;
             hl.sum_height += i64::from(h);
             hl.cold += i64::from(cold[c]);
+            hl.precip += f64::from(climate[c].0);
+            hl.pet += f64::from(climate[c].1);
         }
     }
     (hollows, joined)
@@ -400,10 +480,14 @@ fn merge_tree(
 struct Pour<'a> {
     hollows: &'a [Hollow],
     need: &'a [f64],
+    breached: &'a [bool],
     term: &'a [u32],
     /// Water reaching each hollow's pool, m³/s.
     water: Vec<f64>,
+    /// Whether water leaves it: it filled, or it is breached.
     full: Vec<bool>,
+    /// Whether it filled to its spill with a lake.
+    lake: Vec<bool>,
     /// Whether the hollow holds a pool of its own: always for the
     /// innermost, and for a parent once both its children are full.
     pool: Vec<bool>,
@@ -412,6 +496,20 @@ struct Pour<'a> {
 }
 
 impl Pour<'_> {
+    /// Settle a pool's state from the water reaching it: full with a lake
+    /// if it pays its evaporation, else open and dry if breached, else
+    /// closed.
+    fn fill(&mut self, x: usize) {
+        if self.water[x] >= self.need[x] {
+            self.full[x] = true;
+            self.lake[x] = true;
+            self.excess[x] = self.water[x] - self.need[x];
+        } else if self.breached[x] {
+            self.full[x] = true;
+            self.excess[x] = self.water[x];
+        }
+    }
+
     /// Pour `w` in at `cell`, inside hollow `stop` (already poured): it runs
     /// to the hollow it ends in, fills it, and what spills moves on — to a
     /// sibling, or up to a shared pool — but never out of `stop`, whose
@@ -428,11 +526,11 @@ impl Pour<'_> {
             }
             if !self.full[x] {
                 self.water[x] += w;
-                if self.water[x] < self.need[x] {
+                self.fill(x);
+                if !self.full[x] {
                     return;
                 }
-                self.full[x] = true;
-                w = self.water[x] - self.need[x];
+                w = std::mem::take(&mut self.excess[x]);
             }
             if x == stop {
                 self.excess[x] += w;
