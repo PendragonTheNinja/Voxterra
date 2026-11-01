@@ -519,6 +519,12 @@ resolution): 309 → 257 ms a frame at 8 levels from task 2 alone.
   in two of six runs; every other standing phase stays under ~31 ms.
 - **Two far-horizon pinholes** in the owner's census, as at M11's close.
 
+## Release
+
+**Not tagged or released, by the owner's decision (2026-11-01):** M12 changed
+performance, not what the game does or looks like. Its work ships in the next
+milestone's release; there is no `v0.12.0-m12`.
+
 ## Lessons
 
 1. **Split a queue before optimising what drains it.** "The backlog does not
