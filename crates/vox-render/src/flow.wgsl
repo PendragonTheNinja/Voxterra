@@ -44,20 +44,36 @@ fn flow_at(world_rel: vec3<f32>) -> vec2<f32> {
 fn water_sample(layer: u32, face_uv: vec2<f32>, world_rel: vec3<f32>, normal: vec3<f32>) -> vec4<f32> {
     let is_water = layer == WATER_LAYER;
     let top = is_water && abs(normal.y) > 0.5;
-    let uv = select(face_uv, world_rel.xz, top);
-    let flow = select(vec2<f32>(0.0, 0.0), flow_at(world_rel), is_water);
     let t = sky.morph.z;
-    let p0 = fract(t / FLOW_CYCLE);
-    let p1 = fract(t / FLOW_CYCLE + 0.5);
-    // Both samples always taken: implicit derivatives need uniform control
-    // flow.
-    let s0 = textureSample(block_tex, block_sampler, uv - flow * (p0 * FLOW_CYCLE), layer);
-    let s1 = textureSample(block_tex, block_sampler, uv - flow * (p1 * FLOW_CYCLE), layer);
-    // Water's sides are falling water — a waterfall's sheet, a rapid's
-    // step (M14): its texture runs straight down.
+    let uv = select(face_uv, world_rel.xz, top);
     let falling_uv = vec2<f32>(world_rel.x + world_rel.z, -world_rel.y - t * FALL_SPEED);
-    let falling = textureSample(block_tex, block_sampler, falling_uv, layer);
-    let c = select(mix(s0, s1, abs(1.0 - 2.0 * p0)), falling, is_water && !top);
+    // Derivatives taken here, in uniform control flow, so each kind of water
+    // below pays only for the samples it uses (M14 bench: three samples on
+    // every water pixel, the open sea's included, cost ~10% of frame rate):
+    // still water one, a river two, falling water one. Flow offsets are
+    // constant across a pixel, so the base uv's derivatives serve them all.
+    let dx = dpdx(uv);
+    let dy = dpdy(uv);
+    let fdx = dpdx(falling_uv);
+    let fdy = dpdy(falling_uv);
+    var flow = vec2<f32>(0.0, 0.0);
+    if (is_water) {
+        flow = flow_at(world_rel);
+    }
+    var c: vec4<f32>;
+    if (is_water && !top) {
+        // Water's sides are falling water — a waterfall's sheet, a rapid's
+        // step: its texture runs straight down.
+        c = textureSampleGrad(block_tex, block_sampler, falling_uv, layer, fdx, fdy);
+    } else if (flow.x != 0.0 || flow.y != 0.0) {
+        let p0 = fract(t / FLOW_CYCLE);
+        let p1 = fract(t / FLOW_CYCLE + 0.5);
+        let s0 = textureSampleGrad(block_tex, block_sampler, uv - flow * (p0 * FLOW_CYCLE), layer, dx, dy);
+        let s1 = textureSampleGrad(block_tex, block_sampler, uv - flow * (p1 * FLOW_CYCLE), layer, dx, dy);
+        c = mix(s0, s1, abs(1.0 - 2.0 * p0));
+    } else {
+        c = textureSampleGrad(block_tex, block_sampler, uv, layer, dx, dy);
+    }
     // Fast water foams; falling water is white water.
     let foam = max(smoothstep(1.5, 3.5, length(flow)) * 0.6, select(0.0, 0.35, is_water && !top));
     return vec4<f32>(mix(c.rgb, vec3<f32>(0.92, 0.95, 0.97), foam), mix(c.a, 1.0, foam * 0.8));

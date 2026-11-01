@@ -359,8 +359,16 @@ becomes an ADR; the simulation itself remains its own milestone.
      against 42 blocks, `rivers_differ_by_slope_discharge_and_sediment`).
    - [ ] Reservoir or finite per body — for the simulation (layer 2) when
      it is built; the network has what it needs (discharge, cover).
-   - [ ] Cost: `ground` ~2× the eroded surface per column; measure with
-     `--bench` (owner).
+   - [ ] Cost (criterion 9). **`--bench` (owner, 2026-11-01, RTX 4060,
+     800×600), against M13's close:** sprint at 8 levels 677 / 664 fps
+     (land / ocean; was 754 / 745, −10 / −11%); standing 880 / 770 at 6
+     levels, 774 / 718 at 8; mesh 205–214 µs per chunk (~197); relight
+     181–189 ms/s (184–190), backlog at the end 192–227 (190–232), GPU 741
+     MB (741) — streaming unchanged, frames ~10% slower, at the limit.
+     Suspect: flow.wgsl took three texture samples on every water pixel,
+     the open sea's included. Now still water takes one, a river two,
+     falling water one (`textureSampleGrad`, derivatives taken first; the
+     image is unchanged — 1 pixel of 921 600). Re-bench to confirm.
 4. Lakes, salt flats, floodplains, wetlands, deltas, waterfalls; the new
    biomes.
    - [x] The nine water biomes (`docs/biomes.md`, "Water biomes as
