@@ -141,6 +141,15 @@ pub(crate) fn biome_colour(b: Biome) -> [u8; 3] {
         Biome::TemperateSea => [50, 110, 170],
         Biome::PolarSea => [170, 200, 225],
         Biome::DeepOcean => [20, 40, 100],
+        Biome::River => [40, 90, 220],
+        Biome::Lake => [90, 200, 230],
+        Biome::SaltLake => [250, 245, 235],
+        Biome::Floodplain => [140, 190, 70],
+        Biome::Marsh => [110, 150, 110],
+        Biome::Swamp => [70, 100, 60],
+        Biome::Bog => [120, 95, 70],
+        Biome::Delta => [200, 170, 120],
+        Biome::MangroveCoast => [60, 120, 80],
     }
 }
 
@@ -354,7 +363,7 @@ mod tests {
         );
         // Biomes, from the generator's own classification.
         let mut biomes = rgb.clone();
-        let mut counts = [0u32; 23];
+        let mut counts = [0u32; Biome::ALL.len()];
         let mut land = 0u32;
         for j in 0..px {
             let z = (f64::from(j) * step) as i64;
@@ -559,10 +568,10 @@ mod survey {
     /// Per-biome share of a world: land biomes of its land, sea biomes of
     /// the world. Sampled on a grid, plus a finer pass along the shores,
     /// where coasts are narrower than any coarse grid.
-    pub(crate) fn shares(g: &Generator, px: i64) -> ([f64; 23], Vec<i64>, Vec<i64>) {
+    pub(crate) fn shares(g: &Generator, px: i64) -> ([f64; Biome::ALL.len()], Vec<i64>, Vec<i64>) {
         let shape = g.shape();
         let step = shape.size_x() / px;
-        let (mut counts, mut land, mut total) = ([0u64; 23], 0u64, 0u64);
+        let (mut counts, mut land, mut total) = ([0u64; Biome::ALL.len()], 0u64, 0u64);
         for j in 0..px {
             for i in 0..px {
                 let b = g.column(i * step, j * step).biome;
@@ -571,14 +580,14 @@ mod survey {
                 land += u64::from(!b.is_sea());
             }
         }
-        let mut out = [0.0; 23];
+        let mut out = [0.0; Biome::ALL.len()];
         for b in Biome::ALL {
             let of = if b.is_sea() { total } else { land.max(1) };
             out[b as usize] = counts[b as usize] as f64 / of as f64;
         }
         // Coasts are narrower than any coarse grid: measure them exactly,
         // on a few whole rows walked block by block.
-        let (mut coast, mut row_land) = ([0u64; 23], 0u64);
+        let (mut coast, mut row_land) = ([0u64; Biome::ALL.len()], 0u64);
         // Lengths of unbroken land-biome stretches along those rows (coasts
         // left out: they are shore, not a place to cross).
         let mut runs = Vec::new();
@@ -606,6 +615,34 @@ mod survey {
         }
         for b in Biome::ALL.into_iter().filter(|b| b.is_coast()) {
             out[b as usize] = coast[b as usize] as f64 / row_land.max(1) as f64;
+        }
+        // River mouths (M14): deltas and mangrove coasts are narrower still,
+        // and where they are is known — beside the reaches that reach the
+        // sea. Looked for there, finely; found ones count as present.
+        let d = g.drainage();
+        let (dnx, dnz) = d.cells();
+        let (cw, ch) = d.cell_blocks();
+        // The 400 largest mouths, whatever the world's size.
+        let mut mouths = Vec::new();
+        for j in 0..dnz {
+            for i in 0..dnx {
+                let (_, _, q, (ri, rj)) = d.cell(i, j);
+                if !d.is_sea(i, j) && d.is_sea(ri, rj) && q > 0.0 {
+                    mouths.push((q, i, j));
+                }
+            }
+        }
+        mouths.sort_by(|a, b| b.0.total_cmp(&a.0));
+        for &(_, i, j) in mouths.iter().take(400) {
+            let (x0, z0) = ((i as f64 * cw) as i64, (j as f64 * ch) as i64);
+            for dz in (-64..192).step_by(8) {
+                for dx in (-64..192).step_by(8) {
+                    let b = g.column(x0 + dx, z0 + dz).biome;
+                    if matches!(b, Biome::Delta | Biome::MangroveCoast) && out[b as usize] == 0.0 {
+                        out[b as usize] = 1e-6;
+                    }
+                }
+            }
         }
         // And north–south, across the climate belts rather than along them.
         let mut ns_runs = Vec::new();
@@ -667,16 +704,16 @@ mod survey {
         );
         for size in sizes {
             let shape = WorldShape::new(size, size).expect("a legal size");
-            let mut sum = [0.0f64; 23];
-            let mut min = [f64::MAX; 23];
-            let mut missing = [0u32; 23];
+            let mut sum = [0.0f64; Biome::ALL.len()];
+            let mut min = [f64::MAX; Biome::ALL.len()];
+            let mut missing = [0u32; Biome::ALL.len()];
             let (mut runs, mut ns_runs) = (Vec::new(), Vec::new());
             for seed in 0..seeds {
                 let g = Generator::new(seed.wrapping_mul(0x9E37_79B9) ^ 0x7e22ac0de, shape);
                 let (s, r, ns) = shares(&g, 300);
                 runs.extend(r);
                 ns_runs.extend(ns);
-                for k in 0..23 {
+                for k in 0..Biome::ALL.len() {
                     sum[k] += s[k];
                     min[k] = min[k].min(s[k]);
                     missing[k] += u32::from(s[k] == 0.0);

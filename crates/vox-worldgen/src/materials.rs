@@ -45,7 +45,13 @@ pub fn block_in(col: &Column, wy: i64, strata: impl Fn(i64) -> BlockId) -> Block
     // Rivers and lakes (M14): settled, full water blocks up to their own
     // level — the hybrid's layer 1 (`docs/design/water.md`). A lake freezes
     // at its surface where the sea would.
-    if wy > h && wy <= w.level && matches!(w.body, Body::River(_) | Body::Lake | Body::SaltLake) {
+    if wy > h
+        && wy <= w.level
+        && matches!(
+            w.body,
+            Body::River(_) | Body::Lake | Body::SaltLake | Body::Pool
+        )
+    {
         return if wy == w.level && w.body == Body::Lake && col.temperature < LAKE_ICE_BELOW_C {
             r::ICE
         } else {
@@ -60,7 +66,16 @@ pub fn block_in(col: &Column, wy: i64, strata: impl Fn(i64) -> BlockId) -> Block
             Body::River(Bed::Sand) => Some((r::SAND, 2)),
             Body::River(Bed::Silt) | Body::Lake => Some((r::SILT, 2)),
             Body::SaltLake | Body::SaltFlat => Some((if d == 0 { r::SALT } else { r::SILT }, 2)),
-            Body::Dry => None,
+            // A wetland pool's floor: peat in a bog, mud elsewhere.
+            Body::Pool => Some((
+                if col.biome == Biome::Bog {
+                    r::PEAT
+                } else {
+                    r::MUD
+                },
+                1,
+            )),
+            Body::Dry | Body::Wetland | Body::Floodplain | Body::Delta => None,
         };
         if let Some((block, thick)) = bed
             && d < thick
@@ -91,6 +106,18 @@ pub fn block_in(col: &Column, wy: i64, strata: impl Fn(i64) -> BlockId) -> Block
         Biome::TemperateSea => layers(d, &[(pick(0.3, r::GRAVEL, r::SAND), 3)]),
         Biome::PolarSea => layers(d, &[(r::GRAVEL, 2)]),
         Biome::DeepOcean => layers(d, &[(r::MUD, 1), (r::CLAY, 3)]),
+        // --- Water (M14): the body lays the top of a bed (river gravel,
+        // sand or silt; silt; salt); these are what lies under it, and the
+        // ground of the lowlands.
+        Biome::River => layers(d, &[(r::GRAVEL, 4)]),
+        Biome::Lake => layers(d, &[(r::SILT, 2), (r::CLAY, 3)]),
+        Biome::SaltLake => layers(d, &[(r::SALT, 1), (r::SILT, 3)]),
+        Biome::Floodplain => layers(d, &[(r::GRASS, 1), (r::SILT, 3), (r::RIVER_GRAVEL, 2)]),
+        Biome::Marsh => layers(d, &[(pick(-0.1, r::GRASS, r::MUD), 1), (r::MUD, 3)]),
+        Biome::Swamp => layers(d, &[(pick(0.2, r::GRASS, r::MUD), 1), (r::MUD, 3)]),
+        Biome::Bog => layers(d, &[(pick(0.4, r::GRASS, r::PEAT), 1), (r::PEAT, 3)]),
+        Biome::Delta => layers(d, &[(pick(0.0, r::SAND, r::MUD), 2), (r::SILT, 3)]),
+        Biome::MangroveCoast => layers(d, &[(r::MUD, 3), (r::SILT, 2)]),
         // --- Coasts.
         Biome::SandBeach => layers(d, &[(r::SAND, 4), (r::SANDSTONE, 3)]),
         Biome::ShingleBeach => layers(d, &[(r::GRAVEL, 3)]),

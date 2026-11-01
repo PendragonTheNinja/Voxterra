@@ -68,13 +68,33 @@ pub struct Water {
     /// [`Body::SaltFlat`].
     pub level: i64,
     pub body: Body,
+    /// The nearest river, if one is within reach of its banks: what
+    /// floodplains, wetlands and deltas are classified from (task 4).
+    pub near: Option<Near>,
 }
 
 impl Water {
     pub const DRY: Self = Self {
         level: i64::MIN,
         body: Body::Dry,
+        near: None,
     };
+}
+
+/// The river nearest a column.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Near {
+    /// How far beyond its bank, blocks (negative inside the channel).
+    pub out: f32,
+    /// Its water level there, blocks.
+    pub level: i64,
+    /// Its slope, blocks per block.
+    pub slope: f32,
+    pub width: f32,
+    /// Its discharge, m³/s.
+    pub discharge: f32,
+    /// Whether this reach flows into the sea: a river mouth.
+    pub mouth: bool,
 }
 
 /// The kind of water a column holds.
@@ -87,6 +107,15 @@ pub enum Body {
     SaltLake,
     /// The dry, salt-crusted floor of a closed basin.
     SaltFlat,
+    /// A wetland's shallow pool (task 4): water a block deep at the
+    /// river's level — finite water, in the hybrid's terms.
+    Pool,
+    /// Waterlogged ground of a wetland, at the river's level.
+    Wetland,
+    /// Flat ground beside a lowland river, a block above it.
+    Floodplain,
+    /// The flats of a large river's mouth, at sea level.
+    Delta,
 }
 
 /// A river bed, by the energy of the water over it: gravel where it is
@@ -110,6 +139,8 @@ struct Reach {
     depth: (f32, f32),
     wander: (f32, f32),
     slope: f32,
+    discharge: f32,
+    mouth: bool,
 }
 
 thread_local! {
@@ -159,6 +190,7 @@ impl DrainageMap {
         let mut best: Option<(f32, f32, Bed)> = None; // (inside, level, bed)
         // The banks: no higher than `ceiling`, no lower than `floor`.
         let (mut ceiling, mut floor) = (f32::INFINITY, f32::NEG_INFINITY);
+        let mut nearest: Option<Near> = None;
         // The grid-scale wander is the same for every reach: once a column,
         // and only if some reach is near.
         let mut wander = None;
@@ -189,6 +221,16 @@ impl DrainageMap {
                 let surface = reach.level.0 + (reach.level.1 - reach.level.0) * t;
                 let level = surface.floor();
                 let out = d - half;
+                if nearest.is_none_or(|n: Near| out < n.out) {
+                    nearest = Some(Near {
+                        out,
+                        level: level as i64,
+                        slope: reach.slope,
+                        width: 2.0 * half,
+                        discharge: reach.discharge,
+                        mouth: reach.mouth,
+                    });
+                }
                 // Banks: within a 45° rise or fall of a block above the
                 // water, easing back to the ground by BANK_REACH (the
                 // quartic term outgrows any ground there).
@@ -221,6 +263,7 @@ impl DrainageMap {
                 Water {
                     level: level as i64,
                     body: Body::River(bed),
+                    near: nearest,
                 },
             );
         }
@@ -229,7 +272,9 @@ impl DrainageMap {
         // lower water — the levee wins, so no water is ever held by air.
         let h = h.min(ceiling).max(floor).round() as i64;
         let h = self.alluvium(ci, cj, h);
-        (h, self.still_water(ci, cj, h))
+        let mut water = self.still_water(ci, cj, h);
+        water.near = nearest;
+        (h, water)
     }
 
     /// The ground of a column of cell `(ci, cj)` (unwrapped) after the
@@ -277,13 +322,18 @@ impl DrainageMap {
             }
         }
         match found {
-            Some((level, body)) if h < level => Water { level, body },
+            Some((level, body)) if h < level => Water {
+                level,
+                body,
+                near: None,
+            },
             _ if self.cover_at(here) == Cover::SaltFlat
                 && h <= i64::from(self.h(here)) + SALT_FLAT_RISE =>
             {
                 Water {
                     level: h,
                     body: Body::SaltFlat,
+                    near: None,
                 }
             }
             _ => Water::DRY,
@@ -353,6 +403,8 @@ impl DrainageMap {
             depth: (depth(q), depth(qr)),
             wander: (wander(width(q)), wander(width(qr))),
             slope,
+            discharge: qr,
+            mouth: self.sea_at(r),
         })
     }
 }

@@ -283,11 +283,11 @@ impl DrainageMap {
         // time — a flat alluvial floor (stage 2 raises it).
         for c in 0..nx * nz {
             let still_water = matches!(cover[receiver[c] as usize], Cover::Lake | Cover::SaltLake);
-            if cover[c] == Cover::Land
-                && spill[c] > height[c]
-                && (ponded[c] || still_water)
-                && discharge[c] < STREAM_FROM_M3S
-            {
+            // Backed-up water is the lake's whether or not a stream crosses
+            // it: a river entering a lake ends there. (Exempting stream
+            // cells left their straight flood paths as strips of land across
+            // the lake.)
+            if cover[c] == Cover::Land && spill[c] > height[c] && (ponded[c] || still_water) {
                 cover[c] = Cover::Lake;
             }
         }

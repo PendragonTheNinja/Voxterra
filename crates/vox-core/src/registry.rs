@@ -178,6 +178,8 @@ pub const SILT: BlockId = BlockId(22);
 pub const SALT: BlockId = BlockId(23);
 /// Rounded, water-worn gravel of a steep river's bed (M14).
 pub const RIVER_GRAVEL: BlockId = BlockId(24);
+/// Waterlogged, half-rotted plant matter of a bog (M14).
+pub const PEAT: BlockId = BlockId(25);
 
 // --- Texture-array layer assignment (one layer per distinct tile). Used by
 // the texture pipeline in task 2; declared here so the registry is the
@@ -209,10 +211,11 @@ pub const L_MUD: u32 = 21;
 pub const L_SILT: u32 = 22;
 pub const L_SALT: u32 = 23;
 pub const L_RIVER_GRAVEL: u32 = 24;
+pub const L_PEAT: u32 = 25;
 /// Number of texture-array layers the default registry references. The
 /// renderer builds exactly this many, so a new layer is one change here and
 /// one tile in `vox-render`'s `tile_pixels`.
-pub const DEFAULT_LAYER_COUNT: u32 = 25;
+pub const DEFAULT_LAYER_COUNT: u32 = 26;
 
 /// Block-light level emitted by the lamp block.
 pub const LAMP_EMISSION: u8 = 14;
@@ -226,7 +229,7 @@ impl BlockRegistry {
     /// Build the default starter registry. Indices are dense and match the
     /// `BlockId` numeric values, so lookup is O(1) indexing.
     pub fn default_set() -> Self {
-        // Order MUST match the BlockId values (0..=24).
+        // Order MUST match the BlockId values (0..=25).
         let types = vec![
             BlockType::air(),                                         // 0 AIR
             BlockType::uniform("stone", L_STONE, [0.55, 0.55, 0.58]), // 1
@@ -259,6 +262,7 @@ impl BlockRegistry {
             BlockType::uniform("silt", L_SILT, [0.55, 0.50, 0.42]),   // 22
             BlockType::uniform("salt", L_SALT, [0.93, 0.92, 0.88]),   // 23
             BlockType::uniform("river gravel", L_RIVER_GRAVEL, [0.48, 0.47, 0.45]), // 24
+            BlockType::uniform("peat", L_PEAT, [0.24, 0.18, 0.12]),   // 25
         ];
         Self { types }
     }
@@ -366,10 +370,11 @@ mod tests {
         assert_eq!(reg.get(SILT).name, "silt");
         assert_eq!(reg.get(SALT).name, "salt");
         assert_eq!(reg.get(RIVER_GRAVEL).name, "river gravel");
-        assert_eq!(reg.len(), 25);
+        assert_eq!(reg.get(PEAT).name, "peat");
+        assert_eq!(reg.len(), 26);
         // Every natural surface is an opaque solid cube (ADR-0011's three
         // properties): ice above all, which unlike water is walked on.
-        for id in 9..=24 {
+        for id in 9..=25 {
             let b = BlockId(id);
             assert!(
                 reg.is_solid(b) && reg.is_opaque(b) && reg.renders(b),
@@ -471,7 +476,7 @@ mod tests {
         let placeable: Vec<BlockId> = reg.placeable().collect();
         assert!(!placeable.contains(&AIR));
         assert!(placeable.contains(&STONE));
-        assert_eq!(placeable.len(), 23); // stone..lamp, snow..mud (M13), silt..river gravel (M14)
+        assert_eq!(placeable.len(), 24); // stone..lamp, snow..mud (M13), silt..peat (M14)
     }
 
     #[test]

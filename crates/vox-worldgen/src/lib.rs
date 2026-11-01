@@ -83,10 +83,25 @@ const fn vox_mesh_dry() -> i32 {
 /// The top of a column's standing water, or `i64::MIN` where it has none.
 fn wet_top(w: &Water) -> i64 {
     match w.body {
-        Body::River(_) | Body::Lake | Body::SaltLake => w.level,
-        Body::Dry | Body::SaltFlat => i64::MIN,
+        Body::River(_) | Body::Lake | Body::SaltLake | Body::Pool => w.level,
+        Body::Dry | Body::SaltFlat | Body::Wetland | Body::Floodplain | Body::Delta => i64::MIN,
     }
 }
+
+/// Lowland rivers (task 4): below this slope a river has a floodplain.
+const LOWLAND_SLOPE: f32 = 0.003;
+/// How far beyond its banks a lowland river's flats reach: this many of
+/// its widths, at least [`LOWLAND_MIN_REACH`] blocks.
+const LOWLAND_WIDTHS: f32 = 4.0;
+const LOWLAND_MIN_REACH: f32 = 16.0;
+/// Precipitation over potential evaporation from which a lowland is a
+/// wetland rather than a floodplain.
+const WETLAND_HUMIDITY: f32 = 1.0;
+/// Patch noise below which a wetland column holds a pool.
+const POOL_BELOW: f32 = -0.3;
+/// The least discharge that builds a delta at its mouth, m³/s, in a world
+/// of the default size or larger ([`Generator::delta_from`]).
+const DELTA_FROM_M3S: f32 = 0.5;
 
 /// The drainage network's cache, in the world folder (ADR-0019 §6).
 pub const DRAINAGE_CACHE_FILE: &str = "drainage.cache";
@@ -205,8 +220,77 @@ impl Generator {
         let (h, water) = self.drainage().shape_column(wx, wz, s.height, |x, z, l| {
             self.elevation.meander_warp(x, z, l)
         });
+        let (h, water) = self.lowlands(wx, wz, h, water, true);
         s.height = h;
         (s, water)
+    }
+
+    /// The least discharge that builds a delta in this world: large for its
+    /// world. Discharge grows with catchment area, which grows with the
+    /// world's area, so a small world's largest rivers are tens of times
+    /// smaller than the default world's (as M13 widened small worlds'
+    /// mountain belts only where needed, `Elevation::calibrate_ranges`).
+    fn delta_from(&self) -> f32 {
+        let d = WorldShape::DEFAULT;
+        let area = (self.shape.size_x() as f64 * self.shape.size_z() as f64)
+            / (d.size_x() as f64 * d.size_z() as f64);
+        DELTA_FROM_M3S * area.min(1.0) as f32
+    }
+
+    /// [`Self::ground`]'s height without wetland pools: what a pool's
+    /// neighbours must stand at for it to hold.
+    fn ground_without_pools(&self, wx: i64, wz: i64) -> i64 {
+        let s = self.eroded_surface(wx, wz);
+        let (h, water) = self.drainage().shape_column(wx, wz, s.height, |x, z, l| {
+            self.elevation.meander_warp(x, z, l)
+        });
+        self.lowlands(wx, wz, h, water, false).0
+    }
+
+    /// The flat ground beside lowland rivers (M14 task 4): wetlands where
+    /// it is wet, floodplains where it is not, deltas at large mouths.
+    /// Each is shaped flat at its river's level, as the river's floods and
+    /// sediment make it; a wetland is waterlogged, with shallow pools.
+    fn lowlands(&self, wx: i64, wz: i64, h: i64, water: Water, pools: bool) -> (i64, Water) {
+        let Some(n) = water.near else {
+            return (h, water);
+        };
+        if water.body != Body::Dry || n.out < 0.0 {
+            return (h, water);
+        }
+        let reach = (LOWLAND_WIDTHS * n.width).max(LOWLAND_MIN_REACH);
+        let pool = self.elevation.patch_noise(wx, wz) < POOL_BELOW;
+        let with = |body| Water { body, ..water };
+        // A large river's mouth on a gentle coast — low ground beside it,
+        // however steeply its last reach fell: flats at sea level, the sea
+        // in their pools.
+        if n.mouth && n.discharge >= self.delta_from() && n.out < 2.0 * reach && h.abs() <= 3 {
+            return (if pool { -1 } else { 1 }, with(Body::Delta));
+        }
+        if n.slope >= LOWLAND_SLOPE || n.out >= reach || h > n.level + 3 {
+            return (h, water);
+        }
+        let (sea_level_c, precip) = self.climate().sample(wx, wz);
+        let pet = climate::potential_evaporation(climate::temperature_at(sea_level_c, h));
+        if precip >= WETLAND_HUMIDITY * pet {
+            // A pool only where every side stands as high as its water —
+            // inside its own wetland, not beside another river's lower one.
+            if pools
+                && pool
+                && [(1, 0), (-1, 0), (0, 1), (0, -1)]
+                    .iter()
+                    .all(|&(dx, dz)| self.ground_without_pools(wx + dx, wz + dz) >= n.level)
+            {
+                let w = Water {
+                    level: n.level,
+                    body: Body::Pool,
+                    near: water.near,
+                };
+                return (n.level - 1, w);
+            }
+            return (n.level, with(Body::Wetland));
+        }
+        (n.level + 1, with(Body::Floodplain))
     }
 
     /// The elevation field cut by the erosion stage, before rivers shape
@@ -241,6 +325,10 @@ impl Generator {
         );
         col.patch = self.elevation.patch_noise(wx, wz);
         col.water = water;
+        if let Some(b) = biome::water_biome(water.body, col.temperature, col.sea_level_temperature)
+        {
+            col.biome = b;
+        }
         col
     }
 
@@ -946,9 +1034,16 @@ mod tests {
             "too few rivers and lakes: {}",
             sites.len()
         );
+        // Water standing on a column: a river's or a lake's, or the sea's
+        // over ground below sea level.
         let top = |x: i64, z: i64| {
             let (s, w) = g.ground(x, z);
-            (s.height, wet_top(&w))
+            let sea = if s.height < SEA_LEVEL_BLOCKS {
+                SEA_LEVEL_BLOCKS
+            } else {
+                i64::MIN
+            };
+            (s.height, wet_top(&w).max(sea))
         };
         let (mut wet, mut falls, mut held_by_air) = (0u32, 0u32, Vec::new());
         for &(_, i, j) in &sites {
@@ -1152,7 +1247,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (4, 0x6845_14bc_0518_b11c);
+        const PINNED: (u32, u64) = (4, 0xf2e4_60ec_708f_d3e3);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),

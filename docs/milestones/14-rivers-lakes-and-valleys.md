@@ -352,6 +352,18 @@ becomes an ADR; the simulation itself remains its own milestone.
      `--bench` (owner).
 4. Lakes, salt flats, floodplains, wetlands, deltas, waterfalls; the new
    biomes.
+   - [x] The nine water biomes (`docs/biomes.md`, "Water biomes as
+     built"): river, lake, salt lake/flat from the column's water;
+     floodplains, wetlands (marsh, swamp, bog by temperature) and deltas
+     (mangrove in the tropics) from the nearest river — flattened at its
+     level, wetlands waterlogged with shallow pools that only form where
+     every side holds them. Peat. All 32 biomes in every legal world size;
+     the delta threshold scales with world area.
+   - [x] Backed-up water is a lake even where a stream crosses it (stream
+     cells had been left as straight strips of land across a lake).
+   - [ ] Waterfalls and rapids as features (today: whole-block steps where
+     a river's profile falls; 2+ block steps are rare).
+   - [ ] Deltas' distributary channels; oxbow lakes.
 5. Distant water in the LOD (criterion 8).
    - [x] The LOD's water at each cell's own level (`mesh_lod_cells`,
      `LodCells`; `lod_surface` returns the water of the column it sampled):

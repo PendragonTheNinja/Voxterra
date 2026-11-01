@@ -60,11 +60,23 @@ pub enum Biome {
     TemperateSea,
     PolarSea,
     DeepOcean,
+    // --- Water (M14, `docs/biomes.md` #24–32): classified from the
+    // drainage network, over the climate biome the column would have.
+    River,
+    Lake,
+    /// A closed basin's salt lake or salt flat.
+    SaltLake,
+    Floodplain,
+    Marsh,
+    Swamp,
+    Bog,
+    Delta,
+    MangroveCoast,
 }
 
 impl Biome {
     /// The whole catalogue, in its order.
-    pub const ALL: [Biome; 23] = [
+    pub const ALL: [Biome; 32] = [
         Biome::TropicalRainforest,
         Biome::TropicalDryForest,
         Biome::Savanna,
@@ -88,6 +100,15 @@ impl Biome {
         Biome::TemperateSea,
         Biome::PolarSea,
         Biome::DeepOcean,
+        Biome::River,
+        Biome::Lake,
+        Biome::SaltLake,
+        Biome::Floodplain,
+        Biome::Marsh,
+        Biome::Swamp,
+        Biome::Bog,
+        Biome::Delta,
+        Biome::MangroveCoast,
     ];
 
     pub fn name(self) -> &'static str {
@@ -115,6 +136,15 @@ impl Biome {
             Biome::TemperateSea => "temperate sea",
             Biome::PolarSea => "polar sea",
             Biome::DeepOcean => "deep ocean",
+            Biome::River => "river",
+            Biome::Lake => "freshwater lake",
+            Biome::SaltLake => "salt lake or salt flat",
+            Biome::Floodplain => "floodplain",
+            Biome::Marsh => "marsh",
+            Biome::Swamp => "swamp",
+            Biome::Bog => "bog",
+            Biome::Delta => "delta",
+            Biome::MangroveCoast => "mangrove coast",
         }
     }
 
@@ -133,6 +163,39 @@ impl Biome {
         )
     }
 }
+
+/// The water biome of a column the drainage network has given water or a
+/// lowland (M14 task 4), if any: the column's own body says which, and the
+/// climate which kind of wetland — bog where it is cold (the Hudson Bay
+/// lowlands, Irish bogs), swamp where it is hot (the Pantanal, the
+/// Atchafalaya), marsh between (the Camargue) — and which delta is
+/// mangrove (the Sundarbans).
+pub fn water_biome(
+    body: crate::drainage::Body,
+    temperature: f32,
+    sea_level_c: f32,
+) -> Option<Biome> {
+    use crate::drainage::Body;
+    Some(match body {
+        Body::River(_) => Biome::River,
+        Body::Lake => Biome::Lake,
+        Body::SaltLake | Body::SaltFlat => Biome::SaltLake,
+        Body::Floodplain => Biome::Floodplain,
+        Body::Pool | Body::Wetland if temperature < BOG_BELOW_C => Biome::Bog,
+        Body::Pool | Body::Wetland if temperature >= SWAMP_FROM_C => Biome::Swamp,
+        Body::Pool | Body::Wetland => Biome::Marsh,
+        Body::Delta if sea_level_c >= MANGROVE_FROM_C => Biome::MangroveCoast,
+        Body::Delta => Biome::Delta,
+        Body::Dry => return None,
+    })
+}
+
+/// A wetland colder than this (mean annual °C) is a bog: peat.
+const BOG_BELOW_C: f32 = 3.0;
+/// A wetland at least this warm is a swamp.
+const SWAMP_FROM_C: f32 = 18.0;
+/// A delta whose sea is at least this warm grows mangroves.
+const MANGROVE_FROM_C: f32 = 20.0;
 
 /// Land this close to sea level, blocks, is shore.
 pub const SHORE_HEIGHT: i64 = 3;
@@ -423,7 +486,7 @@ mod tests {
 
     #[test]
     fn the_catalogue_is_complete_and_named() {
-        assert_eq!(Biome::ALL.len(), 23);
+        assert_eq!(Biome::ALL.len(), 32);
         for (k, b) in Biome::ALL.iter().enumerate() {
             assert_eq!(*b as usize, k, "ALL is in declaration order");
             assert!(!b.name().is_empty());

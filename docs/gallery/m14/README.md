@@ -20,3 +20,4 @@ milestone is kept here, with the commit it shows.
 | `view-salt-flats.jpg` | task 3 | Salt flats near (87 744, 15 936) in a closed basin of the subtropical desert: white playa pans in the sand, badlands beyond |
 | `view-frozen-lake-far-with-lod-water.jpg` | task 5 | The mountain lake from 300 blocks with the LOD's water (compare `view-frozen-lake-before-span-fix.jpg`): frozen over from full resolution into the LOD with no seam; an open lake far off on the right |
 | `view-river-with-lod-water.jpg` | task 5 | The first river again (compare `view-first-river.jpg`): its water and its tributary's continue past full resolution into the LOD |
+| `biomes.png` | task 4 | The 32 biomes: M13's 23 and the nine water biomes (river blue, lakes cyan, salt lakes white, floodplain bright green, marsh grey-green, swamp dark green, bog brown, delta tan, mangrove dark teal); lake districts on the ice-scoured bands. `rivers.png` updated with it |
