@@ -42,7 +42,7 @@ mod rivers;
 pub use cache::{CacheKey, FORMAT_VERSION as CACHE_FORMAT_VERSION};
 use erosion::Erosion;
 pub use hollows::Cover;
-pub use rivers::{Bed, Body, MAX_FLOW, Near, STREAM_FROM_M3S, Water};
+pub use rivers::{Bed, Body, MAX_FLOW, Near, RiverKind, STREAM_FROM_M3S, Water, river_kind};
 
 /// Target size of a drainage cell, in blocks. Rivers need finer cells than
 /// climate (ADR-0017's 256); the grid is capped so the largest worlds stay
@@ -99,6 +99,13 @@ const GLACIATED_BELOW_C: f32 = 2.0;
 const HERE: u8 = 8;
 /// The bit of a cell's cover marking a closed basin's sink.
 const SINK: u8 = 0x80;
+/// The cover byte's low bits: the `Cover` itself.
+const COVER_BITS: u8 = 0x07;
+/// The cover byte's climate bits (M14 criterion 10): the cell is arid
+/// (precipitation under half its potential evaporation), or ice-scoured —
+/// what makes a river braided or a wadi.
+const ARID: u8 = 0x08;
+const COLD: u8 = 0x10;
 
 /// The world's drainage, on a grid of cells, row-major (`j * nx + i`).
 pub struct DrainageMap {
@@ -301,7 +308,13 @@ impl DrainageMap {
             height: height.iter().map(|&h| narrow(h)).collect(),
             level: spill.iter().map(|&h| narrow(h)).collect(),
             cover: (0..nx * nz)
-                .map(|c| cover[c] as u8 | if sink[c] { SINK } else { 0 })
+                .map(|c| {
+                    let (precip, pet) = water[c];
+                    cover[c] as u8
+                        | if sink[c] { SINK } else { 0 }
+                        | if precip < 0.5 * pet { ARID } else { 0 }
+                        | if cold[c] { COLD } else { 0 }
+                })
                 .collect(),
             flow: (0..nx * nz)
                 .map(|c| {
@@ -369,11 +382,19 @@ impl DrainageMap {
     }
 
     fn cover_at(&self, c: usize) -> Cover {
-        Cover::from_u8(self.cover[c] & !SINK)
+        Cover::from_u8(self.cover[c] & COVER_BITS)
     }
 
     fn sea_at(&self, c: usize) -> bool {
         self.cover_at(c) == Cover::Sea
+    }
+
+    fn arid_at(&self, c: usize) -> bool {
+        self.cover[c] & ARID != 0
+    }
+
+    fn cold_at(&self, c: usize) -> bool {
+        self.cover[c] & COLD != 0
     }
 
     fn sink_at(&self, c: usize) -> bool {
@@ -940,6 +961,49 @@ mod tests {
         }
         eprintln!("steepest slope erosion adds: {steepest:.2}");
         assert!(steepest < 1.0, "erosion adds a slope of {steepest:.2}");
+    }
+
+    /// Criterion 10: rivers differ as Earth's do — every kind appears;
+    /// torrents run higher than meandering rivers; braided rivers only on
+    /// arid or ice-scoured ground, wadis only on arid.
+    #[test]
+    fn rivers_differ_by_slope_discharge_and_sediment() {
+        let d = small(11);
+        let (nx, nz) = d.cells();
+        let mut tally = std::collections::HashMap::new();
+        for j in 0..nz {
+            for i in 0..nx {
+                let Some(kind) = d.river_kind_at(i, j) else {
+                    continue;
+                };
+                let c = j * nx + i;
+                let e = tally.entry(kind).or_insert((0u32, 0i64));
+                e.0 += 1;
+                e.1 += i64::from(d.h(c));
+                match kind {
+                    RiverKind::Braided => assert!(d.arid_at(c) || d.cold_at(c)),
+                    RiverKind::Wadi => assert!(d.arid_at(c)),
+                    _ => {}
+                }
+            }
+        }
+        eprintln!("river kinds (cells, mean height): {tally:?}");
+        for kind in [
+            RiverKind::Torrent,
+            RiverKind::Braided,
+            RiverKind::Meandering,
+            RiverKind::Wadi,
+        ] {
+            assert!(tally.contains_key(&kind), "no {kind:?}: {tally:?}");
+        }
+        let mean = |k| {
+            let (n, sum) = tally[&k];
+            sum as f64 / f64::from(n)
+        };
+        assert!(
+            mean(RiverKind::Torrent) > mean(RiverKind::Meandering),
+            "{tally:?}"
+        );
     }
 
     #[test]

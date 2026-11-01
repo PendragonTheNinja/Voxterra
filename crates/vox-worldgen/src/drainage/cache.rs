@@ -17,7 +17,8 @@ use super::{DrainageMap, erosion::Erosion};
 
 const MAGIC: &[u8; 4] = b"VXDR";
 /// Bump when the layout changes. A file of another version is rebuilt.
-pub const FORMAT_VERSION: u32 = 1;
+/// 2 — the cover byte carries arid and ice-scoured bits (M14 criterion 10).
+pub const FORMAT_VERSION: u32 = 2;
 
 /// What a cache must have been built for to be used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

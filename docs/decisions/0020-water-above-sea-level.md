@@ -83,6 +83,22 @@ and far tile alike. The water clock is real time, not world time: rivers
 keep flowing when the day stands still. Re-meshes nothing; one texture
 sample more per water pixel. Visual only, so it may use `cbrt`.
 
+### 7. Rivers differ by kind
+
+Each reach is one of Earth's kinds (`drainage::river_kind`), from its
+slope, discharge and the sediment its climate gives it — the cover byte
+carries whether a cell is arid (precipitation under half its potential
+evaporation) or ice-scoured (cache format 2):
+
+- **Wadi** — arid and under 0.05 m³/s: a dry sand channel, no water.
+- **Braided** — 0.002–0.03 slope, arid or ice-scoured, 0.05+ m³/s: 2.5×
+  as wide, a block deep, split by dry gravel bars (32-block noise).
+- **Torrent** — steeper than 0.01: gravel bed, fast, nearly straight.
+- **Meandering** — the rest: sand, or silt under 0.002, winding, slow.
+- **Slow, lake-like reaches** are where a river crosses a lake.
+
+Speed (§6) follows from slope and depth for all of them.
+
 ## Consequences
 
 - `ground` costs ~2× the eroded surface per column (~0.6 against ~0.3 µs in

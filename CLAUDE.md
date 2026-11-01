@@ -283,13 +283,14 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   (`Generator::ground`, `drainage::rivers`); the nine water biomes (32 in
   all, every one in every world); the LOD draws rivers and lakes at their
   own levels; river water visibly flows (the flow map, `flow.wgsl`).
-  Open: river kinds measured (criterion 10), waterfalls, distributaries and
-  oxbows, `--bench`, and the owner's walk. vox-worldgen now 66 tests. No
+  River kinds (wadi, braided, torrent, meandering) differ by slope,
+  discharge and climate (criterion 10). Open: waterfalls, distributaries
+  and oxbows, `--bench`, and the owner's walk. vox-worldgen now 66 tests. No
   low-end machine exists yet — M12's spec says how to judge low-end
   performance by proxy.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 288, vox-mesh 70, vox-worldgen 66, vox-render 21, vox-app 9
+  vox-core 288, vox-mesh 70, vox-worldgen 67, vox-render 21, vox-app 9
   passing (vox-worldgen was 54 at the M13 close), plus the ignored `every_biome_in_every_world`
   and `biome_survey`, run in release), then start the first unchecked item.
 - **Instruments (from M11):** the P key logs a `VIEW` line (exact position,

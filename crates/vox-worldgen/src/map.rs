@@ -535,6 +535,16 @@ mod drainage_survey {
             for seed in 0..seeds {
                 let g = Generator::new(seed.wrapping_mul(0x9E37_79B9) ^ 0x7e22ac0de, shape);
                 let s = g.drainage().stats(g.climate());
+                let d = g.drainage();
+                let (dnx, dnz) = d.cells();
+                let mut kinds = [0u32; 4];
+                for j in 0..dnz {
+                    for i in 0..dnx {
+                        if let Some(k) = d.river_kind_at(i, j) {
+                            kinds[k as usize] += 1;
+                        }
+                    }
+                }
                 println!(
                     "  {:#013x}  {:5.1}%  {:5.1}% / {:4.1}%  {:5.0} km  {:.2}  {:4.1}% / {:4.1}% / {:4.1}%  {:5.1} m³/s",
                     g.seed(),
@@ -547,6 +557,10 @@ mod drainage_survey {
                     100.0 * s.density[1],
                     100.0 * s.density[2],
                     s.largest
+                );
+                println!(
+                    "      river cells: torrent {} braided {} meandering {} wadi {}",
+                    kinds[0], kinds[1], kinds[2], kinds[3]
                 );
             }
         }

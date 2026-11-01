@@ -123,6 +123,52 @@ pub enum Body {
     Delta,
 }
 
+/// What kind of river a reach is (M14 criterion 10): from its slope, its
+/// discharge and its sediment — which follows its climate — as Earth's
+/// rivers differ. (Earth's fifth kind, the slow lake-like reach, is where a
+/// river crosses a lake: the network's lakes.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RiverKind {
+    /// Steep: narrow, fast, straight-ish, over gravel (Alpine streams).
+    Torrent,
+    /// Moderately steep, loaded with coarse sediment — below glaciers, in
+    /// deserts: wide, shallow, split among gravel bars (the Rakaia, Alaska).
+    Braided,
+    /// Gentle: winding, deeper, slow, over sand and silt (the Mississippi).
+    Meandering,
+    /// A desert channel too small to run but after storms: a dry bed.
+    Wadi,
+}
+
+/// The kind of a reach of slope `slope` carrying `q` m³/s through ground
+/// that is `arid` or ice-scoured (`cold`).
+pub fn river_kind(slope: f32, q: f32, arid: bool, cold: bool) -> RiverKind {
+    if arid && q < WADI_BELOW_M3S {
+        RiverKind::Wadi
+    } else if (arid || cold)
+        && q >= BRAIDED_FROM_M3S
+        && (BRAID_SLOPES.0..BRAID_SLOPES.1).contains(&slope)
+    {
+        RiverKind::Braided
+    } else if slope > TORRENT_SLOPE {
+        RiverKind::Torrent
+    } else {
+        RiverKind::Meandering
+    }
+}
+
+/// Steeper than this, a river is a torrent.
+const TORRENT_SLOPE: f32 = 0.01;
+/// Braided rivers: slopes and the least discharge.
+const BRAID_SLOPES: (f32, f32) = (0.002, 0.03);
+const BRAIDED_FROM_M3S: f32 = 0.05;
+/// How much wider a braided river spreads than a single channel.
+const BRAIDED_SPREAD: f32 = 2.5;
+/// Braid noise below which a braided river's bed is a dry bar.
+const BRAID_BARS: f32 = -0.15;
+/// An arid stream smaller than this runs only after storms: a wadi.
+const WADI_BELOW_M3S: f32 = 0.05;
+
 /// A river bed, by the energy of the water over it: gravel where it is
 /// steep, sand between, silt where it is slow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,6 +192,7 @@ struct Reach {
     slope: f32,
     discharge: f32,
     mouth: bool,
+    kind: RiverKind,
 }
 
 thread_local! {
@@ -250,15 +297,23 @@ impl DrainageMap {
                     let depth = reach.depth.0 + (reach.depth.1 - reach.depth.0) * t;
                     let across = (d / half.max(0.5)).min(1.0);
                     let deep = (depth * (1.0 - across * across)).round().max(1.0);
-                    let bed = if reach.slope > 0.02 {
-                        Bed::Gravel
-                    } else if reach.slope > 0.004 {
-                        Bed::Sand
-                    } else {
-                        Bed::Silt
+                    let (bed, bar) = match reach.kind {
+                        RiverKind::Torrent => (Bed::Gravel, false),
+                        // Gravel bars between the braids: the bed at the
+                        // water's level, dry.
+                        RiverKind::Braided => (Bed::Gravel, warp(x, z, 32.0).0 < BRAID_BARS),
+                        RiverKind::Wadi => (Bed::Sand, false),
+                        RiverKind::Meandering if reach.slope > 0.002 => (Bed::Sand, false),
+                        RiverKind::Meandering => (Bed::Silt, false),
                     };
-                    best = Some((out, level, bed));
-                    h = level - deep;
+                    h = if bar { level } else { level - deep };
+                    // A wadi's channel holds no water: its level is its bed.
+                    let water = if reach.kind == RiverKind::Wadi {
+                        h
+                    } else {
+                        level
+                    };
+                    best = Some((out, water, bed));
                 }
             }
         });
@@ -399,6 +454,11 @@ impl DrainageMap {
         best.map_or((0.0, 0.0), |(_, vx, vz)| (vx, vz))
     }
 
+    /// The kind of river leaving cell `(i, j)`, if one does.
+    pub fn river_kind_at(&self, i: usize, j: usize) -> Option<RiverKind> {
+        self.reach(i as i64, j as i64).map(|r| r.kind)
+    }
+
     /// The reach leaving cell `(i, j)` (unwrapped), if it carries a stream.
     fn reach(&self, i: i64, j: i64) -> Option<Reach> {
         let c = self.wrap(i, j);
@@ -433,6 +493,16 @@ impl DrainageMap {
             |q: f32| (DEPTH_PER_Q * q.sqrt() / q.sqrt().sqrt().sqrt()).clamp(1.0, MAX_DEPTH);
         let flat = 1.0 - (slope / MEANDER_SLOPE).min(1.0);
         let wander = |w: f32| w * (0.3 + 1.2 * flat);
+        let kind = river_kind(slope, qr, self.arid_at(c), self.cold_at(c));
+        // A braided river spreads wide and shallow over its gravel; a wadi
+        // is a dry channel, a block deep.
+        let (spread, deep): (f32, Option<f32>) = match kind {
+            RiverKind::Braided => (BRAIDED_SPREAD, Some(1.0)),
+            RiverKind::Wadi => (1.0, Some(1.0)),
+            _ => (1.0, None),
+        };
+        let width = |q: f32| width(q) * spread;
+        let depth = |q: f32| deep.unwrap_or_else(|| depth(q));
         let (w0, w1) = (width(q), width(qr));
         let (a0, a1) = (wander(w0), wander(w1));
         Some(Reach {
@@ -440,12 +510,13 @@ impl DrainageMap {
             from,
             to,
             level: (lc, lr),
-            width: (width(q), width(qr)),
+            width: (w0, w1),
             depth: (depth(q), depth(qr)),
-            wander: (wander(width(q)), wander(width(qr))),
+            wander: (a0, a1),
             slope,
             discharge: qr,
             mouth: self.sea_at(r),
+            kind,
         })
     }
 }

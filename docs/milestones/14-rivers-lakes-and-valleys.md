@@ -351,6 +351,12 @@ becomes an ADR; the simulation itself remains its own milestone.
      `flow.wgsl`, ADR-0020 §6): river water drifts downstream at its speed
      near and far, foams where fast; lakes and the sea are still. Checked
      headlessly: between two water-clock times only water pixels change.
+   - [x] River kinds (criterion 10, ADR-0020 §7): wadi, braided, torrent,
+     meandering from slope, discharge and arid/ice-scoured ground; slow
+     reaches are the lakes rivers cross. Every kind in every surveyed world
+     (`drainage_survey`: torrent 13–18 k cells, braided ~1 k, meandering
+     31–41 k, wadi 1–2 k); torrents run higher than meandering rivers (133
+     against 42 blocks, `rivers_differ_by_slope_discharge_and_sediment`).
    - [ ] Reservoir or finite per body — for the simulation (layer 2) when
      it is built; the network has what it needs (discharge, cover).
    - [ ] Cost: `ground` ~2× the eroded surface per column; measure with
