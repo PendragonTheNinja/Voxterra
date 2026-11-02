@@ -18,7 +18,8 @@ use super::{DrainageMap, erosion::Erosion};
 const MAGIC: &[u8; 4] = b"VXDR";
 /// Bump when the layout changes. A file of another version is rebuilt.
 /// 2 — the cover byte carries arid and ice-scoured bits (M14 criterion 10).
-pub const FORMAT_VERSION: u32 = 2;
+/// 3 — waterfalls' lips.
+pub const FORMAT_VERSION: u32 = 3;
 
 /// What a cache must have been built for to be used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,7 +33,7 @@ impl DrainageMap {
     /// The network as cache-file bytes, for `key`.
     pub fn to_cache_bytes(&self, key: CacheKey) -> Vec<u8> {
         let n = self.nx * self.nz;
-        let mut out = Vec::with_capacity(64 + n * 11 + self.erosion.delta.len() * 4);
+        let mut out = Vec::with_capacity(64 + n * 12 + self.erosion.delta.len() * 4);
         out.extend_from_slice(MAGIC);
         put_u32(&mut out, FORMAT_VERSION);
         put_u32(&mut out, key.generator_version);
@@ -56,6 +57,7 @@ impl DrainageMap {
         }
         out.extend_from_slice(&self.cover);
         out.extend_from_slice(&self.flow);
+        out.extend_from_slice(&self.lip);
         for &v in &self.discharge {
             out.extend_from_slice(&v.to_le_bytes());
         }
@@ -99,6 +101,7 @@ impl DrainageMap {
         let level = r.array(n, |b| i16::from_le_bytes([b[0], b[1]]), 2)?;
         let cover = r.take(n)?.to_vec();
         let flow = r.take(n)?.to_vec();
+        let lip = r.take(n)?.to_vec();
         let discharge = r.array(n, |b| f32::from_le_bytes(b.try_into().unwrap()), 4)?;
         let delta = r.array(en, |b| f32::from_le_bytes(b.try_into().unwrap()), 4)?;
         if !r.0.is_empty() || flow.iter().any(|&d| d > super::HERE) {
@@ -115,6 +118,7 @@ impl DrainageMap {
             cover,
             flow,
             discharge,
+            lip,
             erosion: Erosion {
                 nx: enx,
                 nz: enz,
@@ -201,6 +205,7 @@ mod tests {
         assert_eq!(back.level, d.level);
         assert_eq!(back.cover, d.cover);
         assert_eq!(back.flow, d.flow);
+        assert_eq!(back.lip, d.lip);
         assert!(
             back.discharge
                 .iter()

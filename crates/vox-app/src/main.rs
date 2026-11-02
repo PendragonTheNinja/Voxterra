@@ -363,12 +363,17 @@ fn bench_water_starts(
         let (x, z) = at(di, dj);
         let (i, j) = wrap(si as i64 + di, sj as i64 + dj);
         let (_, upper, _, _) = d.cell(i, j);
-        // The lip is halfway to the receiver, half a cell west; stand
-        // ~100 blocks downstream of it, a little above the pool's level.
-        let lip_x = x - (cw / 2.0) as i64;
+        // The lip is where the ground falls away, that far of the way to
+        // the receiver a cell west; stand ~100 blocks downstream of it, a
+        // little above the pool's level.
+        let lip = f64::from(d.waterfall_lip(i, j).unwrap_or(0.5));
+        let lip_x = x - (cw * lip) as i64;
+        // Never inside the hillside: the ground there can stand above the
+        // pool.
+        let ground = generator.surface_height(lip_x - 100, z);
         [
             (lip_x - 100) as f64 + 0.5,
-            f64::from(upper) + 12.0,
+            f64::from(upper).max(ground as f64) + 12.0,
             z as f64 + 0.5,
         ]
     });

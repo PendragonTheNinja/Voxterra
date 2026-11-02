@@ -62,7 +62,13 @@ at exactly the same fractions.
    graded to the sea's surface, level 0, never below it. Ground below the
    grade that results is filled — with a lake's backwater where it backs
    up from a lake, else with sediment to the grade, a flat alluvial floor
-   (ADR-0020).
+   (ADR-0020). Then each stream's level is **seated** in the
+   full-resolution ground (`GENERATOR_VERSION` 5, after the owner's first
+   flight found rivers on walls): outlets first, lowered until the line to
+   its receiver runs a block under the lowest ground across its meander
+   belt, sampled every 8 blocks; never below its receiver. A waterfall's
+   lip is stored per cell (where the ground falls below its pool; cache
+   format 3). ADR-0020 §9.
 7. **Discharge** accumulated down the tree, lakes losing their
    evaporation, closed basins keeping what reaches them.
 

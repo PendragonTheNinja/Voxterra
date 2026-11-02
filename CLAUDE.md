@@ -288,12 +288,16 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   in a river's profile, owner's decision), delta distributaries and oxbow
   lakes built. `--bench` criterion 9 met after a per-frame span-cache
   fix (`App::span`); the bench has three water phases and `VOX_NO_FLOW=1`
-  for A/B. Open: the owner's walk and the retrospective. vox-worldgen now 66 tests. No
+  for A/B. The owner's first flight found rivers on walls (an 85-block
+  wall under the bench's waterfall): fixed in `GENERATOR_VERSION` 5
+  (ADR-0020 §9: reaches seated in the ground, waterfall lips and height
+  caps, fills and lake banks sloping, banks blended; drainage cache format
+  3). Open: the rest of the owner's walk and the retrospective. No
   low-end machine exists yet — M12's spec says how to judge low-end
   performance by proxy.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 288, vox-mesh 70, vox-worldgen 67, vox-render 21, vox-app 11
+  vox-core 288, vox-mesh 70, vox-worldgen 69, vox-render 21, vox-app 11
   passing (vox-worldgen was 54 at the M13 close), plus the ignored `every_biome_in_every_world`
   and `biome_survey`, run in release), then start the first unchecked item.
 - **Instruments (from M11):** the P key logs a `VIEW` line (exact position,

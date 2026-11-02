@@ -97,6 +97,11 @@ const GLACIATED_BELOW_C: f32 = 2.0;
 
 /// A cell that drains into itself: the sea, a closed basin.
 const HERE: u8 = 8;
+/// How often the ground is sampled along a reach to seat the river in it,
+/// and to find a waterfall's lip, blocks.
+const SEAT_SPACING: f64 = 8.0;
+const LIP_SPACING: f64 = 4.0;
+
 /// The bit of a cell's cover marking a closed basin's sink.
 const SINK: u8 = 0x80;
 /// The cover byte's low bits: the `Cover` itself.
@@ -132,6 +137,9 @@ pub struct DrainageMap {
     flow: Vec<u8>,
     /// Water leaving the cell, m³/s.
     discharge: Vec<f32>,
+    /// Where along its reach a waterfall's drop is, in 256ths, if its reach
+    /// is one: where the ground stops holding the pool above.
+    lip: Vec<u8>,
     /// The elevation's erosion stage (task 2).
     erosion: Erosion,
     /// The water budget, kept for the conservation test.
@@ -298,6 +306,125 @@ impl DrainageMap {
                 cover[c] = Cover::Lake;
             }
         }
+        // The full-resolution ground, which stage 2 shapes.
+        let ground = |x: f64, z: f64| {
+            let (x, z) = (x.floor() as i64, z.floor() as i64);
+            elevation.height(x, z) as i32 + erosion.at(x as f64, z as f64).round() as i32
+        };
+        // Rivers sit in their ground, never on it: the levels so far are the
+        // cells' centres' ground, but a reach runs between jittered nodes
+        // over the full-resolution ground, which a 128-block grid does not
+        // see. Wherever that ground falls below the line, stage 2 had to
+        // build it up to hold the water — embankments carrying rivers over
+        // the land, 85 blocks high at a mountain waterfall's pool (the
+        // owner's walk). So each reach's level is lowered until the line to
+        // its receiver runs a block under the ground along it.
+        let stream = |c: usize| {
+            receiver[c] as usize != c
+                && !sea[c]
+                && cover[c] == Cover::Land
+                && discharge[c] >= STREAM_FROM_M3S
+        };
+        let reach_line = |c: usize| {
+            let (i, j) = ((c % nx) as i64, (c / nx) as i64);
+            let r = receiver[c] as usize;
+            let dir = neighbours(c, nx, nz)
+                .iter()
+                .position(|&nb| nb == r)
+                .unwrap();
+            let (di, dj) = rivers::OFFSETS[dir];
+            let cell = (cell_x, cell_z);
+            (
+                rivers::node(c, i, j, cell),
+                rivers::node(r, i + di, j + dj, cell),
+            )
+        };
+        let water_level = |spill: &[i32], c: usize| if sea[c] { 0 } else { spill[c] };
+        // The ground along a reach, every `spacing` blocks: at each step
+        // the lowest of the line and points `belt` either side of it.
+        let along = |c: usize, spacing: f64, belt: f64| -> Vec<i32> {
+            let (a, b) = reach_line(c);
+            let len = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+            let (ux, uz) = ((b.0 - a.0) / len, (b.1 - a.1) / len);
+            let n = (len / spacing).ceil().max(2.0) as usize;
+            (0..n)
+                .map(|k| {
+                    let t = k as f64 / n as f64;
+                    let (x, z) = (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
+                    let across = |f: f64| ground(x - uz * belt * f, z + ux * belt * f);
+                    if belt > 0.0 {
+                        [-1.0, -0.5, 0.0, 0.5, 1.0]
+                            .map(across)
+                            .into_iter()
+                            .min()
+                            .unwrap()
+                    } else {
+                        across(0.0)
+                    }
+                })
+                .collect()
+        };
+        // The river may lie anywhere across its belt — its meanders and
+        // wander carry it there — and wherever it lies, the ground beside
+        // it must hold it: a river crossing a hillside, seated on its
+        // line, needed its downhill bank built up into a ridge.
+        let samples: Vec<Vec<i32>> = (0..nx * nz)
+            .into_par_iter()
+            .map(|c| {
+                if !stream(c) {
+                    return Vec::new();
+                }
+                let r = receiver[c] as usize;
+                let drop = (water_level(&spill, c) - water_level(&spill, r)).max(0);
+                let slope = drop as f32 / cell_x.min(cell_z) as f32;
+                let belt = rivers::belt(discharge[r].max(discharge[c]), slope);
+                along(c, SEAT_SPACING, f64::from(belt))
+            })
+            .collect();
+        // Outlets first, so every receiver is seated before its donors.
+        for &c in &order {
+            let c = c as usize;
+            if samples[c].is_empty() {
+                continue;
+            }
+            let lr = water_level(&spill, receiver[c] as usize).min(spill[c]);
+            let n = samples[c].len() as f64;
+            let mut seat = spill[c];
+            for (k, &g) in samples[c].iter().enumerate() {
+                let under = g - 1;
+                let t = k as f64 / n;
+                // The highest level here whose line to `lr` passes under
+                // this sample; where the ground dips below the receiver
+                // itself, the line can only be the receiver's.
+                let most = if under <= lr {
+                    lr
+                } else {
+                    lr + (f64::from(under - lr) / (1.0 - t)).floor() as i32
+                };
+                seat = seat.min(most);
+            }
+            spill[c] = seat.max(lr);
+        }
+        // Where a waterfall's reach falls: its pool holds its level only as
+        // far as the ground stands above it, then drops — the lip is where
+        // the ground falls away, not a fixed point halfway (whose pool stood
+        // on a wall over ground falling steadily to the river below).
+        let lip: Vec<u8> = (0..nx * nz)
+            .into_par_iter()
+            .map(|c| {
+                if !stream(c) {
+                    return 0;
+                }
+                let lr = water_level(&spill, receiver[c] as usize).min(spill[c]);
+                if ((spill[c] - lr) as f32) < rivers::FALL_FROM {
+                    return 0;
+                }
+                let line = along(c, LIP_SPACING, 0.0);
+                let held = line.iter().take_while(|&&g| g > spill[c]).count();
+                let last = held.saturating_sub(1) as f64 / line.len() as f64;
+                (last * 256.0).floor().min(255.0) as u8
+            })
+            .collect();
         let narrow = |v: i32| i16::try_from(v).expect("heights fit the world's vertical range");
         Self {
             id: next_id(),
@@ -330,6 +457,7 @@ impl DrainageMap {
                 })
                 .collect(),
             discharge,
+            lip,
             erosion,
             #[cfg(test)]
             budget: (runoff, demand),

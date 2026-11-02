@@ -430,6 +430,28 @@ becomes an ADR; the simulation itself remains its own milestone.
      where a sample lands in it — at far levels, by chance. Judge on the
      owner's walk before building more.
 6. The owner's walk, `--bench`, retro.
+   - [x] **Walls under rivers** (owner's first flight, 2026-11-01: "raised
+     blocks around them not congruent with the terrain, especially bad in
+     the mountains… a massive wall of raised stone that supports basically
+     a flying river" at the bench's waterfall). Found: an 85-block wall
+     under that waterfall's pool, and a lake beside it standing 17 blocks
+     over dry ground at a straight edge. The network's levels come from
+     128-block cells; the full-resolution ground under a reach is often
+     lower, and stage 2 built it up to hold the water. Fixed in
+     `GENERATOR_VERSION` 5 (drainage cache format 3): each reach is seated
+     under the ground across its meander belt (stage 1); a waterfall's lip
+     is where the ground falls away, and it falls at most 32 blocks; fills
+     slope at 45° to their sides instead of ending in cliffs; lakes reach
+     48 blocks into their neighbours' cells, a bank holding them beyond;
+     banks blend into the land smoothly; floodplains are laid only on ground
+     within 2 blocks below their river. Measured around 313 stream cells of
+     the default world: shaping-made steps of 11–20 / 20+ blocks
+     11 / 12 → 75 / 3 (the new ones gorge walls below waterfalls). Rivers in
+     filled hollows still stand above the hollow's natural floor — on the
+     flat sediment fill, which now meets its sides. Tests that fail on v4: `rivers_build_no_walls`
+     (394 columns raised 16+ blocks → 0), `lake_shores_hold_their_water`
+     (64 sides held by air → 0). Gallery `walls-*`. Existing v4 worlds are
+     refused: a new world is needed.
 
 ## Non-goals
 

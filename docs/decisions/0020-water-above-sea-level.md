@@ -118,6 +118,42 @@ waterfalls, lakes and closed basins chosen from the network: scattered
 columns almost never landed on water, and a waterfall change had moved no
 pin (checked: disabling waterfalls now fails it).
 
+### 9. Rivers sit in their ground (v5, the owner's walk)
+
+The owner's first flight found rivers on walls: "raised blocks around them
+not congruent with the terrain, especially bad in the mountains", and at
+the bench's waterfall "a massive wall of raised stone that supports
+basically a flying river" — 85 blocks of it under the pool, which §8 held
+level to the reach's midpoint over ground falling steadily below it. The
+cause throughout: levels come from 128-block cells' centres, and the
+full-resolution ground under a reach is often lower, so §3's levee built
+it up. `GENERATOR_VERSION` 5:
+
+- **Seated reaches** (ADR-0019 §2.6): stage 1 lowers each stream until
+  its line runs a block under the lowest ground across its belt (half its
+  width, its meanders' amplitude and the grid-scale wander, either side).
+  A river crossing a hillside sits in a cut, not on a ridge.
+- **Waterfalls** fall where the ground falls away below the pool (the lip
+  stored per cell) and at most 32 blocks; below, the river runs at the
+  fall's foot until its grade comes down to it — a gorge as deep as the
+  fall.
+- **Fills** raise their own cell flat and slope down at 45° through their
+  neighbours' low ground, instead of flattening it all to the fill's level
+  and ending in a cliff where the ground beyond was lower.
+- **Lakes** reach 48 blocks into their neighbours' cells; beyond, a bank
+  falling at 45° holds them (a lake stood 17 blocks over dry ground at a
+  straight cell edge). A higher lake beside a lake's cells is held the
+  same way.
+- **Banks** blend into the land by smoothstep over BANK_REACH from the
+  nearest channel, not by a quartic term that outgrew the ground and stood
+  deep cuts' sides up as cliffs.
+- **Floodplains and wetlands** are laid only on ground within 2 blocks
+  below their river's level.
+
+Tests that fail on v4: `rivers_build_no_walls`, `lake_shores_hold_their_water`.
+Rivers in filled hollows still run above the hollow's natural floor — on
+its sediment, which now meets its sides.
+
 ## Consequences
 
 - `ground` costs ~2× the eroded surface per column (~0.6 against ~0.3 µs in

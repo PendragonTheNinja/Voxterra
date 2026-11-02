@@ -94,6 +94,11 @@ const LOWLAND_SLOPE: f32 = 0.003;
 /// its widths, at least [`LOWLAND_MIN_REACH`] blocks.
 const LOWLAND_WIDTHS: f32 = 4.0;
 const LOWLAND_MIN_REACH: f32 = 16.0;
+/// How far below its river's level ground may lie and still be made a
+/// floodplain or wetland, blocks: flats are laid on the ground near the
+/// river's level, not built up from far below it (raised platforms on
+/// hillsides, the owner's walk).
+const LOWLAND_BELOW: i64 = 2;
 /// Precipitation over potential evaporation from which a lowland is a
 /// wetland rather than a floodplain.
 const WETLAND_HUMIDITY: f32 = 1.0;
@@ -150,8 +155,15 @@ pub enum DrainageSource {
 /// `calibrate_ranges`; worlds of the default size and larger keep their
 /// heights exactly).
 /// 4 — valleys (M14 task 2): the surface is cut by the erosion stage, river
-/// valleys carved by stream power from the drainage network.
-pub const GENERATOR_VERSION: u32 = 4;
+/// valleys carved by stream power from the drainage network. Rivers, lakes,
+/// wetlands, deltas and waterfalls (tasks 3–5) came in under it before any
+/// world was saved with it.
+/// 5 — rivers sit in their ground (M14, the owner's walk): reaches seated
+/// under the full-resolution ground across their meander belt, waterfalls
+/// where the ground falls away and at most 32 blocks high, fills sloping to
+/// their sides, lakes held by banks, banks blended smoothly into the land,
+/// floodplains laid only near their river's level.
+pub const GENERATOR_VERSION: u32 = 5;
 
 impl Generator {
     /// A generator for one world: its seed and its size. The size is part of
@@ -290,7 +302,11 @@ impl Generator {
             };
             return (ground, with(Body::Delta));
         }
-        if n.slope >= LOWLAND_SLOPE || n.out >= reach || h > n.level + 3 {
+        if n.slope >= LOWLAND_SLOPE
+            || n.out >= reach
+            || h > n.level + 3
+            || h < n.level - LOWLAND_BELOW
+        {
             return (h, water);
         }
         let (sea_level_c, precip) = self.climate().sample(wx, wz);
@@ -1123,6 +1139,147 @@ mod tests {
         );
     }
 
+    /// Lake shores hold their water (the owner's walk, M14): a lake reaches
+    /// past its cells into its neighbours' low ground, and where the ground
+    /// beyond that was lower still, its water stood over air — 17 blocks of
+    /// it at the bench's waterfall. Scans the cells around lakes' edges,
+    /// where `water_is_never_held_by_air`'s sites never looked.
+    #[test]
+    fn lake_shores_hold_their_water() {
+        let shape = WorldShape::DEFAULT;
+        let g = Generator::new(0x7e22ac0de, shape);
+        let d = g.drainage();
+        let (nx, nz) = d.cells();
+        let (cw, ch) = d.cell_blocks();
+        let mut shores = Vec::new();
+        for j in (0..nz).step_by(5) {
+            for i in (0..nx).step_by(5) {
+                let dry_beside = [(1, 0), (-1, 0), (0, 1), (0, -1)].iter().any(|&(di, dj)| {
+                    let (ii, jj) = (
+                        (i + nx).wrapping_add_signed(di) % nx,
+                        (j + nz).wrapping_add_signed(dj) % nz,
+                    );
+                    !d.is_lake(ii, jj) && !d.is_sea(ii, jj)
+                });
+                if d.is_lake(i, j) && dry_beside && shores.len() < 40 {
+                    shores.push((i as i64, j as i64));
+                }
+            }
+        }
+        assert!(shores.len() >= 12, "too few lake shores: {}", shores.len());
+        let top = |x: i64, z: i64| {
+            let (s, w) = g.ground(x, z);
+            let sea = if s.height < SEA_LEVEL_BLOCKS {
+                SEA_LEVEL_BLOCKS
+            } else {
+                i64::MIN
+            };
+            (s.height, wet_top(&w).max(sea))
+        };
+        let (mut wet, mut held_by_air) = (0u32, Vec::new());
+        for &(i, j) in &shores {
+            let (x0, z0) = (((i - 1) as f64 * cw) as i64, ((j - 1) as f64 * ch) as i64);
+            let span = (3.0 * cw) as i64;
+            for z in (z0..z0 + span).step_by(2) {
+                for x in (x0..x0 + span).step_by(2) {
+                    let (h, level) = top(x, z);
+                    if level <= h {
+                        continue;
+                    }
+                    wet += 1;
+                    for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                        let (nh, nl) = top(x + dx, z + dz);
+                        if nh < level && nl <= nh {
+                            held_by_air.push((x, z, level, nh));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(wet > 1_000, "only {wet} wet columns");
+        assert!(
+            held_by_air.is_empty(),
+            "{} sides of {wet} wet columns held by air, e.g. {:?}",
+            held_by_air.len(),
+            &held_by_air[..held_by_air.len().min(8)]
+        );
+    }
+
+    /// Rivers sit in their ground, never on walls (the owner's walk, M14):
+    /// river shaping had built ground up to hold rivers whose levels, from
+    /// the 128-block network, stood above the full-resolution ground — an
+    /// 85-block wall under a mountain waterfall's pool, ridges along rivers
+    /// crossing hillsides, raised platforms of floodplain. Around rivers of
+    /// every size, counts the steps shaping makes between neighbouring
+    /// columns over 10 blocks steeper than the natural ground's, and the
+    /// columns it raises more than 16 blocks without a fill (sediment
+    /// filling a hollow to a river's grade, flat and meeting its sides).
+    #[test]
+    fn rivers_build_no_walls() {
+        let shape = WorldShape::new(65_536, 65_536).unwrap();
+        let g = Generator::new(0x41_7E45, shape);
+        let d = g.drainage();
+        let (nx, nz) = d.cells();
+        let (cw, ch) = d.cell_blocks();
+        let filled = |i: usize, j: usize| {
+            let (h, l, _, _) = d.cell(i, j);
+            l > h && !d.is_lake(i, j)
+        };
+        let (mut columns, mut cliffs, mut raised) = (0u32, Vec::new(), Vec::new());
+        for j in (0..nz).step_by(4) {
+            for i in (0..nx).step_by(4) {
+                let (_, _, q, _) = d.cell(i, j);
+                if q < drainage::STREAM_FROM_M3S || d.is_sea(i, j) || d.is_lake(i, j) {
+                    continue;
+                }
+                let near_fill =
+                    (0..9).any(|k| filled((i + nx + k % 3 - 1) % nx, (j + nz + k / 3 - 1) % nz));
+                let (x0, z0) = ((i as f64 * cw) as i64, (j as f64 * ch) as i64);
+                for z in (z0..z0 + ch as i64).step_by(2) {
+                    for x in (x0..x0 + cw as i64).step_by(2) {
+                        let (s, w) = g.ground(x, z);
+                        if w.near.is_none_or(|n| n.out > 48.0) {
+                            continue;
+                        }
+                        columns += 1;
+                        let nat = g.eroded_surface(x, z).height;
+                        let wet = |w: &Water| !matches!(w.body, drainage::Body::Dry);
+                        if !wet(&w) && !near_fill && s.height - nat > 16 {
+                            raised.push((x, z, s.height - nat));
+                        }
+                        let (sn, wn) = g.ground(x + 1, z);
+                        if wet(&w) || wet(&wn) {
+                            continue;
+                        }
+                        let nn = g.eroded_surface(x + 1, z).height;
+                        let excess = (s.height - sn.height).abs() - (nat - nn).abs();
+                        if excess > 10 {
+                            cliffs.push((x, z, excess));
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "{columns} columns by rivers: {} cliffs, {} raised",
+            cliffs.len(),
+            raised.len()
+        );
+        assert!(columns > 50_000, "only {columns} columns by rivers");
+        assert!(
+            cliffs.len() * 2_000 < columns as usize,
+            "{} cliffs shaping made among {columns} columns, e.g. {:?}",
+            cliffs.len(),
+            &cliffs[..cliffs.len().min(6)]
+        );
+        assert!(
+            raised.len() * 2_000 < columns as usize,
+            "{} columns raised 16+ blocks among {columns}, e.g. {:?}",
+            raised.len(),
+            &raised[..raised.len().min(6)]
+        );
+    }
+
     /// A lake's surface is in the span streaming loads (M14): it can stand
     /// tens of blocks above its bed, in chunk layers above the ground's.
     #[test]
@@ -1338,7 +1495,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (4, 0xff87_3091_89fa_aa2b);
+        const PINNED: (u32, u64) = (5, 0x7ba9_0b10_6d45_fca2);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),
