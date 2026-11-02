@@ -266,6 +266,11 @@ impl DrainageMap {
         // The grid-scale wander is the same for every reach: once a column,
         // and only if some reach is near.
         let mut wander = None;
+        // Under a lake or the sea, rivers end: the water there is the
+        // lake's or the sea's. A reach runs on to its lake's or the sea's
+        // cell centre, and its channel and levees had been built out across
+        // the open water — a dike (the owner's walk).
+        let mut drowned = None;
         NEAR.with_borrow_mut(|near| {
             if (near.0, near.1, near.2) != (self.id, ci, cj) {
                 self.reaches_near(ci, cj, &mut near.3);
@@ -275,6 +280,9 @@ impl DrainageMap {
                 let (d0, t0) = segment(fx, fz, reach.from, reach.to);
                 if d0 > f64::from(reach.out) {
                     continue;
+                }
+                if *drowned.get_or_insert_with(|| self.drowned((ci, cj), (x, z), ground)) {
+                    break;
                 }
                 // Warp the query by this reach's meander, as it stands at
                 // the column's place along it.
@@ -338,7 +346,10 @@ impl DrainageMap {
                 } else {
                     (surface + reach.slope).ceil()
                 };
-                floor = floor.max(held + 1.0 - give);
+                // Water is held by ground level with its surface; a bank a
+                // block above it raised flat ground beside every river into
+                // a little levee (the owner's walk).
+                floor = floor.max(held - (give - BANK_SLOPE).max(0.0));
                 if out < 0.0 && best.is_none_or(|b| out < b.0) {
                     let depth = reach.depth.0 + (reach.depth.1 - reach.depth.0) * t;
                     let across = (d / half.max(0.5)).min(1.0);
@@ -428,7 +439,41 @@ impl DrainageMap {
                 }
             }
         }
-        top
+        // A fill's slope runs on under a lake or the sea beside it, but
+        // never up out of the water: that would make the lake land.
+        let here = self.wrap(ci, cj);
+        let still = match self.cover_at(here) {
+            Cover::Lake | Cover::SaltLake => Some(i64::from(self.lvl(here))),
+            Cover::Sea => Some(0),
+            _ => None,
+        };
+        match still {
+            Some(level) if h < level => top.min(level - 1).max(h),
+            _ => top,
+        }
+    }
+
+    /// Whether ground `h` at column `(x, z)`, of cell `(ci, cj)`
+    /// (unwrapped), lies under a lake or the sea: below a lake's level in
+    /// its cells or as far as it reaches into theirs neighbours', or below
+    /// sea level by the sea.
+    fn drowned(&self, (ci, cj): (i64, i64), (x, z): (i64, i64), h: i64) -> bool {
+        for dj in -1..=1 {
+            for di in -1..=1 {
+                let (i, j) = (ci + di, cj + dj);
+                let c = self.wrap(i, j);
+                let level = match self.cover_at(c) {
+                    Cover::Lake | Cover::SaltLake => i64::from(self.lvl(c)),
+                    Cover::Sea => 0,
+                    _ => continue,
+                };
+                let reach = if di == 0 && dj == 0 { 0.0 } else { LAKE_REACH };
+                if h < level && self.outside(i, j, x, z) <= reach {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// The ground and the lake or salt flat at column `(x, z)`, of cell
@@ -450,7 +495,11 @@ impl DrainageMap {
         };
         let own = lake_of(here);
         let mut found = own;
-        let mut bank = i64::MIN;
+        // Banks, by the level of the lake each holds: a bank only stands
+        // where no lake as high already covers the column (a lake's own
+        // cells' banks had stood up as ridges in its water).
+        let mut banks: [(i64, i64); 9] = [(i64::MIN, i64::MIN); 9];
+        let mut k = 0;
         for dj in -1..=1 {
             for di in -1..=1 {
                 let (i, j) = (ci + di, cj + dj);
@@ -463,7 +512,8 @@ impl DrainageMap {
                     // needs holding: from its edge.
                     Some((mine, _)) => {
                         if level > mine && d > 0.0 {
-                            bank = bank.max(level + 1 - (d * BANK_FALL).floor() as i64);
+                            banks[k] = (level, level + 1 - (d * BANK_FALL).floor() as i64);
+                            k += 1;
                         }
                     }
                     None if d <= LAKE_REACH => {
@@ -473,11 +523,26 @@ impl DrainageMap {
                     }
                     None => {
                         let past = d - LAKE_REACH;
-                        bank = bank.max(level + 1 - (past * BANK_FALL).floor() as i64);
+                        banks[k] = (level, level + 1 - (past * BANK_FALL).floor() as i64);
+                        k += 1;
                     }
                 }
             }
         }
+        // The sea covers all ground below sea level (0), wherever it is.
+        let sea = if h < 0 { 0 } else { i64::MIN };
+        let wet = found
+            .map_or(
+                i64::MIN,
+                |(level, _)| if h < level { level } else { i64::MIN },
+            )
+            .max(sea);
+        let bank = banks[..k]
+            .iter()
+            .filter(|&&(level, _)| level > wet)
+            .map(|&(_, b)| b)
+            .max()
+            .unwrap_or(i64::MIN);
         let h = h.max(bank);
         let water = match found {
             Some((level, body)) if h < level => Water {

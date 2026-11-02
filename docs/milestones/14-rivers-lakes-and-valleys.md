@@ -452,6 +452,20 @@ becomes an ADR; the simulation itself remains its own milestone.
      (394 columns raised 16+ blocks → 0), `lake_shores_hold_their_water`
      (64 sides held by air → 0). Gallery `walls-*`. Existing v4 worlds are
      refused: a new world is needed.
+   - [x] **More walls, found in renders of every kind of river near spawn**
+     (2026-11-02, `GENERATOR_VERSION` 6): floodplains a block above flat
+     desert with steps at their edges; a large river's channel and levees
+     built out across a lake and the sea as dikes (a reach runs on to the
+     water's cell centre); a lake's banks standing as ridges in its own
+     water and in the sea; fill slopes raising lake beds out of the water.
+     Now flats only cut ground down to their level, blending out over their
+     reach and 4 blocks above it; river shaping stops where a lake or the
+     sea covers the ground; a bank stands only where no water as high (the
+     sea included) covers the column; fill slopes stay under still water;
+     river banks are level with the water for a block, then fall at 45°.
+     Test that fails on v5: `rivers_end_at_still_water_and_flats_are_cut`
+     (146 427 raised flat columns → 0). Flats cover ~30% fewer columns;
+     every biome is still in every world. Gallery `rivers-by-kind-*`.
 
 ## Non-goals
 

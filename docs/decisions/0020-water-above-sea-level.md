@@ -150,7 +150,23 @@ it up. `GENERATOR_VERSION` 5:
 - **Floodplains and wetlands** are laid only on ground within 2 blocks
   below their river's level.
 
-Tests that fail on v4: `rivers_build_no_walls`, `lake_shores_hold_their_water`.
+Version 6 (renders of every kind of river near spawn):
+
+- **Flats are cut, never built**: floodplains, wetlands and deltas lower
+  ground to their level, blending out over their reach and 4 blocks above
+  it; ground below is left alone (a block-high strip with stepped edges
+  along every desert river).
+- **Rivers end at still water**: no channel or bank is shaped where a lake
+  or the sea covers the ground (a reach runs on to the water's cell
+  centre, and its levees had stood out across it as dikes).
+- **Banks only where needed**: a lake's bank stands only where no water as
+  high — the sea's included — covers the column; fill slopes stay under a
+  lake or the sea; river banks are level with the water for a block, then
+  fall at 45° (a bank a block above the water made every flat river a
+  little levee).
+
+Tests that fail on earlier versions: `rivers_build_no_walls`,
+`lake_shores_hold_their_water` (v4), `rivers_end_at_still_water_and_flats_are_cut` (v5).
 Rivers in filled hollows still run above the hollow's natural floor — on
 its sediment, which now meets its sides.
 

@@ -94,11 +94,18 @@ const LOWLAND_SLOPE: f32 = 0.003;
 /// its widths, at least [`LOWLAND_MIN_REACH`] blocks.
 const LOWLAND_WIDTHS: f32 = 4.0;
 const LOWLAND_MIN_REACH: f32 = 16.0;
-/// How far below its river's level ground may lie and still be made a
-/// floodplain or wetland, blocks: flats are laid on the ground near the
-/// river's level, not built up from far below it (raised platforms on
-/// hillsides, the owner's walk).
+/// How far below a floodplain's or wetland's level ground may lie and
+/// still count as one, blocks; flats never raise ground (the owner's walk).
 const LOWLAND_BELOW: i64 = 2;
+/// Ground this far above a flat's level is left as it is; below, it is cut
+/// down to the flat, easing out (blocks).
+const LOWLAND_ABOVE: i64 = 4;
+
+/// Hermite smoothstep of `e` over 0..1.
+fn smooth(e: f32) -> f32 {
+    let e = e.clamp(0.0, 1.0);
+    e * e * (3.0 - 2.0 * e)
+}
 /// Precipitation over potential evaporation from which a lowland is a
 /// wetland rather than a floodplain.
 const WETLAND_HUMIDITY: f32 = 1.0;
@@ -163,7 +170,12 @@ pub enum DrainageSource {
 /// where the ground falls away and at most 32 blocks high, fills sloping to
 /// their sides, lakes held by banks, banks blended smoothly into the land,
 /// floodplains laid only near their river's level.
-pub const GENERATOR_VERSION: u32 = 5;
+/// 6 — more of the owner's walk: floodplains, wetlands and deltas cut ground
+/// down to their level and blend into the land, never raise it; river
+/// shaping ends where a lake or the sea covers the ground (no dikes out
+/// across the water); a lake's banks stand only where no water as high
+/// covers them; river banks stand level with the water, not a block above.
+pub const GENERATOR_VERSION: u32 = 6;
 
 impl Generator {
     /// A generator for one world: its seed and its size. The size is part of
@@ -285,37 +297,61 @@ impl Generator {
         let reach = (LOWLAND_WIDTHS * n.width).max(LOWLAND_MIN_REACH);
         let pool = self.elevation.patch_noise(wx, wz) < POOL_BELOW;
         let with = |body| Water { body, ..water };
+        // Flats are cut, never built: ground above `target` is lowered to
+        // it — fully near the river and within a block or so above it,
+        // easing out to the natural ground by `span` from the river and by
+        // LOWLAND_ABOVE above it, so they meet the land without a step.
+        // Ground below it is left as it is (a raised strip a block above
+        // flat desert, with a step at its edge, was the owner's "raised
+        // blocks around them"). Returns the ground, and whether it is flat
+        // at the target — within LOWLAND_BELOW under it.
+        let flatten = |target: i64, span: f32| {
+            let above = h - target;
+            if above <= 0 {
+                return (h, above >= -LOWLAND_BELOW);
+            }
+            let w = (1.0 - smooth(n.out / span))
+                * (1.0 - smooth((above - 1) as f32 / (LOWLAND_ABOVE - 1) as f32));
+            let g = (h as f32 - above as f32 * w).round() as i64;
+            (g, g <= target)
+        };
         // A large river's mouth on a gentle coast — low ground beside it,
         // however steeply its last reach fell: flats at sea level, the sea
         // in their pools.
-        if n.mouth && n.discharge >= self.delta_from() && n.out < 2.0 * reach && h.abs() <= 3 {
+        if n.mouth && n.discharge >= self.delta_from() && n.out < 2.0 * reach && h <= 3 {
             // Distributaries: the river splits across its delta in winding
             // channels — where a smooth noise crosses zero, lines that wind
             // and branch — cut below the sea, which fills them.
             let (braid, _) = self.elevation.meander_warp(wx, wz, DISTRIBUTARY_WAVELENGTH);
-            let ground = if braid.abs() < DISTRIBUTARY_WIDTH {
+            let target = if braid.abs() < DISTRIBUTARY_WIDTH {
                 -2
             } else if pool {
                 -1
             } else {
                 1
             };
-            return (ground, with(Body::Delta));
+            let (g, flat) = flatten(target, 2.0 * reach);
+            return if flat && g >= -3 {
+                (g, with(Body::Delta))
+            } else {
+                (g, water)
+            };
         }
-        if n.slope >= LOWLAND_SLOPE
-            || n.out >= reach
-            || h > n.level + 3
-            || h < n.level - LOWLAND_BELOW
-        {
+        if n.slope >= LOWLAND_SLOPE || n.out >= reach {
             return (h, water);
         }
         let (sea_level_c, precip) = self.climate().sample(wx, wz);
         let pet = climate::potential_evaporation(climate::temperature_at(sea_level_c, h));
         if precip >= WETLAND_HUMIDITY * pet {
+            let (g, flat) = flatten(n.level, reach);
+            if !flat {
+                return (g, water);
+            }
             // A pool only where every side stands as high as its water —
             // inside its own wetland, not beside another river's lower one.
             if pools
                 && pool
+                && g == n.level
                 && [(1, 0), (-1, 0), (0, 1), (0, -1)]
                     .iter()
                     .all(|&(dx, dz)| self.ground_without_pools(wx + dx, wz + dz) >= n.level)
@@ -327,13 +363,17 @@ impl Generator {
                 };
                 return (n.level - 1, w);
             }
-            return (n.level, with(Body::Wetland));
+            return (g, with(Body::Wetland));
+        }
+        let (g, flat) = flatten(n.level + 1, reach);
+        if !flat {
+            return (g, water);
         }
         // Oxbow lakes: on a wide meandering river's floodplain, crescents
         // of water where old bends were cut off — short arcs of a
         // meander-scale noise's zero line — each only where every side
         // holds it, as a wetland's pool.
-        if pools && n.width >= OXBOW_FROM_WIDTH {
+        if pools && n.width >= OXBOW_FROM_WIDTH && g == n.level + 1 {
             let (arc, cut) = self.elevation.meander_warp(wx, wz, 12.0 * n.width);
             if arc.abs() < OXBOW_THICKNESS
                 && cut > OXBOW_ARCS
@@ -349,7 +389,7 @@ impl Generator {
                 return (n.level - 2, w);
             }
         }
-        (n.level + 1, with(Body::Floodplain))
+        (g, with(Body::Floodplain))
     }
 
     /// The elevation field cut by the erosion stage, before rivers shape
@@ -1280,6 +1320,90 @@ mod tests {
         );
     }
 
+    /// Rivers end at still water, and flats are cut, never built (the
+    /// owner's walk, M14): a reach running on to its lake's or the sea's
+    /// cell centre had built its channel and levees out across the water
+    /// as a dike, and floodplains set a block above their river raised
+    /// strips with steps at their edges. Around rivers of every size: no
+    /// floodplain, wetland or delta stands above the ground the river (and
+    /// any fill) left it, and no ground under a lake's cell or the sea is
+    /// raised out of the water.
+    #[test]
+    fn rivers_end_at_still_water_and_flats_are_cut() {
+        let shape = WorldShape::new(65_536, 65_536).unwrap();
+        let g = Generator::new(0x41_7E45, shape);
+        let d = g.drainage();
+        let (nx, nz) = d.cells();
+        let (cw, ch) = d.cell_blocks();
+        let (mut flats, mut drowned) = (0u32, 0u32);
+        let (mut raised_flats, mut raised_under) = (Vec::new(), Vec::new());
+        for j in (0..nz).step_by(3) {
+            for i in (0..nx).step_by(3) {
+                let (_, _, q, (ri, rj)) = d.cell(i, j);
+                if q < drainage::STREAM_FROM_M3S || d.is_sea(i, j) {
+                    continue;
+                }
+                // The cell and its receiver: where a river meets the water.
+                for (ci, cj) in [(i, j), (ri, rj)] {
+                    let (x0, z0) = ((ci as f64 * cw) as i64, (cj as f64 * ch) as i64);
+                    let (_, lake_level, _, _) = d.cell(ci, cj);
+                    let still = if d.is_sea(ci, cj) {
+                        Some(0)
+                    } else if d.is_lake(ci, cj) {
+                        Some(i64::from(lake_level))
+                    } else {
+                        None
+                    };
+                    for z in (z0..z0 + ch as i64).step_by(2) {
+                        for x in (x0..x0 + cw as i64).step_by(2) {
+                            let (s, w) = g.ground(x, z);
+                            let nat = g.eroded_surface(x, z).height;
+                            if matches!(w.body, Body::Floodplain | Body::Wetland | Body::Delta) {
+                                flats += 1;
+                                // The ground as the river and any fill left
+                                // it, before the flats are laid.
+                                let (before, _) = d.shape_column(x, z, nat, |x, z, l| {
+                                    g.elevation.meander_warp(x, z, l)
+                                });
+                                if s.height > before {
+                                    raised_flats.push((x, z, s.height - before));
+                                }
+                            }
+                            if let Some(level) = still
+                                && nat < level
+                            {
+                                drowned += 1;
+                                // Raised out of the water: a dike. (Slopes
+                                // under it — a fill's or a higher lake's
+                                // bank running down into it — are not.)
+                                if s.height > nat && s.height >= level {
+                                    raised_under.push((x, z, s.height - nat));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("{flats} flat columns, {drowned} under still water");
+        assert!(
+            flats > 5_000 && drowned > 5_000,
+            "{flats} flats, {drowned} drowned"
+        );
+        assert!(
+            raised_flats.is_empty(),
+            "{} of {flats} flats raised, e.g. {:?}",
+            raised_flats.len(),
+            &raised_flats[..raised_flats.len().min(6)]
+        );
+        assert!(
+            raised_under.is_empty(),
+            "{} of {drowned} columns under still water raised, e.g. {:?}",
+            raised_under.len(),
+            &raised_under[..raised_under.len().min(6)]
+        );
+    }
+
     /// A lake's surface is in the span streaming loads (M14): it can stand
     /// tens of blocks above its bed, in chunk layers above the ground's.
     #[test]
@@ -1495,7 +1619,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (5, 0x7ba9_0b10_6d45_fca2);
+        const PINNED: (u32, u64) = (6, 0xe3ca_8745_9949_74b0);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),
