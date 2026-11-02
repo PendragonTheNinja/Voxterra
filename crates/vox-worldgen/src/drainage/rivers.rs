@@ -35,7 +35,7 @@
 //! of their neighbours, so a dip at a cell's edge is part of the lake rather
 //! than a hole beside it. **Salt flats** crust the floors of closed basins.
 
-use super::{Cover, DrainageMap, HERE, neighbours};
+use super::{Cover, DrainageMap, HERE, PROFILE_STEPS, neighbours};
 
 /// The least discharge drawn as a stream, m³/s.
 pub const STREAM_FROM_M3S: f32 = 0.01;
@@ -63,9 +63,15 @@ const MANNING_N: f32 = 0.035;
 /// The slowest and fastest water drawn flowing, m/s.
 const MIN_FLOW: f32 = 0.05;
 pub const MAX_FLOW: f32 = 4.0;
-/// How far into the cells beside a lake its water may reach, blocks; a
-/// bank holds it beyond.
-const LAKE_REACH: f64 = 48.0;
+/// How far beside a river ground below its water holds a pond rather than
+/// being raised into a bank, blocks.
+const POND_REACH: f32 = 24.0;
+/// A cell's region (lake, fill, salt flat): a disc about its centre of
+/// this radius, in cells, ± REGION_WOBBLE by noise of REGION_WAVELENGTH
+/// blocks; beyond it a bank or a fill's slope falls to the ground.
+pub(super) const REGION_RADIUS: f64 = 0.9;
+pub(super) const REGION_WOBBLE: f64 = 0.15;
+pub(super) const REGION_WAVELENGTH: f32 = 128.0;
 /// How steeply a lake's bank, and a fill's edge, fall to the ground: rise
 /// per block.
 const BANK_FALL: f64 = 1.0;
@@ -164,14 +170,11 @@ pub fn river_kind(slope: f32, q: f32, arid: bool, cold: bool) -> RiverKind {
     }
 }
 
-/// A reach that falls this far (blocks), and twice as far as the river
-/// below it, does it at once: a waterfall at a step in the profile.
-pub(super) const FALL_FROM: f32 = 12.0;
-/// The highest a waterfall falls at once, blocks; a reach that drops more
-/// runs on down its grade below it.
-const FALL_MAX: f32 = 32.0;
-/// How far past the lip the falling sheet of water reaches, blocks.
-const FALL_SHEET: f32 = 1.5;
+/// A step in a reach's profile this high (blocks) is a waterfall.
+const FALL_FROM: f32 = 12.0;
+/// How far upstream a bank looks for the water it holds, blocks: across a
+/// step in the profile, a bank beside the upper water must hold it.
+const HELD_BACK: f32 = 3.0;
 
 /// Steeper than this, a river is a torrent.
 const TORRENT_SLOPE: f32 = 0.01;
@@ -209,10 +212,36 @@ struct Reach {
     discharge: f32,
     mouth: bool,
     kind: RiverKind,
-    /// Where along the reach (0..1) its whole drop falls at once, if it
-    /// falls enough to be a waterfall; and how long the reach is, blocks.
+    /// Its long profile: the water at each of PROFILE_STEPS stretches
+    /// along it (ADR-0020 §10), held level through each, stepping down
+    /// between; its receiver's level from the end on.
+    steps: [f32; PROFILE_STEPS],
+    /// Where along the reach (0..1) a step is high enough to be a
+    /// waterfall, the highest if several; and how long the reach is, blocks.
     fall: Option<f32>,
     len: f32,
+}
+
+impl Reach {
+    /// The water's level at `t` (0..1) along the reach: down each stretch
+    /// from its point to the next — a step of FALL_FROM or more held level
+    /// to the end and dropped at once, a waterfall. (Every stretch held
+    /// level stood a wide river's water in terraces.) A stretch's point is
+    /// under the ground to the next one, so the slope down to it is too.
+    fn level_at(&self, t: f32) -> f32 {
+        if t >= 1.0 {
+            return self.level.1;
+        }
+        let at = t.max(0.0) * PROFILE_STEPS as f32;
+        let k = (at as usize).min(PROFILE_STEPS - 1);
+        let here = self.steps[k];
+        let next = self.steps.get(k + 1).copied().unwrap_or(self.level.1);
+        if here - next >= FALL_FROM {
+            here
+        } else {
+            here + (next - here) * (at - k as f32)
+        }
+    }
 }
 
 thread_local! {
@@ -254,22 +283,35 @@ impl DrainageMap {
         z: i64,
         ground: i64,
         warp: impl Fn(i64, i64, f32) -> (f32, f32),
+        ground_at: impl Fn(i64, i64) -> i64,
     ) -> (i64, Water) {
         let (fx, fz) = (x as f64, z as f64);
         let ci = (fx / self.cell_x).floor() as i64;
         let cj = (fz / self.cell_z).floor() as i64;
-        let mut h = ground as f32;
+        // Sediment fills first, so a river's banks are cut into them: a
+        // fill sloping down from a higher river's grade, applied after, had
+        // raised a lower channel's banks back up into a slot one block wide
+        // and ten deep (the owner's walk, a waterfall's gorge).
+        let wobble = if self.regions_near(ci, cj) {
+            f64::from(warp(x, z, REGION_WAVELENGTH).0)
+        } else {
+            0.0
+        };
+        let mut h = self.alluvium((ci, cj), (x, z), ground, wobble) as f32;
         let mut best: Option<(f32, f32, Bed)> = None; // (inside, level, bed)
+        // Within POND_REACH of a river, ground below its water holds it as a
+        // pond instead of being raised into a causeway: the nearest's level.
+        let mut pond: Option<(f32, f32)> = None; // (out, level)
         // The banks: no higher than `ceiling`, no lower than `floor`.
         let (mut ceiling, mut floor) = (f32::INFINITY, f32::NEG_INFINITY);
         let mut nearest: Option<Near> = None;
         // The grid-scale wander is the same for every reach: once a column,
         // and only if some reach is near.
         let mut wander = None;
-        // Under a lake or the sea, rivers end: the water there is the
-        // lake's or the sea's. A reach runs on to its lake's or the sea's
-        // cell centre, and its channel and levees had been built out across
-        // the open water — a dike (the owner's walk).
+        // Under a lake or the sea, the water is the lake's or the sea's. A
+        // reach runs on to its lake's or the sea's cell centre, and its
+        // levees had been built out across the open water — a dike (the
+        // owner's walk): there only its channel is cut.
         let mut drowned = None;
         NEAR.with_borrow_mut(|near| {
             if (near.0, near.1, near.2) != (self.id, ci, cj) {
@@ -281,9 +323,12 @@ impl DrainageMap {
                 if d0 > f64::from(reach.out) {
                     continue;
                 }
-                if *drowned.get_or_insert_with(|| self.drowned((ci, cj), (x, z), ground)) {
-                    break;
-                }
+                // Under a lake or the sea the channel goes on — its bed and
+                // its sides cut on into the lake's floor (stopping dead, they
+                // left an underwater ledge jutting out where a river meets a
+                // lake: the owner's walk) — but nothing is built there.
+                let under =
+                    *drowned.get_or_insert_with(|| self.drowned((ci, cj), (x, z), ground, wobble));
                 // Warp the query by this reach's meander, as it stands at
                 // the column's place along it.
                 let at = |pair: (f32, f32)| pair.0 + (pair.1 - pair.0) * t0 as f32;
@@ -298,30 +343,9 @@ impl DrainageMap {
                 let d = d as f32;
                 let t = t as f32;
                 let half = 0.5 * (reach.width.0 + (reach.width.1 - reach.width.0) * t);
-                // A waterfall: the pool above holds its level to the lip and
-                // the sheet just past it; the river below runs at its own.
-                // Its banks stand at the upper level a little further, a
-                // cliff beside the falling water.
-                let line = reach.level.0 + (reach.level.1 - reach.level.0) * t;
-                // Below a waterfall the river runs at its foot, at most
-                // FALL_MAX under the lip, until its grade comes down to it:
-                // the gorge a waterfall cuts is as deep as the fall, not as
-                // the whole reach's drop (which made gorges of 100+ blocks
-                // once the lip moved to where the ground falls away).
-                let below = (reach.level.0 - FALL_MAX).max(reach.level.1).min(line);
-                let (surface, sheet, cliff) = match reach.fall {
-                    Some(lip) => {
-                        let past = (t - lip) * reach.len;
-                        let upper = past < FALL_SHEET;
-                        let level = if upper { reach.level.0 } else { below };
-                        (
-                            level,
-                            (0.0..FALL_SHEET).contains(&past),
-                            past < FALL_SHEET + 2.0,
-                        )
-                    }
-                    None => (line, false, false),
-                };
+                // The water here, from the reach's long profile: level
+                // through each stretch, stepping down between them.
+                let surface = reach.level_at(t);
                 let level = surface.floor();
                 let out = d - half;
                 if nearest.is_none_or(|n: Near| out < n.out) {
@@ -339,17 +363,37 @@ impl DrainageMap {
                 // (below).
                 let give = BANK_SLOPE * out.max(0.0);
                 ceiling = ceiling.min(level + 1.0 + give);
-                // The levee holds the water beside it, which on a steep reach
-                // stands up to a block's fall higher than here.
-                let held = if cliff && reach.fall.is_some() {
-                    reach.level.0.floor()
-                } else {
-                    (surface + reach.slope).ceil()
-                };
+                // The bank holds the water beside it — the highest within a
+                // few blocks upstream, where the profile steps down past it.
+                let held = reach.level_at(t - HELD_BACK / reach.len.max(1.0)).floor();
                 // Water is held by ground level with its surface; a bank a
                 // block above it raised flat ground beside every river into
                 // a little levee (the owner's walk).
-                floor = floor.max(held - (give - BANK_SLOPE).max(0.0));
+                // Where a river is held at its receiver's level over ground
+                // lower still — a hollow it crosses, below the grade
+                // downstream — ground within POND_REACH below the water is
+                // not raised: it holds a pond (below) rather than carrying
+                // the river on a causeway, and the bank falls at 45° beyond.
+                // Elsewhere the profile keeps the river under the ground
+                // beside it, and what dips below it gets a bank, level with
+                // the water for a block, then 45°. (Ponds beside every step
+                // of a profile stacked into terraces of water, and the
+                // ledges holding them stood up through lakes: the owner's
+                // walk.)
+                let pooled = !under
+                    && reach.kind != RiverKind::Wadi
+                    && held <= level
+                    && (level - reach.level.1.floor()).abs() < 0.5;
+                if under {
+                    // Nothing built under still water.
+                } else if !pooled {
+                    floor = floor.max(held - (give - BANK_SLOPE).max(0.0));
+                } else if out >= POND_REACH {
+                    let past = out - POND_REACH;
+                    floor = floor.max(held - (past - 1.0).max(0.0) * BANK_SLOPE);
+                } else if out >= 0.0 && pond.is_none_or(|p| level > p.1) {
+                    pond = Some((out, level));
+                }
                 if out < 0.0 && best.is_none_or(|b| out < b.0) {
                     let depth = reach.depth.0 + (reach.depth.1 - reach.depth.0) * t;
                     let across = (d / half.max(0.5)).min(1.0);
@@ -364,9 +408,8 @@ impl DrainageMap {
                         RiverKind::Meandering => (Bed::Silt, false),
                     };
                     h = if bar { level } else { level - deep };
-                    if sheet {
-                        // The falling sheet stands on the river below's bed.
-                        h = below.floor() - deep;
+                    if under {
+                        h = h.min(ground as f32);
                     }
                     // A wadi's channel holds no water: its level is its bed.
                     let water = if reach.kind == RiverKind::Wadi {
@@ -378,7 +421,9 @@ impl DrainageMap {
                 }
             }
         });
-        if let Some((_, level, bed)) = best {
+        if let Some((_, level, bed)) = best
+            && drowned != Some(true)
+        {
             return (
                 h as i64,
                 Water {
@@ -394,26 +439,105 @@ impl DrainageMap {
         // The banks blend into the natural ground by BANK_REACH from the
         // nearest channel, smoothly (a quartic term that outgrew the ground
         // there had stood deep cuts' sides up as cliffs).
+        // Within a lake's region, a river's banks keep its rim: cut below
+        // the lake beside it, they let the lake out over air.
+        if let Some(rim) = self.lake_level_at((ci, cj), (x, z), wobble)
+            && ground >= rim
+        {
+            floor = floor.max(rim as f32);
+        }
         let banked = h.min(ceiling).max(floor);
         let e = nearest.map_or(1.0, |n| (n.out / BANK_REACH).clamp(0.0, 1.0));
         let natural = e * e * (3.0 - 2.0 * e);
-        let h = (banked + (h - banked) * natural).round() as i64;
-        let h = self.alluvium((ci, cj), (x, z), h);
-        let (h, mut water) = self.still_water((ci, cj), (x, z), h);
+        // The blend eases cuts back into the land; it never lowers a bank
+        // that holds water (a bank falls at 45° to the ground already).
+        let h = (banked + (h - banked) * natural).max(floor).round() as i64;
+        if let Some((_, level)) = pond
+            && h < level as i64
+        {
+            return (
+                h,
+                Water {
+                    level: level as i64,
+                    body: Body::Lake,
+                    near: nearest,
+                },
+            );
+        }
+        let (h, mut water) = self.still_water((ci, cj), (x, z), (h, ground), wobble, &ground_at);
         water.near = nearest;
         (h, water)
     }
 
-    /// How far column `(x, z)` lies outside cell `(i, j)` (both unwrapped),
-    /// blocks: 0 inside it.
-    fn outside(&self, i: i64, j: i64, x: i64, z: i64) -> f64 {
-        let (px, pz) = (x as f64 + 0.5, z as f64 + 0.5);
-        let gap = |p: f64, k: i64, size: f64| {
-            let (lo, hi) = (k as f64 * size, (k + 1) as f64 * size);
-            (lo - p).max(p - hi).max(0.0)
-        };
-        let (dx, dz) = (gap(px, i, self.cell_x), gap(pz, j, self.cell_z));
-        (dx * dx + dz * dz).sqrt()
+    /// How far column `(x, z)` lies outside the region of cell `(i, j)`
+    /// (both unwrapped), blocks: 0 inside it. A cell's region — where its
+    /// lake, fill or salt flat reaches — is a disc about its centre, its
+    /// radius wandering with the noise `wobble` (−1..1), not the cell's
+    /// square: square regions drew lakes, salt flats and fills with straight
+    /// edges and square terraces on the cell grid (the owner's walk). The
+    /// discs of a block of cells cover it whole (REGION_RADIUS > √½).
+    fn outside(&self, i: i64, j: i64, x: i64, z: i64, wobble: f64) -> f64 {
+        let size = self.cell_x.min(self.cell_z);
+        let (cx, cz) = (
+            (i as f64 + 0.5) * self.cell_x,
+            (j as f64 + 0.5) * self.cell_z,
+        );
+        let (dx, dz) = (x as f64 + 0.5 - cx, z as f64 + 0.5 - cz);
+        let radius = size * (REGION_RADIUS + REGION_WOBBLE * wobble);
+        ((dx * dx + dz * dz).sqrt() - radius).max(0.0)
+    }
+
+    /// The highest lake whose region holds column `(x, z)`, of cell
+    /// `(ci, cj)` (unwrapped), if any.
+    fn lake_level_at(&self, (ci, cj): (i64, i64), (x, z): (i64, i64), wobble: f64) -> Option<i64> {
+        let mut best = None;
+        for dj in -1..=1 {
+            for di in -1..=1 {
+                let (i, j) = (ci + di, cj + dj);
+                let c = self.wrap(i, j);
+                if matches!(self.cover_at(c), Cover::Lake | Cover::SaltLake)
+                    && self.outside(i, j, x, z, wobble) <= 0.0
+                {
+                    let level = i64::from(self.lvl(c));
+                    best = Some(best.map_or(level, |b: i64| b.max(level)));
+                }
+            }
+        }
+        best
+    }
+
+    /// The natural ground at the edge of cell `(i, j)`'s region nearest
+    /// column `(x, z)` (just inside it).
+    fn edge_ground(
+        &self,
+        i: i64,
+        j: i64,
+        (x, z): (i64, i64),
+        wobble: f64,
+        ground_at: &dyn Fn(i64, i64) -> i64,
+    ) -> i64 {
+        let size = self.cell_x.min(self.cell_z);
+        let (cx, cz) = (
+            (i as f64 + 0.5) * self.cell_x,
+            (j as f64 + 0.5) * self.cell_z,
+        );
+        let (dx, dz) = (x as f64 + 0.5 - cx, z as f64 + 0.5 - cz);
+        let dist = (dx * dx + dz * dz).sqrt().max(1.0);
+        let radius = size * (REGION_RADIUS + REGION_WOBBLE * wobble) - 1.0;
+        let f = (radius / dist).min(1.0);
+        ground_at((cx + dx * f).floor() as i64, (cz + dz * f).floor() as i64)
+    }
+
+    /// Whether any cell around `(ci, cj)` (unwrapped) holds still water,
+    /// a fill or a salt flat — whether a column there needs its region
+    /// noise.
+    fn regions_near(&self, ci: i64, cj: i64) -> bool {
+        (-1..=1).any(|dj| {
+            (-1..=1).any(|di| {
+                let c = self.wrap(ci + di, cj + dj);
+                self.cover_at(c) != Cover::Land || self.lvl(c) > self.h(c)
+            })
+        })
     }
 
     /// The ground of column `(x, z)`, of cell `(ci, cj)` (unwrapped), after
@@ -424,7 +548,7 @@ impl DrainageMap {
     /// cliff wherever the ground beyond the neighbours was lower — the
     /// owner's walk.) A ramp has fallen a cell's width by the time it leaves
     /// the cells considered, so the ground stays continuous.
-    fn alluvium(&self, (ci, cj): (i64, i64), (x, z): (i64, i64), h: i64) -> i64 {
+    fn alluvium(&self, (ci, cj): (i64, i64), (x, z): (i64, i64), h: i64, wobble: f64) -> i64 {
         let fill = |c: usize| {
             let level = i64::from(self.lvl(c));
             (self.cover_at(c) == Cover::Land && level > i64::from(self.h(c))).then_some(level)
@@ -434,18 +558,19 @@ impl DrainageMap {
             for di in -1..=1 {
                 let (i, j) = (ci + di, cj + dj);
                 if let Some(l) = fill(self.wrap(i, j)) {
-                    let d = self.outside(i, j, x, z);
+                    let d = self.outside(i, j, x, z, wobble);
                     top = top.max(l - (d * ALLUVIUM_SLOPE).floor() as i64);
                 }
             }
         }
         // A fill's slope runs on under a lake or the sea beside it, but
         // never up out of the water: that would make the lake land.
+        // Anywhere a lake's region reaches, not only its cells: fill slopes
+        // had stood up through a salt lake as straight-edged rims.
         let here = self.wrap(ci, cj);
         let still = match self.cover_at(here) {
-            Cover::Lake | Cover::SaltLake => Some(i64::from(self.lvl(here))),
             Cover::Sea => Some(0),
-            _ => None,
+            _ => self.lake_level_at((ci, cj), (x, z), wobble),
         };
         match still {
             Some(level) if h < level => top.min(level - 1).max(h),
@@ -454,10 +579,32 @@ impl DrainageMap {
     }
 
     /// Whether ground `h` at column `(x, z)`, of cell `(ci, cj)`
+    /// (unwrapped), is a salt flat's crust: within SALT_FLAT_RISE of a
+    /// closed basin's floor, in the basin's cell or as far as a lake
+    /// reaches into its neighbours'. The crust follows the ground's
+    /// contours (it had covered its cell's columns only, squares on the
+    /// cell grid: the owner's "white patches").
+    fn salt_flat(&self, (ci, cj): (i64, i64), (x, z): (i64, i64), h: i64, wobble: f64) -> bool {
+        for dj in -1..=1 {
+            for di in -1..=1 {
+                let (i, j) = (ci + di, cj + dj);
+                let c = self.wrap(i, j);
+                if self.cover_at(c) == Cover::SaltFlat
+                    && h <= i64::from(self.h(c)) + SALT_FLAT_RISE
+                    && self.outside(i, j, x, z, wobble) <= 0.0
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether ground `h` at column `(x, z)`, of cell `(ci, cj)`
     /// (unwrapped), lies under a lake or the sea: below a lake's level in
     /// its cells or as far as it reaches into theirs neighbours', or below
     /// sea level by the sea.
-    fn drowned(&self, (ci, cj): (i64, i64), (x, z): (i64, i64), h: i64) -> bool {
+    fn drowned(&self, (ci, cj): (i64, i64), (x, z): (i64, i64), h: i64, wobble: f64) -> bool {
         for dj in -1..=1 {
             for di in -1..=1 {
                 let (i, j) = (ci + di, cj + dj);
@@ -467,8 +614,7 @@ impl DrainageMap {
                     Cover::Sea => 0,
                     _ => continue,
                 };
-                let reach = if di == 0 && dj == 0 { 0.0 } else { LAKE_REACH };
-                if h < level && self.outside(i, j, x, z) <= reach {
+                if h < level && self.outside(i, j, x, z, wobble) <= 0.0 {
                     return true;
                 }
             }
@@ -479,14 +625,22 @@ impl DrainageMap {
     /// The ground and the lake or salt flat at column `(x, z)`, of cell
     /// `(ci, cj)` (unwrapped), whose ground is `h`.
     ///
-    /// A lake fills its cells' ground below its level, and its neighbours'
-    /// as far as [`LAKE_REACH`] into them — the shore follows the ground's
-    /// contours. Beyond that a bank holds it, falling at 45° to the ground:
+    /// A lake fills the natural ground below its level across its cells'
+    /// regions (wavy discs, [`Self::outside`]) — the shore follows the
+    /// ground's contours. Beyond, a bank holds it where it reaches the
+    /// region's edge, level with it a block and then falling at 45°:
     /// the lake's level is its cells' centres' spill, and the ground at the
     /// far side of its neighbours can be lower still, where its water had
     /// stood over air (17 blocks of it at the bench's waterfall, the owner's
     /// walk). A lake's cells hold a higher neighbouring lake the same way.
-    fn still_water(&self, (ci, cj): (i64, i64), (x, z): (i64, i64), h: i64) -> (i64, Water) {
+    fn still_water(
+        &self,
+        (ci, cj): (i64, i64),
+        (x, z): (i64, i64),
+        (h, natural): (i64, i64),
+        wobble: f64,
+        ground_at: &dyn Fn(i64, i64) -> i64,
+    ) -> (i64, Water) {
         let here = self.wrap(ci, cj);
         let lake_of = |c: usize| match self.cover_at(c) {
             Cover::Lake => Some((i64::from(self.lvl(c)), Body::Lake)),
@@ -506,26 +660,37 @@ impl DrainageMap {
                 let Some((level, body)) = lake_of(self.wrap(i, j)) else {
                     continue;
                 };
-                let d = self.outside(i, j, x, z);
+                let d = self.outside(i, j, x, z, wobble);
+                // A bank only where it would raise this ground and the lake
+                // reaches its region's edge on this side — where the natural
+                // ground there is below its level. (A bank standing over a
+                // dry rim, where an outlet river cut its channel, made a
+                // slot ten blocks deep, the owner's "insanely deep groove".)
+                let mut bank = |level: i64| {
+                    // Level with the water for a block, then falling at 45°.
+                    let b = level - ((d - 1.0).max(0.0) * BANK_FALL).floor() as i64;
+                    if b > h && self.edge_ground(i, j, (x, z), wobble, ground_at) < level {
+                        banks[k] = (level, b);
+                        k += 1;
+                    }
+                };
                 match own {
                     // In a lake's own cells, only a higher lake beside it
                     // needs holding: from its edge.
                     Some((mine, _)) => {
                         if level > mine && d > 0.0 {
-                            banks[k] = (level, level + 1 - (d * BANK_FALL).floor() as i64);
-                            k += 1;
+                            bank(level);
                         }
                     }
-                    None if d <= LAKE_REACH => {
-                        if h < level && found.is_none_or(|(l, _)| level < l) {
+                    // Water where the natural ground lies below the lake —
+                    // not where a river's cut lowered it, beside a lake it
+                    // flows out of.
+                    None if d <= 0.0 => {
+                        if h < level && natural < level && found.is_none_or(|(l, _)| level < l) {
                             found = Some((level, body));
                         }
                     }
-                    None => {
-                        let past = d - LAKE_REACH;
-                        banks[k] = (level, level + 1 - (past * BANK_FALL).floor() as i64);
-                        k += 1;
-                    }
+                    None => bank(level),
                 }
             }
         }
@@ -545,20 +710,16 @@ impl DrainageMap {
             .unwrap_or(i64::MIN);
         let h = h.max(bank);
         let water = match found {
-            Some((level, body)) if h < level => Water {
+            Some((level, body)) if h < level && natural < level => Water {
                 level,
                 body,
                 near: None,
             },
-            _ if self.cover_at(here) == Cover::SaltFlat
-                && h <= i64::from(self.h(here)) + SALT_FLAT_RISE =>
-            {
-                Water {
-                    level: h,
-                    body: Body::SaltFlat,
-                    near: None,
-                }
-            }
+            _ if self.salt_flat((ci, cj), (x, z), h, wobble) => Water {
+                level: h,
+                body: Body::SaltFlat,
+                near: None,
+            },
             _ => Water::DRY,
         };
         (h, water)
@@ -673,23 +834,38 @@ impl DrainageMap {
         let depth = |q: f32| deep.unwrap_or_else(|| depth(q));
         let (w0, w1) = (width(q), width(qr));
         let (a0, a1) = (wander(w0), wander(w1));
-        // A waterfall is a step in the long profile, not a steep one: it
-        // falls at least FALL_FROM, and twice what the river below does.
-        let below = {
-            let d = self.flow[r];
-            if d == HERE {
-                0.0
-            } else {
-                let rr = neighbours(r, self.nx, self.nz)[d as usize];
-                (level_of(r) - level_of(rr).min(level_of(r))).max(0.0)
-            }
-        };
-        let drop = lc - lr;
-        // It falls where its ground does (stage 1's `lip`): the pool above
-        // ends where the ground stops holding it.
-        let fall = (drop >= FALL_FROM && drop >= 2.0 * below && kind != RiverKind::Wadi)
-            .then(|| f32::from(self.lip[c]) / 256.0);
+        // The long profile, from stage 1; a reach that does not fall is
+        // level throughout.
+        let steps: [f32; PROFILE_STEPS] =
+            match self.profile.binary_search_by_key(&(c as u32), |p| p.0) {
+                Ok(k) => self.profile[k]
+                    .1
+                    .map(|e| lr + (lc - lr) * f32::from(e) / 255.0),
+                Err(_) => [lc; PROFILE_STEPS],
+            };
+        // A waterfall: a step in the profile FALL_FROM blocks or more (the
+        // ground stepping down), the highest; a wadi has no water to fall.
+        let fall = (kind != RiverKind::Wadi)
+            .then(|| {
+                (0..PROFILE_STEPS)
+                    .map(|k| {
+                        let next = if k + 1 < PROFILE_STEPS {
+                            steps[k + 1]
+                        } else {
+                            lr
+                        };
+                        (
+                            steps[k].floor() - next.floor(),
+                            (k + 1) as f32 / PROFILE_STEPS as f32,
+                        )
+                    })
+                    .filter(|&(drop, _)| drop >= FALL_FROM)
+                    .max_by(|a, b| a.0.total_cmp(&b.0))
+                    .map(|(_, t)| t)
+            })
+            .flatten();
         Some(Reach {
+            steps,
             fall,
             len: step,
             out: w0.max(w1) * 0.5 + BANK_REACH + BASE_WANDER + a0.max(a1),

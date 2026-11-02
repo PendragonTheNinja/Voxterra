@@ -18,8 +18,8 @@ use super::{DrainageMap, erosion::Erosion};
 const MAGIC: &[u8; 4] = b"VXDR";
 /// Bump when the layout changes. A file of another version is rebuilt.
 /// 2 — the cover byte carries arid and ice-scoured bits (M14 criterion 10).
-/// 3 — waterfalls' lips.
-pub const FORMAT_VERSION: u32 = 3;
+/// 3 — waterfalls' lips. 4 — reaches' long profiles instead.
+pub const FORMAT_VERSION: u32 = 4;
 
 /// What a cache must have been built for to be used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,7 +33,9 @@ impl DrainageMap {
     /// The network as cache-file bytes, for `key`.
     pub fn to_cache_bytes(&self, key: CacheKey) -> Vec<u8> {
         let n = self.nx * self.nz;
-        let mut out = Vec::with_capacity(64 + n * 12 + self.erosion.delta.len() * 4);
+        let mut out = Vec::with_capacity(
+            64 + n * 11 + self.profile.len() * 12 + self.erosion.delta.len() * 4,
+        );
         out.extend_from_slice(MAGIC);
         put_u32(&mut out, FORMAT_VERSION);
         put_u32(&mut out, key.generator_version);
@@ -57,7 +59,11 @@ impl DrainageMap {
         }
         out.extend_from_slice(&self.cover);
         out.extend_from_slice(&self.flow);
-        out.extend_from_slice(&self.lip);
+        put_u32(&mut out, self.profile.len() as u32);
+        for (c, steps) in &self.profile {
+            put_u32(&mut out, *c);
+            out.extend_from_slice(steps);
+        }
         for &v in &self.discharge {
             out.extend_from_slice(&v.to_le_bytes());
         }
@@ -101,7 +107,18 @@ impl DrainageMap {
         let level = r.array(n, |b| i16::from_le_bytes([b[0], b[1]]), 2)?;
         let cover = r.take(n)?.to_vec();
         let flow = r.take(n)?.to_vec();
-        let lip = r.take(n)?.to_vec();
+        let reaches = r.u32()? as usize;
+        let mut profile = Vec::with_capacity(reaches.min(n));
+        for _ in 0..reaches {
+            let c = r.u32()?;
+            let steps: [u8; super::PROFILE_STEPS] =
+                r.take(super::PROFILE_STEPS)?.try_into().ok()?;
+            // Ascending and in the grid, or it is not this world's.
+            if c as usize >= n || profile.last().is_some_and(|&(p, _)| p >= c) {
+                return None;
+            }
+            profile.push((c, steps));
+        }
         let discharge = r.array(n, |b| f32::from_le_bytes(b.try_into().unwrap()), 4)?;
         let delta = r.array(en, |b| f32::from_le_bytes(b.try_into().unwrap()), 4)?;
         if !r.0.is_empty() || flow.iter().any(|&d| d > super::HERE) {
@@ -118,7 +135,7 @@ impl DrainageMap {
             cover,
             flow,
             discharge,
-            lip,
+            profile,
             erosion: Erosion {
                 nx: enx,
                 nz: enz,
@@ -205,7 +222,7 @@ mod tests {
         assert_eq!(back.level, d.level);
         assert_eq!(back.cover, d.cover);
         assert_eq!(back.flow, d.flow);
-        assert_eq!(back.lip, d.lip);
+        assert_eq!(back.profile, d.profile);
         assert!(
             back.discharge
                 .iter()

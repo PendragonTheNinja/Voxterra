@@ -175,7 +175,13 @@ pub enum DrainageSource {
 /// shaping ends where a lake or the sea covers the ground (no dikes out
 /// across the water); a lake's banks stand only where no water as high
 /// covers them; river banks stand level with the water, not a block above.
-pub const GENERATOR_VERSION: u32 = 6;
+/// 7 — the owner's walk, continued (ADR-0020 §10): each reach's long profile
+/// follows its ground (stored in stage 1, drainage cache format 4), seated
+/// at its node and never under a lake; ponds where a river crosses a hollow
+/// below its grade; fills cut before banks; lakes, fills and salt flats
+/// reach wavy discs about their cells, not squares; lake banks only where
+/// the lake reaches them; channels run on into lakes.
+pub const GENERATOR_VERSION: u32 = 7;
 
 impl Generator {
     /// A generator for one world: its seed and its size. The size is part of
@@ -253,9 +259,13 @@ impl Generator {
     /// flat the column holds.
     pub fn ground(&self, wx: i64, wz: i64) -> (elevation::Surface, Water) {
         let mut s = self.eroded_surface(wx, wz);
-        let (h, water) = self.drainage().shape_column(wx, wz, s.height, |x, z, l| {
-            self.elevation.meander_warp(x, z, l)
-        });
+        let (h, water) = self.drainage().shape_column(
+            wx,
+            wz,
+            s.height,
+            |x, z, l| self.elevation.meander_warp(x, z, l),
+            |x, z| self.eroded_surface(x, z).height,
+        );
         let (h, water) = self.lowlands(wx, wz, h, water, true);
         s.height = h;
         (s, water)
@@ -273,14 +283,23 @@ impl Generator {
         DELTA_FROM_M3S * area.min(1.0) as f32
     }
 
-    /// [`Self::ground`]'s height without wetland pools: what a pool's
-    /// neighbours must stand at for it to hold.
+    /// [`Self::ground`]'s top — its ground, or water standing on it —
+    /// without wetland pools: what a pool's neighbours must stand at for it
+    /// to hold.
     fn ground_without_pools(&self, wx: i64, wz: i64) -> i64 {
         let s = self.eroded_surface(wx, wz);
-        let (h, water) = self.drainage().shape_column(wx, wz, s.height, |x, z, l| {
-            self.elevation.meander_warp(x, z, l)
-        });
-        self.lowlands(wx, wz, h, water, false).0
+        let (h, water) = self.drainage().shape_column(
+            wx,
+            wz,
+            s.height,
+            |x, z, l| self.elevation.meander_warp(x, z, l),
+            |x, z| self.eroded_surface(x, z).height,
+        );
+        let (h, water) = self.lowlands(wx, wz, h, water, false);
+        // Water as high holds a pool as ground does: a river's channel
+        // beside it had failed the test, leaving a strip of mud along every
+        // river crossing a wetland, an outline (the owner's walk).
+        h.max(wet_top(&water))
     }
 
     /// The flat ground beside lowland rivers (M14 task 4): wetlands where
@@ -1362,9 +1381,13 @@ mod tests {
                                 flats += 1;
                                 // The ground as the river and any fill left
                                 // it, before the flats are laid.
-                                let (before, _) = d.shape_column(x, z, nat, |x, z, l| {
-                                    g.elevation.meander_warp(x, z, l)
-                                });
+                                let (before, _) = d.shape_column(
+                                    x,
+                                    z,
+                                    nat,
+                                    |x, z, l| g.elevation.meander_warp(x, z, l),
+                                    |x, z| g.eroded_surface(x, z).height,
+                                );
                                 if s.height > before {
                                     raised_flats.push((x, z, s.height - before));
                                 }
@@ -1401,6 +1424,75 @@ mod tests {
             "{} of {drowned} columns under still water raised, e.g. {:?}",
             raised_under.len(),
             &raised_under[..raised_under.len().min(6)]
+        );
+    }
+
+    /// Rivers run in valleys, not slots (the owner's walk, M14): beside a
+    /// mountain river a lake's bank, a fill's slope and a ledge each raised
+    /// the ground back up after the channel's banks were cut, and the river
+    /// was seated 27 blocks below the lake it drains — water in a slot one
+    /// block wide and 13 deep, the owner's "insanely deep grooves", at
+    /// their VIEW (−51 679, −82 227). There, and around rivers of every size
+    /// in another world, the ground a block or two from a channel stands no
+    /// more than a few blocks above its water (beside a waterfall, where the
+    /// pool above is near, it may).
+    #[test]
+    fn rivers_run_in_valleys_not_slots() {
+        let slots = |g: &Generator, columns: &mut dyn Iterator<Item = (i64, i64)>| {
+            let (mut banks, mut slots) = (0u32, Vec::new());
+            for (x, z) in columns {
+                let (s, w) = g.ground(x, z);
+                let Some(n) = w.near else { continue };
+                if w.body != Body::Dry || !(0.0..2.0).contains(&n.out) {
+                    continue;
+                }
+                banks += 1;
+                // A 45° bank from a block above the water rises ~3 here;
+                // uneven ground and stepping water allow a few more.
+                if s.height > n.level + 8 {
+                    slots.push((x, z, s.height - n.level));
+                }
+            }
+            (banks, slots)
+        };
+        // The owner's view.
+        let g = Generator::new(0x0007_E22A_C0DE, WorldShape::DEFAULT);
+        let mut here = (-82_300..-82_180).flat_map(|z| (-51_730..-51_610).map(move |x| (x, z)));
+        let (banks, found) = slots(&g, &mut here);
+        assert!(banks > 100, "only {banks} bank columns at the owner's view");
+        assert!(
+            found.is_empty(),
+            "slots at the owner's view: {:?}",
+            &found[..found.len().min(8)]
+        );
+        // Rivers of every size.
+        let g = Generator::new(0x41_7E45, WorldShape::new(65_536, 65_536).unwrap());
+        let d = g.drainage();
+        let (nx, nz) = d.cells();
+        let (cw, ch) = d.cell_blocks();
+        let mut cells = (0..nz)
+            .step_by(3)
+            .flat_map(|j| (0..nx).step_by(3).map(move |i| (i, j)));
+        let mut all = Vec::new();
+        for (i, j) in &mut cells {
+            let (_, _, q, _) = d.cell(i, j);
+            if q < drainage::STREAM_FROM_M3S || d.is_sea(i, j) || d.is_lake(i, j) {
+                continue;
+            }
+            let (x0, z0) = ((i as f64 * cw) as i64, (j as f64 * ch) as i64);
+            all.extend(
+                (z0..z0 + ch as i64)
+                    .flat_map(|z| (x0..x0 + cw as i64).step_by(2).map(move |x| (x, z))),
+            );
+        }
+        let (banks, found) = slots(&g, &mut all.into_iter());
+        eprintln!("{banks} bank columns, {} in slots", found.len());
+        assert!(banks > 20_000, "only {banks} bank columns");
+        assert!(
+            found.len() * 200 < banks as usize,
+            "{} of {banks} banks stand 9+ above their river, e.g. {:?}",
+            found.len(),
+            &found[..found.len().min(8)]
         );
     }
 
@@ -1619,7 +1711,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (6, 0xe3ca_8745_9949_74b0);
+        const PINNED: (u32, u64) = (7, 0xf17e_1940_53de_119f);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),

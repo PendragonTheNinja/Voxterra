@@ -170,6 +170,29 @@ Tests that fail on earlier versions: `rivers_build_no_walls`,
 Rivers in filled hollows still run above the hollow's natural floor — on
 its sediment, which now meets its sides.
 
+### 10. Long profiles; regions as discs (v7, the owner's second flight)
+
+A reach's water no longer runs a straight line from node to node. Stage 1
+stores each falling reach's **long profile**: its level at 8 points, each a
+block under the lowest ground across its belt as far as the next point,
+never rising downstream, between its own level and its receiver's. Stage
+2 slopes the water from point to point and drops a step of 12+ at once —
+a waterfall where the ground steps. (The straight line cut slots where the
+ground was concave and stood on causeways where it was convex; seated
+against it, a lake's outlet sank 27 blocks below the lake.) Nodes are
+seated only against the ground near them, never against ground a lake or
+the sea covers. Where a river is held at its receiver's level over a
+hollow, ground within 24 blocks below its water is a pond, not a causeway.
+
+A cell's lake, fill or salt flat reaches a **disc** about its centre
+(radius 0.9 cell ± 0.15 by noise), not its square: no straight shores,
+square terraces or square salt pans. Fills are applied before a river's
+banks are cut; a lake's bank stands only where the lake's own edge on that
+side is below its level; lake water only where the natural ground is below
+it; a river's banks keep a lake's rim; under a lake its channel runs on
+(bed and sides cut, nothing built). Wetland pools count water as high as
+ground beside them. Drainage cache format 4.
+
 ## Consequences
 
 - `ground` costs ~2× the eroded surface per column (~0.6 against ~0.3 µs in

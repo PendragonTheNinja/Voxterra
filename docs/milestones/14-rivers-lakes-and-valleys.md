@@ -466,6 +466,32 @@ becomes an ADR; the simulation itself remains its own milestone.
      Test that fails on v5: `rivers_end_at_still_water_and_flats_are_cut`
      (146 427 raised flat columns → 0). Flats cover ~30% fewer columns;
      every biome is still in every world. Gallery `rivers-by-kind-*`.
+   - [x] **The owner's second flight** (2026-11-02, 13 VIEW lines;
+     `GENERATOR_VERSION` 7, drainage cache format 4), every one reproduced
+     in the headless renderer before changing anything:
+     - "White patches of snow" — salt flats, squares on the cell grid; now
+       crust on ground near a closed basin's floor, out to a wavy edge.
+     - "Insanely deep grooves" below waterfalls — a slot one block wide and
+       13 deep: the river was seated 27 blocks under the lake it drains (its
+       seat sampled the lake's bed), and a lake's bank and a fill's slope
+       raised its banks back up after they were cut. Now each reach has a
+       **long profile** (stage 1, ADR-0020 §10): its water at 8 points, a
+       block under the lowest ground across its belt, never rising; it
+       steps down a mountain with its ground, and a step of 12+ is a
+       waterfall. Seating looks only near the node and never under a lake;
+       fills are cut before banks; lake banks stand only where the lake
+       reaches them; banks keep a lake's rim.
+     - "A straight-line bridge" where a pond belonged — a river held at its
+       receiver's level over a hollow now fills it as a pond.
+     - "Straight lines" and "flat steps" — lakes, fills and salt flats
+       reached squares about their cells; now wavy discs (the owner: "wavy
+       is 100x better").
+     - "Stone outline" where rivers cross wetland pools — a mud strip, the
+       pool test not counting the river's water; it does now.
+     - "Jutting" terrain where a river enters a lake — its channel stopped
+       dead at the lake's edge; it runs on into the lake now.
+     Test that fails on v6: `rivers_run_in_valleys_not_slots` (banks 28 over
+     their water at the owner's view). Gallery `walk2-*`.
 
 ## Non-goals
 

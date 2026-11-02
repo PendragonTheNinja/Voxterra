@@ -97,10 +97,13 @@ const GLACIATED_BELOW_C: f32 = 2.0;
 
 /// A cell that drains into itself: the sea, a closed basin.
 const HERE: u8 = 8;
-/// How often the ground is sampled along a reach to seat the river in it,
-/// and to find a waterfall's lip, blocks.
-const SEAT_SPACING: f64 = 8.0;
-const LIP_SPACING: f64 = 4.0;
+/// How often the ground is sampled along a reach to seat the river in it
+/// and lay its profile, blocks.
+const SEAT_SPACING: f64 = 4.0;
+/// How much of a reach's start its node is seated against.
+const SEAT_NEAR: f64 = 0.125;
+/// The points of a reach's long profile.
+pub(crate) const PROFILE_STEPS: usize = 8;
 
 /// The bit of a cell's cover marking a closed basin's sink.
 const SINK: u8 = 0x80;
@@ -137,9 +140,10 @@ pub struct DrainageMap {
     flow: Vec<u8>,
     /// Water leaving the cell, m³/s.
     discharge: Vec<f32>,
-    /// Where along its reach a waterfall's drop is, in 256ths, if its reach
-    /// is one: where the ground stops holding the pool above.
-    lip: Vec<u8>,
+    /// Long profiles of the reaches that fall (ADR-0020 §10): by cell
+    /// index, ascending, each its water at PROFILE_STEPS points along it,
+    /// from its own level (255) to its receiver's (0).
+    profile: Vec<(u32, [u8; PROFILE_STEPS])>,
     /// The elevation's erosion stage (task 2).
     erosion: Erosion,
     /// The water budget, kept for the conservation test.
@@ -311,6 +315,52 @@ impl DrainageMap {
             let (x, z) = (x.floor() as i64, z.floor() as i64);
             elevation.height(x, z) as i32 + erosion.at(x as f64, z as f64).round() as i32
         };
+        // The ground a river is seated under: none where a lake or the sea
+        // lies — that is water, not ground to cut through (a river running
+        // along a lake's shore had been seated by the lake's bed, 27 blocks
+        // below the lake it drains: the owner's "insanely deep groove").
+        // The lake's region is stage 2's: discs about its cells' centres
+        // (`rivers::REGION_*`), where its water covers ground below it.
+        let seat_ground = |x: f64, z: f64| {
+            let (fi, fj) = ((x / cell_x).floor() as i64, (z / cell_z).floor() as i64);
+            let at = |i: i64, j: i64| {
+                (j.rem_euclid(nz as i64) as usize) * nx + i.rem_euclid(nx as i64) as usize
+            };
+            if matches!(cover[at(fi, fj)], Cover::Sea) {
+                return i32::MAX;
+            }
+            let g = ground(x, z);
+            let mut wobble = None;
+            for dj in -1..=1 {
+                for di in -1..=1 {
+                    let c = at(fi + di, fj + dj);
+                    if !matches!(cover[c], Cover::Lake | Cover::SaltLake) || g >= spill[c] {
+                        continue;
+                    }
+                    let w = *wobble.get_or_insert_with(|| {
+                        f64::from(
+                            elevation
+                                .meander_warp(
+                                    x.floor() as i64,
+                                    z.floor() as i64,
+                                    rivers::REGION_WAVELENGTH,
+                                )
+                                .0,
+                        )
+                    });
+                    let (cx, cz) = (
+                        ((fi + di) as f64 + 0.5) * cell_x,
+                        ((fj + dj) as f64 + 0.5) * cell_z,
+                    );
+                    let radius =
+                        cell_x.min(cell_z) * (rivers::REGION_RADIUS + rivers::REGION_WOBBLE * w);
+                    if ((x - cx).powi(2) + (z - cz).powi(2)).sqrt() <= radius {
+                        return i32::MAX;
+                    }
+                }
+            }
+            g
+        };
         // Rivers sit in their ground, never on it: the levels so far are the
         // cells' centres' ground, but a reach runs between jittered nodes
         // over the full-resolution ground, which a 128-block grid does not
@@ -319,10 +369,15 @@ impl DrainageMap {
         // the land, 85 blocks high at a mountain waterfall's pool (the
         // owner's walk). So each reach's level is lowered until the line to
         // its receiver runs a block under the ground along it.
+        // Reaches with a profile: streams, and the rivers leaving lakes
+        // (whose water had run at the lake's level all the way to the next
+        // node, its banks held up beside the river below — a slot).
+        let lake_cell = |c: usize| matches!(cover[c], Cover::Lake | Cover::SaltLake);
         let stream = |c: usize| {
-            receiver[c] as usize != c
+            let r = receiver[c] as usize;
+            r != c
                 && !sea[c]
-                && cover[c] == Cover::Land
+                && (cover[c] == Cover::Land || (lake_cell(c) && !lake_cell(r)))
                 && discharge[c] >= STREAM_FROM_M3S
         };
         let reach_line = |c: usize| {
@@ -351,7 +406,7 @@ impl DrainageMap {
                 .map(|k| {
                     let t = k as f64 / n as f64;
                     let (x, z) = (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
-                    let across = |f: f64| ground(x - uz * belt * f, z + ux * belt * f);
+                    let across = |f: f64| seat_ground(x - uz * belt * f, z + ux * belt * f);
                     if belt > 0.0 {
                         [-1.0, -0.5, 0.0, 0.5, 1.0]
                             .map(across)
@@ -381,48 +436,55 @@ impl DrainageMap {
                 along(c, SEAT_SPACING, f64::from(belt))
             })
             .collect();
-        // Outlets first, so every receiver is seated before its donors.
+        // Outlets first, so every receiver is seated before its donors: a
+        // node a block under the ground around it, never below its
+        // receiver. (It had been lowered until the straight line to its
+        // receiver ran under the ground all the way, which on a concave
+        // mountainside sank it tens of blocks — a river 27 below the lake it
+        // drains, in a slot. The profile below follows the ground instead.)
         for &c in &order {
             let c = c as usize;
-            if samples[c].is_empty() {
+            // A lake keeps its level; only land is seated.
+            if samples[c].is_empty() || cover[c] != Cover::Land {
                 continue;
             }
             let lr = water_level(&spill, receiver[c] as usize).min(spill[c]);
-            let n = samples[c].len() as f64;
-            let mut seat = spill[c];
-            for (k, &g) in samples[c].iter().enumerate() {
-                let under = g - 1;
-                let t = k as f64 / n;
-                // The highest level here whose line to `lr` passes under
-                // this sample; where the ground dips below the receiver
-                // itself, the line can only be the receiver's.
-                let most = if under <= lr {
-                    lr
-                } else {
-                    lr + (f64::from(under - lr) / (1.0 - t)).floor() as i32
-                };
-                seat = seat.min(most);
-            }
-            spill[c] = seat.max(lr);
+            let near = ((samples[c].len() as f64 * SEAT_NEAR).ceil() as usize).max(1);
+            let under = samples[c][..near].iter().min().unwrap().saturating_sub(1);
+            spill[c] = spill[c].min(under).max(lr);
         }
-        // Where a waterfall's reach falls: its pool holds its level only as
-        // far as the ground stands above it, then drops — the lip is where
-        // the ground falls away, not a fixed point halfway (whose pool stood
-        // on a wall over ground falling steadily to the river below).
-        let lip: Vec<u8> = (0..nx * nz)
+        // Each reach's long profile: its water at PROFILE_STEPS points, a
+        // block under the lowest ground across its belt as far as the next
+        // point (so the level held between them is under it too), never
+        // rising downstream, between its own level and its receiver's.
+        // Water steps down a mountainside with its ground — rapids, and
+        // waterfalls where the ground steps — instead of running a straight
+        // line from node to node that cut grooves where the slope was
+        // concave and stood on causeways where it was convex (the owner's
+        // walk).
+        let profile: Vec<(u32, [u8; PROFILE_STEPS])> = (0..nx * nz)
             .into_par_iter()
-            .map(|c| {
-                if !stream(c) {
-                    return 0;
+            .filter_map(|c| {
+                let s = &samples[c];
+                if s.is_empty() {
+                    return None;
                 }
-                let lr = water_level(&spill, receiver[c] as usize).min(spill[c]);
-                if ((spill[c] - lr) as f32) < rivers::FALL_FROM {
-                    return 0;
+                let (lc, lr) = (
+                    spill[c],
+                    water_level(&spill, receiver[c] as usize).min(spill[c]),
+                );
+                if lc == lr {
+                    return None;
                 }
-                let line = along(c, LIP_SPACING, 0.0);
-                let held = line.iter().take_while(|&&g| g > spill[c]).count();
-                let last = held.saturating_sub(1) as f64 / line.len() as f64;
-                (last * 256.0).floor().min(255.0) as u8
+                let n = s.len();
+                let mut steps = [0u8; PROFILE_STEPS];
+                for (k, step) in steps.iter_mut().enumerate() {
+                    let upto = ((k + 1) * n / PROFILE_STEPS).min(n - 1);
+                    let under = s[..=upto].iter().min().unwrap().saturating_sub(1);
+                    let p = under.clamp(lr, lc);
+                    *step = (f64::from(p - lr) * 255.0 / f64::from(lc - lr)).round() as u8;
+                }
+                Some((c as u32, steps))
             })
             .collect();
         let narrow = |v: i32| i16::try_from(v).expect("heights fit the world's vertical range");
@@ -457,7 +519,7 @@ impl DrainageMap {
                 })
                 .collect(),
             discharge,
-            lip,
+            profile,
             erosion,
             #[cfg(test)]
             budget: (runoff, demand),
