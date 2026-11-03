@@ -264,9 +264,10 @@ The owner's ideas for all of them, and a proposed order, are recorded in
 ## Current status
 
 - **Active milestone:** 15 — Landforms by Climate
-  (`docs/milestones/15-landforms-by-climate.md`): **draft spec, awaiting the
-  owner's review** — nothing is built until it is approved and its five
-  questions answered (scope, the ice age, cliffs, dune size, order). Dune
+  (`docs/milestones/15-landforms-by-climate.md`): **spec approved
+  2026-11-03** — all five families; glacial landforms wherever last-ice-age
+  ice lay; real cliffs, not all walkable (traversal is later gameplay);
+  dunes 6–30 high, 100–250 apart; dry lands first. Nothing built yet. Dune
   seas, mesas and canyons, glacial valleys and fjords, inselbergs, dissected
   humid hills, as height layers weighted by a stage-1 process map, applied
   before the drainage network so water still fits the ground (M14's lesson).

@@ -14,8 +14,8 @@ erosion stage, and its lesson that water must fit the ground). Written
 2026-11-03 from `docs/vision.md` §9 and §10.1 and M14's decisions, at the
 owner's request.
 
-**Status: draft for the owner's review.** Nothing is built until it is
-approved; the questions at the end need answers first.
+**Status: spec approved (2026-11-03)** — the owner's decisions at the end.
+Task 0 starts with the owner's re-bench of M14 at `GENERATOR_VERSION` 8.
 
 ## Why this milestone exists
 
@@ -60,7 +60,8 @@ underfoot ~800 blocks, terrain character ~2 600, a range ~7 000; peaks to
   risers and talus at their feet; mesas and buttes isolated where the
   network's valleys have cut back; canyons where M14's rivers cross a
   plateau, 50–200 blocks deep. Badlands strata (M13) already mark the beds.
-  Every mesa has a way up for a walker (a talus ramp or a broken bench).
+  Cliffs are as steep as the rock makes them; some mesas have a talus ramp
+  or a broken bench up and some have none, as on Earth.
 
 ### Ice: glacial valleys and coasts (where ice lay, now and in the ice age)
 
@@ -148,7 +149,9 @@ pass.
    dry uplands; U-valleys, cirques and fjords only where ice lay; inselbergs
    in savanna; dissection rising with rainfall. As tests.
 4. **Recognisable at walking speed**: each landform reads as itself on foot
-   and from a distance (owner's walk); every mesa and canyon has a way up.
+   and from a distance (owner's walk). Cliffs may be unclimbable, as Earth's
+   are; traversal of rough terrain is a gameplay system for later (owner,
+   2026-11-03).
 5. **Water still fits the ground**: every M14 water test passes (never held
    by air, shores hold, rivers in valleys not slots, rivers end at still
    water); rivers cut canyons, avoid dune crests, fall from hanging valleys.
@@ -171,8 +174,7 @@ pass.
    approval. The process-weight layer on the world map.
 1. **Process weights in stage 1**, with the ice-age climate; ADR proposed.
 2. **Dry lands:** dune seas oriented by the wind; mesas, buttes and canyons
-   by terracing dry uplands and letting the network cut them; talus and ways
-   up.
+   by terracing dry uplands and letting the network cut them; talus aprons.
 3. **Ice:** glacial erosion in the erosion stage — U-valleys, cirques and
    tarns, overdeepened fjords, hanging tributaries; moraines and lake
    districts on glaciated lowlands.
@@ -195,21 +197,15 @@ pass.
   make dunes and talus walkable without steps, but they are their own
   milestone.
 
-## Questions for the owner
+## Decisions (owner, 2026-11-03)
 
-1. **Scope.** All five families (wind, flash flood, ice, weathering, rain)
-   in M15, or a first cut? Recommendation: all five; ice is the largest, and
-   dry lands and ice give the most striking horizons.
-2. **The ice age.** Glacial landforms where ice lay in the last ice age —
-   fjords and U-valleys on coasts that are temperate today, as Norway's and
-   Scotland's are — or only where it is cold now? Recommendation: the ice
-   age; it is why Earth's temperate mountains look the way they do.
-3. **Cliffs.** Mesas and canyon walls need real cliffs, steeper than
-   ADR-0010's walkable slopes. Allow them, provided every mesa and canyon
-   has a way up (talus ramps, broken benches)? Recommendation: yes.
-4. **Dune size.** 6–30 blocks high and 100–250 apart makes a dune sea a real
-   climb (about ten minutes across). Smaller and gentler, or that?
-   Recommendation: that — crossing a dune sea should be a decision.
-5. **Order.** Ice first (the most work, the most dramatic) or dry lands
-   first (simpler, and they test the layer architecture)? Recommendation:
-   dry lands first.
+1. **Scope: all five families** — wind, flash flood, ice, weathering, rain.
+2. **The ice age**: glacial landforms wherever ice lay in the last ice age
+   (the most realistic), so fjords and U-valleys reach coasts that are
+   temperate today, as Norway's and Scotland's do.
+3. **Cliffs**: real cliffs, and some need not be walkable at all — "not all
+   are walkable in real life"; rough-terrain traversal is a later gameplay
+   system. ADR-0010's walkable slopes no longer bind landform cliffs.
+4. **Dune size as proposed**: ridges 6–30 blocks high, 100–250 apart —
+   crossing a dune sea is a climb.
+5. **Order: dry lands first** (task 2), then ice (task 3).
