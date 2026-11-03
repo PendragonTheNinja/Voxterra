@@ -16,6 +16,10 @@ owner's request.
 
 **Status: spec approved (2026-11-03)** — the owner's decisions at the end.
 Task 0 starts with the owner's re-bench of M14 at `GENERATOR_VERSION` 8.
+**Task 0 progress (2026-11-03):** the landform catalogue is drafted in
+`docs/landforms.md` for the owner's approval, with five questions at its
+end; the re-bench is still the owner's. The process-weight map layer needs
+task 1's weights and lands with them.
 
 ## Why this milestone exists
 
