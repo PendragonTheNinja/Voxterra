@@ -263,45 +263,29 @@ The owner's ideas for all of them, and a proposed order, are recorded in
 
 ## Current status
 
-- **Active milestone:** 14 — Rivers, Lakes & Valleys
-  (`docs/milestones/14-rivers-lakes-and-valleys.md`, spec approved
-  2026-11-01): drainage, rivers, lakes, wetlands, deltas, valleys, each
-  climate zone with Earth's own kind of water at our scale; M15 will be
-  landforms by climate. Nine water biomes added to `docs/biomes.md`; the
-  drainage network cached in the world folder; currents later. **Water
-  physics: the hybrid** (owner, 2026-11-01; `docs/design/water.md`):
-  settled worldgen water, local finite water later, reservoirs. Rivers
-  differ by slope, discharge and sediment, and visibly flow (a flow map in
-  the shader). In progress: tasks 1–2 (`vox_worldgen::drainage`;
-  ADR-0019 proposed): the network, lakes, closed basins by water budget and
-  valley erosion are built; chunks read eroded ground (`Generator::surface`,
-  `GENERATOR_VERSION` 4); the network is cached in the world folder
-  (`drainage.cache`); criterion 4 surveyed over six seeds
-  (`drainage_survey`: closed basins high, ~29% vs Earth's 18%, carried to
-  M15). Tasks 3–5 mostly built (ADR-0020 proposed): rivers,
-  lakes, salt flats, floodplains, wetlands and deltas in the chunks
-  (`Generator::ground`, `drainage::rivers`); the nine water biomes (32 in
-  all, every one in every world); the LOD draws rivers and lakes at their
-  own levels; river water visibly flows (the flow map, `flow.wgsl`).
-  River kinds (wadi, braided, torrent, meandering) differ by slope,
-  discharge and climate (criterion 10). Waterfalls (static sheets at steps
-  in a river's profile, owner's decision), delta distributaries and oxbow
-  lakes built. `--bench` criterion 9 met after a per-frame span-cache
-  fix (`App::span`); the bench has three water phases and `VOX_NO_FLOW=1`
-  for A/B. The owner's first flight found rivers on walls (an 85-block
-  wall under the bench's waterfall): fixed in `GENERATOR_VERSION` 5
-  (ADR-0020 §9: reaches seated in the ground, waterfall lips and height
-  caps, fills and lake banks sloping, banks blended; drainage cache format
-  3), then `GENERATOR_VERSION` 6 after renders of every kind of river
-  (flats cut, never built; no dikes across lakes and the sea), then
-  `GENERATOR_VERSION` 7 after the owner's second flight (ADR-0020 §10:
-  reaches' long profiles stored in stage 1, cache format 4; ponds in
-  hollows; lakes, fills and salt flats as wavy discs), then
-  `GENERATOR_VERSION` 8 after the third (coasts only by the sea, inland
-  sub-sea-level land a lake, braided bars mid-channel; LOD ice undersides).
-  Open: the rest of the owner's walk and the retrospective. No
-  low-end machine exists yet — M12's spec says how to judge low-end
-  performance by proxy.
+- **Active milestone:** 15 — Landforms by Climate
+  (`docs/milestones/15-landforms-by-climate.md`): **draft spec, awaiting the
+  owner's review** — nothing is built until it is approved and its five
+  questions answered (scope, the ice age, cliffs, dune size, order). Dune
+  seas, mesas and canyons, glacial valleys and fjords, inselbergs, dissected
+  humid hills, as height layers weighted by a stage-1 process map, applied
+  before the drainage network so water still fits the ground (M14's lesson).
+  Takes over M14's carried items: closed basins ~29% (Earth ~18%), shallow
+  valleys for large rivers. Task 0 starts with the owner re-benching M14 at
+  `GENERATOR_VERSION` 8 as the baseline. No low-end machine exists yet —
+  M12's spec says how to judge low-end performance by proxy.
+- **Last completed milestone:** 14 — Rivers, Lakes & Valleys (2026-11-03);
+  retrospective at the end of `docs/milestones/14-rivers-lakes-and-valleys.md`,
+  gallery `docs/gallery/m14/`, ADRs 0019 (drainage and erosion) and 0020
+  (water above sea level) accepted. Stage-1 drainage with closed basins by
+  water budget and stream-power valleys, cached in the world folder
+  (`drainage.cache`, format 4); rivers of four kinds with long profiles,
+  waterfalls, lakes, salt flats, floodplains, wetlands, deltas, oxbows,
+  ponds; nine water biomes (32 in all); flowing water in the shader; LOD
+  water at its own levels. Closed after three owner flights in place of the
+  walk (`GENERATOR_VERSION` 5–8 fixed what they found). Carried: closed
+  basins ~29%, shallow large-river valleys, re-bench at version 8, distant
+  rivers as ribbons, reservoirs with the water simulation.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
   vox-core 288, vox-mesh 71, vox-worldgen 72, vox-render 21, vox-app 11
@@ -327,7 +311,7 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   are separate counters. ADRs number decisions in the order they are made;
   milestones number work in the order it is built. Matching numbers are
   coincidence — ADR-0011 (transparency) belongs to milestone M10.
-- **Last completed milestone:** 13 — Climate & Biomes (2026-11-01);
+- Milestone 13 — Climate & Biomes (2026-11-01);
   retrospective at the end of `docs/milestones/13-climate-and-biomes.md`,
   catalogue `docs/biomes.md`, gallery `docs/gallery/m13/`. Stage-1 climate
   (ADR-0017: winds, rain shadows, exaggerated lapse rate, deterministic

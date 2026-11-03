@@ -1,7 +1,7 @@
 # ADR-0019: Stage-1 drainage and the erosion stage
 
-- **Status:** Proposed (2026-11-01, M14 tasks 1–2). To be accepted after
-  the owner's walk.
+- **Status:** Accepted (2026-11-03, with M14's retrospective; proposed
+  2026-11-01, M14 tasks 1–2). The owner's three flights stood in for the walk.
 - **Context:** M14 needs rivers that know their upstream, lakes that know
   their outlet, closed basins that know they have none, and valleys cut by
   the water that runs in them (`docs/milestones/14-rivers-lakes-and-valleys.md`).

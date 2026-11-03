@@ -1,7 +1,7 @@
 # ADR-0020: Water above sea level — rivers and lakes in the chunks
 
-- **Status:** Proposed (2026-11-01, M14 task 3). To be accepted after the
-  owner's walk.
+- **Status:** Accepted (2026-11-03, with M14's retrospective; proposed
+  2026-11-01, M14 task 3). The owner's three flights stood in for the walk.
 - **Context:** Until M14 the generator's fill rule was one line: every block
   above the ground up to sea level is water (ADR-0011). Rivers and lakes
   stand at their own levels, hundreds of blocks above the sea, and the

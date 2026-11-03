@@ -553,3 +553,96 @@ becomes an ADR; the simulation itself remains its own milestone.
    seas, rivers and large lakes as reservoirs.
 6. **Rivers differ by terrain, and look like they flow** (owner's question,
    2026-11-01; see "Kinds of river" and criterion 10).
+
+# Retrospective (2026-11-03)
+
+Closed at the owner's call after three flights over the world (27 `VIEW`
+lines, every one reproduced headlessly before anything changed), not the
+spring-to-sea walk on foot criterion 11 asked for: "it's massive world
+generation and I'm sure I can always find things to tweak — I'd like to move
+on." Further finds come back as fixes against M14's ADRs.
+
+## What shipped
+
+- **Stage-1 drainage (ADR-0019):** a 128-block network over the torus —
+  the water balance (Budyko runoff, temperature-driven evaporation), a merge
+  tree of hollows filled and spilled to a steady state, closed basins by
+  water budget (salt lakes and flats), priority-flood routing, discharge,
+  and valley erosion by implicit stream power on a 256-block grid with walls
+  retreating to walkable slopes. Cached in the world folder
+  (`drainage.cache`, format 4).
+- **Rivers and lakes in the chunks (ADR-0020):** meandering channels sized
+  by discharge, beds by slope, four kinds of river (wadi, braided, torrent,
+  meandering), waterfalls at steps, lakes along contours, salt flats,
+  floodplains, marsh, swamp and bog with pools, deltas with distributaries,
+  oxbow lakes; each reach's **long profile** stored in stage 1 so water
+  steps down with its ground; ponds where a river crosses a hollow below its
+  grade. Nine water biomes (32 in all) and four blocks (silt, salt, river
+  gravel, peat).
+- **Water that flows:** a flow map in the shader, near and far; lakes and
+  the sea are still.
+- **Distant water:** the LOD draws rivers and lakes at their own levels;
+  frozen water has an underside.
+- **Instruments:** river and lake layers on the world map, the
+  `drainage_survey`, the readout naming the water a player is in, bench
+  phases for rivers and a waterfall, and a habit — reproduce every reported
+  spot headlessly at its `VIEW` line first.
+
+## Criteria
+
+| # | Criterion | Result |
+|---|---|---|
+| 1 | Spec, catalogue, ADRs first | Met — ADR-0019 and ADR-0020 accepted with this retro |
+| 2 | Instruments first | Met — maps, survey, readout, bench phases |
+| 3 | Water runs downhill | Met — tested on many worlds (and water is never held by air, its shores hold it, rivers end at still water) |
+| 4 | Earth-like networks | **Mostly** — Hack 0.54–0.55, density by climate, lakes on ice-scoured ground met; closed basins ~29% against Earth's ~18% (the base terrain's enclosed interiors, carried); longest rivers 95–204 km against 40–70 (our continents are larger than the estimate assumed) |
+| 5 | Earth-like rivers | Met — width and depth from discharge, meanders on lowlands, straight torrents, deltas only at large mouths |
+| 6 | Valleys | **Partly** — valleys deepen downstream on the network (5 → 50 blocks by discharge) but larger rivers sit only 11–13 deep in the chunks; never judged on foot |
+| 7 | Every world, every size | Met — all 32 biomes in every legal size |
+| 8 | Near and far agree | **Mostly** — water at its own levels, no seam; distant large rivers drawn only where a sample lands in them |
+| 9 | Sound and fast | Met at version 4 (owner's benches, flow on and off, within noise of M13); **re-bench needed** — versions 5–8 added stage-1 profiles and per-column region checks, not yet benched |
+| 10 | Rivers differ | Met — every kind in every surveyed world; water drifts at its speed |
+| 11 | The owner's walk | Replaced by three flights (see above) |
+
+## Found along the way
+
+The owner's flights found what no test had: every one a case where
+stage 2 met ground the 128-block network could not see.
+
+- **Rivers on walls** (version 5): an 85-block wall under a waterfall's
+  pool. Levels came from cell centres; stage 2 built the ground up to hold
+  them. Reaches are now seated under their ground.
+- **Dikes, raised flats, straight shores, square salt pans, slots, causeways**
+  (versions 6–8): each a rule that shaped by the cell grid or raised ground
+  to fit water. Fixed by the same principle every time — water fits the
+  ground, never the reverse; regions are wavy discs, not squares; rivers end
+  where still water begins.
+- **Straight water lines between nodes 128 blocks apart cannot follow real
+  ground**: concave slopes became slots, convex ones causeways. The long
+  profile (8 points per reach, stored in stage 1) fixed it.
+- **Coasts by height alone** made inland sea-level lakes rocky coasts.
+- **Two bench runs measured an old build** (the world folder was still
+  version 3, which refuses newer generators); the real first M14 bench then
+  found a per-frame span cost (~0.4 ms) that a cache removed.
+
+## Known, carried forward
+
+- **Closed basins ~29%** of land (Earth ~18%) — M15's landforms reshape the
+  enclosed interiors.
+- **Valleys shallow for large rivers** in the chunks (11–13 blocks) — M15.
+- **Re-bench at version 8**; world creation time with profiles unmeasured.
+- **Large rivers as ribbons in the far LOD.**
+- **Reservoirs or finite water per body** — with the water simulation.
+- Still from M13: far-horizon pinholes, water absorbing with depth, seasons.
+
+## Lessons
+
+1. **Fit water to ground, never ground to water.** Every wall, dike and
+   causeway was ground raised to hold water a coarse level had put too high.
+2. **A coarse grid shows through as squares** wherever a rule reads it
+   directly. Distances from cells must be smooth and noisy.
+3. **The owner's eye is the test.** Thousands of passing columns did not see
+   what three flights did. Reproduce the exact view first, then probe the one
+   column, then write the test that fails — every fix here went that way.
+4. **Know which build made the numbers.** A bench is only evidence if the
+   generator version is in its header.
