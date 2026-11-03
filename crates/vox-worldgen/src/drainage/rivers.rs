@@ -76,6 +76,8 @@ pub(super) const REGION_WAVELENGTH: f32 = 128.0;
 /// per block.
 const BANK_FALL: f64 = 1.0;
 const ALLUVIUM_SLOPE: f64 = BANK_FALL;
+/// How near a sea cell's centre a column is coastal, cells.
+const COAST_REACH: f64 = 1.2;
 /// A salt flat's crust reaches this far above its cell's floor, blocks.
 const SALT_FLAT_RISE: i64 = 2;
 
@@ -183,6 +185,9 @@ const BRAID_SLOPES: (f32, f32) = (0.002, 0.03);
 const BRAIDED_FROM_M3S: f32 = 0.05;
 /// How much wider a braided river spreads than a single channel.
 const BRAIDED_SPREAD: f32 = 2.5;
+/// How far out from a braided river's middle its bars may reach, of its
+/// half-width.
+const BAR_ACROSS: f32 = 0.6;
 /// Braid noise below which a braided river's bed is a dry bar.
 const BRAID_BARS: f32 = -0.15;
 /// An arid stream smaller than this runs only after storms: a wadi.
@@ -402,7 +407,14 @@ impl DrainageMap {
                         RiverKind::Torrent => (Bed::Gravel, false),
                         // Gravel bars between the braids: the bed at the
                         // water's level, dry.
-                        RiverKind::Braided => (Bed::Gravel, warp(x, z, 32.0).0 < BRAID_BARS),
+                        // Bars only between the braids, never across the
+                        // whole river: water runs along both banks (bars
+                        // spanning it had cut it into pools, the owner's
+                        // walk).
+                        RiverKind::Braided => (
+                            Bed::Gravel,
+                            across < BAR_ACROSS && warp(x, z, 32.0).0 < BRAID_BARS,
+                        ),
                         RiverKind::Wadi => (Bed::Sand, false),
                         RiverKind::Meandering if reach.slope > 0.002 => (Bed::Sand, false),
                         RiverKind::Meandering => (Bed::Silt, false),
@@ -485,6 +497,35 @@ impl DrainageMap {
         let (dx, dz) = (x as f64 + 0.5 - cx, z as f64 + 0.5 - cz);
         let radius = size * (REGION_RADIUS + REGION_WOBBLE * wobble);
         ((dx * dx + dz * dz).sqrt() - radius).max(0.0)
+    }
+
+    /// Whether column `(x, z)`, of cell `(ci, cj)` (unwrapped), lies by the
+    /// sea: within COAST_REACH cells of a sea cell's centre. Coasts and sea
+    /// biomes are only here; land below sea level farther inland holds a
+    /// lake.
+    fn coastal(&self, (ci, cj): (i64, i64), (x, z): (i64, i64)) -> bool {
+        let size = self.cell_x.min(self.cell_z);
+        (-1..=1).any(|dj| {
+            (-1..=1).any(|di| {
+                let (i, j) = (ci + di, cj + dj);
+                if !self.sea_at(self.wrap(i, j)) {
+                    return false;
+                }
+                let (cx, cz) = (
+                    (i as f64 + 0.5) * self.cell_x,
+                    (j as f64 + 0.5) * self.cell_z,
+                );
+                let (dx, dz) = (x as f64 + 0.5 - cx, z as f64 + 0.5 - cz);
+                (dx * dx + dz * dz).sqrt() <= COAST_REACH * size
+            })
+        })
+    }
+
+    /// Whether column `(x, z)` (any lap) lies by the sea ([`Self::coastal`]).
+    pub fn is_coastal(&self, x: i64, z: i64) -> bool {
+        let ci = (x as f64 / self.cell_x).floor() as i64;
+        let cj = (z as f64 / self.cell_z).floor() as i64;
+        self.coastal((ci, cj), (x, z))
     }
 
     /// The highest lake whose region holds column `(x, z)`, of cell
@@ -605,6 +646,12 @@ impl DrainageMap {
     /// its cells or as far as it reaches into theirs neighbours', or below
     /// sea level by the sea.
     fn drowned(&self, (ci, cj): (i64, i64), (x, z): (i64, i64), h: i64, wobble: f64) -> bool {
+        // Ground below sea level is under water wherever it is — the sea's,
+        // or inland a lake at sea level (an inland pit, too small to be
+        // sea): a river had been carried across one on a causeway.
+        if h < 0 {
+            return true;
+        }
         for dj in -1..=1 {
             for di in -1..=1 {
                 let (i, j) = (ci + di, cj + dj);
@@ -718,6 +765,13 @@ impl DrainageMap {
             _ if self.salt_flat((ci, cj), (x, z), h, wobble) => Water {
                 level: h,
                 body: Body::SaltFlat,
+                near: None,
+            },
+            // Inland, water below sea level is a lake at sea level, not the
+            // sea (its shores had been classed as sea coast).
+            _ if h < 0 && !self.coastal((ci, cj), (x, z)) => Water {
+                level: 0,
+                body: Body::Lake,
                 near: None,
             },
             _ => Water::DRY,

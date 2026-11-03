@@ -181,7 +181,11 @@ pub enum DrainageSource {
 /// below its grade; fills cut before banks; lakes, fills and salt flats
 /// reach wavy discs about their cells, not squares; lake banks only where
 /// the lake reaches them; channels run on into lakes.
-pub const GENERATOR_VERSION: u32 = 7;
+/// 8 — the owner's third flight: sea and coast biomes only within ~150
+/// blocks of the sea, land below sea level farther inland a lake at sea
+/// level; rivers end at any ground below sea level; a braided river's bars
+/// only in its middle, never across it.
+pub const GENERATOR_VERSION: u32 = 8;
 
 impl Generator {
     /// A generator for one world: its seed and its size. The size is part of
@@ -440,6 +444,7 @@ impl Generator {
             sea_level_c,
             precip,
             self.elevation.boundary_noise(wx, wz),
+            self.drainage().is_coastal(wx, wz),
         );
         col.patch = self.elevation.patch_noise(wx, wz);
         col.water = water;
@@ -1496,6 +1501,37 @@ mod tests {
         );
     }
 
+    /// The sea is only by the sea (the owner's third flight, M14): a lake at
+    /// sea level in a hot desert, far from the coast, had a ring of "rocky
+    /// coast" stone round it, coast and sea being classed by height alone;
+    /// and an inland basin below sea level, which the sea's rule fills with
+    /// water, had a dry river carried across it on a causeway. At the
+    /// owner's two VIEWs: no coast or sea biome inland, and no ground below
+    /// sea level raised.
+    #[test]
+    fn the_sea_is_only_by_the_sea() {
+        let g = Generator::new(0x0007_E22A_C0DE, WorldShape::DEFAULT);
+        // The desert lake's shore, (−28 830, 22 030..22 090).
+        let shore: Vec<_> = (22_030..22_090)
+            .step_by(2)
+            .map(|z| (z, g.column(-28_830, z).biome))
+            .filter(|(_, b)| b.is_coast() || b.is_sea())
+            .collect();
+        assert!(shore.is_empty(), "coast or sea inland: {shore:?}");
+        // The inland basin the river crossed, (−43 950..−43 860, 26 260).
+        let raised: Vec<_> = (-43_950..-43_860)
+            .filter_map(|x| {
+                let nat = g.eroded_surface(x, 26_260).height;
+                let h = g.surface_height(x, 26_260);
+                (nat < 0 && h > nat).then_some((x, nat, h))
+            })
+            .collect();
+        assert!(
+            raised.is_empty(),
+            "ground below sea level raised: {raised:?}"
+        );
+    }
+
     /// A lake's surface is in the span streaming loads (M14): it can stand
     /// tens of blocks above its bed, in chunk layers above the ground's.
     #[test]
@@ -1711,7 +1747,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (7, 0xf17e_1940_53de_119f);
+        const PINNED: (u32, u64) = (8, 0x409a_bb6d_efe2_4f67);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),

@@ -281,11 +281,17 @@ pub fn aridity_threshold(t: f32) -> f32 {
 
 /// Classify a column from its surface, its climate-map values and its
 /// boundary noise (each in `[-1, 1]`).
-pub fn classify(surface: Surface, sea_level_c: f32, precip: f32, noise: (f32, f32)) -> Column {
+pub fn classify(
+    surface: Surface,
+    sea_level_c: f32,
+    precip: f32,
+    noise: (f32, f32),
+    coastal: bool,
+) -> Column {
     let sea_level_c = sea_level_c + TEMPERATURE_JITTER_C * noise.0;
     let precipitation = (precip * (1.0 + PRECIPITATION_JITTER * noise.1)).max(0.0);
     let temperature = temperature_at(sea_level_c, surface.height);
-    let biome = biome_of(surface, sea_level_c, temperature, precipitation);
+    let biome = biome_of(surface, sea_level_c, temperature, precipitation, coastal);
     Column {
         surface,
         temperature,
@@ -297,9 +303,11 @@ pub fn classify(surface: Surface, sea_level_c: f32, precip: f32, noise: (f32, f3
     }
 }
 
-fn biome_of(s: Surface, sea_c: f32, t: f32, p: f32) -> Biome {
+/// `coastal`: whether the sea is near (`DrainageMap::is_coastal`). Sea and
+/// coast are only there; low ground inland is land, or a lake's.
+fn biome_of(s: Surface, sea_c: f32, t: f32, p: f32, coastal: bool) -> Biome {
     let h = s.height;
-    if h <= 0 {
+    if h <= 0 && coastal {
         return if sea_c < SEA_ICE_BELOW_C {
             Biome::PolarSea
         } else if -h > DEEP_OCEAN_BELOW {
@@ -310,7 +318,7 @@ fn biome_of(s: Surface, sea_c: f32, t: f32, p: f32) -> Biome {
             Biome::TemperateSea
         };
     }
-    if h <= SHORE_HEIGHT && t >= ICE_SHEET_BELOW_C {
+    if h <= SHORE_HEIGHT && coastal && t >= ICE_SHEET_BELOW_C {
         return if s.relief >= ROCKY_SHORE_RELIEF {
             Biome::RockyCoast
         } else if sea_c < SHINGLE_BELOW_C || s.relief >= SHINGLE_RELIEF {
@@ -384,7 +392,7 @@ mod tests {
     }
 
     fn at(s: Surface, sea_c: f32, p: f32) -> Biome {
-        classify(s, sea_c, p, (0.0, 0.0)).biome
+        classify(s, sea_c, p, (0.0, 0.0), true).biome
     }
 
     /// Spot checks against Earth: a place with that climate classifies as

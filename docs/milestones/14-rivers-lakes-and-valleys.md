@@ -492,6 +492,21 @@ becomes an ADR; the simulation itself remains its own milestone.
        dead at the lake's edge; it runs on into the lake now.
      Test that fails on v6: `rivers_run_in_valleys_not_slots` (banks 28 over
      their water at the owner's view). Gallery `walk2-*`.
+   - [x] **The owner's third flight** (2026-11-03, 7 VIEW lines;
+     `GENERATOR_VERSION` 8), each reproduced headlessly first:
+     - "Funky stony beach" — an inland lake at sea level classed as coast
+       (coast and sea were by height alone): now only within ~150 blocks of
+       a sea cell; land below sea level farther inland holds a lake.
+     - "Still bridging" — a dry river on a causeway across an inland basin
+       below sea level: rivers now end at any ground below sea level.
+     - "Weird break" / "fully cut off" — a braided river's gravel bars
+       spanned it: now only in its middle 60%.
+     - Ice seen from below let the sky through, ruled in a grid — the LOD
+       drew only its top, and its border skirts hung into the water: now an
+       unlit underside, and skirts only the ice's thickness (vox-mesh test
+       `lod_ice_has_an_underside`).
+     - Green strips along badlands rivers: riparian floodplains, as intended.
+     Test that fails on v7: `the_sea_is_only_by_the_sea`. Gallery `walk3-*`.
 
 ## Non-goals
 

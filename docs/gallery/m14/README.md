@@ -41,3 +41,10 @@ milestone is kept here, with the commit it shows.
 | `walk2-bridge-v6-v7.jpg` | owner's second flight | The owner's "straight line bridge", (−51 830, −81 758): v6, a river on a causeway over a hollow; v7, the hollow is a pond |
 | `walk2-all-views-v7.jpg` | owner's second flight | All 13 of the owner's VIEW lines under v7, in order: snow ×2, falls, raised, bridge, salt lines, marsh ×2, bridge 2, steps, swamp, rivers merging, river into a lake |
 | `walk2-rivers-merging-v7.jpg` | owner's second flight | The owner's "really cool view of a bunch of rivers merging", (−37 919, −99 379), swamp, v7 |
+| `walk3-beach-v7-v8.jpg` | owner's third flight | "Funky stony beach", VIEW (−28 839, 22 141): a sea-level lake inland in a hot desert ringed with "rocky coast" stone (v7, left), coast being classed by height alone; v8, a sandy shore (coasts only within ~150 blocks of the sea) |
+| `walk3-bridge3-v7-v8.jpg` | owner's third flight | "Still doing this weird bridging", (−43 985, 26 337): a dry river on a causeway across an inland basin below sea level that the sea's rule floods (v7); v8, the river ends at the water, which is a lake |
+| `walk3-cutoff-v7-v8.jpg` | owner's third flight | "Fully cut off", (−52 712, 21 143): a braided river's gravel bars spanning it into pools (v7); v8, bars only in the middle, water along both banks |
+| `walk3-break-v7-v8.jpg` | owner's third flight | "Weird break in river", (−51 131, 24 946): the same bars (v7); v8 |
+| `walk3-ice-from-below-before-after.jpg` | owner's third flight | Distant ice seen from under a frozen lake, (−73 458, 26 453): v7 showed the sky through it, ruled by the LOD's border skirts; now an unlit underside and skirts only the ice's thickness (vox-mesh, no terrain change) |
+| `walk3-pretty-view.jpg` | owner's third flight | The owner's "just a pretty view", alpine rock and snow, (−39 061, 25 840) |
+| `walk3-riparian-strips-badlands.jpg` | owner's third flight | Green floodplain strips along rivers in badlands, (−42 432, 25 750): riparian corridors, as along desert rivers on Earth (the Nile, the Colorado) |

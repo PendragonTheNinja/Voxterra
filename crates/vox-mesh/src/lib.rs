@@ -3504,11 +3504,19 @@ pub fn mesh_lod_cells(
                     _ => (cx, cz - 1),
                 };
                 let inside = (0..n).contains(&nx) && (0..n).contains(&nz);
+                // Ice's skirt is only the ice: hung deeper, it showed from
+                // below as a lit grid across a frozen lake's underside (the
+                // owner's walk), and frozen water is level between nodes.
+                let skirt = if top_of(cx, cz) == vox_core::registry::ICE {
+                    1
+                } else {
+                    skirt_depth_blocks
+                };
                 let neighbour = if inside {
                     at(nx, nz) - origin_y
                 } else {
                     // Border: drop a skirt instead of assuming a height.
-                    h - skirt_depth_blocks
+                    h - skirt
                 };
                 // Where this wall's bottom edge ends up at full morph. Inside
                 // the node that is the neighbour's coarse height; on the border
@@ -3520,7 +3528,7 @@ pub fn mesh_lod_cells(
                 let coarse_neighbour = if inside {
                     coarse_at(nx, nz) - origin_y
                 } else {
-                    coarse_h - skirt_depth_blocks
+                    coarse_h - skirt
                 };
                 // Emit if the two cells differ at EITHER end of the morph.
                 //
@@ -3619,6 +3627,68 @@ pub fn mesh_lod_cells(
             wall.morph,
         );
     }
+    // Ice from below (the owner's walk, M14): a frozen lake or sea is ground
+    // whose top block is ice, and a top face cannot be seen from beneath —
+    // swimming under distant ice showed the sky straight through it, ruled
+    // by the cells' walls. Its underside, a block down, faces down, unlit by
+    // the sky, as full resolution's ice is from below. Runs along a row at
+    // one height merge, as the water's do.
+    let under_shade = face_brightness(1, false);
+    let ice_layer = layer_of(vox_core::registry::ICE, 3);
+    let w_cell = h_stride as f32;
+    let iced = |cx: i32, cz: i32| (top_of(cx, cz) == vox_core::registry::ICE).then(|| at(cx, cz));
+    for cz in 0..n {
+        let mut cx = 0;
+        while cx < n {
+            let Some(h) = iced(cx, cz) else {
+                cx += 1;
+                continue;
+            };
+            let run_start = cx;
+            while cx < n && iced(cx, cz) == Some(h) && still(cx, cz) == still(run_start, cz) {
+                cx += 1;
+            }
+            let bottom = (h - origin_y) as f32;
+            // It morphs with the top above it: a cell still at the next
+            // level stays put; a moving one follows its own coarse height.
+            let morph = |x: i32| (coarse_at(x, cz) - origin_y) as f32;
+            // A run of still cells shares one quad; a moving cell keeps its own.
+            if still(run_start, cz) {
+                emit_lod_rect(
+                    &mut mesh,
+                    [
+                        (run_start * h_stride) as f32,
+                        bottom,
+                        (cz * h_stride) as f32,
+                    ],
+                    axis_unit(0),
+                    axis_unit(2),
+                    (cx - run_start) as f32 * w_cell,
+                    w_cell,
+                    ice_layer,
+                    0.0,
+                    under_shade,
+                    [bottom; 4],
+                );
+            } else {
+                for x in run_start..cx {
+                    emit_lod_rect(
+                        &mut mesh,
+                        [(x * h_stride) as f32, bottom, (cz * h_stride) as f32],
+                        axis_unit(0),
+                        axis_unit(2),
+                        w_cell,
+                        w_cell,
+                        ice_layer,
+                        0.0,
+                        under_shade,
+                        [morph(x); 4],
+                    );
+                }
+            }
+        }
+    }
+
     // The water surface (ADR-0011 decision 1c; M14 for rivers and lakes): a
     // translucent quad at each cell's water level over every cell with water
     // standing on it, after all the ground, so it lands in the transparent
@@ -3697,6 +3767,56 @@ mod heightfield_tests {
     /// Rivers and lakes far off (M14): water stands at each cell's own
     /// level, over its own cells only, and runs at different levels are
     /// separate surfaces.
+    /// Ice can be seen from below (the owner's walk, M14): under a distant
+    /// frozen lake the sky showed straight through the ice, ruled by its
+    /// cells' walls, since the LOD drew only its top. Its underside faces
+    /// down a block below that top, unlit by the sky, over every ice cell.
+    #[test]
+    fn lod_ice_has_an_underside() {
+        let n = LOD_CELLS;
+        let mut heights = flat(50);
+        let mut tops = vec![vox_core::registry::GRASS; n * n];
+        for z in 4..8 {
+            for x in 2..30 {
+                heights[z * n + x] = 30;
+                tops[z * n + x] = vox_core::registry::ICE;
+            }
+        }
+        let water = vec![LOD_DRY; n * n];
+        let mesh = mesh_lod_cells(
+            LodCells {
+                heights: &heights,
+                tops: &tops,
+                water: &water,
+            },
+            4,
+            0,
+            |_, _| 0,
+            4,
+            true,
+        );
+        let opaque = &mesh.indices[..mesh.opaque_index_count as usize];
+        let mut under = 0.0;
+        for tri in opaque.chunks_exact(3) {
+            let [a, b, c] = [0, 1, 2].map(|k| mesh.vertices[tri[k] as usize].position);
+            let (u, v) = (
+                [b[0] - a[0], b[1] - a[1], b[2] - a[2]],
+                [c[0] - a[0], c[1] - a[1], c[2] - a[2]],
+            );
+            let ny = u[2] * v[0] - u[0] * v[2];
+            if ny < 0.0 && a[1] == b[1] && b[1] == c[1] {
+                assert_eq!(a[1], 30.0, "the underside at the ice's bottom");
+                assert!(
+                    tri.iter().all(|&k| mesh.vertices[k as usize].sky == 0.0),
+                    "the underside is unlit by the sky"
+                );
+                under += ny.abs() / 2.0;
+            }
+        }
+        let area = (4 * 28 * 4 * 4) as f32;
+        assert_eq!(under, area, "the underside covers the ice, once");
+    }
+
     #[test]
     fn lod_water_stands_at_each_cells_level() {
         let n = LOD_CELLS;

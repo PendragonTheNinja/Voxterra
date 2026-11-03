@@ -193,6 +193,15 @@ it; a river's banks keep a lake's rim; under a lake its channel runs on
 (bed and sides cut, nothing built). Wetland pools count water as high as
 ground beside them. Drainage cache format 4.
 
+### 11. Sea only by the sea (v8, the owner's third flight)
+
+Sea and coast biomes need a sea cell within 1.2 cells (`DrainageMap::
+is_coastal`); land below sea level farther inland — an inland pit, too
+small to be sea, which the sea's fill rule floods — is a lake at level 0,
+and river shaping ends at any ground below sea level, as under a lake. A
+braided river's bars stay within 0.6 of its half-width of its middle. The
+LOD gives ice an unlit underside and only an ice-thick border skirt.
+
 ## Consequences
 
 - `ground` costs ~2× the eroded surface per column (~0.6 against ~0.3 µs in
