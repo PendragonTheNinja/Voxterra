@@ -94,3 +94,96 @@ ice sheets; opaque and solid, unlike water), **gravel**, **red sand**,
 **sandstone**, **red sandstone** and two or three **banded badlands rock**
 colours, **coarse dirt**, **podzol**, **clay**, **mud**. Around twelve — palette
 storage makes them free in memory (CLAUDE.md).
+
+## As built (M13, 2026-11-01)
+
+How the catalogue is generated (`vox_worldgen::biome`, `vox_worldgen::materials`;
+ADRs 0017 and 0018). Climate is the annual mean — there are no seasons.
+
+**Classification, in order:** sea by depth and sea temperature; land within
+3 blocks of sea level is shore; mountains (uplift a real share of the height)
+are rock and snow below −5 °C and alpine meadow below +1 °C — unless colder
+than −14 °C, where ice sheet covers them, as in Antarctica; then ice sheet
+(< −14 °C), tundra (< −5 °C); dry land by Köppen's threshold (`20·T + 140`
+mm: desert under half of it, steppe under all of it; badlands where also
+warm, rough and desert-dry); boreal forest (< 3 °C); tropical (≥ 20 °C:
+rainforest from 2 000 mm, dry forest from 1 200, else savanna); Mediterranean
+(≥ 14 °C and humid by less than 1.3× the threshold); temperate rainforest
+(< 16 °C and at least 4× the threshold, never under 1 300 mm); temperate
+forest. Boundaries wander with noise at 1 400, 350 and 24 blocks.
+
+**Ground, top down** (stone beneath; no profile deeper than 12 blocks):
+
+| Biome | Ground |
+|---|---|
+| Tropical rainforest | grass, dirt 3, clay 3 |
+| Tropical dry forest | grass, dirt 3 |
+| Savanna | grass (coarse-dirt patches), coarse dirt 3 |
+| Hot desert | sand 4, sandstone 6; where rough, bare sandstone with sand in hollows (hamada) |
+| Hot steppe | grass with sand and coarse-dirt patches, dirt 3 |
+| Mediterranean scrub | grass with coarse-dirt patches, coarse dirt 2 |
+| Temperate grassland | grass, dirt 5 |
+| Cold desert | gravel with sand patches, gravel 2 |
+| Temperate forest | grass, dirt 3 |
+| Temperate rainforest | grass, dirt 4 |
+| Boreal forest | podzol (grass patches), dirt 3 |
+| Tundra | grass with gravel patches, dirt 1 |
+| Ice sheet | snow 3, ice to the profile's end |
+| Alpine meadow | grass with stone outcrops, dirt 1 |
+| Alpine rock and snow | snow (well below the snowline, or in patches), stone, scree |
+| Badlands | red sand 2, then horizontal strata of four banded rocks |
+| Sand beach | sand 4, sandstone 3 |
+| Shingle beach (cold or rough shores) | gravel 3 |
+| Rocky coast | stone (gravel patches) |
+| Warm shallow sea | seabed sand 3, sandstone 3 |
+| Temperate sea | seabed sand or gravel 3 |
+| Polar sea | seabed gravel 2; **ice on the sea surface** |
+| Deep ocean | seabed mud 1, clay 3 |
+
+**Grass colour** follows climate rather than the biome's name — deep green
+where hot and wet, yellowed where hot and dry, fresh green where mild and
+wet, olive and brown toward the cold — so it shifts smoothly across a
+boundary, near and far alike (ADR-0018).
+
+
+## Water biomes (approved 2026-11-01, built in M14)
+
+Hydrology (M14) makes the biomes deferred above possible. Each comes from the
+drainage network, not from climate alone.
+
+| # | Biome | Where | Earth analogues | Ground |
+|---|---|---|---|---|
+| 24 | River | the channel | Amazon, Rhine, Thames | river gravel and sand; silt in slow lowland rivers |
+| 25 | Freshwater lake | basins that fill and overflow | Great Lakes, Baikal, alpine tarns | silt, gravel at the shore |
+| 26 | Salt lake / salt flat | closed basins in dry climates | Great Salt Lake, Salar de Uyuni, Lop Nur | salt crust over silt |
+| 27 | Floodplain | flat ground beside lowland rivers | the Nile valley, Mississippi bottomlands | silt over river gravel |
+| 28 | Marsh | flat, waterlogged, open, warm or temperate | the Camargue, the Everglades' sawgrass | mud, shallow water |
+| 29 | Swamp | flat, waterlogged, wooded, warm | the Atchafalaya, the Pantanal | mud, shallow water |
+| 30 | Bog / fen | flat, waterlogged, cold | Hudson Bay lowlands, Irish bogs | peat |
+| 31 | Delta | large river mouths on gentle coasts | Nile, Mississippi, Ganges; Okavango inland | mud and sand, distributary channels |
+| 32 | Mangrove coast | tropical delta and estuary shores | the Sundarbans | mud (mangroves with vegetation) |
+
+New blocks: **silt**, **peat**, **salt**, **river gravel**.
+
+## Water biomes as built (M14 task 4)
+
+Classified from the drainage network over the climate biome the column
+would otherwise have (`biome::water_biome`), each from the water the column
+holds or the river nearest it (`Generator::ground`, ADRs 0019–0020):
+
+| Biome | When | Ground, top down |
+|---|---|---|
+| River | in a channel | bed of river gravel (steep, slope > 0.02), sand, or silt (slow, < 0.004), 2; gravel |
+| Freshwater lake | under a lake (frozen at its surface below −2 °C) | silt 2, clay 3 |
+| Salt lake / salt flat | a closed basin's lake or dry floor | salt 1, silt 3 |
+| Floodplain | (oxbow lakes on those of rivers 6+ blocks wide: crescents of lake, 2 deep) flat ground within 4 widths (≥ 16 blocks) of a river whose slope is under 0.003, up to 3 blocks above it, where it is not wet: flattened a block above the river | grass, silt 3, river gravel 2 |
+| Marsh | the same ground where precipitation ≥ potential evaporation: waterlogged at the river's level, with shallow pools (patch noise) | grass and mud patches, mud 3; pools floored with mud |
+| Swamp | a wetland at 18 °C or warmer | mud, grass patches, mud 3 |
+| Bog | a wetland below 3 °C | peat (grass patches), peat 3; pools floored with peat |
+| Delta | low ground (within 3 of sea level) at the mouth of a river large for its world (0.5 m³/s at the default size, less in proportion to area in smaller worlds): flats a block above the sea, sea in their pools and in distributary channels winding across them | sand and mud, silt 3 |
+| Mangrove coast | a delta on a sea of 20 °C or warmer | mud 3, silt 2 |
+
+New block: **peat** (with silt, salt and river gravel from task 3). Every
+biome, all 32, appears in every legal world size
+(`every_biome_in_every_world`); the survey finds deltas and mangroves by
+looking at the 400 largest river mouths, as they are narrower than any grid.

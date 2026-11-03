@@ -3263,18 +3263,97 @@ pub fn mesh_lod_heightfield_with(
     heights: &[i32],
     h_stride: i32,
     origin_y: i32,
+    layer_of: impl FnMut(BlockId, usize) -> u32,
+    skirt_depth_blocks: i32,
+    merge_flat: bool,
+) -> LodMeshData {
+    let grass = [vox_core::registry::GRASS; LOD_CELLS * LOD_CELLS];
+    mesh_lod_surface(
+        heights,
+        &grass,
+        h_stride,
+        origin_y,
+        layer_of,
+        skirt_depth_blocks,
+        merge_flat,
+    )
+}
+
+/// A cell with no standing water, in [`LodCells::water`].
+pub const LOD_DRY: i32 = i32::MIN;
+
+/// The 32×32 cells of an LOD node: each one's ground height, top block, and
+/// the top block of the water standing on it ([`LOD_DRY`] for none).
+#[derive(Clone, Copy)]
+pub struct LodCells<'a> {
+    pub heights: &'a [i32],
+    pub tops: &'a [BlockId],
+    pub water: &'a [i32],
+}
+
+/// The sea's water for a heightfield: sea level over every cell below it.
+pub fn lod_sea(heights: &[i32]) -> Vec<i32> {
+    let sea = vox_core::SEA_LEVEL_BLOCKS as i32;
+    heights
+        .iter()
+        .map(|&h| if h < sea { sea } else { LOD_DRY })
+        .collect()
+}
+
+/// [`mesh_lod_cells`] with the sea as the only water (M13's form).
+pub fn mesh_lod_surface(
+    heights: &[i32],
+    tops: &[BlockId],
+    h_stride: i32,
+    origin_y: i32,
+    layer_of: impl FnMut(BlockId, usize) -> u32,
+    skirt_depth_blocks: i32,
+    merge_flat: bool,
+) -> LodMeshData {
+    let water = lod_sea(heights);
+    mesh_lod_cells(
+        LodCells {
+            heights,
+            tops,
+            water: &water,
+        },
+        h_stride,
+        origin_y,
+        layer_of,
+        skirt_depth_blocks,
+        merge_flat,
+    )
+}
+
+/// The LOD mesh of a node's cells (M13, M14): a cell's top and the walls it
+/// stands on take its top block's faces, so a distant desert reads as sand
+/// and an ice cap as snow, as they do up close; flat cells merge only with
+/// cells of the same block. Then the water: a translucent surface at each
+/// cell's own water level — the sea's, a lake's, a river's — over every
+/// cell with water standing on it.
+pub fn mesh_lod_cells(
+    cells: LodCells,
+    h_stride: i32,
+    origin_y: i32,
     mut layer_of: impl FnMut(BlockId, usize) -> u32,
     skirt_depth_blocks: i32,
     merge_flat: bool,
 ) -> LodMeshData {
+    let LodCells {
+        heights,
+        tops,
+        water,
+    } = cells;
+    assert_eq!(water.len(), heights.len(), "a water level per cell");
     assert_eq!(
         heights.len(),
         LOD_CELLS * LOD_CELLS,
         "heightfield must be 32x32"
     );
+    assert_eq!(tops.len(), heights.len(), "a top block per cell");
     let n = LOD_CELLS as i32;
     let mut mesh = LodMeshData::default();
-    let grass = vox_core::registry::GRASS;
+    let top_of = |cx: i32, cz: i32| tops[(cz * n + cx) as usize];
 
     // Distant LOD is sky-lit surface only. Day/night dims it through the same
     // `sky_scale` uniform as the near field.
@@ -3327,10 +3406,13 @@ pub fn mesh_lod_heightfield_with(
                 continue;
             }
             let h = at(cx, cz);
+            let block = top_of(cx, cz);
             // Cells along x, then whole rows along z.
             let (mut wx, mut wz) = (1, 1);
             if merge_flat && still(cx, cz) {
-                let joins = |x: i32, z: i32| !covered[idx(x, z)] && still(x, z) && at(x, z) == h;
+                let joins = |x: i32, z: i32| {
+                    !covered[idx(x, z)] && still(x, z) && at(x, z) == h && top_of(x, z) == block
+                };
                 while cx + wx < n && joins(cx + wx, cz) {
                     wx += 1;
                 }
@@ -3344,7 +3426,7 @@ pub fn mesh_lod_heightfield_with(
                 }
             }
             let top = (h - origin_y + 1) as f32;
-            let layer = layer_of(grass, 2);
+            let layer = layer_of(block, 2);
             let s = h_stride as f32;
             // A fan costs one triangle per cell of border; one quad per cell
             // costs one per cell of area. Whichever is fewer — and both are
@@ -3422,11 +3504,19 @@ pub fn mesh_lod_heightfield_with(
                     _ => (cx, cz - 1),
                 };
                 let inside = (0..n).contains(&nx) && (0..n).contains(&nz);
+                // Ice's skirt is only the ice: hung deeper, it showed from
+                // below as a lit grid across a frozen lake's underside (the
+                // owner's walk), and frozen water is level between nodes.
+                let skirt = if top_of(cx, cz) == vox_core::registry::ICE {
+                    1
+                } else {
+                    skirt_depth_blocks
+                };
                 let neighbour = if inside {
                     at(nx, nz) - origin_y
                 } else {
                     // Border: drop a skirt instead of assuming a height.
-                    h - skirt_depth_blocks
+                    h - skirt
                 };
                 // Where this wall's bottom edge ends up at full morph. Inside
                 // the node that is the neighbour's coarse height; on the border
@@ -3438,7 +3528,7 @@ pub fn mesh_lod_heightfield_with(
                 let coarse_neighbour = if inside {
                     coarse_at(nx, nz) - origin_y
                 } else {
-                    coarse_h - skirt_depth_blocks
+                    coarse_h - skirt
                 };
                 // Emit if the two cells differ at EITHER end of the morph.
                 //
@@ -3462,7 +3552,7 @@ pub fn mesh_lod_heightfield_with(
                 let (bottom, top) = (neighbour.min(h) + 1, h + 1);
                 let wall_bottom = bottom as f32;
                 let shade = face_brightness(axis, positive);
-                let layer = layer_of(grass, face_index);
+                let layer = layer_of(top_of(cx, cz), face_index);
                 let plane = if positive { w } else { 0.0 };
                 // Winding follows FACE_DIRS so back-face culling keeps these.
                 // `u_vertical` records which of the two quad axes runs UP, so
@@ -3537,27 +3627,92 @@ pub fn mesh_lod_heightfield_with(
             wall.morph,
         );
     }
-    // The sea surface (ADR-0011 decision 1c): a translucent quad at sea level
-    // over every cell whose ground is below it, after all the ground, so it
-    // lands in the transparent index range. Coplanar, so runs along a row
-    // merge into one quad — an open-ocean node is 32 quads, not 1 024. It
-    // never rises above what full resolution shows: a cell's ground is the
-    // MINIMUM of its columns, so over a column of land the sea surface is at
-    // or below that land's top.
-    mesh.opaque_index_count = mesh.indices.len() as u32;
-    let sea = vox_core::SEA_LEVEL_BLOCKS as i32;
-    let sea_top = (sea + 1 - origin_y) as f32;
-    let water_layer = layer_of(vox_core::registry::WATER, 2);
-    let w = h_stride as f32;
+    // Ice from below (the owner's walk, M14): a frozen lake or sea is ground
+    // whose top block is ice, and a top face cannot be seen from beneath —
+    // swimming under distant ice showed the sky straight through it, ruled
+    // by the cells' walls. Its underside, a block down, faces down, unlit by
+    // the sky, as full resolution's ice is from below. Runs along a row at
+    // one height merge, as the water's do.
+    let under_shade = face_brightness(1, false);
+    let ice_layer = layer_of(vox_core::registry::ICE, 3);
+    let w_cell = h_stride as f32;
+    let iced = |cx: i32, cz: i32| (top_of(cx, cz) == vox_core::registry::ICE).then(|| at(cx, cz));
     for cz in 0..n {
         let mut cx = 0;
         while cx < n {
-            if at(cx, cz) >= sea {
+            let Some(h) = iced(cx, cz) else {
                 cx += 1;
                 continue;
-            }
+            };
             let run_start = cx;
-            while cx < n && at(cx, cz) < sea {
+            while cx < n && iced(cx, cz) == Some(h) && still(cx, cz) == still(run_start, cz) {
+                cx += 1;
+            }
+            let bottom = (h - origin_y) as f32;
+            // It morphs with the top above it: a cell still at the next
+            // level stays put; a moving one follows its own coarse height.
+            let morph = |x: i32| (coarse_at(x, cz) - origin_y) as f32;
+            // A run of still cells shares one quad; a moving cell keeps its own.
+            if still(run_start, cz) {
+                emit_lod_rect(
+                    &mut mesh,
+                    [
+                        (run_start * h_stride) as f32,
+                        bottom,
+                        (cz * h_stride) as f32,
+                    ],
+                    axis_unit(0),
+                    axis_unit(2),
+                    (cx - run_start) as f32 * w_cell,
+                    w_cell,
+                    ice_layer,
+                    0.0,
+                    under_shade,
+                    [bottom; 4],
+                );
+            } else {
+                for x in run_start..cx {
+                    emit_lod_rect(
+                        &mut mesh,
+                        [(x * h_stride) as f32, bottom, (cz * h_stride) as f32],
+                        axis_unit(0),
+                        axis_unit(2),
+                        w_cell,
+                        w_cell,
+                        ice_layer,
+                        0.0,
+                        under_shade,
+                        [morph(x); 4],
+                    );
+                }
+            }
+        }
+    }
+
+    // The water surface (ADR-0011 decision 1c; M14 for rivers and lakes): a
+    // translucent quad at each cell's water level over every cell with water
+    // standing on it, after all the ground, so it lands in the transparent
+    // index range. Runs along a row at one level merge into one quad — an
+    // open-ocean node is 32 quads, not 1 024. It never rises above what full
+    // resolution shows: a cell's ground is the MINIMUM of its columns, and
+    // its water is the water standing on that lowest column.
+    mesh.opaque_index_count = mesh.indices.len() as u32;
+    let water_layer = layer_of(vox_core::registry::WATER, 2);
+    let w = h_stride as f32;
+    let wet = |cx: i32, cz: i32| {
+        let level = water[(cz * n + cx) as usize];
+        (level != LOD_DRY && level > at(cx, cz)).then_some(level)
+    };
+    for cz in 0..n {
+        let mut cx = 0;
+        while cx < n {
+            let Some(level) = wet(cx, cz) else {
+                cx += 1;
+                continue;
+            };
+            let sea_top = (level + 1 - origin_y) as f32;
+            let run_start = cx;
+            while cx < n && wet(cx, cz) == Some(level) {
                 cx += 1;
             }
             emit_lod_rect(
@@ -3608,6 +3763,104 @@ mod heightfield_tests {
     }
 
     // ---- Distant water (ADR-0011 decision 1c) ----
+
+    /// Rivers and lakes far off (M14): water stands at each cell's own
+    /// level, over its own cells only, and runs at different levels are
+    /// separate surfaces.
+    /// Ice can be seen from below (the owner's walk, M14): under a distant
+    /// frozen lake the sky showed straight through the ice, ruled by its
+    /// cells' walls, since the LOD drew only its top. Its underside faces
+    /// down a block below that top, unlit by the sky, over every ice cell.
+    #[test]
+    fn lod_ice_has_an_underside() {
+        let n = LOD_CELLS;
+        let mut heights = flat(50);
+        let mut tops = vec![vox_core::registry::GRASS; n * n];
+        for z in 4..8 {
+            for x in 2..30 {
+                heights[z * n + x] = 30;
+                tops[z * n + x] = vox_core::registry::ICE;
+            }
+        }
+        let water = vec![LOD_DRY; n * n];
+        let mesh = mesh_lod_cells(
+            LodCells {
+                heights: &heights,
+                tops: &tops,
+                water: &water,
+            },
+            4,
+            0,
+            |_, _| 0,
+            4,
+            true,
+        );
+        let opaque = &mesh.indices[..mesh.opaque_index_count as usize];
+        let mut under = 0.0;
+        for tri in opaque.chunks_exact(3) {
+            let [a, b, c] = [0, 1, 2].map(|k| mesh.vertices[tri[k] as usize].position);
+            let (u, v) = (
+                [b[0] - a[0], b[1] - a[1], b[2] - a[2]],
+                [c[0] - a[0], c[1] - a[1], c[2] - a[2]],
+            );
+            let ny = u[2] * v[0] - u[0] * v[2];
+            if ny < 0.0 && a[1] == b[1] && b[1] == c[1] {
+                assert_eq!(a[1], 30.0, "the underside at the ice's bottom");
+                assert!(
+                    tri.iter().all(|&k| mesh.vertices[k as usize].sky == 0.0),
+                    "the underside is unlit by the sky"
+                );
+                under += ny.abs() / 2.0;
+            }
+        }
+        let area = (4 * 28 * 4 * 4) as f32;
+        assert_eq!(under, area, "the underside covers the ice, once");
+    }
+
+    #[test]
+    fn lod_water_stands_at_each_cells_level() {
+        let n = LOD_CELLS;
+        let mut heights = flat(50);
+        let mut water = vec![LOD_DRY; n * n];
+        // A lake at 40 over ground at 30 in rows 0..4, a river at 20 over
+        // ground at 15 in row 10, dry land elsewhere.
+        for z in 0..4 {
+            for x in 0..n {
+                heights[z * n + x] = 30;
+                water[z * n + x] = 40;
+            }
+        }
+        for x in 0..n {
+            heights[10 * n + x] = 15;
+            water[10 * n + x] = 20;
+        }
+        let tops = vec![vox_core::registry::GRASS; n * n];
+        let mesh = mesh_lod_cells(
+            LodCells {
+                heights: &heights,
+                tops: &tops,
+                water: &water,
+            },
+            4,
+            0,
+            |_, _| 0,
+            4,
+            true,
+        );
+        let (_, wet) = lod_ranges(&mesh);
+        let mut levels: Vec<i32> = wet.iter().map(|v| v.position[1] as i32).collect();
+        levels.sort_unstable();
+        levels.dedup();
+        assert_eq!(levels, vec![21, 41], "water tops at level + 1");
+        for v in &wet {
+            let row = (v.position[2] / 4.0) as usize;
+            let level = v.position[1] as i32;
+            assert!(
+                (level == 41 && row <= 4) || (level == 21 && (10..=11).contains(&row)),
+                "water at {level} in row {row}"
+            );
+        }
+    }
 
     /// Distinct layers so a test can tell sea from land by texture.
     fn sea_or_land(b: BlockId, _face: usize) -> u32 {
@@ -3714,6 +3967,63 @@ mod heightfield_tests {
             1 + 4 * LOD_CELLS + 4 * 4 * LOD_CELLS,
             "fan vertices are shared"
         );
+    }
+
+    // ---- Per-cell top blocks (M13 task 4) ----
+
+    /// A flat field half sand, half grass: every cell's top is its own
+    /// block's top layer — merging joins flat cells of one block only, so no
+    /// merged rectangle or fan spans the boundary.
+    #[test]
+    fn lod_tops_keep_each_cells_block_across_merging() {
+        use vox_core::registry::{GRASS, SAND};
+        let n = LOD_CELLS as i32;
+        let tops: Vec<BlockId> = (0..n * n)
+            .map(|i| if (i % n) < 13 { SAND } else { GRASS })
+            .collect();
+        let layer = |b: BlockId, face: usize| u32::from(b.0) * 6 + face as u32;
+        let mesh = mesh_lod_surface(&flat(30), &tops, 4, 0, layer, 4, true);
+        let tri: Vec<[LodVertex; 3]> = mesh
+            .opaque_indices()
+            .chunks_exact(3)
+            .map(|t| [0, 1, 2].map(|k| mesh.vertices[t[k] as usize]))
+            .filter(|t| t[0].layer % 6 == 2)
+            .collect();
+        for cz in 0..n {
+            for cx in 0..n {
+                let (px, pz) = ((cx as f32 + 0.37) * 4.0, (cz as f32 + 0.61) * 4.0);
+                let under: Vec<_> = tri.iter().filter(|t| contains_xz(t, px, pz)).collect();
+                assert_eq!(under.len(), 1, "cell ({cx},{cz})");
+                let want = layer(tops[(cz * n + cx) as usize], 2);
+                assert_eq!(under[0][0].layer, want, "cell ({cx},{cz})");
+            }
+        }
+    }
+
+    /// A wall belongs to the cell standing above it: a sand mesa's cliff is
+    /// sand, not the grass below.
+    #[test]
+    fn lod_walls_take_the_higher_cells_block() {
+        use vox_core::registry::{GRASS, SAND};
+        let n = LOD_CELLS as i32;
+        let mut heights = flat(10);
+        let mut tops = vec![GRASS; LOD_CELLS * LOD_CELLS];
+        for cz in 10..20 {
+            for cx in 10..20 {
+                heights[(cz * n + cx) as usize] = 40;
+                tops[(cz * n + cx) as usize] = SAND;
+            }
+        }
+        let layer = |b: BlockId, face: usize| u32::from(b.0) * 6 + face as u32;
+        let mesh = mesh_lod_surface(&heights, &tops, 4, 0, layer, 4, true);
+        // Wall vertices above the low ground's top are the mesa's.
+        let walls: Vec<&LodVertex> = mesh
+            .vertices
+            .iter()
+            .filter(|v| v.layer % 6 != 2 && v.position[1] > 11.5)
+            .collect();
+        assert!(!walls.is_empty());
+        assert!(walls.iter().all(|v| v.layer / 6 == u32::from(SAND.0)));
     }
 
     // ---- Triangles submitted vs drawn (M12 task 0) ----

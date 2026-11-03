@@ -46,13 +46,13 @@ use crate::elevation::Elevation;
 /// Temperature drop per block of altitude, °C. Earth's is 0.0065.
 ///
 /// Tuned to the snowline targets in M13 criterion 4 with [`SNOW_LINE_C`]:
-/// permanent snow above ~940 blocks at the equator, ~470 at 45°, ~110 at
+/// permanent snow above ~1 000 blocks at the equator, ~530 at 45°, ~170 at
 /// 60°, sea level near the poles. Land's median height is ~75 blocks (2.4 °C
 /// below the coast) and 90% of land is under ~200–330.
 pub const LAPSE_PER_BLOCK: f32 = 0.032;
 
 /// Mean annual temperature at or below which snow lies all year, °C.
-pub const SNOW_LINE_C: f32 = -3.0;
+pub const SNOW_LINE_C: f32 = -5.0;
 
 /// Target size of a climate cell, in blocks; the grid has between
 /// [`MIN_CELLS`] and [`MAX_CELLS`] cells per axis. Climate belts scale with
@@ -71,7 +71,7 @@ const CELL_SAMPLES: i64 = 3;
 /// rain reaches thousands of kilometres inland (the Amazon); our continents
 /// are ~60× smaller, so ~30 km here — deserts come mostly from sinking air
 /// ([`vertical_motion`]) and rain shadows, as Earth's do, not from distance.
-const DRYING_LENGTH: f32 = 35_000.0;
+const DRYING_LENGTH: f32 = 30_000.0;
 /// Sideways mixing of moisture between neighbouring rows, per cell of
 /// travel (0..0.5). Winds are not single lines: without it each peak dries a
 /// one-cell streak all the way downwind.
@@ -126,6 +126,33 @@ pub fn temperature_at(sea_level_c: f32, height: i64) -> f32 {
     sea_level_c - LAPSE_PER_BLOCK * height.max(0) as f32
 }
 
+/// Potential evaporation (mm/yr) at a mean annual temperature: what open
+/// water or a well-watered field would lose. Linear through Earth's annual
+/// values — ~0 at −6 °C (the tundra and ice sheets lose almost nothing,
+/// which is why a polar desert still runs with meltwater), ~720 mm at
+/// 10 °C (western Europe), ~1 400 at 25 °C (the tropics, the Sahel). Used
+/// by the water balance (M14), not by biome classification, which keeps
+/// Köppen's own threshold.
+pub fn potential_evaporation(temp_c: f32) -> f32 {
+    (45.0 * (temp_c + 6.0)).max(0.0)
+}
+
+/// Runoff (mm/yr): what precipitation `precip` leaves after the land's
+/// actual evaporation, by the Budyko curve in Pike's (1964) form,
+/// `AET = P / √(1 + (P/PET)²)` — evaporation approaches what falls where
+/// it is dry and what could evaporate where it is wet. About a third of the
+/// rain runs off in western Europe, almost none in a desert, nearly all of
+/// it on the ice. A square root is exact on every machine.
+pub fn runoff(temp_c: f32, precip: f32) -> f32 {
+    let pet = potential_evaporation(temp_c);
+    if pet <= 0.0 || precip <= 0.0 {
+        return precip.max(0.0);
+    }
+    let ratio = precip / pet;
+    let actual = precip / (1.0 + ratio * ratio).sqrt();
+    (precip - actual).max(0.0)
+}
+
 /// How much moisture air at `temp_c` can carry, as the precipitation it
 /// would give (mm/yr). Over the open sea air carries this much.
 fn moisture_capacity(temp_c: f32) -> f32 {
@@ -140,9 +167,9 @@ fn vertical_motion(abs_s: f32) -> f32 {
     const STOPS: [(f32, f32); 11] = [
         (0.000, 1.60),
         (0.139, 1.50),
-        (0.259, 0.90),
-        (0.375, 0.40),
-        (0.500, 0.40),
+        (0.259, 0.75),
+        (0.375, 0.25),
+        (0.500, 0.28),
         (0.616, 0.85),
         (0.707, 1.25),
         (0.819, 1.25),
@@ -161,9 +188,24 @@ fn eastward_share(abs_s: f32) -> f32 {
     smoothstep(0.423, 0.574, abs_s) * (1.0 - smoothstep(0.819, 0.906, abs_s))
 }
 
-/// Cooling of a continental interior after `fetch` blocks of land upwind.
-fn continental_cooling(abs_s: f32, fetch: f32) -> f32 {
-    CONTINENTAL_COOLING_C * smoothstep(0.3, 0.9, abs_s) * (1.0 - exp(-fetch / CONTINENTAL_LENGTH))
+/// How much faster air dries over land in the subtropics (15–30°), as a
+/// multiplier: under the subtropical highs hot interiors take the moisture
+/// out of incoming air within a few hundred kilometres — the Sahara is dry
+/// well inland of both its coasts, not just where no rain falls.
+fn subtropical_drying(abs_s: f32) -> f32 {
+    // sin 15° = 0.259, sin 22° = 0.375, sin 30° = 0.5, sin 38° = 0.616.
+    1.0 + SUBTROPICAL_DRYING
+        * smoothstep(0.259, 0.375, abs_s)
+        * (1.0 - smoothstep(0.5, 0.616, abs_s))
+}
+const SUBTROPICAL_DRYING: f32 = 3.0;
+
+/// Cooling of a continental interior after `fetch` blocks of land upwind,
+/// in a world whose continents are `scale` times the default's.
+fn continental_cooling(abs_s: f32, fetch: f32, scale: f32) -> f32 {
+    CONTINENTAL_COOLING_C
+        * smoothstep(0.3, 0.9, abs_s)
+        * (1.0 - exp(-fetch / (CONTINENTAL_LENGTH * scale)))
 }
 
 /// The planet's climate on a coarse grid (stage 1).
@@ -185,10 +227,25 @@ pub struct ClimateMap {
 struct Grid<'a> {
     nx: usize,
     nz: usize,
+    /// [`Elevation::continent_scale`]: distances measured "into a
+    /// continent" shrink with the continents in small worlds, or no small
+    /// world would have a dry interior (`docs/vision.md` §1.1).
+    continents: f32,
     cell: f32,
     abs_s: &'a [f32],
     elev: &'a [f32],
     land: &'a [f32],
+}
+
+/// Its size, not its 640 000 cells.
+impl std::fmt::Debug for ClimateMap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ClimateMap({}×{} cells of {:.0} blocks)",
+            self.nx, self.nz, self.cell_x
+        )
+    }
 }
 
 impl ClimateMap {
@@ -230,9 +287,11 @@ impl ClimateMap {
                 (shape.latitude_sine(z) as f32).abs()
             })
             .collect();
+        let continents = elevation.continent_scale();
         let grid = Grid {
             nx,
             nz,
+            continents,
             cell: cell_x as f32,
             abs_s: &abs_s,
             elev: &elev,
@@ -247,7 +306,7 @@ impl ClimateMap {
             for i in 0..nx {
                 let c = j * nx + i;
                 let fetch = west.1[c] + (east.1[c] - west.1[c]) * w;
-                sea_temp.push(t0 - continental_cooling(a, fetch));
+                sea_temp.push(t0 - continental_cooling(a, fetch, continents));
                 precip.push(west.0[c] + (east.0[c] - west.0[c]) * w);
             }
         }
@@ -294,21 +353,35 @@ impl ClimateMap {
         self.bilinear(&self.precip, x, z)
     }
 
+    /// Sea-level temperature and precipitation together: one lookup, since
+    /// they share every index and weight — what the generator asks for per
+    /// column.
+    pub fn sample(&self, x: i64, z: i64) -> (f32, f32) {
+        let (c, t) = self.corners(x, z);
+        (lerp4(&self.sea_temp, c, t), lerp4(&self.precip, c, t))
+    }
+
+    /// The four cells around a column and its weights between them.
+    fn corners(&self, x: i64, z: i64) -> ([usize; 4], (f32, f32)) {
+        let u = x as f64 / self.cell_x - 0.5;
+        let v = z as f64 / self.cell_z - 0.5;
+        let (fu, fv) = (u.floor(), v.floor());
+        let i0 = (fu as i64).rem_euclid(self.nx as i64) as usize;
+        let j0 = (fv as i64).rem_euclid(self.nz as i64) as usize;
+        let (i1, j1) = ((i0 + 1) % self.nx, (j0 + 1) % self.nz);
+        let at = |i: usize, j: usize| j * self.nx + i;
+        (
+            [at(i0, j0), at(i1, j0), at(i0, j1), at(i1, j1)],
+            ((u - fu) as f32, (v - fv) as f32),
+        )
+    }
+
     /// Bilinear between cell centres, wrapping with the torus. This is
     /// content addressing — the grid tiles the world as the noise does
     /// (CLAUDE.md: terrain generation is a canonicalising site).
     fn bilinear(&self, field: &[f32], x: i64, z: i64) -> f32 {
-        let u = x as f64 / self.cell_x - 0.5;
-        let v = z as f64 / self.cell_z - 0.5;
-        let (fu, fv) = (u.floor(), v.floor());
-        let (tu, tv) = ((u - fu) as f32, (v - fv) as f32);
-        let i0 = (fu as i64).rem_euclid(self.nx as i64) as usize;
-        let j0 = (fv as i64).rem_euclid(self.nz as i64) as usize;
-        let (i1, j1) = ((i0 + 1) % self.nx, (j0 + 1) % self.nz);
-        let at = |i: usize, j: usize| field[j * self.nx + i];
-        let top = at(i0, j0) + (at(i1, j0) - at(i0, j0)) * tu;
-        let bottom = at(i0, j1) + (at(i1, j1) - at(i0, j1)) * tu;
-        top + (bottom - top) * tv
+        let (c, t) = self.corners(x, z);
+        lerp4(field, c, t)
     }
 }
 
@@ -331,9 +404,16 @@ fn sweep(g: &Grid, east: bool) -> (Vec<f32>, Vec<f32>) {
     // trade-wind coast, not just under the subtropical high).
     let drying: Vec<f32> = motion
         .iter()
-        .map(|&m| 1.0 - exp(-cell * m.max(1.0) * (1.0 - RECYCLING) / DRYING_LENGTH))
+        .zip(g.abs_s)
+        .map(|(&m, &a)| {
+            let rate = m.max(1.0) * subtropical_drying(a);
+            1.0 - exp(-cell * rate * (1.0 - RECYCLING) / (DRYING_LENGTH * g.continents))
+        })
         .collect();
-    let ocean_uptake = 1.0 - exp(-cell / OCEAN_UPTAKE_LENGTH);
+    // Ocean basins shrink with the continents in small worlds; air crossing
+    // a narrow sea must still arrive saturated, or no small world has a
+    // wet windward coast (ADR-0017 §5).
+    let ocean_uptake = 1.0 - exp(-cell / (OCEAN_UPTAKE_LENGTH * g.continents));
     let orographic = 1.0 - exp(-cell / OROGRAPHIC_LENGTH);
 
     let mut q: Vec<f32> = t0.iter().map(|&t| moisture_capacity(t)).collect();
@@ -352,7 +432,7 @@ fn sweep(g: &Grid, east: bool) -> (Vec<f32>, Vec<f32>) {
                 } else {
                     fetch[j] += cell;
                 }
-                let sea_level = t0[j] - continental_cooling(a, fetch[j]);
+                let sea_level = t0[j] - continental_cooling(a, fetch[j], g.continents);
                 if sea {
                     q[j] += (moisture_capacity(sea_level) - q[j]) * ocean_uptake;
                 }
@@ -408,6 +488,13 @@ fn blur(field: &mut [f32], nx: usize, nz: usize) {
             }
         }
     }
+}
+
+/// Bilinear blend of `field` at four corners `[00, 10, 01, 11]`.
+fn lerp4(field: &[f32], c: [usize; 4], (tu, tv): (f32, f32)) -> f32 {
+    let top = field[c[0]] + (field[c[1]] - field[c[0]]) * tu;
+    let bottom = field[c[2]] + (field[c[3]] - field[c[2]]) * tu;
+    top + (bottom - top) * tv
 }
 
 /// `e^x`, from basic arithmetic only, so it is bit-identical on every
@@ -585,7 +672,7 @@ mod tests {
 
     /// Criterion 4's belts: land rain peaks at the equator, dips in the
     /// subtropics (where Earth's deserts are), recovers in mid-latitudes and
-    /// is least at the poles — averaged over several worlds.
+    /// is low again at the poles — averaged over several worlds.
     #[test]
     fn rain_follows_the_belts() {
         let mut bands = [(0.0f64, 0u32); 9];
@@ -615,37 +702,40 @@ mod tests {
         let (equator, subtropics, mid, polar) = (mean[0], mean[2], mean[4], mean[8]);
         assert!(subtropics < 0.5 * equator, "{mean:.0?}");
         assert!(subtropics < mid, "{mean:.0?}");
-        assert!(polar < subtropics && polar < 0.15 * equator, "{mean:.0?}");
+        // Polar air is dry, but subtropical deserts can be as dry: Earth's
+        // 20–30° band averages higher only through its monsoon coasts,
+        // which this model has no seasons to make.
+        assert!(polar < mid && polar < 0.15 * equator, "{mean:.0?}");
     }
 
     #[test]
     fn interiors_are_colder_than_coasts_away_from_the_equator() {
-        assert_eq!(continental_cooling(0.0, 50_000.0), 0.0);
+        assert_eq!(continental_cooling(0.0, 50_000.0, 1.0), 0.0);
         let (coast, inland) = (
-            continental_cooling(0.8, 0.0),
-            continental_cooling(0.8, 30_000.0),
+            continental_cooling(0.8, 0.0, 1.0),
+            continental_cooling(0.8, 30_000.0, 1.0),
         );
         assert_eq!(coast, 0.0);
         assert!(inland > 5.0 && inland <= CONTINENTAL_COOLING_C);
     }
 
     /// Criterion 4's snowline targets follow from the lapse rate at sea-level
-    /// temperatures: ~940 at the equator, ~470 at 45°, ~110 at 60°.
+    /// temperatures: ~1 000 at the equator, ~530 at 45°, ~170 at 60°.
     #[test]
     fn snowlines_fall_where_the_spec_puts_them() {
         let snowline =
             |s: f32| (sea_level_temperature_at_latitude(s) - SNOW_LINE_C) / LAPSE_PER_BLOCK;
         assert!(
-            (900.0..1_000.0).contains(&snowline(0.0)),
+            (900.0..1_050.0).contains(&snowline(0.0)),
             "{}",
             snowline(0.0)
         );
         assert!(
-            (430.0..600.0).contains(&snowline(0.707)),
+            (450.0..600.0).contains(&snowline(0.707)),
             "{}",
             snowline(0.707)
         );
-        assert!(snowline(0.866) < 160.0, "{}", snowline(0.866));
+        assert!(snowline(0.866) < 200.0, "{}", snowline(0.866));
         assert!(snowline(1.0) < 0.0);
         assert!(temperature_at(10.0, 500) < temperature_at(10.0, 100));
         assert_eq!(temperature_at(10.0, -300), 10.0, "seabeds read sea level");

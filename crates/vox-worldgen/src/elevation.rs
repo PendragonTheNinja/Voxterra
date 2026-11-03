@@ -144,9 +144,23 @@ const OROGENY_FLOOR: f32 = 0.42;
 const OROGENY_GATE_WAVELENGTH: i64 = 13_000;
 const OROGENY_GATE_LO: f32 = 0.10;
 const OROGENY_GATE_HI: f32 = 0.52;
+
+/// Every world has mountains (M13, the owner's choice, 2026-11-01): at
+/// least this share of its land under ranges with [`RANGE_UPLIFT`] blocks of
+/// uplift or more, or its alpine biomes — and the rain shadows behind them —
+/// would be missing. Worlds of the default size and larger always have it
+/// (≥ 4.6% over 48 seeds), so they are untouched; a small world, whose
+/// mountain-belt field has only a few lattice cells around it, can miss its
+/// land entirely, and widens its belts until it has this much
+/// ([`Elevation::calibrate_ranges`]) — shrinking the room between ranges
+/// only where it is needed (`docs/vision.md` §1.1).
+const MIN_RANGE_SHARE: f32 = 0.025;
+const RANGE_UPLIFT: f32 = 400.0;
+/// The most the belt gate may be lowered by.
+const MAX_GATE_SHIFT: f32 = 0.6;
 /// Uplift at full orogeny, in blocks. The ceiling a summit can reach, and only
 /// where the field saturates across a very wide region.
-const MAX_UPLIFT: f32 = 1_150.0;
+pub(crate) const MAX_UPLIFT: f32 = 1_150.0;
 
 // --- Detail ----------------------------------------------------------------
 
@@ -216,6 +230,9 @@ pub struct Elevation {
     /// Subtracted from the continent field so this world's land fraction lands
     /// on [`TARGET_LAND_FRACTION`]. See [`Elevation::calibrate_coastline`].
     continent_offset: f32,
+    /// Lowers the mountain-belt gate in a world that would otherwise have
+    /// too few ranges; 0 in almost every world. See [`MIN_RANGE_SHARE`].
+    gate_shift: f32,
     continent: [Octave; 3],
     relief: [Octave; 2],
     orogeny: [Octave; 2],
@@ -223,7 +240,46 @@ pub struct Elevation {
     trench: Octave,
     trench_gate: Octave,
     detail: [Octave; 3],
+    /// Not part of the height: noise that lets biome boundaries wander
+    /// (M13), kept here so it tiles with the world like every other field.
+    boundary: [Octave; 3],
+    /// Small-scale patches of a biome's surface (M13): sand through a
+    /// steppe, gravel through tundra, outcrops on a meadow.
+    patch: [Octave; 2],
+    /// The meander warp (M14), an octave apart: rivers bend at a
+    /// wavelength set by their width.
+    meander: [Octave; 6],
 }
+
+/// What a column's surface is made of, as the elevation field knows it — the
+/// height and the two stages climate classification reads (M13). Every field
+/// is a pure function of `(x, z)`, so the chunk generator, the LOD sampler
+/// and any readout agree on them exactly.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Surface {
+    /// Blocks above sea level; see [`Elevation::height`].
+    pub height: i64,
+    /// [`Elevation::relief`]: how rough the region is, `[0, 1]`.
+    pub relief: f32,
+    /// Blocks of the height raised by mountain building (0 off the ranges,
+    /// up to `MAX_UPLIFT`).
+    pub uplift: f32,
+}
+
+/// Wavelengths of the biome-boundary noise, blocks: edges wander over a
+/// kilometre or so, and the finest octave frays them over tens of blocks —
+/// an ecotone, tongues and islands of each biome in the other, not a line
+/// (M13 criterion 6).
+const BOUNDARY_WAVELENGTHS: [i64; 3] = [1_400, 350, 24];
+const BOUNDARY_WEIGHTS: [f32; 3] = [1.0, 0.4, 0.35];
+
+/// Wavelengths of the meander warp, blocks, each twice the last: a river
+/// picks its own between them (`Elevation::meander_warp`).
+pub const MEANDER_WAVELENGTHS: [i64; 6] = [32, 64, 128, 256, 512, 1_024];
+
+/// Wavelengths of the surface-patch noise, blocks.
+const PATCH_WAVELENGTHS: [i64; 2] = [40, 11];
+const PATCH_WEIGHTS: [f32; 2] = [1.0, 0.45];
 
 impl Elevation {
     pub fn new(seed: u64, shape: WorldShape) -> Self {
@@ -232,6 +288,7 @@ impl Elevation {
             seed,
             shape,
             continent_offset: 0.0,
+            gate_shift: 0.0,
             continent: CONTINENT_WAVELENGTHS.map(oct),
             relief: RELIEF_WAVELENGTHS.map(oct),
             orogeny: OROGENY_WAVELENGTHS.map(oct),
@@ -239,8 +296,12 @@ impl Elevation {
             trench: oct(TRENCH_WAVELENGTH),
             trench_gate: oct(TRENCH_GATE_WAVELENGTH),
             detail: DETAIL_WAVELENGTHS.map(oct),
+            boundary: BOUNDARY_WAVELENGTHS.map(oct),
+            patch: PATCH_WAVELENGTHS.map(oct),
+            meander: MEANDER_WAVELENGTHS.map(oct),
         };
         e.continent_offset = e.calibrate_coastline();
+        e.gate_shift = e.calibrate_ranges();
         e
     }
 
@@ -270,18 +331,149 @@ impl Elevation {
         samples[at] - shoreline_continent_value()
     }
 
+    /// The mountain-belt gate shift that gives this world at least
+    /// [`MIN_RANGE_SHARE`] of its land under ranges — 0 if it already has
+    /// that, which is almost every world, so their terrain is unchanged.
+    /// Bisection on a coarse grid, like the coastline; deterministic from
+    /// the seed and size.
+    fn calibrate_ranges(&self) -> f32 {
+        let (sx, sz) = (self.shape.size_x(), self.shape.size_z());
+        let share = |shift: f32| {
+            let e = Self {
+                gate_shift: shift,
+                ..*self
+            };
+            let (mut land, mut ranges) = (0u32, 0u32);
+            for j in 0..CALIBRATION_GRID {
+                for i in 0..CALIBRATION_GRID {
+                    let s =
+                        e.surface_canonical(i * sx / CALIBRATION_GRID, j * sz / CALIBRATION_GRID);
+                    if s.height > 0 {
+                        land += 1;
+                        ranges += u32::from(s.uplift >= RANGE_UPLIFT);
+                    }
+                }
+            }
+            ranges as f32 / land.max(1) as f32
+        };
+        if share(0.0) >= MIN_RANGE_SHARE {
+            return 0.0;
+        }
+        let (mut lo, mut hi) = (0.0f32, MAX_GATE_SHIFT);
+        for _ in 0..12 {
+            let mid = 0.5 * (lo + hi);
+            if share(mid) >= MIN_RANGE_SHARE {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        hi
+    }
+
     /// Surface height in blocks at world column `(x, z)`. Sea level is 0.
     ///
     /// `x`/`z` may be on any lap of the world; the result repeats exactly every
     /// world width. The column is wrapped ONCE here and every stage below works
     /// in canonical coordinates, rather than each octave wrapping for itself.
     pub fn height(&self, x: i64, z: i64) -> i64 {
-        self.height_canonical(self.shape.canonical_x(x), self.shape.canonical_z(z))
+        self.surface(x, z).height
+    }
+
+    /// The height with the relief and uplift it was built from, at no extra
+    /// cost: the composition computes them anyway.
+    pub fn surface(&self, x: i64, z: i64) -> Surface {
+        self.surface_canonical(self.shape.canonical_x(x), self.shape.canonical_z(z))
+    }
+
+    /// How large this world's continents are, against the default world's:
+    /// the coarsest continent octave's real wavelength over the default
+    /// size's. 1 at the default size; ~0.2 in the smallest world, where
+    /// every octave keeps at least three cells around the world (ADR-0012)
+    /// and continents shrink with it. Climate distances that are really
+    /// "how far into a continent" scale by this (ADR-0017).
+    pub fn continent_scale(&self) -> f32 {
+        let wavelength = |size: i64, nx: u32| size as f32 / nx as f32;
+        let default = WorldShape::DEFAULT;
+        let here = wavelength(self.shape.size_x(), self.continent[0].nx);
+        let there = wavelength(
+            default.size_x(),
+            default.cells_around_x(CONTINENT_WAVELENGTHS[0]),
+        );
+        here / there
+    }
+
+    /// Two independent noises in `[-1, 1]` for wandering biome boundaries
+    /// (M13): one for temperature, one for precipitation. Hashed with salts
+    /// apart from every terrain octave's, so they do not follow the terrain.
+    pub fn boundary_noise(&self, x: i64, z: i64) -> (f32, f32) {
+        let (x, z) = (self.shape.canonical_x(x), self.shape.canonical_z(z));
+        let pair = |salt: u64| {
+            let (mut sum, mut norm) = (0.0, 0.0);
+            for (oct, w) in self.boundary.iter().zip(BOUNDARY_WEIGHTS.iter()) {
+                let o = Octave {
+                    salt: oct.salt ^ salt,
+                    ..*oct
+                };
+                sum += self.value_noise(x, z, &o) * w;
+                norm += w;
+            }
+            sum / norm
+        };
+        (pair(0x7E3D_0001), pair(0x9A1F_0002))
+    }
+
+    /// Surface-patch noise in `[-1, 1]` (M13): decides, within a biome,
+    /// which columns take its secondary surface — tens of blocks across.
+    pub fn patch_noise(&self, x: i64, z: i64) -> f32 {
+        let (x, z) = (self.shape.canonical_x(x), self.shape.canonical_z(z));
+        let o = |oct: &Octave| Octave {
+            salt: oct.salt ^ 0x5A7C_0003,
+            ..*oct
+        };
+        let a = self.value_noise(x, z, &o(&self.patch[0]));
+        let b = self.value_noise(x, z, &o(&self.patch[1]));
+        (a * PATCH_WEIGHTS[0] + b * PATCH_WEIGHTS[1]) / (PATCH_WEIGHTS[0] + PATCH_WEIGHTS[1])
+    }
+
+    /// The meander warp at a column (M14): a smooth displacement, each
+    /// component in `[-1, 1]`, varying at `wavelength` blocks — blended
+    /// between the two octaves either side of it, so a river widening
+    /// downstream lengthens its bends smoothly. Not part of the height;
+    /// salted apart from every terrain octave, and tiled with the world.
+    pub fn meander_warp(&self, x: i64, z: i64, wavelength: f32) -> (f32, f32) {
+        let (x, z) = (self.shape.canonical_x(x), self.shape.canonical_z(z));
+        let w = wavelength.clamp(
+            MEANDER_WAVELENGTHS[0] as f32,
+            MEANDER_WAVELENGTHS[MEANDER_WAVELENGTHS.len() - 1] as f32,
+        );
+        let k = MEANDER_WAVELENGTHS[..MEANDER_WAVELENGTHS.len() - 1]
+            .iter()
+            .rposition(|&m| m as f32 <= w)
+            .unwrap_or(0);
+        let lo = MEANDER_WAVELENGTHS[k] as f32;
+        let t = ((w - lo) / lo).clamp(0.0, 1.0);
+        let pair = |oct: &Octave| {
+            let o = |salt: u64| Octave {
+                salt: oct.salt ^ salt,
+                ..*oct
+            };
+            (
+                self.value_noise(x, z, &o(0x3EA2_0001)),
+                self.value_noise(x, z, &o(0x3EA2_0002)),
+            )
+        };
+        let a = pair(&self.meander[k]);
+        if t == 0.0 {
+            return a; // on an octave: the other weighs nothing
+        }
+        let b = pair(&self.meander[k + 1]);
+        (lerp(a.0, b.0, t), lerp(a.1, b.1, t))
     }
 
     /// The single composition point. Every stage feeds in here and nowhere
     /// else, so a future erosion pass has one place to attach.
-    fn height_canonical(&self, x: i64, z: i64) -> i64 {
+    fn surface_canonical(&self, x: i64, z: i64) -> Surface {
         let c = self.continent_c(x, z) - self.continent_offset;
         let CoastalProfile {
             mut base,
@@ -307,7 +499,8 @@ impl Elevation {
         let massif = if land > 0.0 {
             let raw = self.orogeny_c(x, z);
             let g = self.value_noise(x, z, &self.orogeny_gate);
-            let belt = smoothstep01((g - OROGENY_GATE_LO) / (OROGENY_GATE_HI - OROGENY_GATE_LO));
+            let lo = OROGENY_GATE_LO - self.gate_shift;
+            let belt = smoothstep01((g - lo) / (OROGENY_GATE_HI - OROGENY_GATE_LO));
             let u = ((raw - OROGENY_FLOOR) / (1.0 - OROGENY_FLOOR)).clamp(0.0, 1.0) * land * belt;
             // Squared smoothstep, not a raw cube. Both make high uplift rare,
             // but a cube's slope keeps CLIMBING to the summit, so the crest
@@ -330,10 +523,14 @@ impl Elevation {
             * lerp(COASTAL_CALM_FLOOR, 1.0, calm);
 
         let h = base + massif + self.detail_c(x, z) * amplitude;
-        (h.round() as i64).clamp(
-            WORLD_Y_MIN_BLOCKS + BOUND_MARGIN,
-            WORLD_Y_MAX_BLOCKS - BOUND_MARGIN,
-        )
+        Surface {
+            height: (h.round() as i64).clamp(
+                WORLD_Y_MIN_BLOCKS + BOUND_MARGIN,
+                WORLD_Y_MAX_BLOCKS - BOUND_MARGIN,
+            ),
+            relief,
+            uplift: massif,
+        }
     }
 
     // --- Stages. Each has a public form taking any (x, z) — for tuning and
@@ -561,6 +758,49 @@ fn mix64(mut z: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every world has ranges (M13): a small world short of them widens its
+    /// belts to the minimum, and a default-size world — which always has
+    /// enough — is untouched, so its terrain is exactly as before.
+    #[test]
+    fn every_world_has_mountain_ranges_and_only_small_ones_are_changed() {
+        let range_share = |e: &Elevation| {
+            let size = e.shape.size_x();
+            let (mut land, mut ranges) = (0u32, 0u32);
+            for j in 0..128 {
+                for i in 0..128 {
+                    let s = e.surface(i * size / 128, j * size / 128);
+                    if s.height > 0 {
+                        land += 1;
+                        ranges += u32::from(s.uplift >= RANGE_UPLIFT);
+                    }
+                }
+            }
+            ranges as f32 / land as f32
+        };
+        let small = WorldShape::new(32_768, 32_768).unwrap();
+        let mut widened = 0;
+        for seed in 0..12u64 {
+            let e = Elevation::new(seed.wrapping_mul(0x9E37_79B9) ^ 0x7e22ac0de, small);
+            widened += u32::from(e.gate_shift > 0.0);
+            assert!(
+                range_share(&e) >= 0.6 * MIN_RANGE_SHARE,
+                "seed {seed}: {:.3} of land under ranges",
+                range_share(&e)
+            );
+        }
+        assert!(
+            widened > 0,
+            "no small world needed widening: the test proves nothing"
+        );
+        for seed in [0x7e22ac0de, 1, 2, 3] {
+            let e = Elevation::new(seed, WorldShape::DEFAULT);
+            assert_eq!(
+                e.gate_shift, 0.0,
+                "seed {seed:#x} at the default size was changed"
+            );
+        }
+    }
 
     const SEED: u64 = 0x0007_E22A_C0DE;
 

@@ -655,6 +655,12 @@ impl SpanCache {
             .or_insert_with(|| compute(cx, cz))
     }
 
+    /// The span of column `(cx, cz)` if it is remembered, without computing
+    /// it: for readers that hold the cache only shared.
+    pub fn peek(&self, cx: i64, cz: i64) -> Option<(i64, i64)> {
+        self.spans.get(&(cx, cz)).copied()
+    }
+
     /// Forget columns more than `radius` chunks from `center` horizontally.
     /// Scans only when the camera has changed chunk column.
     pub fn prune(&mut self, center: ChunkPos, radius: i64) {

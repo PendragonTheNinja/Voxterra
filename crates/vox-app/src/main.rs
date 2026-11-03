@@ -277,6 +277,130 @@ fn relight_chunks_parallel(
         .collect()
 }
 
+/// The world's climate map as texels for `Renderer::set_climate` (M13,
+/// ADR-0018): a cell's sea-level temperature and precipitation, row by row.
+fn climate_texels(generator: &Generator) -> (Vec<u8>, (u32, u32)) {
+    let climate = generator.climate();
+    let (nx, nz) = climate.cells();
+    let mut texels = Vec::with_capacity(nx * nz * 4);
+    for j in 0..nz {
+        for i in 0..nx {
+            let (sea_level_c, precip, _, _) = climate.cell(i, j);
+            texels.extend_from_slice(&vox_render::encode_climate(sea_level_c, precip));
+        }
+    }
+    (texels, (nx as u32, nz as u32))
+}
+
+/// Where the benchmark's water phases start (M14), from the drainage
+/// network alone, so a given world always benchmarks the same water:
+/// the rivers phase where the sprint path, along +X, crosses the most river
+/// and lake cells within ~15 km of spawn; the waterfall phase downstream of
+/// the largest waterfall there that falls toward −X, so the camera, looking
+/// +X, faces its sheet. Positions in the spawn's frame (no wrapping).
+fn bench_water_starts(
+    generator: &Generator,
+    sx: i64,
+    sz: i64,
+    path: i64,
+    above: f64,
+) -> (Option<[f64; 3]>, Option<[f64; 3]>) {
+    let d = generator.drainage();
+    let (nx, nz) = d.cells();
+    let (cw, ch) = d.cell_blocks();
+    let (si, sj) = d.cell_of(sx, sz);
+    let wrap = |i: i64, j: i64| {
+        (
+            i.rem_euclid(nx as i64) as usize,
+            j.rem_euclid(nz as i64) as usize,
+        )
+    };
+    // Unwrapped cell (si + di, sj + dj) to a world position near spawn.
+    let at = |di: i64, dj: i64| {
+        (
+            sx - sx.rem_euclid(cw as i64) + di * cw as i64 + (cw / 2.0) as i64,
+            sz - sz.rem_euclid(ch as i64) + dj * ch as i64 + (ch / 2.0) as i64,
+        )
+    };
+    const REACH: i64 = 120;
+    let path_cells = (path as f64 / cw).ceil() as i64;
+    let mut best_rivers: Option<(usize, i64, i64, i64)> = None; // (score, -dist, di, dj)
+    let mut best_fall: Option<(f32, i64, i64)> = None;
+    for dj in -REACH..=REACH {
+        for di in -REACH..=REACH {
+            let (i, j) = wrap(si as i64 + di, sj as i64 + dj);
+            if di % 3 == 0 && dj % 3 == 0 && !d.is_sea(i, j) {
+                let score = (0..path_cells)
+                    .filter(|&k| {
+                        let (ci, cj) = wrap(si as i64 + di + k, sj as i64 + dj);
+                        d.river_kind_at(ci, cj).is_some() || d.is_lake(ci, cj)
+                    })
+                    .count();
+                let key = (score, -(di * di + dj * dj), di, dj);
+                if best_rivers.is_none_or(|b| key > b) {
+                    best_rivers = Some(key);
+                }
+            }
+            if d.waterfall_at(i, j) {
+                let (_, _, q, (ri, _)) = d.cell(i, j);
+                let west = (ri as i64 - i as i64).rem_euclid(nx as i64) == nx as i64 - 1;
+                if west && best_fall.is_none_or(|b| q > b.0) {
+                    best_fall = Some((q, di, dj));
+                }
+            }
+        }
+    }
+    let rivers = best_rivers.filter(|b| b.0 > 0).map(|(_, _, di, dj)| {
+        let (x, z) = at(di, dj);
+        let highest = (0..=path)
+            .step_by(64)
+            .map(|k| generator.surface_height(x + k, z))
+            .max()
+            .unwrap_or(0);
+        [x as f64 + 0.5, highest as f64 + above, z as f64 + 0.5]
+    });
+    let waterfall = best_fall.map(|(_, di, dj)| {
+        let (x, z) = at(di, dj);
+        let (i, j) = wrap(si as i64 + di, sj as i64 + dj);
+        let (_, upper, _, _) = d.cell(i, j);
+        // The lip is where the ground falls away, that far of the way to
+        // the receiver a cell west; stand ~100 blocks downstream of it, a
+        // little above the pool's level.
+        let lip = f64::from(d.waterfall_lip(i, j).unwrap_or(0.5));
+        let lip_x = x - (cw * lip) as i64;
+        // Never inside the hillside: the ground there can stand above the
+        // pool.
+        let ground = generator.surface_height(lip_x - 100, z);
+        [
+            (lip_x - 100) as f64 + 0.5,
+            f64::from(upper).max(ground as f64) + 12.0,
+            z as f64 + 0.5,
+        ]
+    });
+    (rivers, waterfall)
+}
+
+/// Whether flowing water is switched off (`VOX_NO_FLOW=1`): all water still,
+/// for measuring what the flow shader costs.
+fn no_flow() -> bool {
+    std::env::var("VOX_NO_FLOW").is_ok_and(|v| v == "1")
+}
+
+/// The drainage network's flow as texels for `Renderer::set_flow` (M14):
+/// each cell's water velocity, row by row.
+fn flow_texels(generator: &Generator) -> (Vec<u8>, (u32, u32)) {
+    let drainage = generator.drainage();
+    let (nx, nz) = drainage.cells();
+    let mut texels = Vec::with_capacity(nx * nz * 2);
+    for j in 0..nz {
+        for i in 0..nx {
+            let (vx, vz) = drainage.flow(i, j);
+            texels.extend_from_slice(&vox_render::encode_flow(vx, vz));
+        }
+    }
+    (texels, (nx as u32, nz as u32))
+}
+
 /// `jobs` pairs each chunk with its SEALED faces: a bit per entry of
 /// `NEIGHBOR_OFFSETS`, set where that face neighbour is absent and never
 /// coming (M10 A3). The mesher continues the chunk's own edge there: no face
@@ -342,7 +466,8 @@ fn mesh_one_chunk(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MoveMode {
     /// Free-fly noclip (the original behavior): WASD relative to yaw,
-    /// Space/Shift for vertical, Ctrl to sprint. Passes through blocks.
+    /// Space/Shift for vertical, Ctrl to sprint, the scroll wheel sets the
+    /// speed. Passes through blocks.
     Spectator,
     /// Grounded survival movement: gravity, jumping, AABB collision against
     /// solid blocks, Minecraft-style auto-step over single-block ledges.
@@ -371,11 +496,19 @@ struct FlyCamera {
     /// Whether the player is standing on solid ground (survival).
     on_ground: bool,
     mode: MoveMode,
+    /// Spectator speed, in quarter-octave steps from [`Self::SPEED`]: the
+    /// scroll wheel moves it, sprint multiplies whatever it is. Survival
+    /// ignores it (the wheel picks blocks there), and the bench sets the
+    /// camera's position itself, so neither depends on it.
+    fly_step: i32,
 }
 
 impl FlyCamera {
     const SPEED: f64 = 30.0; // m/s (spectator)
     const SPRINT_MULTIPLIER: f64 = 4.0; // hold Ctrl (spectator)
+    /// Scroll-wheel range: 2^(±12/4) = ⅛× to 8× — 3.75 to 240 m/s, sprint
+    /// 15 to 960. Each notch is ×1.19, four notches double it.
+    const FLY_STEPS: std::ops::RangeInclusive<i32> = -12..=12;
     const SENSITIVITY: f64 = 0.0022; // radians per mouse count
     const PITCH_LIMIT: f64 = 1.55; // just under PI/2
 
@@ -460,12 +593,24 @@ impl FlyCamera {
 
         if dir != DVec3::ZERO {
             let speed = if keys.contains(&KeyCode::ControlLeft) {
-                Self::SPEED * Self::SPRINT_MULTIPLIER
+                self.fly_speed() * Self::SPRINT_MULTIPLIER
             } else {
-                Self::SPEED
+                self.fly_speed()
             };
             self.position += dir.normalize() * speed * dt;
         }
+    }
+
+    /// Spectator speed before sprint, m/s, at the wheel's setting.
+    fn fly_speed(&self) -> f64 {
+        Self::SPEED * 2f64.powf(f64::from(self.fly_step) / 4.0)
+    }
+
+    /// Move the wheel's speed setting `notches` up (positive) or down,
+    /// within [`Self::FLY_STEPS`].
+    fn adjust_fly_speed(&mut self, notches: i32) {
+        self.fly_step =
+            (self.fly_step + notches).clamp(*Self::FLY_STEPS.start(), *Self::FLY_STEPS.end());
     }
 
     /// The player AABB (min, max) in world blocks, derived from the eye.
@@ -701,6 +846,30 @@ impl Default for App {
         // Streaming follows the SURFACE, so a camera far from any surface loads
         // terrain it cannot see: the chunks are resident, just 3 km below.
         let generator = Generator::new(seed, shape);
+        // Stage-1 climate (ADR-0017), built here so world load pays for it
+        // rather than whichever chunk happens to be generated first.
+        let started = Instant::now();
+        let climate = generator.climate();
+        log::info!(
+            "climate map: {:?} built in {:.0} ms",
+            climate,
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+        // Stage-1 drainage and the erosion stage (M14, ADR-0019): every
+        // surface query reads them, so they too are made ready here, before
+        // the first chunk — from the world folder's cache when it holds this
+        // world's network, else built and cached for next time.
+        let started = Instant::now();
+        let (drainage, source) = generator.drainage_cached(store.root());
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        match source {
+            vox_worldgen::DrainageSource::BuiltUnsaved(e) => {
+                log::warn!(
+                    "drainage network: {drainage:?} built in {ms:.0} ms; cache not written: {e}"
+                )
+            }
+            source => log::info!("drainage network: {drainage:?} ({source:?}) in {ms:.0} ms"),
+        }
         let (spawn_x, spawn_z) = vox_core::find_spawn(
             shape,
             0,
@@ -734,6 +903,7 @@ impl Default for App {
                 velocity: DVec3::ZERO,
                 on_ground: false,
                 mode: MoveMode::Spectator,
+                fly_step: 0,
             },
             keys: HashSet::new(),
             cursor_captured: false,
@@ -863,6 +1033,7 @@ impl App {
             velocity: self.camera.velocity,
             on_ground: self.camera.on_ground,
             mode: self.camera.mode,
+            fly_step: self.camera.fly_step,
         };
 
         // Horizontal velocity from input (yaw-relative).
@@ -1132,8 +1303,20 @@ impl App {
     /// truth — anything judging it independently gets it wrong the moment the
     /// margins or the clamping change.
     fn surface_window_chunks(&self, cx: i64, cz: i64) -> vox_core::ColumnWindow {
-        self.streamer
-            .surface_window(self.generator.surface_span_chunks(cx, cz))
+        self.streamer.surface_window(self.span(cx, cz))
+    }
+
+    /// A column's surface span, from the streamer's cache when it holds it.
+    /// Every judge of residency must take the same span, and here they do:
+    /// the cache holds exactly what `surface_span_chunks` returns. It
+    /// matters for cost (M14 bench): the span now reads rivers, lakes and
+    /// wetlands (`Generator::ground`, several times dearer than elevation
+    /// alone), and `fullres_columns` asks for ~300 columns every frame —
+    /// uncached, that cost a quarter of the frame rate standing still.
+    fn span(&self, cx: i64, cz: i64) -> (i64, i64) {
+        self.spans
+            .peek(cx, cz)
+            .unwrap_or_else(|| self.generator.surface_span_chunks(cx, cz))
     }
 
     /// The streaming configuration for a load radius. The one place it is
@@ -1157,12 +1340,8 @@ impl App {
     /// this column" must cover both, or it misses what the player built
     /// above the terrain window.
     fn column_window_chunks(&self, cx: i64, cz: i64) -> vox_core::ColumnWindow {
-        self.streamer.column_window(
-            self.camera.block_pos().chunk(),
-            cx,
-            cz,
-            self.generator.surface_span_chunks(cx, cz),
-        )
+        self.streamer
+            .column_window(self.camera.block_pos().chunk(), cx, cz, self.span(cx, cz))
     }
 
     /// One streaming step, run every frame. Keeps the resident chunk set
@@ -1179,7 +1358,7 @@ impl App {
         // 1. Ask the streamer what should change. A still camera over a
         //    settled world costs nothing; otherwise spans come from the cache,
         //    so only columns new to the neighbourhood sample the terrain.
-        let generator = self.generator;
+        let generator = self.generator.clone();
         self.spans
             .prune(camera_chunk, self.streamer.unload_radius() + 1);
         let spans = &mut self.spans;
@@ -1232,7 +1411,7 @@ impl App {
                 continue;
             }
             self.gen_in_flight.insert(pos);
-            let generator = self.generator;
+            let generator = self.generator.clone();
             let store = self.store.clone();
             let tx = self.gen_tx.clone();
             rayon::spawn(move || {
@@ -1506,11 +1685,7 @@ impl App {
     /// not) both ask exactly this, so both ask here: two independent answers
     /// drifting apart is how a gate deadlocks or an edge opens onto the void.
     fn neighbor_coming(&self, n: ChunkPos, camera_chunk: ChunkPos) -> bool {
-        self.streamer.wants(
-            n,
-            camera_chunk,
-            self.generator.surface_span_chunks(n.x, n.z),
-        )
+        self.streamer.wants(n, camera_chunk, self.span(n.x, n.z))
     }
 
     /// The faces of `p` to seal for meshing: a bit per `NEIGHBOR_OFFSETS`
@@ -1544,7 +1719,7 @@ impl App {
     /// camera flies 40 blocks over the highest ground (or the sea) along that
     /// path, so a sprint never passes through a hill.
     fn start_bench(&mut self) {
-        let generator = self.generator;
+        let generator = self.generator.clone();
         let shape = self.store.shape();
         let (sx, sz) = (
             self.camera.position.x.floor() as i64,
@@ -1587,6 +1762,14 @@ impl App {
             "Settings: defaults (full-res radius 8, curvature on, air density 1), \
              spectator, noon, time frozen"
                 .to_string(),
+            format!(
+                "Flowing water: {}",
+                if no_flow() {
+                    "off (VOX_NO_FLOW=1)"
+                } else {
+                    "on"
+                }
+            ),
         ];
         let ocean = match ocean_xz {
             Some((x, z)) => [x as f64 + 0.5, (sea + 1) as f64 + ABOVE, z as f64 + 0.5],
@@ -1595,13 +1778,31 @@ impl App {
                 land
             }
         };
+        let (rivers, waterfall) = bench_water_starts(&generator, sx, sz, path, ABOVE);
+        let rivers = rivers.unwrap_or_else(|| {
+            header.push("No rivers found near spawn: river phases ran on land".into());
+            land
+        });
+        let waterfall = waterfall.unwrap_or_else(|| {
+            header.push("No waterfall facing the camera near spawn: its phase ran on land".into());
+            land
+        });
         self.settings = vox_core::Settings::default();
         self.camera.mode = MoveMode::Spectator;
         self.time_paused = true;
         self.time_accum = 0.5 * vox_core::TICKS_PER_DAY as f64;
         self.world_time = vox_core::WorldTime::from_ticks(self.time_accum as u64);
         log::info!("bench: starting — land at {land:?}, ocean at {ocean:?}");
-        self.bench = Some(bench::Bench::new(land, ocean, header));
+        log::info!("bench: rivers at {rivers:?}, waterfall at {waterfall:?}");
+        self.bench = Some(bench::Bench::new(
+            bench::Starts {
+                land,
+                ocean,
+                rivers,
+                waterfall,
+            },
+            header,
+        ));
         self.bench_started = Some(Instant::now());
     }
 
@@ -1620,6 +1821,25 @@ impl App {
             }
         }
         split
+    }
+
+    /// The column under the camera, as the generator classifies it (M13):
+    /// biome, mean annual temperature at the ground, annual precipitation
+    /// and latitude — `docs/biomes.md`'s terms, for play-testing climate.
+    /// The seed's column, not edits: a dug pit reads as the ground it was.
+    fn place_readout(&self) -> String {
+        let (x, z) = (
+            self.camera.position.x.floor() as i64,
+            self.camera.position.z.floor() as i64,
+        );
+        let c = self.generator.column(x, z);
+        format!(
+            "{} {:.0}C {:.0}mm lat {:.1}",
+            c.biome.name(),
+            c.temperature,
+            c.precipitation,
+            self.store.shape().latitude_degrees(z)
+        )
     }
 
     /// One frame of the benchmark: measure, then do what the script says.
@@ -2072,14 +2292,14 @@ impl App {
 
         // Spawn up to the budget from the pending queue. Coarse gen + mesh run
         // on rayon (pure CPU); only the upload above is on the main thread.
-        let grass = vox_core::registry::GRASS;
-        let stone = vox_core::registry::STONE;
-        let grass_layers: [u32; 6] = std::array::from_fn(|f| self.registry.face_layer(grass, f));
-        let stone_layers: [u32; 6] = std::array::from_fn(|f| self.registry.face_layer(stone, f));
-        // The LOD's sea surface is the same translucent water as up close
-        // (ADR-0011 decision 1c).
-        let water = vox_core::registry::WATER;
-        let water_layers: [u32; 6] = std::array::from_fn(|f| self.registry.face_layer(water, f));
+        // Every block's face layers, by id, for the LOD workers: distant
+        // terrain wears each biome's own top block (M13), and the sea surface
+        // is the same translucent water as up close (ADR-0011 decision 1c).
+        let layers: Arc<Vec<[u32; 6]>> = Arc::new(
+            (0..self.registry.len())
+                .map(|id| std::array::from_fn(|f| self.registry.face_layer(BlockId(id as u16), f)))
+                .collect(),
+        );
 
         let mut spawned = 0;
         if !self.lod_pending_set.is_empty() {
@@ -2120,9 +2340,9 @@ impl App {
                 // column, and the edit overlay is saved with the world, so the
                 // gather added nothing but the cost (M10 A3).
                 //
-                // Copied into the rayon job (Generator is Copy, so this is free).
+                // Copied into the rayon job (a cheap clone: the climate map is shared behind an Arc).
                 let sampling = self.lod_sampling(n.level);
-                let generator = self.generator;
+                let generator = self.generator.clone();
                 let tx = self.lod_tx.clone();
                 let origin_y = origin.y as i32;
                 let skirt = if self.lod_skirts {
@@ -2132,26 +2352,29 @@ impl App {
                 };
                 let edits = Arc::clone(&self.edited_columns);
                 let merge = self.lod_merge;
+                let layers = Arc::clone(&layers);
                 rayon::spawn(move || {
-                    let mut heights =
-                        generator.lod_heightfield(origin.x, origin.z, stride, sampling);
+                    let (mut heights, tops, mut water) =
+                        generator.lod_surface(origin.x, origin.z, stride, sampling);
                     // Fold in player edits. The seed always reads higher than
                     // dug ground, so without this the coarse surface floats
                     // above the hole and shows through it (the "ghost block").
                     edits.apply_to_node(&mut heights, origin.x, origin.z, stride, origin_y);
-                    let mesh = vox_mesh::mesh_lod_heightfield_with(
-                        &heights,
+                    // Ground dug below sea level shows the sea, as before M14.
+                    for (w, sea) in water.iter_mut().zip(vox_mesh::lod_sea(&heights)) {
+                        if *w == vox_mesh::LOD_DRY {
+                            *w = sea;
+                        }
+                    }
+                    let mesh = vox_mesh::mesh_lod_cells(
+                        vox_mesh::LodCells {
+                            heights: &heights,
+                            tops: &tops,
+                            water: &water,
+                        },
                         stride as i32,
                         origin_y,
-                        |b, face| {
-                            if b == grass {
-                                grass_layers[face]
-                            } else if b == water {
-                                water_layers[face]
-                            } else {
-                                stone_layers[face]
-                            }
-                        },
+                        |b, face| layers.get(b.0 as usize).map_or(0, |l| l[face]),
                         skirt,
                         merge,
                     );
@@ -2327,7 +2550,24 @@ impl ApplicationHandler for App {
                 .expect("failed to create window"),
         );
 
-        let renderer = Renderer::new(window.clone());
+        let mut renderer = Renderer::new(window.clone());
+        // Biome colour (M13, ADR-0018): the world's climate map, for the
+        // terrain shaders to tint grass by, near and far alike.
+        let (texels, cells) = climate_texels(&self.generator);
+        let shape = self.store.shape();
+        renderer.set_climate(
+            &texels,
+            cells,
+            (shape.size_x(), shape.size_z()),
+            vox_worldgen::climate::LAPSE_PER_BLOCK,
+        );
+        // Rivers drift with their flow (M14), placed as the climate map is.
+        // VOX_NO_FLOW=1 leaves all water still: an A/B switch for measuring
+        // what flowing water costs (`--bench` notes it in its header).
+        if !no_flow() {
+            let (flow, cells) = flow_texels(&self.generator);
+            renderer.set_flow(&flow, cells);
+        }
 
         // The world is no longer pre-built: chunks stream in around the
         // camera each frame via stream_tick (M02). resumed() just stands up
@@ -2513,13 +2753,14 @@ impl ApplicationHandler for App {
                                 let (w, h) =
                                     self.renderer.as_ref().map_or((0, 0), |r| r.surface_size());
                                 log::info!(
-                                    "VIEW pos {:.2} {:.2} {:.2} yaw {:.4} pitch {:.4} window {w}x{h} time {:.3} | {:?}",
+                                    "VIEW pos {:.2} {:.2} {:.2} yaw {:.4} pitch {:.4} window {w}x{h} time {:.3} | {} | {:?}",
                                     self.camera.position.x,
                                     self.camera.position.y,
                                     self.camera.position.z,
                                     self.camera.yaw,
                                     self.camera.pitch,
                                     self.world_time.time_of_day(),
+                                    self.place_readout(),
                                     self.settings
                                 );
                                 self.census_requested = true;
@@ -2556,7 +2797,8 @@ impl ApplicationHandler for App {
                 _ => {}
             },
 
-            // Scroll wheel cycles the selected block.
+            // Scroll wheel: flight speed in spectator (number keys still
+            // pick blocks there), the selected block in survival.
             WindowEvent::MouseWheel { delta, .. } => {
                 if self.cursor_captured {
                     let dir = match delta {
@@ -2564,7 +2806,18 @@ impl ApplicationHandler for App {
                         winit::event::MouseScrollDelta::PixelDelta(p) => -(p.y.signum() as i32),
                     };
                     if dir != 0 {
-                        self.cycle_selection(dir);
+                        match self.camera.mode {
+                            MoveMode::Spectator => {
+                                // Wheel up (away from you) is faster.
+                                self.camera.adjust_fly_speed(-dir);
+                                let speed = self.camera.fly_speed();
+                                log::info!(
+                                    "fly speed: {speed:.1} m/s (sprint {:.0})",
+                                    speed * FlyCamera::SPRINT_MULTIPLIER
+                                );
+                            }
+                            MoveMode::Survival => self.cycle_selection(dir),
+                        }
                     }
                 }
             }
@@ -2646,6 +2899,13 @@ impl ApplicationHandler for App {
                 self.targeted = hit;
 
                 let loaded = self.streamer.loaded_count();
+                // Where the player stands, for the telemetry line (M13) —
+                // only on the frame that logs it.
+                let place = if self.telemetry_accum + dt >= 1.0 {
+                    self.place_readout()
+                } else {
+                    String::new()
+                };
                 let in_flight = self.gen_in_flight.len();
                 let dirty = self.dirty.len();
                 let relight = self.relight.len();
@@ -2800,7 +3060,7 @@ impl ApplicationHandler for App {
                         let fps = self.telemetry_frames as f32 / self.telemetry_accum;
                         let lod_backlog = self.lod_pending_set.len() + self.lod_in_flight.len();
                         log::info!(
-                            "{:.0} fps (worst {:.1}ms) | drawn {}/{} | {:.2}M tris | {:.0}MB gpu | lod {}+{} | loaded {} | hmap {}k | gen {} | dirty {} | relight {} | lt {:.0}ms msh {:.0}ms",
+                            "{:.0} fps (worst {:.1}ms) | drawn {}/{} | {:.2}M tris | {:.0}MB gpu | lod {}+{} | loaded {} | hmap {}k | gen {} | dirty {} | relight {} | lt {:.0}ms msh {:.0}ms | {}",
                             fps,
                             self.worst_frame_ms,
                             renderer.drawn_last_frame(),
@@ -2819,6 +3079,7 @@ impl ApplicationHandler for App {
                             relight,
                             self.relight_ms_accum,
                             self.mesh_ms_accum,
+                            place,
                         );
                         self.telemetry_accum = 0.0;
                         self.telemetry_frames = 0;
@@ -2868,11 +3129,27 @@ fn main() {
 mod specks_scratch {
     use super::*;
 
+    /// The benchmark's water starts on the default world, printed: run with
+    /// `--ignored --nocapture` to see where the rivers and waterfall phases
+    /// stand (and feed them to `specks` to look).
+    #[test]
+    #[ignore]
+    fn bench_water_starts_on_the_default_world() {
+        let g = vox_worldgen::Generator::new(0x7e22ac0de, WorldShape::default());
+        let (sx, sz) = (-19712, 20480);
+        let path = (bench::SPRINT_SPEED * bench::SPRINT_SECS) as i64;
+        let (rivers, fall) = bench_water_starts(&g, sx, sz, path, 40.0);
+        println!("rivers {rivers:?}\nwaterfall {fall:?}");
+        assert!(rivers.is_some() && fall.is_some());
+    }
+
     /// Scratch: render the LOD ring headlessly with a magenta sky and count
     /// isolated magenta pixels (holes). Env: SPECK_EXTRA, SPECK_X, SPECK_Y
     /// (or SPECK_UP above ground), SPECK_Z, SPECK_YAW, SPECK_PITCH, SPECK_W,
     /// SPECK_H, SPECK_FOV, SPECK_MORPH, SPECK_CURVE, SPECK_OUT — the P key's
-    /// VIEW line has them all — and SPECK_FRAMES (time that many frames).
+    /// VIEW line has them all — and SPECK_FRAMES (time that many frames),
+    /// SPECK_NOCLIMATE (no biome colour), SPECK_LIT (daylight the
+    /// full-resolution chunks).
     #[test]
     #[ignore]
     fn specks() {
@@ -2906,15 +3183,21 @@ mod specks_scratch {
         );
         let update = ring.update(cam_chunk);
 
-        let grass = vox_core::registry::GRASS;
-        let stone = vox_core::registry::STONE;
-        let water = vox_core::registry::WATER;
-        let gl: [u32; 6] = std::array::from_fn(|f| registry.face_layer(grass, f));
-        let sl: [u32; 6] = std::array::from_fn(|f| registry.face_layer(stone, f));
-        let wl: [u32; 6] = std::array::from_fn(|f| registry.face_layer(water, f));
-
         let mut r = vox_render::Renderer::new_headless(w, h);
         r.set_render_origin(cam_chunk);
+        if std::env::var("SPECK_NOCLIMATE").is_err() {
+            let (texels, cells) = climate_texels(&generator);
+            r.set_climate(
+                &texels,
+                cells,
+                (shape.size_x(), shape.size_z()),
+                vox_worldgen::climate::LAPSE_PER_BLOCK,
+            );
+            let (flow, cells) = flow_texels(&generator);
+            r.set_flow(&flow, cells);
+            // SPECK_WATER_T: the water clock, seconds (a still frame of it).
+            r.set_water_time(Some(env("SPECK_WATER_T", 0.0) as f32));
+        }
         r.set_debug_holes(std::env::var("SPECK_NOH").is_err());
         let unload = 8 + 2; // default radius 8 + streamer slack, roughly
         use rayon::prelude::*;
@@ -2930,21 +3213,18 @@ mod specks_scratch {
                 } else {
                     LodSampling::Sparse
                 };
-                let heights = generator.lod_heightfield(bx, bz, stride, sampling);
-                let mesh = vox_mesh::mesh_lod_heightfield(
-                    &heights,
+                let (heights, tops, water) = generator.lod_surface(bx, bz, stride, sampling);
+                let mesh = vox_mesh::mesh_lod_cells(
+                    vox_mesh::LodCells {
+                        heights: &heights,
+                        tops: &tops,
+                        water: &water,
+                    },
                     stride as i32,
                     by as i32,
-                    |b, f| {
-                        if b == grass {
-                            gl[f]
-                        } else if b == water {
-                            wl[f]
-                        } else {
-                            sl[f]
-                        }
-                    },
+                    |b, f| registry.face_layer(b, f),
                     LOD_SKIRT_DEPTH_CELLS * stride as i32,
+                    true,
                 );
                 (*n, mesh)
             })
@@ -3015,11 +3295,24 @@ mod specks_scratch {
             for dz in -r8 - 1..=r8 + 1 {
                 for dx in -r8 - 1..=r8 + 1 {
                     let (cx, cz) = (cam_chunk.x + dx, cam_chunk.z + dz);
-                    let top = generator.surface_height(cx * 32 + 16, cz * 32 + 16) >> 5;
-                    for cy in top - 3..=top + 3 {
+                    // The game's span (ground and standing water, M14).
+                    let (lo, hi) = generator.surface_span_chunks(cx, cz);
+                    for cy in lo - 3..=hi + 3 {
                         let pos = ChunkPos::new(cx, cy, cz);
-                        world.insert_chunk(pos, generator.generate_chunk(pos));
-                        if dx * dx + dz * dz <= r8 * r8 && (top - 2..=top + 2).contains(&cy) {
+                        let mut chunk = generator.generate_chunk(pos);
+                        // SPECK_LIT=1: full daylight in every non-opaque cell —
+                        // crude next to real propagation (no shade under
+                        // overhangs), but enough to judge colour across the
+                        // full-res/LOD edge (M13). Unlit by default.
+                        if std::env::var("SPECK_LIT").is_ok() {
+                            for p in LocalPos::iter() {
+                                if !registry.is_opaque(chunk.get(p)) {
+                                    chunk.set_sky_light(p, 15);
+                                }
+                            }
+                        }
+                        world.insert_chunk(pos, chunk);
+                        if dx * dx + dz * dz <= r8 * r8 && (lo - 2..=hi + 2).contains(&cy) {
                             targets.push(pos);
                         }
                     }
@@ -3096,5 +3389,50 @@ mod specks_scratch {
         );
         let out = std::env::var("SPECK_OUT").unwrap_or("/tmp/specks.rgba".into());
         std::fs::write(&out, &px).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod fly_speed {
+    use super::*;
+
+    fn camera() -> FlyCamera {
+        FlyCamera {
+            position: DVec3::ZERO,
+            yaw: 0.0,
+            pitch: 0.0,
+            velocity: DVec3::ZERO,
+            on_ground: false,
+            mode: MoveMode::Spectator,
+            fly_step: 0,
+        }
+    }
+
+    /// The wheel starts at the speed the bench is tied to, four notches
+    /// double or halve it, and it stops at ⅛× and 8×.
+    #[test]
+    fn the_wheel_scales_flight_speed_within_bounds() {
+        let mut cam = camera();
+        assert_eq!(cam.fly_speed(), FlyCamera::SPEED);
+        cam.adjust_fly_speed(4);
+        assert!((cam.fly_speed() - 2.0 * FlyCamera::SPEED).abs() < 1e-9);
+        cam.adjust_fly_speed(100);
+        assert!((cam.fly_speed() - 8.0 * FlyCamera::SPEED).abs() < 1e-9);
+        cam.adjust_fly_speed(-100);
+        assert!((cam.fly_speed() - FlyCamera::SPEED / 8.0).abs() < 1e-9);
+    }
+
+    /// Flying covers distance at the wheel's speed, sprint on top.
+    #[test]
+    fn spectator_moves_at_the_wheel_speed() {
+        let mut cam = camera();
+        cam.adjust_fly_speed(4);
+        let mut keys = HashSet::new();
+        keys.insert(KeyCode::KeyW);
+        cam.update_spectator(&keys, 1.0);
+        assert!((cam.position.x - 60.0).abs() < 1e-9);
+        keys.insert(KeyCode::ControlLeft);
+        cam.update_spectator(&keys, 1.0);
+        assert!((cam.position.x - 300.0).abs() < 1e-9);
     }
 }

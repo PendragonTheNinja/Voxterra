@@ -186,6 +186,12 @@ The division of labour:
 - **At the start of a session, verify the remote before trusting it.** Check
   `git log` on a fresh clone; if the work under discussion isn't there, stop and
   say so before auditing or editing anything.
+- **Keep every image.** Every map, render and screenshot made during a
+  milestone goes into `docs/gallery/<milestone>/` with a line in its README
+  (what it shows, the commit it shows) — before/after pairs especially.
+  `target/` is gitignored and the container is wiped, so an image left
+  there is lost. Palette-reduce maps and save renders as JPEG to keep the
+  repository small. (Owner, 2026-11-01.)
 - **Judge terrain at ground speed.** Survival sprint is 5.612 m/s; spectator
   sprint-flight is 120 m/s, **21× faster**. One minute of flight is twenty-one
   minutes on foot. Every walking-time figure in the docs is ground sprint.
@@ -257,17 +263,35 @@ The owner's ideas for all of them, and a proposed order, are recorded in
 
 ## Current status
 
-- **Active milestone:** 13 — Climate & Biomes
-  (`docs/milestones/13-climate-and-biomes.md`; catalogue `docs/biomes.md`,
-  approved 2026-11-01). Done: the world map writer (`world_map`, PNGs to
-  `target/world-map/`) and stage-1 climate maps (`climate.rs`, ADR-0017
-  proposed: winds, rain shadows, exaggerated lapse rate, deterministic
-  maths). Next: task 2, classification. No low-end machine exists yet —
+- **Active milestone:** 15 — Landforms by Climate
+  (`docs/milestones/15-landforms-by-climate.md`): **spec approved
+  2026-11-03** — all five families; glacial landforms wherever last-ice-age
+  ice lay; real cliffs, not all walkable (traversal is later gameplay);
+  dunes 6–30 high, 100–250 apart; dry lands first. Nothing built yet. Dune
+  seas, mesas and canyons, glacial valleys and fjords, inselbergs, dissected
+  humid hills, as height layers weighted by a stage-1 process map, applied
+  before the drainage network so water still fits the ground (M14's lesson).
+  Takes over M14's carried items: closed basins ~29% (Earth ~18%), shallow
+  valleys for large rivers. Task 0 starts with the owner re-benching M14 at
+  `GENERATOR_VERSION` 8 as the baseline. No low-end machine exists yet —
   M12's spec says how to judge low-end performance by proxy.
+- **Last completed milestone:** 14 — Rivers, Lakes & Valleys (2026-11-03);
+  retrospective at the end of `docs/milestones/14-rivers-lakes-and-valleys.md`,
+  gallery `docs/gallery/m14/`, ADRs 0019 (drainage and erosion) and 0020
+  (water above sea level) accepted. Stage-1 drainage with closed basins by
+  water budget and stream-power valleys, cached in the world folder
+  (`drainage.cache`, format 4); rivers of four kinds with long profiles,
+  waterfalls, lakes, salt flats, floodplains, wetlands, deltas, oxbows,
+  ponds; nine water biomes (32 in all); flowing water in the shader; LOD
+  water at its own levels. Closed after three owner flights in place of the
+  walk (`GENERATOR_VERSION` 5–8 fixed what they found). Carried: closed
+  basins ~29%, shallow large-river valleys, re-bench at version 8, distant
+  rivers as ribbons, reservoirs with the water simulation.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 288, vox-mesh 67, vox-worldgen 41, vox-render 17, vox-app 9
-  passing as of M13 task 1), then start the first unchecked item.
+  vox-core 288, vox-mesh 71, vox-worldgen 72, vox-render 21, vox-app 11
+  passing (vox-worldgen was 54 at the M13 close), plus the ignored `every_biome_in_every_world`
+  and `biome_survey`, run in release), then start the first unchecked item.
 - **Instruments (from M11):** the P key logs a `VIEW` line (exact position,
   angles, window, settings) and a `hole_census` — the frame re-rendered six
   ways on the player's GPU with pinholes counted per variant. In the cloud
@@ -288,7 +312,19 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   are separate counters. ADRs number decisions in the order they are made;
   milestones number work in the order it is built. Matching numbers are
   coincidence — ADR-0011 (transparency) belongs to milestone M10.
-- **Last completed milestone:** 12 — Performance Pass (2026-11-01);
+- Milestone 13 — Climate & Biomes (2026-11-01);
+  retrospective at the end of `docs/milestones/13-climate-and-biomes.md`,
+  catalogue `docs/biomes.md`, gallery `docs/gallery/m13/`. Stage-1 climate
+  (ADR-0017: winds, rain shadows, exaggerated lapse rate, deterministic
+  maths, built at world load); 23 biomes classified from climate and
+  terrain (`Generator::column`); 13 new ground blocks with per-biome
+  profiles, sea ice, badlands strata (`GENERATOR_VERSION` 3); the LOD wears
+  each biome's ground and grass is tinted from the climate map near and far
+  (ADR-0018); every biome in every legal world size. Tools: `world_map`,
+  `biome_survey`, `every_biome_in_every_world`, `SPECK_LIT`. Carried: the
+  far-horizon LOD pinholes (reproduced at the owner's M13 view), water
+  absorbing with depth, seasons.
+- Milestone 12 — Performance Pass (2026-11-01);
   retrospective with numbers at the end of
   `docs/milestones/12-performance-pass.md`. Meshing −88% CPU per chunk in
   game (uniform chunks sweep only their boundary, a bitwise face prefilter,

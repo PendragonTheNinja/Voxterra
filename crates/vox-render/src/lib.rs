@@ -46,12 +46,16 @@ const DEPTH_NEARER_OR_EQUAL: wgpu::CompareFunction = wgpu::CompareFunction::Grea
 const TERRAIN_SHADER: &str = concat!(
     include_str!("shader.wgsl"),
     include_str!("curvature.wgsl"),
-    include_str!("atmosphere.wgsl")
+    include_str!("atmosphere.wgsl"),
+    include_str!("climate.wgsl"),
+    include_str!("flow.wgsl")
 );
 const LOD_SHADER: &str = concat!(
     include_str!("lod.wgsl"),
     include_str!("curvature.wgsl"),
-    include_str!("atmosphere.wgsl")
+    include_str!("atmosphere.wgsl"),
+    include_str!("climate.wgsl"),
+    include_str!("flow.wgsl")
 );
 
 /// The perspective projection for this renderer's depth convention.
@@ -323,6 +327,24 @@ pub struct Renderer {
     /// for the sky-pass additions (sun direction, moon) in task 3b.
     sky_buffer: wgpu::Buffer,
     sky_bind_group: wgpu::BindGroup,
+    /// Kept to rebuild `sky_bind_group` when a world's climate map arrives.
+    sky_bgl: wgpu::BindGroupLayout,
+    fullres_mask_view: wgpu::TextureView,
+    climate_sampler: wgpu::Sampler,
+    /// The world's climate map placement, once set (`set_climate`): world
+    /// size in blocks and the lapse rate; `None` leaves grass untinted.
+    climate: Option<ClimatePlacement>,
+    /// The climate and flow maps as bound, kept so setting either rebuilds
+    /// the bind group with the other.
+    climate_view: wgpu::TextureView,
+    flow_view: wgpu::TextureView,
+    /// Whether a flow map is set (M14): until then water is still.
+    has_flow: bool,
+    /// The water clock (flow.wgsl): real time since the renderer started,
+    /// not world time — rivers keep flowing when the day stands still — or a
+    /// fixed time for headless renders (`set_water_time`).
+    water_clock: std::time::Instant,
+    water_time: Option<f32>,
     /// Which chunk columns around the render origin full resolution draws:
     /// 1 = drawn, so the LOD shader discards there (see `set_fullres_columns`).
     fullres_mask: wgpu::Texture,
@@ -669,11 +691,13 @@ impl Renderer {
         // these flags is a pipeline-creation panic, not a compile error. ---
         let sky_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sky uniform"),
-            // 5 vec4s: camera+sky_scale, fog colour, fog range, morph params
-            // (ADR-0009), full-res mask placement. Must match `SkyChunk` in
-            // both shader.wgsl and lod.wgsl. Two writers, disjoint ranges:
-            // `set_sky` owns vec4s 0-3, `set_fullres_columns` owns vec4 4.
-            size: std::mem::size_of::<[f32; 20]>() as u64,
+            // 7 vec4s: camera+sky_scale, fog colour, fog range, morph params
+            // (ADR-0009), full-res mask placement, and the climate map's
+            // placement (two, M13). Must match `SkyChunk` in both shader.wgsl
+            // and lod.wgsl. Three writers, disjoint ranges: `set_sky` owns
+            // vec4s 0-3, `set_fullres_columns` vec4 4, `write_climate_placement`
+            // vec4s 5-6.
+            size: std::mem::size_of::<[f32; 28]>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -720,22 +744,61 @@ impl Renderer {
                     },
                     count: None,
                 },
+                // The climate map and its sampler (M13, ADR-0018): biome
+                // colour, interpolated between cells as the generator
+                // interpolates, wrapping as the world does.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                // The flow map (M14, flow.wgsl): read with the climate
+                // map's sampler, as it covers the same lap of the world.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
-        let sky_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("sky bind group"),
-            layout: &sky_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: sky_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&fullres_mask_view),
-                },
-            ],
+        let climate_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("climate sampler"),
+            // The torus: the map repeats exactly as the world does.
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
         });
+        // A 1x1 placeholder until a world's map arrives (`set_climate`);
+        // the shader leaves grass untinted until then.
+        let climate_texture_view = climate_texture(&device, &queue, 1, 1, &[128, 128, 0, 255]);
+        // Still water until a world's flow map arrives (`set_flow`).
+        let flow_view = flow_texture(&device, &queue, 1, 1, &[128, 128]);
+        let sky_bind_group = sky_bind_group(
+            &device,
+            &sky_bgl,
+            &sky_buffer,
+            &fullres_mask_view,
+            (&climate_texture_view, &flow_view),
+            &climate_sampler,
+        );
 
         // --- Per-chunk offset uniform layout (group 1), for floating
         // origin. One small uniform per chunk, rebound per draw. ---
@@ -1202,6 +1265,15 @@ impl Renderer {
             highlight_target: None,
             sky_buffer,
             sky_bind_group,
+            sky_bgl,
+            fullres_mask_view,
+            climate_sampler,
+            climate: None,
+            climate_view: climate_texture_view,
+            flow_view,
+            has_flow: false,
+            water_clock: std::time::Instant::now(),
+            water_time: None,
             fullres_mask,
             fullres_texels: Vec::new(),
             fullres_center: ChunkPos::new(0, 0, 0),
@@ -1485,6 +1557,88 @@ impl Renderer {
         self.buffer_bytes
     }
 
+    /// Give the renderer a world's climate map (M13, ADR-0018): `texels` is
+    /// `nx × nz` RGBA8 from [`encode_climate`], cell `(i, j)` at row `j`,
+    /// covering one lap of a world `size_x × size_z` blocks; `lapse` is the
+    /// generator's °C per block. Grass is tinted by it near and far from the
+    /// next frame. Call once per world.
+    pub fn set_climate(
+        &mut self,
+        texels: &[u8],
+        (nx, nz): (u32, u32),
+        (size_x, size_z): (i64, i64),
+        lapse: f32,
+    ) {
+        self.climate_view = climate_texture(&self.device, &self.queue, nx, nz, texels);
+        self.rebuild_sky_bind_group();
+        self.climate = Some(ClimatePlacement {
+            size_x,
+            size_z,
+            lapse,
+        });
+        self.write_climate_placement();
+    }
+
+    /// Give the renderer a world's flow map (M14, flow.wgsl): `texels` is
+    /// `nx × nz` RG8 from [`encode_flow`], cell `(i, j)` at row `j`, over the
+    /// same lap of the world as the climate map (`set_climate` places both).
+    /// River water drifts with it from the next frame. Call once per world.
+    pub fn set_flow(&mut self, texels: &[u8], (nx, nz): (u32, u32)) {
+        self.flow_view = flow_texture(&self.device, &self.queue, nx, nz, texels);
+        self.has_flow = true;
+        self.rebuild_sky_bind_group();
+        self.write_climate_placement();
+    }
+
+    /// Fix the water clock (flow.wgsl) at `seconds`, for headless renders;
+    /// `None` runs it in real time again.
+    pub fn set_water_time(&mut self, seconds: Option<f32>) {
+        self.water_time = seconds;
+    }
+
+    fn rebuild_sky_bind_group(&mut self) {
+        self.sky_bind_group = sky_bind_group(
+            &self.device,
+            &self.sky_bgl,
+            &self.sky_buffer,
+            &self.fullres_mask_view,
+            (&self.climate_view, &self.flow_view),
+            &self.climate_sampler,
+        );
+    }
+
+    /// Where the render origin sits on the climate map. The map's
+    /// coordinates are the world's content address, wrapped to one lap —
+    /// the climate map is terrain generation's content, read here (ADR-0018
+    /// on why this is not a fourth place the seam lives). Computed in f64
+    /// and narrowed to f32 only as a fraction of the world, so it stays
+    /// exact however far the unwrapped origin has travelled.
+    fn write_climate_placement(&mut self) {
+        let data: [f32; 8] = match self.climate {
+            Some(c) => {
+                let s = CHUNK_SIZE as f64;
+                let u = (self.render_origin.x as f64 * s / c.size_x as f64).rem_euclid(1.0);
+                let v = (self.render_origin.z as f64 * s / c.size_z as f64).rem_euclid(1.0);
+                [
+                    u as f32,
+                    v as f32,
+                    (1.0 / c.size_x as f64) as f32,
+                    (1.0 / c.size_z as f64) as f32,
+                    (self.render_origin.y as f64 * s) as f32,
+                    1.0,
+                    c.lapse,
+                    if self.has_flow { 1.0 } else { 0.0 },
+                ]
+            }
+            None => [0.0; 8],
+        };
+        self.queue.write_buffer(
+            &self.sky_buffer,
+            CLIMATE_UNIFORM_OFFSET,
+            bytemuck::cast_slice(&data),
+        );
+    }
+
     /// Move the render origin (ADR-0002) and recompute every chunk's offset
     /// uniform and render-relative AABB. Call when the camera crosses into a
     /// new chunk; cheap relative to how often that happens. No-op if the
@@ -1494,6 +1648,7 @@ impl Renderer {
             return;
         }
         self.render_origin = origin;
+        self.write_climate_placement();
         for (&pos, mesh) in self.meshes.iter_mut() {
             let offset = chunk_offset(pos, origin);
             mesh.aabb_min = offset;
@@ -1557,6 +1712,15 @@ impl Renderer {
     /// reconstruction). Writes both the chunk-shader sky uniform (sky_scale) and
     /// the sky-pass uniform (sun/moon directions, star knob), and stores
     /// sky_scale for the fallback clear color.
+    /// The water clock's reading, seconds: wrapped at a whole number of flow
+    /// cycles, so an f32 keeps its precision and the drift never jumps.
+    fn water_seconds(&self) -> f32 {
+        let t = self
+            .water_time
+            .map_or_else(|| self.water_clock.elapsed().as_secs_f64(), f64::from);
+        (t % 4_000.0) as f32
+    }
+
     pub fn set_sky(
         &mut self,
         time: vox_core::WorldTime,
@@ -1578,8 +1742,8 @@ impl Renderer {
         //   2: fog start, fog end, curvature coefficient 1/2R (0 = flat;
         //      curvature.wgsl, ADR-0015), air density (atmosphere.wgsl,
         //      ADR-0016)
-        //   3: geomorph band width, eye height above sea level, reserved,
-        //      reserved
+        //   3: geomorph band width, eye height above sea level, the water
+        //      clock (flow.wgsl, M14), reserved
         // The camera position is needed per-fragment to measure view distance
         // for fog; it is render-relative so it matches vertex positions under
         // the floating origin (ADR-0002). Geomorph reuses it in the VERTEX
@@ -1604,7 +1768,7 @@ impl Renderer {
             fog.density,
             shape.morph_band,
             fog.eye_height,
-            0.0,
+            self.water_seconds(),
             0.0,
         ];
         self.queue
@@ -2085,36 +2249,74 @@ fn create_block_texture(
     })
 }
 
-/// Procedural RGBA pixels for one tile layer. A simple per-layer base color
-/// plus a cheap deterministic per-texel variation so surfaces read as
-/// textured rather than flat. Placeholder until real art drops in.
+/// How a tile's texels vary around its base colour — enough that each
+/// material reads as itself at a glance. Placeholder until real art drops
+/// in; deterministic per texel.
+#[derive(Clone, Copy)]
+enum Grain {
+    /// Even speckle of this amplitude (the original dither at 16).
+    Fine(i32),
+    /// 2×2 clumps of strong variation: pebbles.
+    Clumped(i32),
+    /// Horizontal bands (rows vary together) plus a light speckle: strata.
+    Banded(i32),
+}
+
+/// Procedural RGBA pixels for one tile layer: a base colour and a grain.
 fn tile_pixels(layer: u32, tile: u32) -> Vec<u8> {
-    use vox_core::registry::L_WATER;
-    // Base colors keyed to the registry's layer assignment.
-    let base: [u8; 3] = match layer {
-        0 => [128, 128, 134], // stone
-        1 => [134, 96, 64],   // dirt
-        2 => [80, 150, 64],   // grass top
-        3 => [96, 132, 70],   // grass side (dirt-with-green-ish)
-        4 => [206, 192, 138], // sand
-        5 => [120, 120, 126], // cobblestone
-        6 => [156, 116, 70],  // planks
-        7 => [255, 236, 170], // lamp (warm, bright)
-        L_WATER => WATER_RGB,
-        _ => [255, 0, 255], // magenta = missing
+    use vox_core::registry as r;
+    let (base, grain): ([u8; 3], Grain) = match layer {
+        0 => ([128, 128, 134], Grain::Fine(16)),    // stone
+        1 => ([134, 96, 64], Grain::Fine(16)),      // dirt
+        2 => ([80, 150, 64], Grain::Fine(16)),      // grass top
+        3 => ([96, 132, 70], Grain::Fine(16)),      // grass side
+        4 => ([206, 192, 138], Grain::Fine(10)),    // sand
+        5 => ([120, 120, 126], Grain::Clumped(22)), // cobblestone
+        6 => ([156, 116, 70], Grain::Banded(10)),   // planks
+        7 => ([255, 236, 170], Grain::Fine(16)),    // lamp (warm, bright)
+        r::L_WATER => (WATER_RGB, Grain::Fine(16)),
+        r::L_SNOW => ([236, 242, 250], Grain::Fine(5)),
+        r::L_ICE => ([168, 200, 232], Grain::Banded(8)),
+        r::L_GRAVEL => ([128, 124, 120], Grain::Clumped(34)),
+        r::L_RED_SAND => ([190, 108, 58], Grain::Fine(12)),
+        r::L_SANDSTONE => ([214, 196, 148], Grain::Banded(10)),
+        r::L_RED_SANDSTONE => ([172, 92, 52], Grain::Banded(12)),
+        r::L_BADLANDS_ORANGE => ([198, 122, 66], Grain::Banded(8)),
+        r::L_BADLANDS_RED => ([148, 70, 52], Grain::Banded(8)),
+        r::L_BADLANDS_TAN => ([204, 170, 132], Grain::Banded(8)),
+        r::L_COARSE_DIRT => ([128, 98, 70], Grain::Clumped(24)),
+        r::L_PODZOL => ([106, 80, 52], Grain::Clumped(18)),
+        r::L_CLAY => ([158, 162, 176], Grain::Fine(6)),
+        r::L_MUD => ([82, 70, 62], Grain::Fine(8)),
+        r::L_SILT => ([140, 128, 106], Grain::Fine(7)),
+        r::L_SALT => ([236, 234, 226], Grain::Fine(6)),
+        r::L_RIVER_GRAVEL => ([122, 118, 112], Grain::Clumped(26)),
+        r::L_PEAT => ([62, 46, 32], Grain::Clumped(14)),
+        _ => ([255, 0, 255], Grain::Fine(0)), // magenta = missing
     };
     // Only water is see-through.
-    let alpha = if layer == L_WATER { WATER_ALPHA } else { 255 };
+    let alpha = if layer == r::L_WATER {
+        WATER_ALPHA
+    } else {
+        255
+    };
+    // Cheap deterministic hash of a texel (or a clump, or a row) in -1..1.
+    let hash = |x: u32, y: u32| {
+        let h = x
+            .wrapping_mul(73)
+            .wrapping_add(y.wrapping_mul(151))
+            .wrapping_add(layer.wrapping_mul(977));
+        let h = (h ^ (h >> 7)).wrapping_mul(0x2C1B_3C6D) ^ (h >> 3);
+        ((h >> 8) & 0x3F) as i32 - 32
+    };
     let mut px = Vec::with_capacity((tile * tile * 4) as usize);
     for y in 0..tile {
         for x in 0..tile {
-            // Cheap hash-based dither, deterministic per texel.
-            let h = (x
-                .wrapping_mul(73)
-                .wrapping_add(y.wrapping_mul(151))
-                .wrapping_add(layer.wrapping_mul(977)))
-                & 0x1F;
-            let jitter = h as i32 - 16; // -16..15
+            let jitter = match grain {
+                Grain::Fine(a) => hash(x, y) * a / 32,
+                Grain::Clumped(a) => (hash(x / 2, y / 2) * a + hash(x, y) * 6) / 32,
+                Grain::Banded(a) => (hash(0, y / 2) * a + hash(x, y) * 4) / 32,
+            };
             let shade = |c: u8| -> u8 { (c as i32 + jitter).clamp(0, 255) as u8 };
             px.push(shade(base[0]));
             px.push(shade(base[1]));
@@ -2155,6 +2357,137 @@ const _: () = assert!(
 const FULLRES_MASK_SIDE: u32 = (2 * FULLRES_MASK_RADIUS + 1) as u32;
 /// Byte offset of the mask placement (vec4 4) in the chunk uniform.
 const FULLRES_MASK_UNIFORM_OFFSET: wgpu::BufferAddress = 4 * 16;
+/// Where the climate map's placement starts in the sky uniform (vec4s 5-6).
+const CLIMATE_UNIFORM_OFFSET: wgpu::BufferAddress = 5 * 16;
+
+/// A world's climate map, as the renderer places it (`set_climate`).
+#[derive(Clone, Copy, Debug)]
+struct ClimatePlacement {
+    size_x: i64,
+    size_z: i64,
+    lapse: f32,
+}
+
+/// One climate-map cell as a texel (M13, ADR-0018): sea-level temperature
+/// linear over -50..50 °C in red, precipitation as the square root of its
+/// share of 9 000 mm in green — fine where rain is scarce, where grass colour
+/// changes fastest. climate.wgsl decodes it.
+pub fn encode_climate(sea_level_c: f32, precip_mm: f32) -> [u8; 4] {
+    let t = ((sea_level_c + 50.0) / 100.0).clamp(0.0, 1.0);
+    let p = (precip_mm / 9_000.0).clamp(0.0, 1.0).sqrt();
+    [(t * 255.0).round() as u8, (p * 255.0).round() as u8, 0, 255]
+}
+
+/// The climate map as a filterable texture, uploaded once.
+fn climate_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    nx: u32,
+    nz: u32,
+    texels: &[u8],
+) -> wgpu::TextureView {
+    assert_eq!(texels.len(), (nx * nz * 4) as usize, "climate texels");
+    let texture = device.create_texture_with_data(
+        queue,
+        &wgpu::TextureDescriptor {
+            label: Some("climate map"),
+            size: wgpu::Extent3d {
+                width: nx,
+                height: nz,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        texels,
+    );
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// The group-3 bind group: sky uniform, full-res mask, climate and flow maps.
+fn sky_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    buffer: &wgpu::Buffer,
+    fullres_mask: &wgpu::TextureView,
+    (climate, flow): (&wgpu::TextureView, &wgpu::TextureView),
+    climate_sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("sky bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(fullres_mask),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(climate),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::Sampler(climate_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(flow),
+            },
+        ],
+    })
+}
+
+/// The fastest flow the map encodes, blocks per second (flow.wgsl's
+/// `FLOW_MAX`, pinned by a test).
+pub const FLOW_MAX: f32 = 4.0;
+
+/// One flow-map cell as a texel (M14): the water's velocity, blocks per
+/// second along x and z, each centred on 128 with ±127 for ±[`FLOW_MAX`].
+/// flow.wgsl decodes it.
+pub fn encode_flow(vx: f32, vz: f32) -> [u8; 2] {
+    let e = |v: f32| (128.0 + (v / FLOW_MAX).clamp(-1.0, 1.0) * 127.0).round() as u8;
+    [e(vx), e(vz)]
+}
+
+/// The flow map as a filterable texture, uploaded once.
+fn flow_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    nx: u32,
+    nz: u32,
+    texels: &[u8],
+) -> wgpu::TextureView {
+    assert_eq!(texels.len(), (nx * nz * 2) as usize, "flow texels");
+    let texture = device.create_texture_with_data(
+        queue,
+        &wgpu::TextureDescriptor {
+            label: Some("flow map"),
+            size: wgpu::Extent3d {
+                width: nx,
+                height: nz,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rg8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        texels,
+    );
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
 
 /// The mask's texels: 255 where `covered(cx, cz)`, row-major from the
 /// corner column `(center.x - R, center.z - R)`.
@@ -2598,16 +2931,105 @@ mod tests {
         }
     }
 
+    /// The climate map's texels read back, through climate.wgsl's decoding,
+    /// as the climate they encode (M13, ADR-0018).
+    #[test]
+    fn climate_texels_round_trip_as_the_shader_decodes_them() {
+        for (t, p) in [
+            (-45.0f32, 0.0f32),
+            (-3.0, 120.0),
+            (12.0, 900.0),
+            (27.0, 2_500.0),
+            (30.0, 8_800.0),
+        ] {
+            let [r, g, _, _] = encode_climate(t, p);
+            // climate.wgsl: r * 100 - 50, g² * 9000.
+            let (rt, rp) = (
+                f32::from(r) / 255.0 * 100.0 - 50.0,
+                (f32::from(g) / 255.0).powi(2) * 9_000.0,
+            );
+            assert!((rt - t).abs() < 0.25, "{t} °C read back as {rt}");
+            assert!((rp - p).abs() < 0.02 * p + 40.0, "{p} mm read back as {rp}");
+        }
+    }
+
+    /// climate.wgsl's constants are copies; pin them to their sources. The
+    /// grass layers are the registry's, and the tint is relative to the
+    /// grass tile's own colour — so mild, wet grass looks as it did before
+    /// biomes, and only climate moves it.
+    #[test]
+    fn climate_shader_constants_match_their_sources() {
+        use vox_core::registry::{L_GRASS_SIDE, L_GRASS_TOP};
+        let shader = include_str!("climate.wgsl");
+        assert!(shader.contains(&format!("const GRASS_TOP_LAYER: u32 = {L_GRASS_TOP}u;")));
+        assert!(shader.contains(&format!("const GRASS_SIDE_LAYER: u32 = {L_GRASS_SIDE}u;")));
+        let tile = tile_pixels(L_GRASS_TOP, 1);
+        // The tile's base colour, before its per-texel grain: average a
+        // large tile so the grain cancels.
+        let big = tile_pixels(L_GRASS_TOP, 64);
+        let mean: Vec<f32> = (0..3)
+            .map(|c| {
+                big.chunks_exact(4).map(|px| f32::from(px[c])).sum::<f32>() / (64.0 * 64.0) / 255.0
+            })
+            .collect();
+        let reference = [0.3137f32, 0.5882, 0.2510];
+        assert!(shader.contains("vec3<f32>(0.3137, 0.5882, 0.2510)"));
+        for c in 0..3 {
+            assert!(
+                (mean[c] - reference[c]).abs() < 0.02,
+                "grass tile {mean:?} vs {reference:?}"
+            );
+        }
+        assert_eq!(tile.len(), 4);
+    }
+
+    /// flow.wgsl's mirrored constants (M14), pinned to their sources, and
+    /// both water shaders drift their water through it: a river must move
+    /// the same near and far.
+    #[test]
+    fn flow_shader_matches_its_sources_and_both_passes_use_it() {
+        let shader = include_str!("flow.wgsl");
+        assert!(shader.contains(&format!(
+            "const WATER_LAYER: u32 = {}u;",
+            vox_core::registry::L_WATER
+        )));
+        assert!(shader.contains(&format!("const FLOW_MAX: f32 = {FLOW_MAX:.1};")));
+        for (name, src) in [("shader.wgsl", TERRAIN_SHADER), ("lod.wgsl", LOD_SHADER)] {
+            assert_eq!(src.matches("fn water_sample(").count(), 1, "{name}");
+            assert_eq!(src.matches("water_sample(in.layer").count(), 1, "{name}");
+        }
+    }
+
+    /// The flow map's texels decode, as flow.wgsl decodes them, to the
+    /// velocity they encode, within a texel's step; still water is exactly
+    /// still.
+    #[test]
+    fn flow_texels_round_trip_as_the_shader_decodes_them() {
+        let decode = |b: u8| (f32::from(b) - 128.0) / 127.0 * FLOW_MAX;
+        assert_eq!(encode_flow(0.0, 0.0), [128, 128]);
+        assert_eq!(decode(128), 0.0);
+        for v in [-4.0f32, -2.5, -0.3, 0.05, 1.0, 3.9] {
+            let [x, z] = encode_flow(v, -v);
+            assert!((decode(x) - v).abs() <= FLOW_MAX / 127.0, "{v}");
+            assert!((decode(z) + v).abs() <= FLOW_MAX / 127.0, "{v}");
+        }
+        assert_eq!(encode_flow(99.0, -99.0), [255, 1], "clamped");
+    }
+
     /// Full resolution and LOD must curve identically and see through the
     /// same air, or the boundary between them shows: both carry the one
     /// appended curvature and atmosphere, neither has its own, and both use
     /// them.
     #[test]
     fn both_terrain_shaders_share_curvature_and_atmosphere() {
+        // And biome colour (climate.wgsl, M13): grass the same near and far;
+        // and flowing water (flow.wgsl, M14).
         let shared = format!(
-            "{}{}",
+            "{}{}{}{}",
             include_str!("curvature.wgsl"),
-            include_str!("atmosphere.wgsl")
+            include_str!("atmosphere.wgsl"),
+            include_str!("climate.wgsl"),
+            include_str!("flow.wgsl")
         );
         for (name, own, composed) in [
             ("terrain", include_str!("shader.wgsl"), TERRAIN_SHADER),
