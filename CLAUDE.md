@@ -267,13 +267,13 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   (`docs/milestones/15-landforms-by-climate.md`): **spec approved
   2026-11-03** — all five families; glacial landforms wherever last-ice-age
   ice lay; real cliffs, not all walkable (traversal is later gameplay);
-  dunes 6–30 high, 100–250 apart; dry lands first. No code yet. **Handoff (2026-11-04):** the landform catalogue (`docs/landforms.md`) is drafted and its five questions are answered (its *Decisions* section). Next: get the owner's one-line approval of the catalogue and the M14 re-bench at version 8, then task 1 (process weights + ice-age climate in stage 1, the world-map layer, the ADR) — see the spec's *Task 0 progress* note. Dune
+  dunes 6–30 high, 100–250 apart; dry lands first. No code yet. **Handoff (2026-11-04):** the landform catalogue (`docs/landforms.md`) is drafted and its five questions are answered (its *Decisions* section). The M14 re-bench at version 8 is in (2026-11-04, `docs/benches/`; within noise of M14/M13, the spec's *Baseline* section). Next: the owner's one-line approval of the catalogue, then task 1 (process weights + ice-age climate in stage 1, the world-map layer, the ADR) — see the spec's *Task 0 progress* note. Dune
   seas, mesas and canyons, glacial valleys and fjords, inselbergs, dissected
   humid hills, as height layers weighted by a stage-1 process map, applied
   before the drainage network so water still fits the ground (M14's lesson).
   Takes over M14's carried items: closed basins ~29% (Earth ~18%), shallow
-  valleys for large rivers. Task 0 starts with the owner re-benching M14 at
-  `GENERATOR_VERSION` 8 as the baseline. No low-end machine exists yet —
+  valleys for large rivers. Criterion 9's baseline is the owner's version-8
+  bench of 2026-11-04. No low-end machine exists yet —
   M12's spec says how to judge low-end performance by proxy.
 - **Last completed milestone:** 14 — Rivers, Lakes & Valleys (2026-11-03);
   retrospective at the end of `docs/milestones/14-rivers-lakes-and-valleys.md`,
@@ -285,7 +285,7 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   ponds; nine water biomes (32 in all); flowing water in the shader; LOD
   water at its own levels. Closed after three owner flights in place of the
   walk (`GENERATOR_VERSION` 5–8 fixed what they found). Carried: closed
-  basins ~29%, shallow large-river valleys, re-bench at version 8, distant
+  basins ~29%, shallow large-river valleys, distant
   rivers as ribbons, reservoirs with the water simulation.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect

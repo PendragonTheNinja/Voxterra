@@ -20,10 +20,11 @@ Task 0 starts with the owner's re-bench of M14 at `GENERATOR_VERSION` 8.
 `docs/landforms.md`; the owner answered its five questions (its Decisions
 section: linear dunes from a seasonal dune-wind swing, slot canyons left
 for geology, the dune wind tilted, tors on temperate uplands too, about
-half the mesas with a way up). **Still open in task 0:** (a) the owner's
-one-line confirmation that the catalogue as a whole is approved; (b) the
-owner's re-bench of M14 at `GENERATOR_VERSION` 8 (`cargo run -p vox-app --
---bench`, result committed under `bench/`). The process-weight map layer
+half the mesas with a way up). **Baseline benched (owner, 2026-11-04,
+version 8):** `docs/benches/2026-11-04-m14-v8.md` (`/bench` is gitignored,
+so benches are committed there); see *Baseline* below. **Still open in
+task 0:** the owner's one-line confirmation that the catalogue as a whole
+is approved. The process-weight map layer
 needs task 1's weights and lands with them. **Next after that: task 1** —
 process weights and the ice-age climate in stage 1 (targets in the
 catalogue's *process weights* and *ice-age climate* sections), the
@@ -178,6 +179,33 @@ pass.
    within its budget; `--bench` within ~10% of M14's version-8 re-bench.
 10. **The owner's walk** (or flights, as M14), and a retrospective with
     before-and-after maps and renders.
+
+## Baseline (criterion 9)
+
+The owner's `--bench` at `GENERATOR_VERSION` 8, 2026-11-04, RTX 4060,
+800×600, dev build, flowing water on — `docs/benches/2026-11-04-m14-v8.md`.
+Against M14's version-4 bench (after the span-cache fix) and M13's close:
+
+| Phase | v8 (this) | M14 v4 | M13 close |
+|---|---|---|---|
+| 6 levels, land, standing | 834 | 850 | 894 |
+| 6 levels, ocean, standing | 737 | 727 | 811 |
+| 8 levels, land, sprint | 740 | 684 | 754 |
+| 8 levels, ocean, sprint | 731 | 664 | 745 |
+| 8 levels, rivers, standing / sprint | 695 / 741 | 716 / 709 | — |
+| 8 levels, waterfall, standing | 617 | 598 | — |
+
+Versions 5–8 (stage-1 long profiles, per-column region checks) cost
+nothing measurable: every phase is within this machine's ~14% run-to-run
+noise, and sprint is back at M13's level. Streaming unchanged: relight
+177–212 ms/s (M13 181–190), mesh 195–205 µs per chunk, encode ~0.7 ms at
+8 levels. Two things to watch, not act on yet: the sprint backlog at the
+end is 177–354 (M13 190–232; the 354 is 8-level ocean, ~200 of it
+waiting on relight), and the rivers standing phase had one 22 ms frame
+with nothing streaming (1% low 389, so a single hitch). Criterion 9
+compares against the v8 column. The bench header now names the
+generator version and build profile (M14 lesson 4); this run predates
+that, and its version is inferred from the build.
 
 ## Tasks (proposed order)
 
