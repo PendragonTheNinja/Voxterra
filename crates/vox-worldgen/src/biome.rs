@@ -219,7 +219,7 @@ const MOUNTAIN_UPLIFT: f32 = 0.06;
 /// Mean annual temperature, °C, at the treeline (mountains only).
 const TREELINE_C: f32 = 1.0;
 /// Mean annual temperature below which lowland is ice sheet, and tundra.
-const ICE_SHEET_BELOW_C: f32 = -14.0;
+pub(crate) const ICE_SHEET_BELOW_C: f32 = -14.0;
 const TUNDRA_BELOW_C: f32 = -5.0;
 /// Below this, humid lowland is boreal forest.
 const BOREAL_BELOW_C: f32 = 3.0;

@@ -89,6 +89,22 @@ are temperate today, as Norway's and Scotland's are. Where ice still lies
 
 These are tuning targets; task 1 fits the curve and the threshold to them.
 
+**Task 1's fit (2026-11-04, ADR-0021 §3).** The curve and threshold above
+reproduce the table exactly (ΔT a smoothstep in `sin(latitude)` from 20° to
+50°; a test pins it). Two things were added, because temperature alone put
+54% of land under ice, with every cold interior glaciated: **snow** — the
+threshold shifts with today's precipitation (−8 °C at 100 mm, 0 at the
+table's reference 1 000 mm, +2.5 at 4 000: wet ranges glaciate lower, as
+on Earth), and below 200–450 mm no ice sheet grows (Siberia stayed
+ice-free); and **today's ice sheet** counts as glaciated however dry
+(Antarctica). Result: 23–41% of land glaciated over four seeds (Earth's
+last glacial maximum ~25–32%).
+
+"Mountains" in the table's *Zero where* column means real ranges — uplift
+200–400 blocks and more — not any uplift: almost all high ground here is
+raised by mountain building, so the stricter reading left flash floods on
+1.4% of land.
+
 ## Wind — dune seas
 
 | Landform | Earth analogues | Earth size | Ours | Walking | Where |

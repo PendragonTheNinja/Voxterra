@@ -183,7 +183,7 @@ fn vertical_motion(abs_s: f32) -> f32 {
 /// Share of the wind blowing east (the westerlies, ~30–60°); the rest blows
 /// west (trades and polar easterlies). Blended across ~±5° at the boundaries,
 /// where Earth's winds are light and variable.
-fn eastward_share(abs_s: f32) -> f32 {
+pub(crate) fn eastward_share(abs_s: f32) -> f32 {
     // sin 25° = 0.423, sin 35° = 0.574, sin 55° = 0.819, sin 65° = 0.906.
     smoothstep(0.423, 0.574, abs_s) * (1.0 - smoothstep(0.819, 0.906, abs_s))
 }
@@ -362,7 +362,7 @@ impl ClimateMap {
     }
 
     /// The four cells around a column and its weights between them.
-    fn corners(&self, x: i64, z: i64) -> ([usize; 4], (f32, f32)) {
+    pub(crate) fn corners(&self, x: i64, z: i64) -> ([usize; 4], (f32, f32)) {
         let u = x as f64 / self.cell_x - 0.5;
         let v = z as f64 / self.cell_z - 0.5;
         let (fu, fv) = (u.floor(), v.floor());
@@ -469,7 +469,7 @@ fn sweep(g: &Grid, east: bool) -> (Vec<f32>, Vec<f32>) {
 }
 
 /// Three passes of a [1 4 6 4 1] blur on each axis, wrapping.
-fn blur(field: &mut [f32], nx: usize, nz: usize) {
+pub(crate) fn blur(field: &mut [f32], nx: usize, nz: usize) {
     const K: [f32; 5] = [1.0 / 16.0, 4.0 / 16.0, 6.0 / 16.0, 4.0 / 16.0, 1.0 / 16.0];
     let mut tmp = vec![0.0f32; field.len()];
     for _ in 0..3 {
@@ -491,7 +491,7 @@ fn blur(field: &mut [f32], nx: usize, nz: usize) {
 }
 
 /// Bilinear blend of `field` at four corners `[00, 10, 01, 11]`.
-fn lerp4(field: &[f32], c: [usize; 4], (tu, tv): (f32, f32)) -> f32 {
+pub(crate) fn lerp4(field: &[f32], c: [usize; 4], (tu, tv): (f32, f32)) -> f32 {
     let top = field[c[0]] + (field[c[1]] - field[c[0]]) * tu;
     let bottom = field[c[2]] + (field[c[3]] - field[c[2]]) * tu;
     top + (bottom - top) * tv
@@ -517,13 +517,13 @@ pub fn exp(x: f32) -> f32 {
     p * pow2(half) * pow2(n as i32 - half)
 }
 
-fn smoothstep(lo: f32, hi: f32, v: f32) -> f32 {
+pub(crate) fn smoothstep(lo: f32, hi: f32, v: f32) -> f32 {
     let t = ((v - lo) / (hi - lo)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
 
 /// Linear between `(x, y)` stops sorted by x, clamped at the ends.
-fn piecewise(stops: &[(f32, f32)], x: f32) -> f32 {
+pub(crate) fn piecewise(stops: &[(f32, f32)], x: f32) -> f32 {
     if x <= stops[0].0 {
         return stops[0].1;
     }

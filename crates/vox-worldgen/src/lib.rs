@@ -22,6 +22,7 @@ pub mod biome;
 pub mod climate;
 pub mod drainage;
 pub mod elevation;
+pub mod landform;
 #[cfg(test)]
 mod map;
 pub mod materials;
@@ -33,6 +34,7 @@ use biome::Column;
 use climate::ClimateMap;
 use drainage::{Body, DrainageMap, Water};
 use elevation::Elevation;
+use landform::{ProcessMap, Processes};
 use vox_core::{BlockId, CHUNK_SIZE, Chunk, ChunkPos, LocalPos, SEA_LEVEL_BLOCKS, WorldShape};
 
 /// Block ids used by the placeholder generator. These now come from the
@@ -71,6 +73,7 @@ pub struct Generator {
     shape: WorldShape,
     elevation: Elevation,
     climate: Arc<OnceLock<ClimateMap>>,
+    process_map: Arc<OnceLock<ProcessMap>>,
     drainage: Arc<OnceLock<DrainageMap>>,
 }
 
@@ -197,6 +200,7 @@ impl Generator {
             shape,
             elevation: Elevation::new(seed, shape),
             climate: Arc::new(OnceLock::new()),
+            process_map: Arc::new(OnceLock::new()),
             drainage: Arc::new(OnceLock::new()),
         }
     }
@@ -207,6 +211,28 @@ impl Generator {
     pub fn climate(&self) -> &ClimateMap {
         self.climate
             .get_or_init(|| ClimateMap::build(&self.elevation, self.shape))
+    }
+
+    /// The landform processes' stage-1 fields (M15, ADR-0021): basins and
+    /// sand, on the climate's grid, built on first use after it (a few
+    /// milliseconds) and shared by every clone.
+    pub fn process_map(&self) -> &ProcessMap {
+        self.process_map
+            .get_or_init(|| ProcessMap::build(self.climate(), &self.elevation, self.shape))
+    }
+
+    /// The five landform processes' weights at a column (M15,
+    /// `docs/landforms.md`): from the base ground and the stage-1 maps, so
+    /// the landforms they will shape never feed back into them.
+    pub fn processes(&self, wx: i64, wz: i64) -> Processes {
+        landform::weights(&landform::inputs_at(
+            self.climate(),
+            self.process_map(),
+            &self.elevation,
+            self.shape,
+            wx,
+            wz,
+        ))
     }
 
     /// The world's drainage network and erosion stage (M14), built on first

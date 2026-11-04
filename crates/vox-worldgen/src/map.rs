@@ -501,6 +501,115 @@ mod tests {
             write_png(&path, px, px, img).unwrap();
             println!("wrote {}", path.display());
         }
+        process_layers(&g, px, &dir);
+    }
+
+    /// Only the landform-process layers (M15 task 1):
+    /// `cargo test -p vox-worldgen --release process_map -- --ignored
+    /// --nocapture`, with the same environment as [`world_map`].
+    #[test]
+    #[ignore]
+    fn process_map() {
+        let (g, px, dir) = map_world();
+        process_layers(&g, px, &dir);
+    }
+
+    /// The landform processes (M15, `docs/landforms.md`), as two images over
+    /// the hill-shaded ground: `processes-*` the four climate processes
+    /// (wind sand-yellow, flash flood rust, weathering violet, rain green,
+    /// each by its weight), and `ice-age-*` where ice lay in the last ice
+    /// age (cyan) against where it lies today (white: M13's ice sheet and
+    /// permanent snow). Prints each process's share of land, and the
+    /// glaciated share per 10° band.
+    fn process_layers(g: &Generator, px: u32, dir: &Path) {
+        let shape = g.shape();
+        let step = shape.size_x() as f64 / f64::from(px);
+        let _ = g.climate();
+        let t = std::time::Instant::now();
+        let _ = g.process_map();
+        println!(
+            "process map: built in {:.0} ms",
+            t.elapsed().as_secs_f64() * 1000.0
+        );
+        const COLOURS: [[u8; 3]; 4] = [
+            [240, 200, 80], // wind
+            [205, 85, 40],  // flash flood
+            [160, 80, 210], // weathering
+            [40, 165, 60],  // rain
+        ];
+        let n = (px * px) as usize;
+        let (mut procs, mut ice) = (vec![0u8; n * 3], vec![0u8; n * 3]);
+        let (mut land, mut strong, mut mean) = (0u32, [0u32; 5], [0.0f64; 5]);
+        let mut bands = [(0u32, 0u32); 9];
+        let heights: Vec<i64> = (0..n)
+            .map(|k| {
+                let (i, j) = (k as u32 % px, k as u32 / px);
+                g.surface_height((f64::from(i) * step) as i64, (f64::from(j) * step) as i64)
+            })
+            .collect();
+        for j in 0..px {
+            let z = (f64::from(j) * step) as i64;
+            let band = ((shape.latitude_degrees(z).abs() / 10.0) as usize).min(8);
+            for i in 0..px {
+                let x = (f64::from(i) * step) as i64;
+                let k = (j * px + i) as usize;
+                let h = heights[k];
+                // Hill shade from the pixel up-left, in grey.
+                let up = heights[(j.saturating_sub(1) * px + i.saturating_sub(1)) as usize];
+                let shade = (1.0 + (up - h) as f32 / 80.0).clamp(0.5, 1.4);
+                let grey = if h > 0 { 150.0 } else { 60.0 };
+                let base = [(grey * shade).min(255.0) as u8; 3];
+                let p = g.processes(x, z);
+                let mut c = base;
+                for (w, col) in [p.wind, p.flood, p.weathering, p.rain].iter().zip(COLOURS) {
+                    c = ramp(&[(0.0, c), (1.0, col)], 0.9 * w);
+                }
+                procs[k * 3..k * 3 + 3].copy_from_slice(&c);
+                // Ice: today's (the column's own temperature below the snow
+                // line, or an ice-sheet biome) white, the ice age's cyan.
+                let (sea_c, _) = g.climate().sample(x, z);
+                let today = temperature_at(sea_c, h) < crate::climate::SNOW_LINE_C;
+                let c = if h <= 0 {
+                    base
+                } else if today {
+                    [250, 250, 250]
+                } else {
+                    ramp(&[(0.0, base), (1.0, [60, 200, 240])], 0.85 * p.ice)
+                };
+                ice[k * 3..k * 3 + 3].copy_from_slice(&c);
+                if h > 0 {
+                    land += 1;
+                    for (s, (_, w)) in p.named().iter().enumerate() {
+                        strong[s] += u32::from(*w >= 0.5);
+                        mean[s] += f64::from(*w);
+                    }
+                    bands[band].0 += 1;
+                    bands[band].1 += u32::from(p.ice >= 0.5);
+                }
+            }
+        }
+        let names = crate::landform::Processes::default().named();
+        for (s, (name, _)) in names.iter().enumerate() {
+            println!(
+                "  {:<12} weight ≥ 0.5 on {:>5.1}% of land, mean {:.3}",
+                name,
+                100.0 * f64::from(strong[s]) / f64::from(land),
+                mean[s] / f64::from(land)
+            );
+        }
+        let glaciated: Vec<u32> = bands
+            .iter()
+            .map(|&(l, g)| (100 * g).checked_div(l).unwrap_or(0))
+            .collect();
+        println!(
+            "ice-age glaciated % of land by 10° band from the equator: {glaciated:?} \
+             (Earth's last glacial maximum: ~25–30% of all land)"
+        );
+        for (name, img) in [("processes", &procs), ("ice-age", &ice)] {
+            let path = dir.join(format!("{name}-{:x}-{}.png", g.seed(), shape.size_x()));
+            write_png(&path, px, px, img).unwrap();
+            println!("wrote {}", path.display());
+        }
     }
 }
 

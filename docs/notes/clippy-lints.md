@@ -58,6 +58,7 @@ to run the tests. Same class of thing as the pre-existing let-chain in
 | `cloned_ref_to_slice_refs` | `buffers: &[vertex_layout.clone()]` — cloning a value only to make a one-element slice of it, when a second pipeline also needed the layout (A1, 2026-09-26) | `std::slice::from_ref(&vertex_layout)`: borrow, don't clone. Newer than the sandbox's Rust 1.75, so found only on the native run. |
 | `unusual_byte_groupings` | a test seed spelled `0x5EED_0F_8088` — hex digits grouped 4/2/4 (M12, 2026-11-01) | group hex literals evenly (`0x5EED_8088`) or not at all. |
 | `manual_is_multiple_of` | `rng.next() % 3 == 0` on a `u64` in a test (M12, 2026-10-31) | `rng.next().is_multiple_of(3)` — **unsigned only** (stable since Rust 1.87). Existing `% n == 0` on unsigned ints elsewhere predates the lint's arrival in this toolchain and is untouched; new code must use the method. |
+| `manual_checked_ops` | `if l > 0 { 100 * g / l } else { 0 }` — a zero check guarding an integer division (M15 task 1, 2026-11-04, Rust 1.97) | `(100 * g).checked_div(l).unwrap_or(0)`. Integers only; a float division behind a guard is not flagged. |
 
 ---
 

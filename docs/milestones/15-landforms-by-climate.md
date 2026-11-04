@@ -23,11 +23,19 @@ for geology, the dune wind tilted, tors on temperate uplands too, about
 half the mesas with a way up). **Baseline benched (owner, 2026-11-04,
 version 8):** `docs/benches/2026-11-04-m14-v8.md` (`/bench` is gitignored,
 so benches are committed there); see *Baseline* below. **Catalogue
-approved by the owner (2026-11-04)** — task 0 is done. The process-weight map layer
-needs task 1's weights and lands with them. **Next after that: task 1** —
-process weights and the ice-age climate in stage 1 (targets in the
-catalogue's *process weights* and *ice-age climate* sections), the
-world-map layer, and the ADR proposed.
+approved by the owner (2026-11-04)** — task 0 is done.
+**Task 1 progress (2026-11-04):** process weights and the ice-age climate
+built (`vox_worldgen::landform`, `Generator::processes`), the world map's
+`processes-*` and `ice-age-*` layers (`process_map`; gallery
+`docs/gallery/m15/`), ADR-0021 proposed. No terrain changed
+(`GENERATOR_VERSION` stays 8). Shares of land at weight ≥ 0.5, default
+seed: wind 8%, flash flood 2.5%, ice 41%, weathering 9%, rain 36%; over
+four seeds ice 23–41%. Two changes from the approved catalogue, for the
+owner to confirm: ice needs snow as well as cold (temperature alone
+glaciated 54% of land), and "mountains" means real ranges, not any uplift
+(see the catalogue's *Task 1's fit*). **Still open in task 1:** the
+owner's look at the two maps. **Next: task 2** — dry lands (dune seas,
+mesas, canyons), the first `GENERATOR_VERSION` bump.
 
 ## Why this milestone exists
 
