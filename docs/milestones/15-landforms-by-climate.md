@@ -16,10 +16,18 @@ owner's request.
 
 **Status: spec approved (2026-11-03)** — the owner's decisions at the end.
 Task 0 starts with the owner's re-bench of M14 at `GENERATOR_VERSION` 8.
-**Task 0 progress (2026-11-03):** the landform catalogue is drafted in
-`docs/landforms.md` for the owner's approval, with five questions at its
-end; the re-bench is still the owner's. The process-weight map layer needs
-task 1's weights and lands with them.
+**Task 0 progress (2026-11-04):** the landform catalogue is drafted in
+`docs/landforms.md`; the owner answered its five questions (its Decisions
+section: linear dunes from a seasonal dune-wind swing, slot canyons left
+for geology, the dune wind tilted, tors on temperate uplands too, about
+half the mesas with a way up). **Still open in task 0:** (a) the owner's
+one-line confirmation that the catalogue as a whole is approved; (b) the
+owner's re-bench of M14 at `GENERATOR_VERSION` 8 (`cargo run -p vox-app --
+--bench`, result committed under `bench/`). The process-weight map layer
+needs task 1's weights and lands with them. **Next after that: task 1** —
+process weights and the ice-age climate in stage 1 (targets in the
+catalogue's *process weights* and *ice-age climate* sections), the
+world-map layer, and the ADR proposed.
 
 ## Why this milestone exists
 
@@ -213,3 +221,5 @@ pass.
 4. **Dune size as proposed**: ridges 6–30 blocks high, 100–250 apart —
    crossing a dune sea is a climb.
 5. **Order: dry lands first** (task 2), then ice (task 3).
+6. **The catalogue's five questions** (2026-11-04) are answered in
+   `docs/landforms.md`, *Decisions*.

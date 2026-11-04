@@ -1,6 +1,10 @@
 # Landform catalogue
 
-*Draft 2026-11-03, for the owner's approval before M15 builds anything
+*Draft 2026-11-03; the owner answered its five questions on 2026-11-04
+(Decisions, at the end — the text below already follows them). Awaiting
+the owner's one-line confirmation that the catalogue as a whole is
+approved, then M15 task 1 may start. Written for the owner's approval
+before M15 builds anything
 (M15 criterion 1: "a landform catalogue … approved before code"). Once
 approved, this is what the landform layers must produce, what the
 where-Earth-puts-it tests check (criterion 3), and what the every-world test
@@ -102,10 +106,10 @@ These are tuning targets; task 1 fits the curve and the threshold to them.
   (`climate.rs`: trades westward, westerlies eastward, blended at ~25–35° and
   ~55–65°). Transverse crests therefore run roughly north–south, lee faces
   west in the trades and east in the westerlies. Earth's trades blow from
-  the north-east and south-east, not due east; **proposed**: give the
-  dune-orientation wind a fixed tilt per belt (trades from ~ENE/ESE,
-  westerlies from ~WSW/WNW), so crests run diagonally as on Earth. It
-  changes only the dunes, not M13's rain.
+  the north-east and south-east, not due east, so **the dune wind is
+  tilted per belt** (trades from ~ENE/ESE, westerlies from ~WSW/WNW) and
+  crests run diagonally as on Earth (decision 3). The tilt is read only by
+  the dunes: M13's rain, temperatures and biomes are unchanged.
 - **Interdunes** between ridges: flat sand or gravel corridors, the walking
   routes through a sea, as on Earth.
 - **Water.** Rivers die in dune seas (M14's dry rivers end in closed
@@ -113,9 +117,15 @@ These are tuning targets; task 1 fits the curve and the threshold to them.
 - **Ground.** Sand on dunes (red sand in the badlands' and hot deserts'
   redder regions is a later choice); interdunes keep the desert's ground.
 - **Linear (seif) dunes** — Earth's most common dune, long ridges *along* a
-  two-way wind (the Simpson, the Namib's south) — need two winds at an angle,
-  which our zonal model has nowhere. Left out unless the owner wants them
-  faked from the tilted belts (question 1).
+  two-way wind (the Simpson, the Namib's south) — need two winds at an
+  angle. M13 has no seasons, so the dune wind gets one (decision 1): a
+  **seasonal swing** of its direction per latitude, read only by the dunes
+  like the tilt. Small in the trades' core (transverse dunes), large toward
+  the deserts' poleward edges, ~20–30° (linear dunes along the mean wind,
+  as the Simpson's and the Kalahari's form from the seasonal shift of the
+  subtropical high); where belts meet the wind turns right round (star
+  dunes). Fryberger's rule: one wind → transverse and barchans, two at an
+  obtuse angle → linear, many → star.
 
 ## Flash flood — benches, mesas, buttes, canyons
 
@@ -125,7 +135,6 @@ These are tuning targets; task 1 fits the curve and the threshold to them.
 | **Mesa** | Monument Valley, the Hopi mesas | flat top km across, cliffs 100–300 m | flat top 200–1 000 across, walls 30–120 | top crossed in 0.5–3 min | where the network's valleys have cut back into a bench and left it isolated |
 | **Butte** | Monument Valley's Mittens | narrower than tall | 40–200 across, as tall or taller than wide | — | the last stage of a mesa: small remnants between valleys |
 | **Canyon** | Grand Canyon, Fish River, Canyonlands | to 1.8 km deep, rim to rim to 29 km | 50–200 deep, rim to rim 150–800, stepped walls, a gorge at the bottom | rim to river: a long climb or none | where an M14 river of any size crosses a flash-flood upland; depth grows with discharge and the plateau's height |
-| **Slot canyon** | Antelope Canyon, Buckskin Gulch | 1–5 m wide, 30–50 m deep | 2–5 wide, 15–40 deep, winding | — | small tributaries cutting soft beds; **proposed, optional** (question 2) |
 | **Talus apron** | every cliff in the desert West | slopes of fallen rock at ~34° | at the foot of every riser and mesa, up to half its height | walkable (1 block per 1.5) | below cliffs, from the caprock's rubble |
 
 - **The caprock.** Benches form where a hard bed resists: a bench's top is
@@ -133,8 +142,12 @@ These are tuning targets; task 1 fits the curve and the threshold to them.
   riser's foot. M13's badlands strata already band the rock; the bench
   heights should land on band boundaries, so the colours read as beds.
 - **A way up, or none.** Some mesas keep a talus ramp or a broken bench to
-  their top and some have none (owner, decision 3). Proposed: about half
-  have a walkable route, chosen per mesa from the seed.
+  their top and some have none (owner, spec decision 3). Some have a
+  walkable route (decision 5): about half, chosen per mesa from the seed,
+  the share a tuning knob.
+- **Slot canyons** (Antelope Canyon) are left for the geology milestone
+  (decision 2): they need soft and hard beds the rock does not have yet,
+  and they are narrower than anything the network sees.
 - **Rivers cut them.** Benches are applied before the network, so M14's
   rivers find the plateau and cut canyons through it; the canyon's walls
   step as the benches do. Dry washes (arroyos) are M14's dry rivers.
@@ -171,7 +184,7 @@ decides what lies in them (ice sheet, tundra, forest, a lake).
 | Landform | Earth analogues | Earth size | Ours | Walking | Where |
 |---|---|---|---|---|---|
 | **Bornhardt (dome)** | Uluru, Sugarloaf, Spitzkoppe, Zimbabwe's domes | 100–700 m high, 1–3 km across | 40–150 high, 200–600 across, convex, walls near vertical at the foot | round the base in 2–5 min; seen for kilometres | savanna and dry-forest plains, one every ~2–5 km, sometimes in clusters |
-| **Tor / kopje** (boulder pile) | the Serengeti's kopjes, Dartmoor's tors | 5–30 m | 6–20 high, 20–60 across, stacked blocks | — | the same plains, more often than domes; proposed also on temperate uplands (Dartmoor) at low weight |
+| **Tor / kopje** (boulder pile) | the Serengeti's kopjes, Dartmoor's tors | 5–30 m | 6–20 high, 20–60 across, stacked blocks | — | the same plains, more often than domes; also on temperate uplands (Dartmoor) at low weight (decision 4) |
 
 - **Bare rock**, no soil on the dome; the plain around it is flat — that
   abruptness is the landform. Some domes are climbable on one flank, some
@@ -219,13 +232,24 @@ Over many seeds, conditioned on the process weights:
 - **Every landform in every legal world size** whose climates allow it
   (criterion 7), as `every_biome_in_every_world` does for biomes.
 
-## Questions for the owner
+## Decisions (owner, 2026-11-04)
 
-1. **Linear (seif) dunes**: leave them out (our wind has no two-way belts),
-   or fake them where the tilted belts meet?
-2. **Slot canyons**: include them in task 2 (fun to walk, narrow, a little
-   dangerous later with flash floods), or leave them for geology?
-3. **Tilted wind for dunes**: give dunes the north-east/south-east trades
-   (diagonal crests, Earth-like) without changing M13's rain?
-4. **Tors on temperate uplands** (Dartmoor) as well as kopjes in savanna?
-5. **Mesas with a way up**: about half, as proposed?
+The five questions the draft asked, and the owner's answers.
+
+1. **Linear (seif) dunes** — the owner asked for Claude's recommendation;
+   recommended and recorded: **include them**, from a seasonal swing of the
+   dune wind per latitude (dune-only, like the tilt), so each dune type
+   follows Fryberger's wind regimes rather than being placed.
+2. **Slot canyons** — **left for geology** ("if it's best to leave for
+   geology, we can do that"): they need rock of differing hardness.
+3. **Tilted wind for dunes** — the owner asked whether it would hurt
+   anything; it does not: only the dunes read it, so M13's rain,
+   temperatures and biomes are unchanged, and it costs one direction per
+   latitude. The terrain changes anyway in M15 (`GENERATOR_VERSION` bump).
+   **Included.**
+4. **Tors on temperate uplands** — **yes** ("any kind of unique Earth
+   topology would be so cool to see"). The owner's wider wish — every
+   distinctive kind of Earth topography in time — is for later milestones
+   too (karst and volcanoes already wait for geology).
+5. **Mesas with a way up** — **some do** ("I'm fine if some of them do");
+   about half, a tuning knob.
