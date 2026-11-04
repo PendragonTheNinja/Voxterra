@@ -33,8 +33,9 @@ seed: wind 8%, flash flood 2.5%, ice 41%, weathering 9%, rain 36%; over
 four seeds ice 23–41%. Two changes from the approved catalogue, for the
 owner to confirm: ice needs snow as well as cold (temperature alone
 glaciated 54% of land), and "mountains" means real ranges, not any uplift
-(see the catalogue's *Task 1's fit*). **Still open in task 1:** the
-owner's look at the two maps. **Next: task 2** — dry lands (dune seas,
+(see the catalogue's *Task 1's fit*). The owner approved
+the maps and both refinements (2026-11-04: "Seems good, move ahead!") —
+task 1 is done. **Next: task 2** — dry lands (dune seas,
 mesas, canyons), the first `GENERATOR_VERSION` bump.
 
 ## Why this milestone exists

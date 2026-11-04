@@ -89,7 +89,7 @@ are temperate today, as Norway's and Scotland's are. Where ice still lies
 
 These are tuning targets; task 1 fits the curve and the threshold to them.
 
-**Task 1's fit (2026-11-04, ADR-0021 §3).** The curve and threshold above
+**Task 1's fit (2026-11-04, ADR-0021 §3; approved by the owner the same day).** The curve and threshold above
 reproduce the table exactly (ΔT a smoothstep in `sin(latitude)` from 20° to
 50°; a test pins it). Two things were added, because temperature alone put
 54% of land under ice, with every cold interior glaciated: **snow** — the
