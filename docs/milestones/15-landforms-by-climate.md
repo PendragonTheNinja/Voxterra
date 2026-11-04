@@ -22,9 +22,8 @@ section: linear dunes from a seasonal dune-wind swing, slot canyons left
 for geology, the dune wind tilted, tors on temperate uplands too, about
 half the mesas with a way up). **Baseline benched (owner, 2026-11-04,
 version 8):** `docs/benches/2026-11-04-m14-v8.md` (`/bench` is gitignored,
-so benches are committed there); see *Baseline* below. **Still open in
-task 0:** the owner's one-line confirmation that the catalogue as a whole
-is approved. The process-weight map layer
+so benches are committed there); see *Baseline* below. **Catalogue
+approved by the owner (2026-11-04)** — task 0 is done. The process-weight map layer
 needs task 1's weights and lands with them. **Next after that: task 1** —
 process weights and the ice-age climate in stage 1 (targets in the
 catalogue's *process weights* and *ice-age climate* sections), the

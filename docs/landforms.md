@@ -1,9 +1,8 @@
 # Landform catalogue
 
 *Draft 2026-11-03; the owner answered its five questions on 2026-11-04
-(Decisions, at the end — the text below already follows them). Awaiting
-the owner's one-line confirmation that the catalogue as a whole is
-approved, then M15 task 1 may start. Written for the owner's approval
+(Decisions, at the end — the text below already follows them).
+**Approved by the owner, 2026-11-04** ("Yes that is approved!"). Written for the owner's approval
 before M15 builds anything
 (M15 criterion 1: "a landform catalogue … approved before code"). Once
 approved, this is what the landform layers must produce, what the

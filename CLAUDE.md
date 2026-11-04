@@ -267,7 +267,7 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   (`docs/milestones/15-landforms-by-climate.md`): **spec approved
   2026-11-03** — all five families; glacial landforms wherever last-ice-age
   ice lay; real cliffs, not all walkable (traversal is later gameplay);
-  dunes 6–30 high, 100–250 apart; dry lands first. No code yet. **Handoff (2026-11-04):** the landform catalogue (`docs/landforms.md`) is drafted and its five questions are answered (its *Decisions* section). The M14 re-bench at version 8 is in (2026-11-04, `docs/benches/`; within noise of M14/M13, the spec's *Baseline* section). Next: the owner's one-line approval of the catalogue, then task 1 (process weights + ice-age climate in stage 1, the world-map layer, the ADR) — see the spec's *Task 0 progress* note. Dune
+  dunes 6–30 high, 100–250 apart; dry lands first. No code yet. **Handoff (2026-11-04):** the landform catalogue (`docs/landforms.md`) is drafted and its five questions are answered (its *Decisions* section). The M14 re-bench at version 8 is in (2026-11-04, `docs/benches/`; within noise of M14/M13, the spec's *Baseline* section). The owner approved the catalogue (2026-11-04); task 0 is done. Next: task 1 (process weights + ice-age climate in stage 1, the world-map layer, the ADR) — see the spec's *Task 0 progress* note. Dune
   seas, mesas and canyons, glacial valleys and fjords, inselbergs, dissected
   humid hills, as height layers weighted by a stage-1 process map, applied
   before the drainage network so water still fits the ground (M14's lesson).
