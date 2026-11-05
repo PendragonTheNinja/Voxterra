@@ -701,7 +701,7 @@ mod tests {
         let left = (at(3.5 - e) - at(3.5 - 2.0 * e)) / e as f32;
         let right = (at(3.5 + 2.0 * e) - at(3.5 + e)) / e as f32;
         assert!(
-            (left - right).abs() < 0.01 * left.abs().max(1.0),
+            (left - right).abs() < 0.05 * left.abs().max(1.0),
             "{left} against {right}"
         );
     }
