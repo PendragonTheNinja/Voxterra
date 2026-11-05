@@ -244,6 +244,19 @@ pub fn flood_possible(sea_level_c: f32, precip: f32, base_height: i64) -> bool {
     driest / aridity_threshold(warmest) < FLOOD_ARIDITY.1
 }
 
+/// Whether ice can have any weight at a column, from today's sea-level
+/// temperature before boundary noise, `|sin(latitude)|` and its base
+/// height: cheap and conservative (the warmest the noise could make it,
+/// the wettest snow's shift).
+pub fn ice_possible(sea_level_c: f32, abs_s: f32, base_height: i64) -> bool {
+    let warmest = ice_age_temperature(
+        sea_level_c + biome::TEMPERATURE_JITTER_C,
+        abs_s,
+        base_height,
+    );
+    warmest < GLACIATED_NONE_C + SNOW_SHIFT_C[SNOW_SHIFT_C.len() - 1].1
+}
+
 /// The five weights from a column's inputs. Pure; `docs/landforms.md`'s
 /// table, *The process weights*, row by row.
 pub fn weights(i: &Inputs) -> Processes {

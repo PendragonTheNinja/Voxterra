@@ -166,22 +166,23 @@ impl DrainageMap {
     pub fn build(elevation: &Elevation, climate: &ClimateMap, shape: WorldShape) -> Self {
         Self::build_on(
             elevation,
-            |x, z| (elevation.height(x, z), 0.0),
+            |x, z| (elevation.height(x, z), 0.0, 0.0),
             climate,
             shape,
         )
     }
 
     /// Build the network on any ground: `ground(x, z)` gives its height in
-    /// blocks and how strongly a caprock there makes rivers cut canyons
-    /// (the flash-flood weight, M15; `elevation` gives only the meander
-    /// noise). The
+    /// blocks, how strongly a caprock there makes rivers cut canyons (the
+    /// flash-flood weight, M15) and whether ice lay there in the ice age
+    /// (the ice weight, M15: glacial troughs); `elevation` gives only the
+    /// meander noise. The
     /// generator passes the elevation field with the landform layers that
     /// come before the network (M15, ADR-0021 §4); [`Self::build`] the
     /// elevation field alone.
     pub fn build_on(
         elevation: &Elevation,
-        ground: impl Fn(i64, i64) -> (i64, f32) + Sync,
+        ground: impl Fn(i64, i64) -> (i64, f32, f32) + Sync,
         climate: &ClimateMap,
         shape: WorldShape,
     ) -> Self {
@@ -195,14 +196,17 @@ impl DrainageMap {
                 ((j as f64 + 0.5) * cell_z).floor() as i64,
             )
         };
-        let (base, canyon): (Vec<i32>, Vec<f32>) = (0..nx * nz)
+        let sampled: Vec<(i32, f32, f32)> = (0..nx * nz)
             .into_par_iter()
             .map(|c| {
                 let (x, z) = centre(c);
-                let (h, canyon) = ground(x, z);
-                (h as i32, canyon)
+                let (h, canyon, ice) = ground(x, z);
+                (h as i32, canyon, ice)
             })
-            .unzip();
+            .collect();
+        let base: Vec<i32> = sampled.iter().map(|s| s.0).collect();
+        let canyon: Vec<f32> = sampled.iter().map(|s| s.1).collect();
+        let ice: Vec<f32> = sampled.iter().map(|s| s.2).collect();
         let sea = seas(nx, nz, &base);
         // Runoff per cell (the Budyko water balance), and what a lake over
         // it would cost: its evaporation less the rain on it, plus the
@@ -258,11 +262,20 @@ impl DrainageMap {
                 }
             })
             .collect();
-        let erosion = Erosion::build(nx, nz, (cell_x, cell_z), &base, &sea, &carving, &canyon);
+        let erosion = Erosion::build(
+            nx,
+            nz,
+            (cell_x, cell_z),
+            &base,
+            &sea,
+            &carving,
+            &canyon,
+            &ice,
+        );
         let height: Vec<i32> = (0..nx * nz)
             .map(|c| {
                 let (x, z) = centre(c);
-                base[c] + erosion.at(x as f64, z as f64).round() as i32
+                erosion.apply(x as f64, z as f64, i64::from(base[c])) as i32
             })
             .collect();
         let held = hollows::settle(
@@ -335,7 +348,7 @@ impl DrainageMap {
         // The full-resolution ground, which stage 2 shapes.
         let ground = |x: f64, z: f64| {
             let (x, z) = (x.floor() as i64, z.floor() as i64);
-            ground(x, z).0 as i32 + erosion.at(x as f64, z as f64).round() as i32
+            erosion.apply(x as f64, z as f64, ground(x, z).0) as i32
         };
         // The ground a river is seated under: none where a lake or the sea
         // lies — that is water, not ground to cut through (a river running
@@ -621,10 +634,18 @@ impl DrainageMap {
         self.erosion_at(x, z)
     }
 
-    /// The elevation's erosion stage at any column: what erosion took from
-    /// the base, blocks (never positive), on any lap of the world.
+    /// The rivers' erosion at any column: what they took from the base,
+    /// blocks (never positive), on any lap of the world. Glacial troughs
+    /// (M15) are not a change but a surface: see [`Self::erode`].
     pub fn erosion_at(&self, x: f64, z: f64) -> f32 {
         self.erosion.at(x, z)
+    }
+
+    /// The ground at a column after the erosion stage, from its ground `h`
+    /// before (the landformed elevation): cut by the rivers, then by any
+    /// glacial trough (M15). On any lap of the world.
+    pub fn erode(&self, x: i64, z: i64, h: i64) -> i64 {
+        self.erosion.apply(x as f64, z as f64, h)
     }
 
     /// Whether the cell is sea.

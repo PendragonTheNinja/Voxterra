@@ -212,7 +212,12 @@ pub enum DrainageSource {
 /// 11 — canyons (M15 task 2): on flash-flood ground the erosion stage cuts
 /// up to 4× harder and leaves walls up to 3:1, so rivers crossing a plateau
 /// cut canyons.
-pub const GENERATOR_VERSION: u32 = 11;
+/// 12 — glacial troughs (M15 task 3): where ice lay in the ice age and a
+/// valley had relief to channel it, the ground is the lower of its own and
+/// a U about the network's line, deeper and wider with the glaciated
+/// catchment; overdeepened floors fill as lakes, small valleys hang above
+/// large ones; drainage cache format 5.
+pub const GENERATOR_VERSION: u32 = 12;
 
 impl Generator {
     /// A generator for one world: its seed and its size. The size is part of
@@ -318,7 +323,7 @@ impl Generator {
     /// so no water is left held by air, and rivers keep to the interdunes.
     pub fn ground(&self, wx: i64, wz: i64) -> (elevation::Surface, Water) {
         let (base, mut s, _) = self.landformed(wx, wz);
-        s.height += self.drainage().erosion_at(wx as f64, wz as f64).round() as i64;
+        s.height = self.drainage().erode(wx, wz, s.height);
         let (h, water) = self.drainage().shape_column(
             wx,
             wz,
@@ -352,8 +357,8 @@ impl Generator {
         DrainageMap::build_on(
             &self.elevation,
             |x, z| {
-                let (_, s, _, flood) = self.landformed_flood(x, z);
-                (s.height, flood)
+                let (base, s, _, flood) = self.landformed_flood(x, z);
+                (s.height, flood, self.ice_weight(x, z, base))
             },
             self.climate(),
             self.shape,
@@ -423,6 +428,27 @@ impl Generator {
             }
             None => (base, base, None, flood),
         }
+    }
+
+    /// The ice process's weight at a column (M15): where ice lay in the
+    /// ice age, read by the network's glacial erosion; 0 without the full
+    /// weights where ice cannot have lain.
+    fn ice_weight(&self, wx: i64, wz: i64, base: elevation::Surface) -> f32 {
+        let (sea_c, _) = self.climate().sample(wx, wz);
+        let abs_s = (self.shape.latitude_sine(wz) as f32).abs();
+        if !landform::ice_possible(sea_c, abs_s, base.height) {
+            return 0.0;
+        }
+        let inputs = landform::inputs_with(
+            self.climate(),
+            self.process_map(),
+            &self.elevation,
+            self.shape,
+            wx,
+            wz,
+            base,
+        );
+        landform::weights(&inputs).ice
     }
 
     /// The landform a column stands on (M15), by name, for the readout:
@@ -614,8 +640,7 @@ impl Generator {
     /// it: the ground the drainage network was built on.
     pub fn eroded_surface(&self, wx: i64, wz: i64) -> elevation::Surface {
         let mut s = self.landformed(wx, wz).1;
-        let cut = self.drainage().erosion_at(wx as f64, wz as f64);
-        s.height += cut.round() as i64;
+        s.height = self.drainage().erode(wx, wz, s.height);
         s
     }
 
@@ -2092,7 +2117,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (11, 0xc460_55f8_96fb_c449);
+        const PINNED: (u32, u64) = (12, 0x99fd_8bd8_b68c_1105);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),

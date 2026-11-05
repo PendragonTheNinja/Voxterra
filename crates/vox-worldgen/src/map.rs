@@ -395,7 +395,10 @@ mod tests {
         let _ = g.process_map();
         let drainage = crate::drainage::DrainageMap::build_on(
             g.elevation(),
-            |x, z| (g.landformed(x, z).1.height, g.processes(x, z).flood),
+            |x, z| {
+                let p = g.processes(x, z);
+                (g.landformed(x, z).1.height, p.flood, p.ice)
+            },
             &climate,
             shape,
         );
@@ -1139,6 +1142,71 @@ mod mesa_survey {
             if best.2 > 0.0 && (seed == 0x7e22ac0de || seed == 1) {
                 super::dune_survey::closeup(&g, &dir, &format!("mesas-{seed:x}"), best.0, best.1);
             }
+        }
+    }
+}
+
+/// Glacial troughs and fjords (M15 task 3): close-ups of the deepest
+/// glacial cut inland and of the deepest glaciated cut reaching the sea,
+/// and a cross-section through each (heights across the trough).
+///
+/// `cargo test -p vox-worldgen --release ice_survey -- --ignored
+/// --nocapture`; env `WORLD_MAP_SEED`, `WORLD_MAP_DIR`.
+#[cfg(test)]
+mod ice_survey {
+    #[test]
+    #[ignore]
+    fn ice_survey() {
+        let (g, _, dir) = super::tests::map_world();
+        let d = g.drainage();
+        let (nx, nz) = d.cells();
+        let (cw, ch) = d.cell_blocks();
+        let (mut inland, mut coast) = ((0i64, 0i64, 0.0f32), (0i64, 0i64, 0.0f32));
+        for j in 0..nz {
+            for i in 0..nx {
+                if d.is_sea(i, j) {
+                    continue;
+                }
+                let (x, z) = (
+                    ((i as f64 + 0.5) * cw) as i64,
+                    ((j as f64 + 0.5) * ch) as i64,
+                );
+                let cut = (g.landformed(x, z).1.height - g.eroded_surface(x, z).height) as f32;
+                let by_sea =
+                    (0..9).any(|k| d.is_sea((i + nx + k % 3 - 1) % nx, (j + nz + k / 3 - 1) % nz));
+                let best = if by_sea { &mut coast } else { &mut inland };
+                if cut > best.2 && g.processes(x, z).ice >= 0.9 {
+                    *best = (x, z, cut);
+                }
+            }
+        }
+        for (name, (x, z, cut)) in [("trough", inland), ("fjord", coast)] {
+            if cut == 0.0 {
+                continue;
+            }
+            println!(
+                "{name}: cut {cut:.0} at ({x}, {z}), {:.1}°",
+                g.shape().latitude_degrees(z)
+            );
+            let line: Vec<String> = (-300..=300)
+                .step_by(25)
+                .map(|k| {
+                    let (s, w) = g.ground(x + k, z);
+                    let wet = if matches!(w.body, crate::drainage::Body::Dry) {
+                        ""
+                    } else {
+                        "~"
+                    };
+                    format!("{}{wet}", s.height)
+                })
+                .collect();
+            println!("  across x every 25: {}", line.join(" "));
+            let line: Vec<String> = (-300..=300)
+                .step_by(25)
+                .map(|k| g.ground(x, z + k).0.height.to_string())
+                .collect();
+            println!("  across z every 25: {}", line.join(" "));
+            super::dune_survey::closeup(&g, &dir, &format!("ice-{name}-{:x}", g.seed()), x, z);
         }
     }
 }
