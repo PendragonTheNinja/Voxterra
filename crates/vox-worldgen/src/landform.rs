@@ -35,6 +35,7 @@
 //! climate map.
 
 mod deposits;
+mod dissection;
 mod dunes;
 mod inselbergs;
 mod mesas;
@@ -49,6 +50,7 @@ use crate::climate::{
 use crate::elevation::{Elevation, Surface};
 
 pub use deposits::{Deposit, Deposits};
+pub use dissection::{DISSECTED_FROM_RELIEF, Dissection};
 pub use dunes::{Dune, DuneKind, Dunes};
 pub use inselbergs::{Inselbergs, Rock};
 pub use mesas::{MesaPart, Mesas};
@@ -573,6 +575,7 @@ mod tests {
             uplift,
             sand: 0,
             rock: false,
+            ridge: 0,
         }
     }
 

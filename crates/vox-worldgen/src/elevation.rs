@@ -286,6 +286,9 @@ pub struct Surface {
     /// Bare rock on top (M15: an inselberg's dome or a tor), no soil: the
     /// generator sets it.
     pub rock: bool,
+    /// Blocks rain-dissected hills' ridges raised it (M15): 0 from the
+    /// elevation field; the generator sets it. Counted in `height`.
+    pub ridge: i64,
 }
 
 /// Wavelengths of the biome-boundary noise, blocks: edges wander over a
@@ -568,6 +571,7 @@ impl Elevation {
             uplift: massif,
             sand: 0,
             rock: false,
+            ridge: 0,
         }
     }
 

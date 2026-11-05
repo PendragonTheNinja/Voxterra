@@ -1266,8 +1266,8 @@ mod rock_survey {
     fn rock_survey() {
         let (g, _, dir) = super::tests::map_world();
         let shape = g.shape();
-        let (mut land, mut domes, mut tors) = (0u32, 0u32, 0u32);
-        let (mut dome_at, mut tor_at) = (None, None);
+        let (mut land, mut domes, mut tors, mut hills) = (0u32, 0u32, 0u32, 0u32);
+        let (mut dome_at, mut tor_at, mut hills_at) = (None, None, None);
         let step = 40;
         let n = shape.size_x() / step;
         for j in 0..n {
@@ -1286,16 +1286,23 @@ mod rock_survey {
                         tors += 1;
                         tor_at.get_or_insert((x, z));
                     }
+                    Some("dissected hills") => {
+                        hills += 1;
+                        if hills == 2_000 {
+                            hills_at = Some((x, z));
+                        }
+                    }
                     _ => {}
                 }
             }
         }
         println!(
-            "inselbergs on {:.3}% of land, tors on {:.3}%",
+            "inselbergs on {:.3}% of land, tors on {:.3}%, dissected hills on {:.1}%",
             100.0 * f64::from(domes) / f64::from(land),
-            100.0 * f64::from(tors) / f64::from(land)
+            100.0 * f64::from(tors) / f64::from(land),
+            100.0 * f64::from(hills) / f64::from(land)
         );
-        for (name, at) in [("inselberg", dome_at), ("tor", tor_at)] {
+        for (name, at) in [("inselberg", dome_at), ("tor", tor_at), ("hills", hills_at)] {
             if let Some((x, z)) = at {
                 println!("{name} at ({x}, {z}), {:.1}°", shape.latitude_degrees(z));
                 super::dune_survey::closeup(&g, &dir, &format!("{name}-{:x}", g.seed()), x, z);

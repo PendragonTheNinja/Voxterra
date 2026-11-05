@@ -245,6 +245,7 @@ mod tests {
                 uplift: 0.0,
                 sand: 0,
                 rock: false,
+                ridge: 0,
             },
             temperature: 10.0,
             sea_level_temperature: 10.0,

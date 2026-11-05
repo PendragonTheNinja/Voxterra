@@ -81,6 +81,7 @@ pub struct Generator {
     inselbergs: landform::Inselbergs,
     /// The noise that roughens inselbergs' outlines (~150 blocks).
     outline: elevation::LandformNoise,
+    dissection: landform::Dissection,
 }
 
 /// The LOD's mark for a dry cell (`vox_mesh::LOD_DRY`; vox-worldgen does not
@@ -243,7 +244,11 @@ pub enum DrainageSource {
 /// 16 — inselbergs and tors (M15 task 4): bare-rock domes 40–150 high on
 /// savanna and dry-forest plains, rock piles there and on temperate
 /// uplands, whole and before the network.
-pub const GENERATOR_VERSION: u32 = 16;
+/// 17 — rain-dissected hills (M15 task 4): on humid hills, rounded ridges
+/// 10–40 high between small valleys 40–120 apart left at the ground's
+/// level, closer with more rain; raised after the water, faded toward
+/// rivers.
+pub const GENERATOR_VERSION: u32 = 17;
 
 impl Generator {
     /// A generator for one world: its seed and its size. The size is part of
@@ -262,6 +267,7 @@ impl Generator {
             deposits: landform::Deposits::new(shape),
             inselbergs: landform::Inselbergs::new(seed, shape),
             outline: elevation::LandformNoise::new(shape, 150, 0xB0_0010),
+            dissection: landform::Dissection::new(shape),
         }
     }
 
@@ -366,8 +372,45 @@ impl Generator {
             let sand = self.dune_sand(wx, wz, base, water.near);
             s.height += sand;
             s.sand = sand;
+            if sand == 0 && !s.rock {
+                s.ridge = self.ridges(wx, wz, base, water.near);
+                s.height += s.ridge;
+            }
         }
         (s, water)
+    }
+
+    /// Blocks rain-dissected hills (M15 task 4) raise a dry column: ridges
+    /// between small valleys left at the ground's level, faded toward the
+    /// nearest river (`near`) as the dunes are. The rain weight here is
+    /// the climate's without boundary noise: cheap, and the layer is fine
+    /// grained enough that frayed edges would not show.
+    fn ridges(&self, wx: i64, wz: i64, base: elevation::Surface, near: Option<Near>) -> i64 {
+        // Plains stay plains: most of the world, and the cheapest test.
+        if base.relief <= landform::DISSECTED_FROM_RELIEF {
+            return 0;
+        }
+        let (sea_c, precip) = self.climate().sample(wx, wz);
+        let rain = landform::weights(&landform::Inputs {
+            surface: base,
+            sea_level_c: sea_c,
+            precipitation: precip,
+            abs_s: (self.shape.latitude_sine(wz) as f32).abs(),
+            basin: 0.0,
+            sand: 0.0,
+        })
+        .rain;
+        if rain <= 0.0 {
+            return 0;
+        }
+        let clear = near.map_or(1.0, |n| {
+            climate::smoothstep(DUNE_RIVER_CLEAR.0, DUNE_RIVER_CLEAR.1, n.out)
+        });
+        (self
+            .dissection
+            .at(&self.elevation, wx, wz, rain, base.relief)
+            * clear)
+            .round() as i64
     }
 
     /// Blocks of dune sand at a dry column (M15 task 2), from its base
@@ -563,6 +606,9 @@ impl Generator {
         let (s, w) = self.ground(wx, wz);
         if s.sand == 0 {
             let base = self.elevation.surface(wx, wz);
+            if w.body == Body::Dry && !s.rock && self.ridges(wx, wz, base, w.near) >= 3 {
+                return Some("dissected hills");
+            }
             if let Some((_, r)) = self.rock(wx, wz, base) {
                 return Some(r.name());
             }
@@ -1869,8 +1915,9 @@ mod tests {
                         columns += 1;
                         let nat = g.eroded_surface(x, z).height;
                         let wet = |w: &Water| !matches!(w.body, drainage::Body::Dry);
-                        // Dune sand (M15) is wind's, not the river's shaping.
-                        let shaped = s.height - s.sand;
+                        // Dune sand and rain's ridges (M15) are the wind's
+                        // and the rain's, not the river's shaping.
+                        let shaped = s.height - s.sand - s.ridge;
                         if !wet(&w) && !near_fill && shaped - nat > 16 {
                             raised.push((x, z, shaped - nat));
                         }
@@ -1879,7 +1926,8 @@ mod tests {
                             continue;
                         }
                         let nn = g.eroded_surface(x + 1, z).height;
-                        let excess = (shaped - (sn.height - sn.sand)).abs() - (nat - nn).abs();
+                        let excess =
+                            (shaped - (sn.height - sn.sand - sn.ridge)).abs() - (nat - nn).abs();
                         if excess > 10 {
                             cliffs.push((x, z, excess));
                         }
@@ -2310,7 +2358,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (16, 0xaf16_8131_9ddd_fcf0);
+        const PINNED: (u32, u64) = (17, 0x6113_ef79_c98f_75f6);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),
