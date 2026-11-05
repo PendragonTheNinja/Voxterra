@@ -877,3 +877,138 @@ mod survey {
         }
     }
 }
+
+/// Dune seas (M15 task 2) over many worlds, against the catalogue: how
+/// much of hot and cold desert they cover, ridge heights, walkable slopes,
+/// and hill-shaded close-ups at one block per pixel — the tallest sand in
+/// each of three latitude bands (trades, the belts' meeting, westerlies).
+///
+/// `cargo test -p vox-worldgen --release dune_survey -- --ignored
+/// --nocapture`; env `SURVEY_SEEDS` (default 4), `WORLD_MAP_DIR`.
+#[cfg(test)]
+mod dune_survey {
+    use super::{ramp, write_png};
+    use crate::Generator;
+    use crate::biome::Biome;
+    use vox_core::WorldShape;
+
+    #[test]
+    #[ignore]
+    fn dune_survey() {
+        let seeds: u64 = std::env::var("SURVEY_SEEDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4);
+        let dir: std::path::PathBuf = std::env::var("WORLD_MAP_DIR").map_or_else(
+            |_| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/world-map"),
+            Into::into,
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+        let shape = WorldShape::DEFAULT;
+        let step = 200;
+        let n = shape.size_x() / step;
+        for seed in [0x7e22ac0de].into_iter().chain(1..seeds) {
+            let g = Generator::new(seed, shape);
+            let (mut hot, mut hot_dune, mut cold, mut cold_dune) = (0u32, 0u32, 0u32, 0u32);
+            let mut best = [(0i64, 0i64, 0i64); 3];
+            let mut heights = Vec::new();
+            for j in 0..n {
+                for i in 0..n {
+                    let (x, z) = (i * step + 7, j * step + 3);
+                    let col = g.column(x, z);
+                    let dune = col.surface.sand >= 3;
+                    match col.biome {
+                        Biome::HotDesert => {
+                            hot += 1;
+                            hot_dune += u32::from(dune);
+                        }
+                        Biome::ColdDesert => {
+                            cold += 1;
+                            cold_dune += u32::from(dune);
+                        }
+                        _ => {}
+                    }
+                    if col.surface.sand > 0 {
+                        heights.push(col.surface.sand);
+                    }
+                    let lat = shape.latitude_degrees(z).abs();
+                    let band = usize::from(lat >= 24.0) + usize::from(lat >= 36.0);
+                    if col.surface.sand > best[band].2 {
+                        best[band] = (x, z, col.surface.sand);
+                    }
+                }
+            }
+            heights.sort_unstable();
+            let q = |f: f64| heights.get((heights.len() as f64 * f) as usize).copied();
+            println!(
+                "seed {seed:#x}: dunes (3+ blocks) on {:.0}% of hot desert ({hot} samples), {:.0}% of cold desert ({cold}); sand height p50 {:?} p90 {:?} max {:?}",
+                100.0 * f64::from(hot_dune) / f64::from(hot.max(1)),
+                100.0 * f64::from(cold_dune) / f64::from(cold.max(1)),
+                q(0.5),
+                q(0.9),
+                heights.last()
+            );
+            if seed != 0x7e22ac0de && seed != 1 {
+                continue; // close-ups of two worlds are enough
+            }
+            for (band, &(cx, cz, top)) in best.iter().enumerate() {
+                if top == 0 {
+                    continue;
+                }
+                closeup(&g, &dir, seed, band, cx, cz);
+            }
+        }
+    }
+
+    /// 1 024 blocks square at one block per pixel, sand yellow, other
+    /// ground brown, water blue, lit from the north-west over 2 blocks so
+    /// single-block steps do not draw contour lines.
+    fn closeup(g: &Generator, dir: &std::path::Path, seed: u64, band: usize, cx: i64, cz: i64) {
+        let px = 1024i64;
+        let cols: Vec<_> = (0..px * px)
+            .map(|k| g.ground(cx - px / 2 + k % px, cz - px / 2 + k / px))
+            .collect();
+        let h = |i: i64, j: i64| {
+            cols[(j.clamp(0, px - 1) * px + i.clamp(0, px - 1)) as usize]
+                .0
+                .height
+        };
+        let mut rgb = vec![0u8; (px * px * 3) as usize];
+        let (mut steps, mut steep) = (0u64, 0u64);
+        for j in 0..px {
+            for i in 0..px {
+                let k = (j * px + i) as usize;
+                let (s, w) = cols[k];
+                if s.sand > 0 && i > 0 {
+                    steps += 1;
+                    steep += u64::from((h(i, j) - h(i - 1, j)).abs() > 1);
+                }
+                let gx = (h(i + 2, j) - h(i - 2, j)) as f32 / 4.0;
+                let gz = (h(i, j + 2) - h(i, j - 2)) as f32 / 4.0;
+                let light = (0.75 - 1.4 * (gx + gz)).clamp(0.15, 1.3);
+                let base = if !matches!(w.body, crate::drainage::Body::Dry) {
+                    [60, 120, 200]
+                } else if s.sand > 0 {
+                    [230, 205, 145]
+                } else {
+                    [165, 140, 110]
+                };
+                let c = if light <= 1.0 {
+                    ramp(&[(0.0, [20, 15, 10]), (1.0, base)], light)
+                } else {
+                    ramp(&[(0.0, base), (1.0, [255, 255, 255])], light - 1.0)
+                };
+                rgb[k * 3..k * 3 + 3].copy_from_slice(&c);
+            }
+        }
+        let shape = g.shape();
+        println!(
+            "  close-up {band} at ({cx}, {cz}), {:.1}°: steps over one block between dune columns {:.2}%",
+            shape.latitude_degrees(cz),
+            100.0 * steep as f64 / steps.max(1) as f64
+        );
+        let path = dir.join(format!("dunes-{seed:x}-{band}.png"));
+        write_png(&path, px as u32, px as u32, &rgb).unwrap();
+        println!("  wrote {}", path.display());
+    }
+}

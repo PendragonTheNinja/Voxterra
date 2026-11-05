@@ -247,8 +247,8 @@ const BADLANDS_RELIEF: f32 = 0.45;
 
 /// How far boundary noise moves the inputs: temperature by up to this many
 /// °C, precipitation by up to this share.
-const TEMPERATURE_JITTER_C: f32 = 1.5;
-const PRECIPITATION_JITTER: f32 = 0.22;
+pub(crate) const TEMPERATURE_JITTER_C: f32 = 1.5;
+pub(crate) const PRECIPITATION_JITTER: f32 = 0.22;
 
 use crate::drainage::Water;
 
@@ -388,6 +388,7 @@ mod tests {
             height,
             relief: 0.1,
             uplift: 0.0,
+            sand: 0,
         }
     }
 
@@ -445,6 +446,7 @@ mod tests {
             height: h,
             relief: 0.2,
             uplift: 0.5 * MAX_UPLIFT,
+            sand: 0,
         };
         // Mid-latitude: sea level 12 °C. Snow from ~470.
         assert_eq!(at(peak(600), 12.0, 1_000.0), Biome::AlpineRock);

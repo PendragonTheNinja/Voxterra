@@ -222,6 +222,21 @@ impl Octave {
     }
 }
 
+/// One landform-layer noise octave, built once per world
+/// ([`Elevation::noise`]).
+#[derive(Clone, Copy, Debug)]
+pub struct LandformNoise(Octave);
+
+impl LandformNoise {
+    pub fn new(shape: WorldShape, wavelength: i64, salt: u64) -> Self {
+        let oct = Octave::new(shape, wavelength);
+        Self(Octave {
+            salt: oct.salt ^ salt.wrapping_mul(0x2545_F491_4F6C_DD1D),
+            ..oct
+        })
+    }
+}
+
 /// The elevation field for one world: its seed and its size.
 #[derive(Clone, Copy, Debug)]
 pub struct Elevation {
@@ -264,6 +279,10 @@ pub struct Surface {
     /// Blocks of the height raised by mountain building (0 off the ranges,
     /// up to `MAX_UPLIFT`).
     pub uplift: f32,
+    /// Blocks of wind-blown sand the dune layer laid on top (M15,
+    /// `landform::dunes`): 0 from the elevation field; the generator sets
+    /// it. Counted in `height`.
+    pub sand: i64,
 }
 
 /// Wavelengths of the biome-boundary noise, blocks: edges wander over a
@@ -471,6 +490,20 @@ impl Elevation {
         (lerp(a.0, b.0, t), lerp(a.1, b.1, t))
     }
 
+    /// Value noise in `[-1, 1]` at `wavelength` blocks for the landform
+    /// layers (M15): tiled with the world, salted apart from every terrain
+    /// octave by `salt`. `x`, `z` on any lap.
+    pub fn landform_noise(&self, x: i64, z: i64, wavelength: i64, salt: u64) -> f32 {
+        self.noise(x, z, &LandformNoise::new(self.shape, wavelength, salt))
+    }
+
+    /// [`Self::landform_noise`] with its octave built once, for layers
+    /// that sample it per column.
+    pub fn noise(&self, x: i64, z: i64, n: &LandformNoise) -> f32 {
+        let (x, z) = (self.shape.canonical_x(x), self.shape.canonical_z(z));
+        self.value_noise(x, z, &n.0)
+    }
+
     /// The single composition point. Every stage feeds in here and nowhere
     /// else, so a future erosion pass has one place to attach.
     fn surface_canonical(&self, x: i64, z: i64) -> Surface {
@@ -530,6 +563,7 @@ impl Elevation {
             ),
             relief,
             uplift: massif,
+            sand: 0,
         }
     }
 

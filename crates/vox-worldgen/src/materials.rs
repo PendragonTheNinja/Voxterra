@@ -83,6 +83,10 @@ pub fn block_in(col: &Column, wy: i64, strata: impl Fn(i64) -> BlockId) -> Block
             return block;
         }
     }
+    // Dune sand (M15): the dune's own body, and one block under it.
+    if wy <= h && h - wy <= col.surface.sand && col.surface.sand > 0 {
+        return r::SAND;
+    }
     if wy > h {
         // Above the ground: the sea fills up to sea level (ADR-0011), and
         // freezes at the surface in polar seas.
@@ -235,6 +239,7 @@ mod tests {
                 height,
                 relief: 0.1,
                 uplift: 0.0,
+                sand: 0,
             },
             temperature: 10.0,
             sea_level_temperature: 10.0,

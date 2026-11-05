@@ -32,9 +32,9 @@ use std::sync::{Arc, OnceLock};
 
 use biome::Column;
 use climate::ClimateMap;
-use drainage::{Body, DrainageMap, Water};
+use drainage::{Body, DrainageMap, Near, Water};
 use elevation::Elevation;
-use landform::{ProcessMap, Processes};
+use landform::{Dunes, ProcessMap, Processes};
 use vox_core::{BlockId, CHUNK_SIZE, Chunk, ChunkPos, LocalPos, SEA_LEVEL_BLOCKS, WorldShape};
 
 /// Block ids used by the placeholder generator. These now come from the
@@ -75,6 +75,7 @@ pub struct Generator {
     climate: Arc<OnceLock<ClimateMap>>,
     process_map: Arc<OnceLock<ProcessMap>>,
     drainage: Arc<OnceLock<DrainageMap>>,
+    dunes: Dunes,
 }
 
 /// The LOD's mark for a dry cell (`vox_mesh::LOD_DRY`; vox-worldgen does not
@@ -90,6 +91,11 @@ fn wet_top(w: &Water) -> i64 {
         Body::Dry | Body::SaltFlat | Body::Wetland | Body::Floodplain | Body::Delta => i64::MIN,
     }
 }
+
+/// Dunes clear of rivers (M15): none within the first of these distances
+/// beyond a river's bank, full beyond the second, blocks. Rivers run in the
+/// interdunes, never over a crest (criterion 5).
+const DUNE_RIVER_CLEAR: (f32, f32) = (4.0, 40.0);
 
 /// Lowland rivers (task 4): below this slope a river has a floodplain.
 const LOWLAND_SLOPE: f32 = 0.003;
@@ -188,7 +194,11 @@ pub enum DrainageSource {
 /// blocks of the sea, land below sea level farther inland a lake at sea
 /// level; rivers end at any ground below sea level; a braided river's bars
 /// only in its middle, never across it.
-pub const GENERATOR_VERSION: u32 = 8;
+/// 9 — dune seas (M15 task 2, ADR-0021): wind-blown sand ridges on dry,
+/// low, flat ground where the wind process acts — transverse, linear, star
+/// and barchan by the wind — laid on dry ground after the water, faded
+/// toward rivers.
+pub const GENERATOR_VERSION: u32 = 9;
 
 impl Generator {
     /// A generator for one world: its seed and its size. The size is part of
@@ -202,6 +212,7 @@ impl Generator {
             climate: Arc::new(OnceLock::new()),
             process_map: Arc::new(OnceLock::new()),
             drainage: Arc::new(OnceLock::new()),
+            dunes: Dunes::new(shape),
         }
     }
 
@@ -287,8 +298,14 @@ impl Generator {
     /// The surface and the water on it (M14): the eroded ground, its river
     /// channels cut and their banks shaped, and the river, lake or salt
     /// flat the column holds.
+    ///
+    /// Dunes (M15, ADR-0021) go on last, on dry ground only and faded out
+    /// toward rivers: they only ever raise ground the water was fitted to,
+    /// so no water is left held by air, and rivers keep to the interdunes.
     pub fn ground(&self, wx: i64, wz: i64) -> (elevation::Surface, Water) {
-        let mut s = self.eroded_surface(wx, wz);
+        let base = self.elevation.surface(wx, wz);
+        let mut s = base;
+        s.height += self.drainage().erosion_at(wx as f64, wz as f64).round() as i64;
         let (h, water) = self.drainage().shape_column(
             wx,
             wz,
@@ -298,7 +315,65 @@ impl Generator {
         );
         let (h, water) = self.lowlands(wx, wz, h, water, true);
         s.height = h;
+        if water.body == Body::Dry && h > 0 {
+            let sand = self.dune_sand(wx, wz, base, water.near);
+            s.height += sand;
+            s.sand = sand;
+        }
         (s, water)
+    }
+
+    /// Blocks of dune sand at a dry column (M15 task 2), from its base
+    /// surface, faded toward the nearest river (`near`): full from
+    /// [`DUNE_RIVER_CLEAR`] blocks beyond its bank.
+    fn dune_sand(&self, wx: i64, wz: i64, base: elevation::Surface, near: Option<Near>) -> i64 {
+        self.dune(wx, wz, base, near)
+            .map_or(0, |(d, clear)| (d.height * clear).round() as i64)
+    }
+
+    /// The landform a column stands on (M15), by name, for the readout:
+    /// `None` where no landform layer has shaped it.
+    pub fn landform(&self, wx: i64, wz: i64) -> Option<&'static str> {
+        let (s, w) = self.ground(wx, wz);
+        if s.sand == 0 {
+            return None;
+        }
+        self.dune(wx, wz, self.elevation.surface(wx, wz), w.near)
+            .map(|(d, _)| d.kind.name())
+    }
+
+    /// The dune layer at a column, with the share of it left clear of the
+    /// nearest river; `None` where wind cannot act at all.
+    fn dune(
+        &self,
+        wx: i64,
+        wz: i64,
+        base: elevation::Surface,
+        near: Option<Near>,
+    ) -> Option<(landform::Dune, f32)> {
+        let (sea_c, precip) = self.climate().sample(wx, wz);
+        if !landform::wind_possible(sea_c, precip, base.height) {
+            return None;
+        }
+        let inputs = landform::inputs_with(
+            self.climate(),
+            self.process_map(),
+            &self.elevation,
+            self.shape,
+            wx,
+            wz,
+            base,
+        );
+        let wind = landform::weights(&inputs).wind;
+        let clear = near.map_or(1.0, |n| {
+            climate::smoothstep(DUNE_RIVER_CLEAR.0, DUNE_RIVER_CLEAR.1, n.out)
+        });
+        let westerly = climate::eastward_share(inputs.abs_s);
+        let temp = climate::temperature_at(inputs.sea_level_c, base.height);
+        let dune = self
+            .dunes
+            .at(&self.elevation, wx, wz, wind, inputs.abs_s, westerly, temp);
+        Some((dune, clear))
     }
 
     /// The least discharge that builds a delta in this world: large for its
@@ -1295,6 +1370,104 @@ mod tests {
         );
     }
 
+    /// Dune seas where Earth puts them (M15 criterion 3): sand only where
+    /// the wind process acts, only on dry ground, clear of river banks;
+    /// most in hot deserts; and every dune sea's ground tiles with the
+    /// world.
+    #[test]
+    fn dunes_lie_where_the_wind_works_and_never_on_water() {
+        use crate::biome::Biome;
+        let shape = WorldShape::DEFAULT;
+        let g = Generator::new(0x7e22ac0de, shape);
+        let (mut dunes, mut hot, mut hot_dunes) = (0u32, 0u32, 0u32);
+        for j in 0..300i64 {
+            for i in 0..300i64 {
+                let (x, z) = (i * 683 + 5, j * 683 + 9);
+                let (s, w) = g.ground(x, z);
+                let col = g.column(x, z);
+                if col.biome == Biome::HotDesert {
+                    hot += 1;
+                    hot_dunes += u32::from(s.sand >= 3);
+                }
+                if s.sand == 0 {
+                    continue;
+                }
+                dunes += 1;
+                assert_eq!(w.body, Body::Dry, "sand on water at ({x}, {z})");
+                assert!(
+                    g.processes(x, z).wind > 0.0,
+                    "sand without wind at ({x}, {z})"
+                );
+                assert!(
+                    w.near.is_none_or(|n| n.out >= DUNE_RIVER_CLEAR.0),
+                    "sand on a river bank at ({x}, {z})"
+                );
+                assert!(s.sand <= 60, "{} blocks of sand at ({x}, {z})", s.sand);
+                let p = shape.size_x();
+                assert_eq!(
+                    g.ground(x + p, z - p),
+                    (s, w),
+                    "dunes do not tile at ({x}, {z})"
+                );
+                assert_eq!(g.block_at(x, s.height, z), vox_core::registry::SAND);
+            }
+        }
+        let share = f64::from(hot_dunes) / f64::from(hot.max(1));
+        assert!(dunes > 1_000, "only {dunes} dune columns");
+        assert!(
+            (0.12..=0.40).contains(&share),
+            "dunes on {:.0}% of hot desert",
+            100.0 * share
+        );
+    }
+
+    /// Transverse ridges run across the dune wind (M15 criterion 3): in the
+    /// trades' core, ground changes far more along the wind (over crests
+    /// and lee faces) than across it (along a crest).
+    #[test]
+    fn transverse_crests_run_across_the_wind() {
+        let shape = WorldShape::DEFAULT;
+        let g = Generator::new(0x7e22ac0de, shape);
+        // The trades blow toward −X, tilted toward the equator by 22.5°.
+        let (mut along, mut across, mut sites) = (0.0f64, 0.0f64, 0u32);
+        for j in 0..400i64 {
+            for i in 0..400i64 {
+                let (x, z) = (i * 509 + 13, j * 509 + 7);
+                let lat = shape.latitude_degrees(z).abs();
+                if !(12.0..20.0).contains(&lat) || g.ground(x, z).0.sand < 6 {
+                    continue;
+                }
+                let u = shape.canonical_z(z) as f64 / shape.size_z() as f64;
+                let eq = if ((u * 4.0).floor() as i64) % 2 == 0 {
+                    -1.0
+                } else {
+                    1.0
+                };
+                let (dx, dz) = (-0.924, eq * 0.383);
+                let h = |t: f64, perpendicular: bool| {
+                    let (ox, oz) = if perpendicular {
+                        (-dz * t, dx * t)
+                    } else {
+                        (dx * t, dz * t)
+                    };
+                    g.ground(x + ox.round() as i64, z + oz.round() as i64)
+                        .0
+                        .sand as f64
+                };
+                for t in [-30.0, -15.0, 15.0, 30.0] {
+                    along += (h(t, false) - h(0.0, false)).abs();
+                    across += (h(t, true) - h(0.0, true)).abs();
+                }
+                sites += 1;
+            }
+        }
+        assert!(sites >= 20, "only {sites} transverse sites");
+        assert!(
+            along > 2.0 * across,
+            "change along the wind {along:.0}, across {across:.0} over {sites} sites"
+        );
+    }
+
     /// Rivers sit in their ground, never on walls (the owner's walk, M14):
     /// river shaping had built ground up to hold rivers whose levels, from
     /// the 128-block network, stood above the full-resolution ground — an
@@ -1334,15 +1507,17 @@ mod tests {
                         columns += 1;
                         let nat = g.eroded_surface(x, z).height;
                         let wet = |w: &Water| !matches!(w.body, drainage::Body::Dry);
-                        if !wet(&w) && !near_fill && s.height - nat > 16 {
-                            raised.push((x, z, s.height - nat));
+                        // Dune sand (M15) is wind's, not the river's shaping.
+                        let shaped = s.height - s.sand;
+                        if !wet(&w) && !near_fill && shaped - nat > 16 {
+                            raised.push((x, z, shaped - nat));
                         }
                         let (sn, wn) = g.ground(x + 1, z);
                         if wet(&w) || wet(&wn) {
                             continue;
                         }
                         let nn = g.eroded_surface(x + 1, z).height;
-                        let excess = (s.height - sn.height).abs() - (nat - nn).abs();
+                        let excess = (shaped - (sn.height - sn.sand)).abs() - (nat - nn).abs();
                         if excess > 10 {
                             cliffs.push((x, z, excess));
                         }
@@ -1773,7 +1948,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (8, 0x409a_bb6d_efe2_4f67);
+        const PINNED: (u32, u64) = (9, 0x76f3_7481_c049_705f);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),

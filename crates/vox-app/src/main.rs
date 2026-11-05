@@ -1846,8 +1846,12 @@ impl App {
             self.camera.position.z.floor() as i64,
         );
         let c = self.generator.column(x, z);
+        let landform = self
+            .generator
+            .landform(x, z)
+            .map_or(String::new(), |l| format!(", {l}"));
         format!(
-            "{} {:.0}C {:.0}mm lat {:.1}",
+            "{}{landform} {:.0}C {:.0}mm lat {:.1}",
             c.biome.name(),
             c.temperature,
             c.precipitation,

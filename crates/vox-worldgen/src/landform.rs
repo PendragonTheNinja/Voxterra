@@ -34,6 +34,8 @@
 //! Basic arithmetic, `floor` and [`crate::climate::exp`] only, as in the
 //! climate map.
 
+mod dunes;
+
 use rayon::prelude::*;
 use vox_core::WorldShape;
 
@@ -42,6 +44,8 @@ use crate::climate::{
     ClimateMap, blur, eastward_share, exp, lerp4, piecewise, smoothstep, temperature_at,
 };
 use crate::elevation::{Elevation, Surface};
+
+pub use dunes::{Dune, DuneKind, Dunes};
 
 // --- The ice-age climate ----------------------------------------------------
 
@@ -209,6 +213,19 @@ pub fn glaciation(ice_age_c: f32, precip: f32) -> f32 {
         GLACIATED_NONE_C + shift,
         ice_age_c,
     )) * smoothstep(SNOW_STARVED_MM.0, SNOW_STARVED_MM.1, precip)
+}
+
+/// Whether wind can have any weight at a column, from its sea-level
+/// temperature and precipitation before boundary noise and its base height:
+/// a cheap, conservative test (it allows the most the noise could make
+/// dry), so the dune layer skips the full weights almost everywhere.
+pub fn wind_possible(sea_level_c: f32, precip: f32, base_height: i64) -> bool {
+    if base_height <= 0 || base_height as f32 >= WIND_HEIGHT.1 {
+        return false;
+    }
+    let warmest = temperature_at(sea_level_c + biome::TEMPERATURE_JITTER_C, base_height);
+    let driest = precip * (1.0 - biome::PRECIPITATION_JITTER);
+    driest / aridity_threshold(warmest) < WIND_ARIDITY.1
 }
 
 /// The five weights from a column's inputs. Pure; `docs/landforms.md`'s
@@ -398,7 +415,27 @@ pub(crate) fn inputs_at(
     x: i64,
     z: i64,
 ) -> Inputs {
-    let surface = elevation.surface(x, z);
+    inputs_with(
+        climate,
+        map,
+        elevation,
+        shape,
+        x,
+        z,
+        elevation.surface(x, z),
+    )
+}
+
+/// [`inputs_at`] for a base surface already computed.
+pub(crate) fn inputs_with(
+    climate: &ClimateMap,
+    map: &ProcessMap,
+    elevation: &Elevation,
+    shape: WorldShape,
+    x: i64,
+    z: i64,
+    surface: Surface,
+) -> Inputs {
     let (corners, t) = climate.corners(x, z);
     let (sea_c, precip) = climate.sample(x, z);
     // M13's boundary noise, through the biomes' own jitter, so a process's
@@ -462,6 +499,7 @@ mod tests {
             height,
             relief,
             uplift,
+            sand: 0,
         }
     }
 
