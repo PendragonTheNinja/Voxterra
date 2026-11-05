@@ -124,6 +124,27 @@ at version 11, 33.5% at version 15 (31.9 → 34.1, 39.7 → 38.4,
 27.4 → 27.9); task 5 must aim at them directly. **Task 3 is built**,
 waiting on the owner's flight with task 2. **Next: task 4** — inselbergs
 and rain-dissected hills.
+**Task 4 progress (2026-11-05):** **inselbergs and tors (4a, version
+16)** — `landform::inselbergs`: sites on a jittered lattice tiled with
+the world (domes every ~2.5 km, tors every ~500 blocks), kept by the
+weathering weight at the site's centre so a dome is always whole; domes
+40–150 high, 200–600 across, elongated with a wobbled outline, steep at
+the foot (half rounder, climbable); tors stepped in 3-block courses, also
+on rainy uplands at low weight; bare stone; before the network. 0.09% and
+0.02% of land on the default seed (domes every few km on savanna
+plains). **Rain-dissected hills (4b, version 17)** —
+`landform::dissection`: ridges 10–40 high between small valleys left at
+the ground's level, after the water and faded toward rivers (cutting
+valleys before the network would hand it pits; after, lakes over air);
+ridge crests on warped two-octave noise; closer with rain (test). 16.5%
+of land. Half-orange hills are not a separate shape: the rounded ridges
+are them at full rain. Cost: the ridge layer ~+10% on `ground()`
+(noisy); the inselberg layer, after its cheap tests, none measurable.
+Tests: `domes_are_whole_steep_and_tiled`,
+`inselbergs_stand_on_weathered_plains`, `ridges_rise_from_untouched_valleys`,
+`valleys_closer_with_more_rain`. **Task 4 is built**, waiting on the
+owner's flight. **Next: task 5** — M14's carried items: closed basins
+(~33%, target ≤ ~22%) and valleys of 1+ m³/s rivers ≥ ~20 deep.
 
 ## Why this milestone exists
 

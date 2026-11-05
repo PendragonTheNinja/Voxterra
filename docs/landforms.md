@@ -254,6 +254,12 @@ and troughs.
   layer, applied before the network samples the ground. Their streams are
   too small for M14's rivers; they are dry valleys or, later, brooks.
 
+**Built (M15 task 4, versions 16–17).** Inselbergs and tors as above,
+whole (the weight is read at each site's centre), bare stone, before the
+network. Dissected hills as ridges raised between valleys left at the
+ground's level, after the water like the dunes, faded toward rivers;
+half-orange hills are the same ridges at full rain.
+
 ## M14's carried items
 
 Not landforms, but this milestone owns them (task 5): closed basins cover

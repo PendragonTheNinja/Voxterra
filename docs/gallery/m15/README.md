@@ -23,3 +23,6 @@ milestone is kept here, with the commit it shows.
 | `ice-cirque-7e22ac0de-v14.jpg` | `63d3e82` | Cirques at glacier heads (−26°): bowls ~240 across with flat floors 11 blocks below their lips and 3:1 headwalls |
 | `ice-moraine-7e22ac0de-v15.jpg` | `c8d4bfc` | An end moraine (38°): a ridge 4–12 high along the ice age's margin, following the ground's contour, broken by meltwater gaps; drumlins behind it |
 | `ice-drumlins-7e22ac0de-v15.jpg` | `c8d4bfc` | Drumlins (38°): small streamlined hills elongated along the ice's flow (Z), behind the moraine |
+| `inselberg-7e22ac0de-v16.jpg` | `e3876be` | An inselberg (7.7°): a bare-rock dome on a savanna plain, elongated and lumpy-outlined, steep at its foot |
+| `tor-7e22ac0de-v16.jpg` | `e3876be` | A tor (5°): a small stepped rock pile on the plain |
+| `hills-7e22ac0de-v17.jpg` | `56ee7a1` | Rain-dissected hills (0.4°): winding rounded ridges between small valleys left at the ground's level. (A first try, not kept as an image, had it inverted — narrow trenches between flat tops — and its valleys ran along the noise's lattice) |

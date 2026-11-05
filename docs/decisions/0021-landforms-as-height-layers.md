@@ -126,6 +126,14 @@ along the network's own jittered nodes and evaluated at full resolution
 from a grid of carved heights: at 128 blocks that grid showed through as
 squares. Troughs only where valleys have relief to channel the ice.
 
+**Dissection raises ridges after the water (task 4b).** The catalogue put
+rain's small valleys before the network; built that way they would hand
+its 128-block cells a field of pits. Like the dunes, they are below its
+resolution, so they go after the water and only raise: valley floors keep
+the ground the water was fitted to, and the ground between rises into
+rounded ridges, faded toward rivers. The rule for every layer stands:
+raise, or reorder nothing.
+
 The climate map and the process weights read the base elevation (step 0),
 never steps 1–3: landforms are smaller than climate cells and would only
 add noise to rain, and reading them back would make weights depend on
