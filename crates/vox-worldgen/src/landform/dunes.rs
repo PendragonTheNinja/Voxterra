@@ -99,7 +99,7 @@ const WESTERLY_SWING: f32 = 0.3;
 
 /// A plane wave tiled with the torus: `m` whole cycles around each axis.
 #[derive(Clone, Copy, Debug)]
-struct Wave {
+pub(super) struct Wave {
     mx: f64,
     mz: f64,
 }
@@ -107,7 +107,7 @@ struct Wave {
 impl Wave {
     /// The nearest tiled wave to direction `(dx, dz)` (a unit vector) at
     /// `spacing` blocks.
-    fn new(shape: WorldShape, (dx, dz): (f64, f64), spacing: f64) -> Self {
+    pub(super) fn new(shape: WorldShape, (dx, dz): (f64, f64), spacing: f64) -> Self {
         let (px, pz) = (shape.size_x() as f64, shape.size_z() as f64);
         Self {
             mx: (px * dx / spacing).round(),
@@ -118,7 +118,7 @@ impl Wave {
     /// The phase in `[0, 1)` at canonical `(x, z)` (fractional, warped):
     /// periodic in each with the world's size, since the cycle counts are
     /// whole.
-    fn phase(&self, shape: WorldShape, x: f64, z: f64) -> f32 {
+    pub(super) fn phase(&self, shape: WorldShape, x: f64, z: f64) -> f32 {
         let (px, pz) = (shape.size_x() as f64, shape.size_z() as f64);
         let a = self.mx * x / px;
         let b = self.mz * z / pz;
@@ -402,7 +402,7 @@ fn linear(phase: f32) -> f32 {
 }
 
 /// A tent over one cycle: 0 at the ends, 1 in the middle.
-fn tent(phase: f32) -> f32 {
+pub(super) fn tent(phase: f32) -> f32 {
     1.0 - (2.0 * phase - 1.0).abs()
 }
 

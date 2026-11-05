@@ -77,6 +77,7 @@ pub struct Generator {
     drainage: Arc<OnceLock<DrainageMap>>,
     dunes: Dunes,
     mesas: Mesas,
+    deposits: landform::Deposits,
 }
 
 /// The LOD's mark for a dry cell (`vox_mesh::LOD_DRY`; vox-worldgen does not
@@ -224,7 +225,10 @@ pub enum DrainageSource {
 /// level: a sawtooth of wedges along mountain rivers).
 /// 14 — cirques (M15 task 3): a glacier's head is a bowl ~240 across, its
 /// floor overdeepened below the lip, its headwall steep.
-pub const GENERATOR_VERSION: u32 = 14;
+/// 15 — end moraines and drumlins (M15 task 3): ridges 5–20 high along
+/// the ice age's ice margin and swarms of streamlined hills behind it, on
+/// low ground, before the drainage network.
+pub const GENERATOR_VERSION: u32 = 15;
 
 impl Generator {
     /// A generator for one world: its seed and its size. The size is part of
@@ -240,6 +244,7 @@ impl Generator {
             drainage: Arc::new(OnceLock::new()),
             dunes: Dunes::new(shape),
             mesas: Mesas::new(shape),
+            deposits: landform::Deposits::new(shape),
         }
     }
 
@@ -399,6 +404,51 @@ impl Generator {
         f32,
     ) {
         let base = self.elevation.surface(wx, wz);
+        let (base, mut formed, part, flood) = self.mesa_layer(wx, wz, base);
+        if let Some((h, _)) = self.deposit(wx, wz, base) {
+            formed.height += h.round() as i64;
+        }
+        (base, formed, part, flood)
+    }
+
+    /// What the last ice age's ice left at a column (M15): an end moraine
+    /// or drumlins, and how many blocks they raise it; from the ice-age
+    /// weight without boundary noise (the margin's contour, smooth).
+    fn deposit(
+        &self,
+        wx: i64,
+        wz: i64,
+        base: elevation::Surface,
+    ) -> Option<(f32, landform::Deposit)> {
+        if base.height <= 0 {
+            return None;
+        }
+        let (sea_c, precip) = self.climate().sample(wx, wz);
+        let abs_s = (self.shape.latitude_sine(wz) as f32).abs();
+        if !landform::ice_possible(sea_c, abs_s, base.height) {
+            return None;
+        }
+        let ice = landform::glaciation(
+            landform::ice_age_temperature(sea_c, abs_s, base.height),
+            precip,
+        );
+        self.deposits
+            .at(&self.elevation, wx, wz, ice, base.relief, base.uplift)
+    }
+
+    /// The mesa layer (M15 task 2b) on a base surface: the base, the
+    /// formed surface, where on the layer, and the flash-flood weight.
+    fn mesa_layer(
+        &self,
+        wx: i64,
+        wz: i64,
+        base: elevation::Surface,
+    ) -> (
+        elevation::Surface,
+        elevation::Surface,
+        Option<MesaPart>,
+        f32,
+    ) {
         if base.height <= landform::FLOOD_FROM_HEIGHT || !self.process_map().floodable(wx, wz) {
             return (base, base, None, 0.0);
         }
@@ -463,6 +513,10 @@ impl Generator {
     pub fn landform(&self, wx: i64, wz: i64) -> Option<&'static str> {
         let (s, w) = self.ground(wx, wz);
         if s.sand == 0 {
+            let base = self.elevation.surface(wx, wz);
+            if let Some((_, d)) = self.deposit(wx, wz, base) {
+                return Some(d.name());
+            }
             return self.landformed(wx, wz).2.map(MesaPart::name);
         }
         self.dune(wx, wz, self.elevation.surface(wx, wz), w.near)
@@ -1562,7 +1616,8 @@ mod tests {
                 let (x, z) = (i * 683 + 5, j * 683 + 9);
                 let (base, formed, part) = g.landformed(x, z);
                 let Some(part) = part else {
-                    assert_eq!(base, formed);
+                    // Only moraines and drumlins, which raise.
+                    assert!(formed.height >= base.height);
                     continue;
                 };
                 assert!(
@@ -1594,6 +1649,53 @@ mod tests {
         assert!(
             cliffs * 2 >= tops,
             "{cliffs} of {tops} mesa tops reach a cliff"
+        );
+    }
+
+    /// Moraines and drumlins where Earth puts them (M15 criterion 3): only
+    /// where ice lay in the ice age, and drumlins streamlined along the
+    /// ice's flow (Z) — the ground changes more across them than along.
+    #[test]
+    fn drumlins_lie_along_the_ice_flow() {
+        let shape = WorldShape::DEFAULT;
+        let g = Generator::new(0x7e22ac0de, shape);
+        let (mut along, mut across, mut sites, mut moraines) = (0i64, 0i64, 0u32, 0u32);
+        for j in 0..400i64 {
+            for i in 0..400i64 {
+                let (x, z) = (i * 509 + 13, j * 509 + 7);
+                let name = g.landform(x, z);
+                if name == Some("end moraine") {
+                    moraines += 1;
+                    assert!(
+                        g.processes(x, z).ice > 0.0,
+                        "a moraine where no ice lay at ({x}, {z})"
+                    );
+                }
+                if name != Some("drumlins") {
+                    continue;
+                }
+                assert!(
+                    g.processes(x, z).ice > 0.0,
+                    "drumlins where no ice lay at ({x}, {z})"
+                );
+                let raised = |x: i64, z: i64| {
+                    let (b, f, _) = g.landformed(x, z);
+                    f.height - b.height
+                };
+                for t in [-40, -20, 20, 40] {
+                    along += (raised(x, z + t) - raised(x, z)).abs();
+                    across += (raised(x + t, z) - raised(x, z)).abs();
+                }
+                sites += 1;
+            }
+        }
+        assert!(
+            sites >= 20 && moraines >= 20,
+            "{sites} drumlin sites, {moraines} moraine"
+        );
+        assert!(
+            across > 2 * along,
+            "change across the flow {across}, along {along}"
         );
     }
 
@@ -2124,7 +2226,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (14, 0xcd9b_b0f3_f3d0_b13d);
+        const PINNED: (u32, u64) = (15, 0xe927_ede1_91f2_4f56);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),

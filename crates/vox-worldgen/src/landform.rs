@@ -34,6 +34,7 @@
 //! Basic arithmetic, `floor` and [`crate::climate::exp`] only, as in the
 //! climate map.
 
+mod deposits;
 mod dunes;
 mod mesas;
 
@@ -46,6 +47,7 @@ use crate::climate::{
 };
 use crate::elevation::{Elevation, Surface};
 
+pub use deposits::{Deposit, Deposits};
 pub use dunes::{Dune, DuneKind, Dunes};
 pub use mesas::{MesaPart, Mesas};
 

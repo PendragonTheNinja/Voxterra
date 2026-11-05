@@ -1186,7 +1186,46 @@ mod ice_survey {
         let deepest = heads.iter().copied().max_by(|a, b| a.2.total_cmp(&b.2));
         println!("glacier heads {}, cirques {cirques}", heads.len());
         let cirque = deepest.map_or((0, 0, 0.0), |(x, z, c)| (x as i64, z as i64, c));
-        for (name, (x, z, cut)) in [("trough", inland), ("fjord", coast), ("cirque", cirque)] {
+        // Moraines and drumlins, by the readout's names, every 4th cell.
+        let (mut land, mut moraine, mut drumlins) = (0u32, None, None);
+        let (mut on_moraine, mut on_drumlins) = (0u32, 0u32);
+        for j in (0..nz).step_by(4) {
+            for i in (0..nx).step_by(4) {
+                if d.is_sea(i, j) {
+                    continue;
+                }
+                land += 1;
+                let (x, z) = (
+                    ((i as f64 + 0.5) * cw) as i64,
+                    ((j as f64 + 0.5) * ch) as i64,
+                );
+                match g.landform(x, z) {
+                    Some("end moraine") => {
+                        on_moraine += 1;
+                        moraine.get_or_insert((x, z, 1.0));
+                    }
+                    Some("drumlins") => {
+                        on_drumlins += 1;
+                        drumlins.get_or_insert((x, z, 1.0));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        println!(
+            "end moraines on {:.2}% of land, drumlins on {:.2}%",
+            100.0 * f64::from(on_moraine) / f64::from(land),
+            100.0 * f64::from(on_drumlins) / f64::from(land)
+        );
+        let moraine = moraine.unwrap_or((0, 0, 0.0));
+        let drumlins = drumlins.unwrap_or((0, 0, 0.0));
+        for (name, (x, z, cut)) in [
+            ("trough", inland),
+            ("fjord", coast),
+            ("cirque", cirque),
+            ("moraine", moraine),
+            ("drumlins", drumlins),
+        ] {
             if cut == 0.0 {
                 continue;
             }
