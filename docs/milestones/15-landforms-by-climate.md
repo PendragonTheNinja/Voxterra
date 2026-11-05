@@ -98,10 +98,15 @@ closed basins unchanged; world creation +1–2 s (network build 5.1 →
 country. Test: `ice_carves_a_valley_into_a_u` (with the existing water
 tests all passing). **Fjords rare:** few glaciated coasts in these worlds
 have mountains to channel ice, so troughs seldom reach the sea (the
-deepest glaciated cut at a coast, default seed: 26 blocks). **Found, not
-fixed (M14's):** in steep mountains the river erosion stage's 256-block
-grid shows through as squares, and mountain rivers have sawtooth notches
-along their banks (gallery `ice-trough-…-v11-before`). **Next in task 3:**
+deepest glaciated cut at a coast, default seed: 26 blocks). **Found in
+M14's code and fixed at the owner's request (version 13):** in steep
+mountains the river erosion stage's 256-block grid showed through as
+squares (bilinear creases; now Catmull–Rom, flanks ~10% steeper at most),
+and mountain rivers had sawtooth wedges along their banks (every steep
+stretch held its water level to its end; now only a reach's highest step
+is a waterfall and the others cascade). Gallery `ice-trough-…-v11-before`
+and `-v13`. **Fjords:** kept rare (recommended, not overruled by the
+owner, 2026-11-05). **Next in task 3:**
 cirques at trough heads, arêtes and horns, moraines and drumlins, and
 fjords where there are coastal mountains (or a decision that they stay
 rare).
