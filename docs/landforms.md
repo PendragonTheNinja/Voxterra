@@ -175,6 +175,17 @@ across the wind. Measured in `dune_survey`; gallery `docs/gallery/m15/`.
   rivers find the plateau and cut canyons through it; the canyon's walls
   step as the benches do. Dry washes (arroyos) are M14's dry rivers.
 
+**Built (M15 task 2b, version 10).** Benches, mesas, buttes and talus as
+above, before the network. Mesas are the caprock *raised* above the
+stripped ground (which keeps the base height and its drainage), never the
+floor dug: dug floors made bowls the network filled with closed basins.
+Caprock covers at most about a third of an upland so it stands in islands.
+A per-mesa "way up" is approximated by a 450-block noise that widens walls
+into ramps — about half of all wall length, not a choice per mesa. Bench
+levels are whole 3-block beds, but walls show the beds only in their top
+12 blocks (the profile depth); below is stone until geology. Canyons not
+yet.
+
 ## Ice — glacial valleys and coasts
 
 All of these are made inside M14's erosion stage, on the network's own

@@ -48,10 +48,26 @@ dunes"). Measured (`dune_survey`, four seeds): dunes 3+ blocks high on
 16–17, max 30–35; under 0.5% of steps between dune columns over one block.
 Cost: `ground()` +2% across the world, +0.65 µs a column inside a dune sea.
 Tests: `dunes_lie_where_the_wind_works_and_never_on_water`,
-`transverse_crests_run_across_the_wind`, waves tile. **Next: 2b** — benches,
-mesas, buttes and canyons on flash-flood uplands, applied before the
-network (it must see them to cut canyons), with talus; then the owner's
-flight over both.
+`transverse_crests_run_across_the_wind`, waves tile. **Benches, mesas
+and buttes built (2b, `GENERATOR_VERSION` 10)** — `landform::mesas`,
+applied before the network (`Generator::landformed`, `DrainageMap::build_on`):
+caprock raised 30–120 blocks in islands over the stripped ground, sheer
+walls with talus aprons (~34°), about half with a walkable ramp; benches
+18–60 high (whole 3-block beds) with risers 5 blocks wide on any slope.
+Raising the caprock, not digging the floors: the first draft dug floors
+and added 2–6 points of land draining to closed basins; raised, the share
+is unchanged (31.9 / 39.7 / 27.4% against 32.1 / 39.6 / 27.4% over three
+seeds). The layer touches ~9% of land (tops ~1%). The reshaped networks
+found two M14 lake-shore seams, fixed with failing tests first: a channel
+on ground level with a lake runs on into it; a column hard against a
+lake's region always gets its bank. Cost: `ground()` ~+10% across the
+world (noisy), ~2.7× inside mesa country. Test:
+`mesas_stand_only_on_flash_flood_uplands`; `mesa_survey`. **Still open in
+task 2:** canyons — rivers crossing flash-flood uplands cut 50–200 deep
+(with M14's carried shallow valleys, in the erosion stage); walls banded
+below their top 12 blocks (deep strata are geology's — the 12-block
+profile keeps the stone-chunk fast path). Then the owner's flight over
+the dry lands.
 
 ## Why this milestone exists
 

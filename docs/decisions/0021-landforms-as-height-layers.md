@@ -108,6 +108,15 @@ ground the water was fitted to, so nothing is held by air, and rivers keep
 to the interdune corridors. Landforms at or above the network's scale
 (benches, mesas, inselbergs, dissection) are still applied before it.
 
+**Mesas raise, they never dig (task 2b).** The network sees the
+landformed ground (`Generator::landformed`, `DrainageMap::build_on`).
+A first draft stripped the floors between mesas down to 120 blocks below
+the plateau; the network filled those bowls, and 2–6 more points of land
+drained to closed basins (criterion 6 asks for fewer). Raising the
+caprock over unchanged floors left the share as it was. Terracing keeps
+heights in order, so it adds no pits either. Every later layer before the
+network should hold to the same rule: raise, or reorder nothing.
+
 The climate map and the process weights read the base elevation (step 0),
 never steps 1–3: landforms are smaller than climate cells and would only
 add noise to rain, and reading them back would make weights depend on

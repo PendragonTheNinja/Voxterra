@@ -15,3 +15,5 @@ milestone is kept here, with the commit it shows.
 | `dunes-1-0-v9.jpg` | `9fbcf00` | Seed 1, trades (23°): transverse ridges |
 | `dunes-1-1-v9.jpg` | `9fbcf00` | Seed 1 at −29°: star dunes |
 | `dunes-1-2-draft.jpg` | a tuning round before `9fbcf00` | Seed 1, westerlies (37°), before the star and crest-wander changes: barchan crescents scattered over the edge of a playa (blue: wet or salt ground) |
+| `mesas-7e22ac0de-v10.jpg` | `6afeb76` | Version 10 at the default seed's most flash-flood-weighted mesa top (22.5°), 1 block per pixel, 1 024 blocks: mesa tops orange with bench lines, talus slopes dark brown, the stripped "mesa country" tan, water blue. Walls sheer at the top edge, talus below |
+| `mesas-1-v10.jpg` | `6afeb76` | The same for seed 1 (20°): a large mesa with a narrow arm, buttes at its edge, and a dune field (yellow) on the plain below |
