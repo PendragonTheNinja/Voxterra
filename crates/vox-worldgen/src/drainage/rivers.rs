@@ -78,6 +78,9 @@ const BANK_FALL: f64 = 1.0;
 const ALLUVIUM_SLOPE: f64 = BANK_FALL;
 /// How near a sea cell's centre a column is coastal, cells.
 const COAST_REACH: f64 = 1.2;
+/// Within this many blocks outside a lake's region, a column below the
+/// lake always gets its bank (M15).
+const EDGE_BANK: f64 = 1.5;
 /// A salt flat's crust reaches this far above its cell's floor, blocks.
 const SALT_FLAT_RISE: i64 = 2;
 
@@ -661,7 +664,11 @@ impl DrainageMap {
                     Cover::Sea => 0,
                     _ => continue,
                 };
-                if h < level && self.outside(i, j, x, z, wobble) <= 0.0 {
+                // Ground level with the lake's surface is its shore: a
+                // channel cut there, a block below, let the lake out over
+                // air (M15: mesa country's stepped ground met a salt lake's
+                // shore at exactly its level).
+                if h <= level && self.outside(i, j, x, z, wobble) <= 0.0 {
                     return true;
                 }
             }
@@ -716,7 +723,14 @@ impl DrainageMap {
                 let mut bank = |level: i64| {
                     // Level with the water for a block, then falling at 45°.
                     let b = level - ((d - 1.0).max(0.0) * BANK_FALL).floor() as i64;
-                    if b > h && self.edge_ground(i, j, (x, z), wobble, ground_at) < level {
+                    // Hard against the region's edge the lake reaches it
+                    // whatever one sample of the edge says: the column inside,
+                    // a block away, holds water (M15: rare shores in
+                    // reshaped networks stood a block over air).
+                    if b > h
+                        && (d <= EDGE_BANK
+                            || self.edge_ground(i, j, (x, z), wobble, ground_at) < level)
+                    {
                         banks[k] = (level, b);
                         k += 1;
                     }

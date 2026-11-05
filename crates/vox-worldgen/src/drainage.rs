@@ -164,6 +164,20 @@ impl std::fmt::Debug for DrainageMap {
 impl DrainageMap {
     /// Build the network for one world from its elevation and climate.
     pub fn build(elevation: &Elevation, climate: &ClimateMap, shape: WorldShape) -> Self {
+        Self::build_on(elevation, |x, z| elevation.height(x, z), climate, shape)
+    }
+
+    /// Build the network on any ground: `ground_height(x, z)` in blocks
+    /// (`elevation` gives only the meander noise). The
+    /// generator passes the elevation field with the landform layers that
+    /// come before the network (M15, ADR-0021 §4); [`Self::build`] the
+    /// elevation field alone.
+    pub fn build_on(
+        elevation: &Elevation,
+        ground_height: impl Fn(i64, i64) -> i64 + Sync,
+        climate: &ClimateMap,
+        shape: WorldShape,
+    ) -> Self {
         let (nx, nz) = grid(shape);
         let cell_x = shape.size_x() as f64 / nx as f64;
         let cell_z = shape.size_z() as f64 / nz as f64;
@@ -178,7 +192,7 @@ impl DrainageMap {
             .into_par_iter()
             .map(|c| {
                 let (x, z) = centre(c);
-                elevation.height(x, z) as i32
+                ground_height(x, z) as i32
             })
             .collect();
         let sea = seas(nx, nz, &base);
@@ -313,7 +327,7 @@ impl DrainageMap {
         // The full-resolution ground, which stage 2 shapes.
         let ground = |x: f64, z: f64| {
             let (x, z) = (x.floor() as i64, z.floor() as i64);
-            elevation.height(x, z) as i32 + erosion.at(x as f64, z as f64).round() as i32
+            ground_height(x, z) as i32 + erosion.at(x as f64, z as f64).round() as i32
         };
         // The ground a river is seated under: none where a lake or the sea
         // lies — that is water, not ground to cut through (a river running

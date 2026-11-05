@@ -392,7 +392,13 @@ mod tests {
         // Drainage (M14): rivers by discharge and lakes, at the network's
         // own resolution, over the elevation.
         let t = std::time::Instant::now();
-        let drainage = crate::drainage::DrainageMap::build(g.elevation(), &climate, shape);
+        let _ = g.process_map();
+        let drainage = crate::drainage::DrainageMap::build_on(
+            g.elevation(),
+            |x, z| g.landformed(x, z).1.height,
+            &climate,
+            shape,
+        );
         println!(
             "drainage: {:?}, built in {:.0} ms",
             drainage,
@@ -955,7 +961,7 @@ mod dune_survey {
                 if top == 0 {
                     continue;
                 }
-                closeup(&g, &dir, seed, band, cx, cz);
+                closeup(&g, &dir, &format!("dunes-{seed:x}-{band}"), cx, cz);
             }
         }
     }
@@ -963,7 +969,7 @@ mod dune_survey {
     /// 1 024 blocks square at one block per pixel, sand yellow, other
     /// ground brown, water blue, lit from the north-west over 2 blocks so
     /// single-block steps do not draw contour lines.
-    fn closeup(g: &Generator, dir: &std::path::Path, seed: u64, band: usize, cx: i64, cz: i64) {
+    pub(super) fn closeup(g: &Generator, dir: &std::path::Path, name: &str, cx: i64, cz: i64) {
         let px = 1024i64;
         let cols: Vec<_> = (0..px * px)
             .map(|k| g.ground(cx - px / 2 + k % px, cz - px / 2 + k / px))
@@ -986,12 +992,18 @@ mod dune_survey {
                 let gx = (h(i + 2, j) - h(i - 2, j)) as f32 / 4.0;
                 let gz = (h(i, j + 2) - h(i, j - 2)) as f32 / 4.0;
                 let light = (0.75 - 1.4 * (gx + gz)).clamp(0.15, 1.3);
+                let part = g.landformed(cx - px / 2 + i, cz - px / 2 + j).2;
                 let base = if !matches!(w.body, crate::drainage::Body::Dry) {
                     [60, 120, 200]
                 } else if s.sand > 0 {
                     [230, 205, 145]
                 } else {
-                    [165, 140, 110]
+                    match part {
+                        Some(crate::landform::MesaPart::Top) => [205, 120, 70],
+                        Some(crate::landform::MesaPart::Talus) => [150, 105, 85],
+                        Some(crate::landform::MesaPart::Floor) => [195, 165, 125],
+                        None => [165, 140, 110],
+                    }
                 };
                 let c = if light <= 1.0 {
                     ramp(&[(0.0, [20, 15, 10]), (1.0, base)], light)
@@ -1003,12 +1015,95 @@ mod dune_survey {
         }
         let shape = g.shape();
         println!(
-            "  close-up {band} at ({cx}, {cz}), {:.1}°: steps over one block between dune columns {:.2}%",
+            "  close-up {name} at ({cx}, {cz}), {:.1}°: steps over one block between dune columns {:.2}%",
             shape.latitude_degrees(cz),
             100.0 * steep as f64 / steps.max(1) as f64
         );
-        let path = dir.join(format!("dunes-{seed:x}-{band}.png"));
+        let path = dir.join(format!("{name}.png"));
         write_png(&path, px as u32, px as u32, &rgb).unwrap();
         println!("  wrote {}", path.display());
+    }
+}
+
+/// Benches, mesas and buttes (M15 task 2b) over many worlds: how much land
+/// the layer shapes, its walls, what share of land drains to closed
+/// basins (M15 criterion 6; the stripped ground must not add pits), and
+/// close-ups at the highest-weighted mesa top.
+///
+/// `cargo test -p vox-worldgen --release mesa_survey -- --ignored
+/// --nocapture`; env `SURVEY_SEEDS` (default 3), `WORLD_MAP_DIR`.
+#[cfg(test)]
+mod mesa_survey {
+    use crate::Generator;
+    use crate::landform::MesaPart;
+    use vox_core::WorldShape;
+
+    #[test]
+    #[ignore]
+    fn mesa_survey() {
+        let seeds: u64 = std::env::var("SURVEY_SEEDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3);
+        let dir: std::path::PathBuf = std::env::var("WORLD_MAP_DIR").map_or_else(
+            |_| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/world-map"),
+            Into::into,
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+        let shape = WorldShape::DEFAULT;
+        let step = 200;
+        let n = shape.size_x() / step;
+        for seed in [0x7e22ac0de].into_iter().chain(1..seeds) {
+            let g = Generator::new(seed, shape);
+            let (mut land, mut parts, mut best) = (0u32, [0u32; 3], (0i64, 0i64, 0.0f32));
+            let mut cut = Vec::new();
+            for j in 0..n {
+                for i in 0..n {
+                    let (x, z) = (i * step + 7, j * step + 3);
+                    let (base, formed, part) = g.landformed(x, z);
+                    if base.height <= 0 {
+                        continue;
+                    }
+                    land += 1;
+                    if let Some(p) = part {
+                        parts[p as usize] += 1;
+                        cut.push((formed.height - base.height).abs());
+                        let w = g.processes(x, z).flood;
+                        if p == MesaPart::Top && w > best.2 {
+                            best = (x, z, w);
+                        }
+                    }
+                }
+            }
+            cut.sort_unstable();
+            let q = |f: f64| cut.get((cut.len() as f64 * f) as usize).copied();
+            let d = g.drainage();
+            let (dx, dz) = d.cells();
+            let endo = d.endorheic();
+            let (mut lc, mut closed) = (0u32, 0u32);
+            for jj in 0..dz {
+                for ii in 0..dx {
+                    if !d.is_sea(ii, jj) {
+                        lc += 1;
+                        closed += u32::from(endo[jj * dx + ii]);
+                    }
+                }
+            }
+            let pct = |k: u32| 100.0 * f64::from(k) / f64::from(land.max(1));
+            println!(
+                "seed {seed:#x}: mesa layer on {:.1}% of land (tops {:.1}%, talus {:.1}%, floors {:.1}%); changed by p50 {:?} p90 {:?} max {:?}; {:.1}% of land drains to closed basins",
+                pct(parts.iter().sum()),
+                pct(parts[0]),
+                pct(parts[1]),
+                pct(parts[2]),
+                q(0.5),
+                q(0.9),
+                cut.last(),
+                100.0 * f64::from(closed) / f64::from(lc.max(1))
+            );
+            if best.2 > 0.0 && (seed == 0x7e22ac0de || seed == 1) {
+                super::dune_survey::closeup(&g, &dir, &format!("mesas-{seed:x}"), best.0, best.1);
+            }
+        }
     }
 }

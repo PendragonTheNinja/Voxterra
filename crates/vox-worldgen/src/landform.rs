@@ -35,6 +35,7 @@
 //! climate map.
 
 mod dunes;
+mod mesas;
 
 use rayon::prelude::*;
 use vox_core::WorldShape;
@@ -46,6 +47,7 @@ use crate::climate::{
 use crate::elevation::{Elevation, Surface};
 
 pub use dunes::{Dune, DuneKind, Dunes};
+pub use mesas::{MesaPart, Mesas};
 
 // --- The ice-age climate ----------------------------------------------------
 
@@ -127,6 +129,9 @@ const WIND_UNSUPPLIED: f32 = 0.35;
 /// strongest, and the share it has on smooth uplands.
 const FLOOD_ARIDITY: (f32, f32) = (0.6, 0.9);
 const FLOOD_HEIGHT: (f32, f32) = (80.0, 140.0);
+/// The height at or below which flash floods never act (the generator's
+/// first, cheapest test).
+pub const FLOOD_FROM_HEIGHT: i64 = FLOOD_HEIGHT.0 as i64;
 const FLOOD_RELIEF: (f32, f32) = (0.2, 0.45);
 const FLOOD_SMOOTH_SHARE: f32 = 0.5;
 
@@ -228,6 +233,17 @@ pub fn wind_possible(sea_level_c: f32, precip: f32, base_height: i64) -> bool {
     driest / aridity_threshold(warmest) < WIND_ARIDITY.1
 }
 
+/// Whether flash floods can have any weight at a column: as
+/// [`wind_possible`], cheap and conservative.
+pub fn flood_possible(sea_level_c: f32, precip: f32, base_height: i64) -> bool {
+    if base_height as f32 <= FLOOD_HEIGHT.0 {
+        return false;
+    }
+    let warmest = temperature_at(sea_level_c + biome::TEMPERATURE_JITTER_C, base_height);
+    let driest = precip * (1.0 - biome::PRECIPITATION_JITTER);
+    driest / aridity_threshold(warmest) < FLOOD_ARIDITY.1
+}
+
 /// The five weights from a column's inputs. Pure; `docs/landforms.md`'s
 /// table, *The process weights*, row by row.
 pub fn weights(i: &Inputs) -> Processes {
@@ -304,6 +320,16 @@ pub fn weights(i: &Inputs) -> Processes {
 pub struct ProcessMap {
     basin: Vec<f32>,
     sand: Vec<f32>,
+    /// Per cell: whether flash floods can act on any column whose climate
+    /// reads this cell (`flood_possible` at the most a column there could
+    /// read: the 3×3 cells around). Lets the generator skip the mesa layer
+    /// with one lookup, which matters because river shaping asks for
+    /// many neighbours' ground per column.
+    floodable: Vec<bool>,
+    nx: usize,
+    nz: usize,
+    cell_x: f64,
+    cell_z: f64,
 }
 
 /// Its size, not its cells.
@@ -362,7 +388,34 @@ impl ProcessMap {
         let mut sand: Vec<f32> = rows.iter().flat_map(|r| r.1.iter().copied()).collect();
         blur(&mut basin, nx, nz);
         blur(&mut sand, nx, nz);
-        Self { basin, sand }
+        let floodable = (0..nx * nz)
+            .map(|c| {
+                let (i, j) = (c % nx, c / nx);
+                (0..9).any(|k| {
+                    let ii = (i + nx + k % 3 - 1) % nx;
+                    let jj = (j + nz + k / 3 - 1) % nz;
+                    let (sea_c, precip, _, _) = climate.cell(ii, jj);
+                    flood_possible(sea_c, precip, FLOOD_HEIGHT.0 as i64 + 1)
+                })
+            })
+            .collect();
+        let (cell_x, cell_z) = climate.cell_blocks();
+        Self {
+            basin,
+            sand,
+            floodable,
+            nx,
+            nz,
+            cell_x,
+            cell_z,
+        }
+    }
+
+    /// Whether flash floods can act at a column at all (conservative).
+    pub fn floodable(&self, x: i64, z: i64) -> bool {
+        let i = ((x as f64 / self.cell_x).floor() as i64).rem_euclid(self.nx as i64) as usize;
+        let j = ((z as f64 / self.cell_z).floor() as i64).rem_euclid(self.nz as i64) as usize;
+        self.floodable[j * self.nx + i]
     }
 
     /// Basin and sand at the four cells and weights the climate map gives.

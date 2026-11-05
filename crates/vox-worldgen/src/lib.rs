@@ -34,7 +34,7 @@ use biome::Column;
 use climate::ClimateMap;
 use drainage::{Body, DrainageMap, Near, Water};
 use elevation::Elevation;
-use landform::{Dunes, ProcessMap, Processes};
+use landform::{Dunes, MesaPart, Mesas, ProcessMap, Processes};
 use vox_core::{BlockId, CHUNK_SIZE, Chunk, ChunkPos, LocalPos, SEA_LEVEL_BLOCKS, WorldShape};
 
 /// Block ids used by the placeholder generator. These now come from the
@@ -76,6 +76,7 @@ pub struct Generator {
     process_map: Arc<OnceLock<ProcessMap>>,
     drainage: Arc<OnceLock<DrainageMap>>,
     dunes: Dunes,
+    mesas: Mesas,
 }
 
 /// The LOD's mark for a dry cell (`vox_mesh::LOD_DRY`; vox-worldgen does not
@@ -91,6 +92,9 @@ fn wet_top(w: &Water) -> i64 {
         Body::Dry | Body::SaltFlat | Body::Wetland | Body::Floodplain | Body::Delta => i64::MIN,
     }
 }
+
+/// Blocks over which the mesa layer measures the base's slope (M15).
+const SLOPE_STEP: i64 = 8;
 
 /// Dunes clear of rivers (M15): none within the first of these distances
 /// beyond a river's bank, full beyond the second, blocks. Rivers run in the
@@ -198,7 +202,14 @@ pub enum DrainageSource {
 /// low, flat ground where the wind process acts — transverse, linear, star
 /// and barchan by the wind — laid on dry ground after the water, faded
 /// toward rivers.
-pub const GENERATOR_VERSION: u32 = 9;
+/// 10 — benches, mesas and buttes (M15 task 2b, ADR-0021): on flash-flood
+/// uplands the caprock stands in islands 30–120 above the stripped ground
+/// with talus at its foot (about half with a walkable ramp), and the ground
+/// steps in benches 18–60 high — before the drainage network, which is
+/// built on this ground. Two lake-shore fixes the reshaped networks found:
+/// a river's channel on ground level with a lake runs on into it, and a
+/// column hard against a lake's region always gets its bank.
+pub const GENERATOR_VERSION: u32 = 10;
 
 impl Generator {
     /// A generator for one world: its seed and its size. The size is part of
@@ -213,6 +224,7 @@ impl Generator {
             process_map: Arc::new(OnceLock::new()),
             drainage: Arc::new(OnceLock::new()),
             dunes: Dunes::new(shape),
+            mesas: Mesas::new(shape),
         }
     }
 
@@ -251,8 +263,7 @@ impl Generator {
     /// and shared by every clone. Call it once at world load, with
     /// [`Self::climate`], so the cost is paid there.
     pub fn drainage(&self) -> &DrainageMap {
-        self.drainage
-            .get_or_init(|| DrainageMap::build(&self.elevation, self.climate(), self.shape))
+        self.drainage.get_or_init(|| self.build_drainage())
     }
 
     /// [`Self::drainage`], read from the world folder's cache when it holds
@@ -275,7 +286,7 @@ impl Generator {
                 source = DrainageSource::Cache;
                 return map;
             }
-            let map = DrainageMap::build(&self.elevation, self.climate(), self.shape);
+            let map = self.build_drainage();
             let tmp = path.with_extension("tmp");
             source = match std::fs::write(&tmp, map.to_cache_bytes(key))
                 .and_then(|()| std::fs::rename(&tmp, &path))
@@ -303,8 +314,7 @@ impl Generator {
     /// toward rivers: they only ever raise ground the water was fitted to,
     /// so no water is left held by air, and rivers keep to the interdunes.
     pub fn ground(&self, wx: i64, wz: i64) -> (elevation::Surface, Water) {
-        let base = self.elevation.surface(wx, wz);
-        let mut s = base;
+        let (base, mut s, _) = self.landformed(wx, wz);
         s.height += self.drainage().erosion_at(wx as f64, wz as f64).round() as i64;
         let (h, water) = self.drainage().shape_column(
             wx,
@@ -331,12 +341,74 @@ impl Generator {
             .map_or(0, |(d, clear)| (d.height * clear).round() as i64)
     }
 
+    /// The network's own build, on the landformed ground.
+    fn build_drainage(&self) -> DrainageMap {
+        // The stage-1 maps the landforms read, first, outside the parallel
+        // build.
+        let _ = (self.climate(), self.process_map());
+        DrainageMap::build_on(
+            &self.elevation,
+            |x, z| self.landformed(x, z).1.height,
+            self.climate(),
+            self.shape,
+        )
+    }
+
+    /// The elevation field's surface, and the same with the landform layers
+    /// that come before the drainage network (M15, ADR-0021 §4: benches,
+    /// mesas and buttes on flash-flood uplands), and where on the mesa
+    /// layer the column stands. The first is what the process weights and
+    /// the dunes read; the second is what everything else builds on.
+    pub fn landformed(
+        &self,
+        wx: i64,
+        wz: i64,
+    ) -> (elevation::Surface, elevation::Surface, Option<MesaPart>) {
+        let base = self.elevation.surface(wx, wz);
+        if base.height <= landform::FLOOD_FROM_HEIGHT || !self.process_map().floodable(wx, wz) {
+            return (base, base, None);
+        }
+        let (sea_c, precip) = self.climate().sample(wx, wz);
+        if !landform::flood_possible(sea_c, precip, base.height) {
+            return (base, base, None);
+        }
+        let inputs = landform::inputs_with(
+            self.climate(),
+            self.process_map(),
+            &self.elevation,
+            self.shape,
+            wx,
+            wz,
+            base,
+        );
+        let flood = landform::weights(&inputs).flood;
+        if flood <= 0.0 {
+            return (base, base, None);
+        }
+        // The base's slope, from two forward differences: only where
+        // benches are cut, since each costs a full elevation sample.
+        let h = base.height as f32;
+        let slope = || {
+            let dx = (self.elevation.height(wx + SLOPE_STEP, wz) as f32 - h) / SLOPE_STEP as f32;
+            let dz = (self.elevation.height(wx, wz + SLOPE_STEP) as f32 - h) / SLOPE_STEP as f32;
+            (dx * dx + dz * dz).sqrt()
+        };
+        match self.mesas.at(&self.elevation, wx, wz, flood, h, slope) {
+            Some((height, part)) => {
+                let mut s = base;
+                s.height = height.round() as i64;
+                (base, s, Some(part))
+            }
+            None => (base, base, None),
+        }
+    }
+
     /// The landform a column stands on (M15), by name, for the readout:
     /// `None` where no landform layer has shaped it.
     pub fn landform(&self, wx: i64, wz: i64) -> Option<&'static str> {
         let (s, w) = self.ground(wx, wz);
         if s.sand == 0 {
-            return None;
+            return self.landformed(wx, wz).2.map(MesaPart::name);
         }
         self.dune(wx, wz, self.elevation.surface(wx, wz), w.near)
             .map(|(d, _)| d.kind.name())
@@ -519,7 +591,7 @@ impl Generator {
     /// The elevation field cut by the erosion stage, before rivers shape
     /// it: the ground the drainage network was built on.
     pub fn eroded_surface(&self, wx: i64, wz: i64) -> elevation::Surface {
-        let mut s = self.elevation.surface(wx, wz);
+        let mut s = self.landformed(wx, wz).1;
         let cut = self.drainage().erosion_at(wx as f64, wz as f64);
         s.height += cut.round() as i64;
         s
@@ -1421,6 +1493,56 @@ mod tests {
         );
     }
 
+    /// Mesas where Earth puts them (M15 criterion 3): the layer acts only
+    /// on flash-flood ground; caprock is raised and floors cut at most one
+    /// bench step (so the network finds no new pits); mesa tops end in
+    /// cliffs; and the
+    /// layer tiles with the world.
+    #[test]
+    fn mesas_stand_only_on_flash_flood_uplands() {
+        let shape = WorldShape::DEFAULT;
+        let g = Generator::new(0x7e22ac0de, shape);
+        let (mut tops, mut cliffs) = (0u32, 0u32);
+        for j in 0..300i64 {
+            for i in 0..300i64 {
+                let (x, z) = (i * 683 + 5, j * 683 + 9);
+                let (base, formed, part) = g.landformed(x, z);
+                let Some(part) = part else {
+                    assert_eq!(base, formed);
+                    continue;
+                };
+                assert!(
+                    g.processes(x, z).flood > 0.0,
+                    "mesa without flash floods at ({x}, {z})"
+                );
+                // Benches cut at most one step (60) to flatten; terracing
+                // keeps heights in order, so it digs no pits.
+                assert!(
+                    formed.height >= base.height - 61,
+                    "ground dug at ({x}, {z})"
+                );
+                let p = shape.size_x();
+                assert_eq!(g.landformed(x - p, z + p), (base, formed, Some(part)));
+                if part == landform::MesaPart::Top {
+                    tops += 1;
+                    // Walk out until the ground falls: a cliff drops 8+ over
+                    // 4 blocks somewhere within 600,
+                    // in one of the four directions.
+                    let cliff = [(1, 0), (-1, 0), (0, 1), (0, -1)].iter().any(|&(dx, dz)| {
+                        let h = |k: i64| g.landformed(x + dx * k, z + dz * k).1.height;
+                        (0..600).step_by(2).any(|k| h(k) - h(k + 4) >= 8)
+                    });
+                    cliffs += u32::from(cliff);
+                }
+            }
+        }
+        assert!(tops >= 50, "only {tops} mesa tops");
+        assert!(
+            cliffs * 2 >= tops,
+            "{cliffs} of {tops} mesa tops reach a cliff"
+        );
+    }
+
     /// Transverse ridges run across the dune wind (M15 criterion 3): in the
     /// trades' core, ground changes far more along the wind (over crests
     /// and lee faces) than across it (along a crest).
@@ -1948,7 +2070,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (9, 0x76f3_7481_c049_705f);
+        const PINNED: (u32, u64) = (10, 0x3851_7f97_bd47_d55c);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),
