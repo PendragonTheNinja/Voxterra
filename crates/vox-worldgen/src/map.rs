@@ -395,7 +395,7 @@ mod tests {
         let _ = g.process_map();
         let drainage = crate::drainage::DrainageMap::build_on(
             g.elevation(),
-            |x, z| g.landformed(x, z).1.height,
+            |x, z| (g.landformed(x, z).1.height, g.processes(x, z).flood),
             &climate,
             shape,
         );
@@ -1089,6 +1089,41 @@ mod mesa_survey {
                     }
                 }
             }
+            // Canyons: how deep erosion cut under rivers of 0.1+ m³/s, on
+            // flash-flood ground and elsewhere.
+            let (cw, ch) = d.cell_blocks();
+            let (mut on, mut off) = (Vec::new(), Vec::new());
+            for jj in (0..dz).step_by(2) {
+                for ii in (0..dx).step_by(2) {
+                    let (_, _, q, _) = d.cell(ii, jj);
+                    if q < 0.1 || d.is_sea(ii, jj) || d.is_lake(ii, jj) {
+                        continue;
+                    }
+                    let (x, z) = (
+                        ((ii as f64 + 0.5) * cw) as i64,
+                        ((jj as f64 + 0.5) * ch) as i64,
+                    );
+                    let cut = -d.erosion(ii, jj);
+                    if g.processes(x, z).flood > 0.3 {
+                        on.push(cut);
+                    } else {
+                        off.push(cut);
+                    }
+                }
+            }
+            let med = |v: &mut Vec<f32>| {
+                v.sort_by(f32::total_cmp);
+                (
+                    v.get(v.len() / 2).copied(),
+                    v.get(v.len() * 9 / 10).copied(),
+                    v.len(),
+                )
+            };
+            println!(
+                "  rivers of 0.1+ m³/s cut (p50, p90, cells): on flash-flood ground {:?}, elsewhere {:?}",
+                med(&mut on),
+                med(&mut off)
+            );
             let pct = |k: u32| 100.0 * f64::from(k) / f64::from(land.max(1));
             println!(
                 "seed {seed:#x}: mesa layer on {:.1}% of land (tops {:.1}%, talus {:.1}%, floors {:.1}%); changed by p50 {:?} p90 {:?} max {:?}; {:.1}% of land drains to closed basins",

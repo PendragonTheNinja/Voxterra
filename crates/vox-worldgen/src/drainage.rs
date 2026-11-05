@@ -164,17 +164,24 @@ impl std::fmt::Debug for DrainageMap {
 impl DrainageMap {
     /// Build the network for one world from its elevation and climate.
     pub fn build(elevation: &Elevation, climate: &ClimateMap, shape: WorldShape) -> Self {
-        Self::build_on(elevation, |x, z| elevation.height(x, z), climate, shape)
+        Self::build_on(
+            elevation,
+            |x, z| (elevation.height(x, z), 0.0),
+            climate,
+            shape,
+        )
     }
 
-    /// Build the network on any ground: `ground_height(x, z)` in blocks
-    /// (`elevation` gives only the meander noise). The
+    /// Build the network on any ground: `ground(x, z)` gives its height in
+    /// blocks and how strongly a caprock there makes rivers cut canyons
+    /// (the flash-flood weight, M15; `elevation` gives only the meander
+    /// noise). The
     /// generator passes the elevation field with the landform layers that
     /// come before the network (M15, ADR-0021 §4); [`Self::build`] the
     /// elevation field alone.
     pub fn build_on(
         elevation: &Elevation,
-        ground_height: impl Fn(i64, i64) -> i64 + Sync,
+        ground: impl Fn(i64, i64) -> (i64, f32) + Sync,
         climate: &ClimateMap,
         shape: WorldShape,
     ) -> Self {
@@ -188,13 +195,14 @@ impl DrainageMap {
                 ((j as f64 + 0.5) * cell_z).floor() as i64,
             )
         };
-        let base: Vec<i32> = (0..nx * nz)
+        let (base, canyon): (Vec<i32>, Vec<f32>) = (0..nx * nz)
             .into_par_iter()
             .map(|c| {
                 let (x, z) = centre(c);
-                ground_height(x, z) as i32
+                let (h, canyon) = ground(x, z);
+                (h as i32, canyon)
             })
-            .collect();
+            .unzip();
         let sea = seas(nx, nz, &base);
         // Runoff per cell (the Budyko water balance), and what a lake over
         // it would cost: its evaporation less the rain on it, plus the
@@ -250,7 +258,7 @@ impl DrainageMap {
                 }
             })
             .collect();
-        let erosion = Erosion::build(nx, nz, (cell_x, cell_z), &base, &sea, &carving);
+        let erosion = Erosion::build(nx, nz, (cell_x, cell_z), &base, &sea, &carving, &canyon);
         let height: Vec<i32> = (0..nx * nz)
             .map(|c| {
                 let (x, z) = centre(c);
@@ -327,7 +335,7 @@ impl DrainageMap {
         // The full-resolution ground, which stage 2 shapes.
         let ground = |x: f64, z: f64| {
             let (x, z) = (x.floor() as i64, z.floor() as i64);
-            ground_height(x, z) as i32 + erosion.at(x as f64, z as f64).round() as i32
+            ground(x, z).0 as i32 + erosion.at(x as f64, z as f64).round() as i32
         };
         // The ground a river is seated under: none where a lake or the sea
         // lies — that is water, not ground to cut through (a river running

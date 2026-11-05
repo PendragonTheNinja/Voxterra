@@ -42,6 +42,13 @@ const Q_REF: f64 = 0.01;
 const STEP_REF: f64 = 256.0;
 /// The steepest valley side erosion leaves, rise over run (~31°).
 const MAX_WALL_SLOPE: f64 = 0.6;
+/// Canyons (M15): where a caprock holds the walls up — flash-flood
+/// uplands, by weight — rivers cut harder and the walls stand steeper, so a
+/// river crossing a plateau cuts a canyon rather than opening a valley
+/// (the Colorado through its plateau). Incision multiplied by up to
+/// `1 + CANYON_CUT`; sides up to [`CANYON_WALL_SLOPE`] (~72°).
+const CANYON_CUT: f64 = 3.0;
+const CANYON_WALL_SLOPE: f64 = 3.0;
 
 /// The erosion stage: the change erosion made, on its own grid.
 pub(super) struct Erosion {
@@ -55,7 +62,8 @@ pub(super) struct Erosion {
 
 impl Erosion {
     /// Erode the drainage grid's ground (`fnx`×`fnz` cells of `cell`
-    /// blocks): `base` heights, the `sea`, and each cell's `runoff`, m³/s.
+    /// blocks): `base` heights, the `sea`, each cell's `runoff`, m³/s, and
+    /// its `canyon` weight (`[0, 1]`, M15).
     pub(super) fn build(
         fnx: usize,
         fnz: usize,
@@ -63,6 +71,7 @@ impl Erosion {
         base: &[i32],
         sea: &[bool],
         runoff: &[f64],
+        canyon: &[f32],
     ) -> Self {
         // Two by two drainage cells to one: the mean height, the summed
         // runoff, sea where most of it is.
@@ -72,6 +81,7 @@ impl Erosion {
         let mut h = vec![0.0f64; n];
         let mut wet = vec![false; n];
         let mut shed = vec![0.0f64; n];
+        let mut cap = vec![0.0f64; n];
         for j in 0..nz {
             for i in 0..nx {
                 let c = j * nx + i;
@@ -81,6 +91,7 @@ impl Erosion {
                     sum += i64::from(base[f]);
                     seas += usize::from(sea[f]);
                     shed[c] += runoff[f];
+                    cap[c] += 0.25 * f64::from(canyon[f]);
                 }
                 h[c] = sum as f64 / 4.0;
                 wet[c] = seas >= 2;
@@ -123,10 +134,13 @@ impl Erosion {
                 if h[c] <= floor {
                     continue; // a hollow's floor: erosion does not fill
                 }
-                let f = STRENGTH * (q[c] / Q_REF).sqrt() * (STEP_REF / step(c, r));
+                let f = STRENGTH
+                    * (q[c] / Q_REF).sqrt()
+                    * (STEP_REF / step(c, r))
+                    * (1.0 + CANYON_CUT * cap[c]);
                 h[c] = (h[c] + f * floor) / (1.0 + f);
             }
-            retreat_walls(nx, nz, &mut h, &start, &wet, step);
+            retreat_walls(nx, nz, &mut h, &start, &wet, &cap, step);
         }
         let delta = (0..n).map(|c| (h[c] - start[c]).min(0.0) as f32).collect();
         Self {
@@ -164,6 +178,7 @@ fn retreat_walls(
     h: &mut [f64],
     start: &[f64],
     wet: &[bool],
+    cap: &[f64],
     step: impl Fn(usize, usize) -> f64,
 ) {
     let at = |i: usize, j: usize, di: isize, dj: isize| {
@@ -180,7 +195,8 @@ fn retreat_walls(
         for (di, dj) in [(s, 0), (s, s), (0, s), (-s, s)] {
             let nb = at(i, j, di, dj);
             let below = if wet[nb] { 0.0 } else { h[nb] };
-            let allowed = (MAX_WALL_SLOPE * step(c, nb)).max(start[c] - start[nb]);
+            let wall = MAX_WALL_SLOPE + (CANYON_WALL_SLOPE - MAX_WALL_SLOPE) * cap[c];
+            let allowed = (wall * step(c, nb)).max(start[c] - start[nb]);
             if h[c] > below + allowed {
                 h[c] = below + allowed;
             }
@@ -195,5 +211,81 @@ fn retreat_walls(
         for i in (0..nx).rev() {
             relax(i, j, true);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Canyons (M15): the same plateau, the same rain — with a caprock
+    /// (flash-flood weight 1) its river cuts deeper and its walls stand
+    /// steeper than without.
+    #[test]
+    fn caprock_cuts_canyons() {
+        // 64×64 drainage cells of 128 blocks: a plateau 300 high falling
+        // gently east to the sea in the last columns, a shallow trough
+        // along its middle row so one river forms.
+        let (fnx, fnz) = (64usize, 64usize);
+        let mut base = vec![0i32; fnx * fnz];
+        let mut sea = vec![false; fnx * fnz];
+        for j in 0..fnz {
+            for i in 0..fnx {
+                let c = j * fnx + i;
+                if i >= fnx - 4 {
+                    sea[c] = true;
+                    base[c] = -20;
+                } else {
+                    let trough = (j as i32 - 32).abs().min(6);
+                    base[c] = 300 - 2 * i as i32 + 3 * trough;
+                }
+            }
+        }
+        let runoff = vec![0.000_05f64; fnx * fnz];
+        let erode = |w: f32| {
+            Erosion::build(
+                fnx,
+                fnz,
+                (128.0, 128.0),
+                &base,
+                &sea,
+                &runoff,
+                &vec![w; fnx * fnz],
+            )
+        };
+        let (plain, capped) = (erode(0.0), erode(1.0));
+        let deepest = |e: &Erosion| e.delta.iter().copied().fold(0.0f32, f32::min);
+        assert!(
+            deepest(&capped) < 1.15 * deepest(&plain),
+            "canyon {} against valley {}",
+            deepest(&capped),
+            deepest(&plain)
+        );
+    }
+
+    /// Canyon walls (M15): beside a cut 500 deep, a valley side retreats to
+    /// 0.6 rise over run; under a caprock it stands at 3.
+    #[test]
+    fn caprock_holds_walls_steep() {
+        let (nx, nz) = (9usize, 9usize);
+        let start = vec![500.0f64; nx * nz];
+        let centre = 4 * nx + 4;
+        let side = |cap: f64| {
+            let mut h = start.clone();
+            h[centre] = 0.0;
+            let step = |_: usize, _: usize| 100.0;
+            retreat_walls(
+                nx,
+                nz,
+                &mut h,
+                &start,
+                &vec![false; nx * nz],
+                &vec![cap; nx * nz],
+                step,
+            );
+            h[centre + 1]
+        };
+        assert_eq!(side(0.0), 0.6 * 100.0);
+        assert_eq!(side(1.0), 3.0 * 100.0);
     }
 }

@@ -209,7 +209,10 @@ pub enum DrainageSource {
 /// built on this ground. Two lake-shore fixes the reshaped networks found:
 /// a river's channel on ground level with a lake runs on into it, and a
 /// column hard against a lake's region always gets its bank.
-pub const GENERATOR_VERSION: u32 = 10;
+/// 11 — canyons (M15 task 2): on flash-flood ground the erosion stage cuts
+/// up to 4× harder and leaves walls up to 3:1, so rivers crossing a plateau
+/// cut canyons.
+pub const GENERATOR_VERSION: u32 = 11;
 
 impl Generator {
     /// A generator for one world: its seed and its size. The size is part of
@@ -348,7 +351,10 @@ impl Generator {
         let _ = (self.climate(), self.process_map());
         DrainageMap::build_on(
             &self.elevation,
-            |x, z| self.landformed(x, z).1.height,
+            |x, z| {
+                let (_, s, _, flood) = self.landformed_flood(x, z);
+                (s.height, flood)
+            },
             self.climate(),
             self.shape,
         )
@@ -364,13 +370,29 @@ impl Generator {
         wx: i64,
         wz: i64,
     ) -> (elevation::Surface, elevation::Surface, Option<MesaPart>) {
+        let (base, formed, part, _) = self.landformed_flood(wx, wz);
+        (base, formed, part)
+    }
+
+    /// [`Self::landformed`] with the column's flash-flood weight, which
+    /// the network's erosion reads for canyons (0 where none can act).
+    fn landformed_flood(
+        &self,
+        wx: i64,
+        wz: i64,
+    ) -> (
+        elevation::Surface,
+        elevation::Surface,
+        Option<MesaPart>,
+        f32,
+    ) {
         let base = self.elevation.surface(wx, wz);
         if base.height <= landform::FLOOD_FROM_HEIGHT || !self.process_map().floodable(wx, wz) {
-            return (base, base, None);
+            return (base, base, None, 0.0);
         }
         let (sea_c, precip) = self.climate().sample(wx, wz);
         if !landform::flood_possible(sea_c, precip, base.height) {
-            return (base, base, None);
+            return (base, base, None, 0.0);
         }
         let inputs = landform::inputs_with(
             self.climate(),
@@ -383,7 +405,7 @@ impl Generator {
         );
         let flood = landform::weights(&inputs).flood;
         if flood <= 0.0 {
-            return (base, base, None);
+            return (base, base, None, 0.0);
         }
         // The base's slope, from two forward differences: only where
         // benches are cut, since each costs a full elevation sample.
@@ -397,9 +419,9 @@ impl Generator {
             Some((height, part)) => {
                 let mut s = base;
                 s.height = height.round() as i64;
-                (base, s, Some(part))
+                (base, s, Some(part), flood)
             }
-            None => (base, base, None),
+            None => (base, base, None, flood),
         }
     }
 
@@ -2070,7 +2092,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (10, 0x3851_7f97_bd47_d55c);
+        const PINNED: (u32, u64) = (11, 0xc460_55f8_96fb_c449);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),
