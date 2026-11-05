@@ -3,7 +3,8 @@
 - **Status:** Proposed (2026-11-04, M15 task 1). Accepted with M15's
   retrospective, after the landform layers and the owner's walk or flights.
   Sections 1–3 are built (task 1); sections 4–5 record the order the later
-  tasks must follow.
+  tasks must follow. Dunes (task 2a, version 9) are the first layer built;
+  see §4's note.
 - **Context:** After M13 and M14 every climate has the same ground: one
   elevation field, coloured by biome and cut by rivers. M15 gives each
   climate its own landforms (`docs/landforms.md`, approved 2026-11-04):
@@ -98,6 +99,14 @@ ice today (Earth ~10%).
    overdeepens basins that hold tarns and fjords — on the valleys it
    reshapes, which only exist after step 2;
 4. → M14's rivers, lakes and wetlands, unchanged.
+
+**Dunes are the exception to step 1 (task 2a).** Ridges 100–250 blocks
+apart are finer than the network's 128-block cells, so the network could
+only see them as noise. They are laid in stage 2 after the water, on dry
+ground only, faded out toward each river's bank: they only ever raise
+ground the water was fitted to, so nothing is held by air, and rivers keep
+to the interdune corridors. Landforms at or above the network's scale
+(benches, mesas, inselbergs, dissection) are still applied before it.
 
 The climate map and the process weights read the base elevation (step 0),
 never steps 1–3: landforms are smaller than climate cells and would only

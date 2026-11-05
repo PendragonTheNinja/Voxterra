@@ -142,6 +142,14 @@ raised by mountain building, so the stricter reading left flash floods on
   dunes). Fryberger's rule: one wind → transverse and barchans, two at an
   obtuse angle → linear, many → star.
 
+**Built (M15 task 2a, version 9).** As above, with: one dune type per
+place (transverse and linear ridges added together made a lattice); the
+erg needs warmth as well as wind (cold deserts keep ~45% of a hot one's),
+so dunes stand on ~20–25% of hot desert and ~12–16% of cold; star dunes
+on a wandering hexagonal lattice of crossing waves, many points empty,
+heights 25–55; barchans from crests cut one spacing long by the wave
+across the wind. Measured in `dune_survey`; gallery `docs/gallery/m15/`.
+
 ## Flash flood — benches, mesas, buttes, canyons
 
 | Landform | Earth analogues | Earth size | Ours | Walking | Where |

@@ -267,7 +267,7 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   (`docs/milestones/15-landforms-by-climate.md`): **spec approved
   2026-11-03** — all five families; glacial landforms wherever last-ice-age
   ice lay; real cliffs, not all walkable (traversal is later gameplay);
-  dunes 6–30 high, 100–250 apart; dry lands first. No code yet. **Handoff (2026-11-04):** the landform catalogue (`docs/landforms.md`) is drafted and its five questions are answered (its *Decisions* section). The M14 re-bench at version 8 is in (2026-11-04, `docs/benches/`; within noise of M14/M13, the spec's *Baseline* section). The owner approved the catalogue (2026-11-04); task 0 is done. Task 1 built (2026-11-04): process weights + ice-age climate (`vox_worldgen::landform`), the world map's process and ice-age layers, ADR-0021 proposed; no terrain change yet. The owner approved the maps and both catalogue refinements (ice needs snow; "mountains" means real ranges); task 1 is done. Next: task 2, dry lands — see the spec's *Task 1 progress* note. Dune
+  dunes 6–30 high, 100–250 apart; dry lands first. No code yet. **Handoff (2026-11-04):** the landform catalogue (`docs/landforms.md`) is drafted and its five questions are answered (its *Decisions* section). The M14 re-bench at version 8 is in (2026-11-04, `docs/benches/`; within noise of M14/M13, the spec's *Baseline* section). The owner approved the catalogue (2026-11-04); task 0 is done. Task 1 built (2026-11-04): process weights + ice-age climate (`vox_worldgen::landform`), the world map's process and ice-age layers, ADR-0021 proposed; no terrain change yet. The owner approved the maps and both catalogue refinements (ice needs snow; "mountains" means real ranges); task 1 is done. Task 2a built (2026-11-05): dune seas, `GENERATOR_VERSION` 9. Next: 2b, benches, mesas, buttes and canyons — see the spec's *Task 2 progress* note. Dune
   seas, mesas and canyons, glacial valleys and fjords, inselbergs, dissected
   humid hills, as height layers weighted by a stage-1 process map, applied
   before the drainage network so water still fits the ground (M14's lesson).
@@ -289,7 +289,7 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   rivers as ribbons, reservoirs with the water simulation.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 288, vox-mesh 71, vox-worldgen 77, vox-render 21, vox-app 11
+  vox-core 288, vox-mesh 71, vox-worldgen 81, vox-render 21, vox-app 11
   passing (vox-worldgen was 54 at the M13 close), plus the ignored `every_biome_in_every_world`
   and `biome_survey`, run in release), then start the first unchecked item.
 - **Instruments (from M11):** the P key logs a `VIEW` line (exact position,

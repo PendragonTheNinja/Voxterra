@@ -35,8 +35,23 @@ owner to confirm: ice needs snow as well as cold (temperature alone
 glaciated 54% of land), and "mountains" means real ranges, not any uplift
 (see the catalogue's *Task 1's fit*). The owner approved
 the maps and both refinements (2026-11-04: "Seems good, move ahead!") —
-task 1 is done. **Next: task 2** — dry lands (dune seas,
-mesas, canyons), the first `GENERATOR_VERSION` bump.
+task 1 is done.
+**Task 2 progress (2026-11-05):** **dune seas built (2a,
+`GENERATOR_VERSION` 9)** — `landform::dunes`: transverse, linear, star and
+barchan dunes chosen by the dune wind (tilted 22.5°, swinging seasonally
+toward the deserts' poleward edges), as waves with whole cycles around the
+torus so they tile with no seam; laid on dry ground after the water (they
+only raise ground, so water still fits it) and faded out within 4–40 blocks
+of a river's bank; sand blocks; the readout names them ("hot desert, star
+dunes"). Measured (`dune_survey`, four seeds): dunes 3+ blocks high on
+20–25% of hot desert and 12–16% of cold; ridge columns' sand p50 6, p90
+16–17, max 30–35; under 0.5% of steps between dune columns over one block.
+Cost: `ground()` +2% across the world, +0.65 µs a column inside a dune sea.
+Tests: `dunes_lie_where_the_wind_works_and_never_on_water`,
+`transverse_crests_run_across_the_wind`, waves tile. **Next: 2b** — benches,
+mesas, buttes and canyons on flash-flood uplands, applied before the
+network (it must see them to cut canyons), with talus; then the owner's
+flight over both.
 
 ## Why this milestone exists
 
