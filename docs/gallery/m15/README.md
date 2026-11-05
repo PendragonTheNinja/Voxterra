@@ -20,4 +20,6 @@ milestone is kept here, with the commit it shows.
 | `ice-trough-7e22ac0de-v11-before.jpg` | `8c32b09` | Before glacial troughs: a glaciated equatorial range (7°, peaks above the ice-age ice line), 1 block per pixel, 1 024 blocks. Rivers in V valleys. Also shows two **M14 artefacts in steep mountains**, found here and not yet fixed: 256-block squares in the shading (the river erosion stage's bilinear grid showing through) and sawtooth notches along the rivers |
 | `ice-trough-7e22ac0de-v12.jpg` | `1d70071` | The same place after: the main valleys carved into U troughs (floors ~200 wide, steeper walls) along the rivers' own lines |
 | `ice-trough-7e22ac0de-v13.jpg` | `23d92e5` | The same place after fixing the two M14 artefacts (owner's request): no 256-block squares (Catmull–Rom erosion) and no sawtooth along the rivers (only each reach's highest step a waterfall) |
-| `ice-cirque-7e22ac0de-v14.jpg` | M15 task 3b | Cirques at glacier heads (−26°): bowls ~240 across with flat floors 11 blocks below their lips and 3:1 headwalls |
+| `ice-cirque-7e22ac0de-v14.jpg` | `63d3e82` | Cirques at glacier heads (−26°): bowls ~240 across with flat floors 11 blocks below their lips and 3:1 headwalls |
+| `ice-moraine-7e22ac0de-v15.jpg` | `c8d4bfc` | An end moraine (38°): a ridge 4–12 high along the ice age's margin, following the ground's contour, broken by meltwater gaps; drumlins behind it |
+| `ice-drumlins-7e22ac0de-v15.jpg` | `c8d4bfc` | Drumlins (38°): small streamlined hills elongated along the ice's flow (Z), behind the moraine |

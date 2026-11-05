@@ -223,7 +223,10 @@ the network's nodes evaluated at full resolution; overdeepened floors
 fill as lakes through M14's routing; tributaries cut less deep hang above
 the main trough. Lowland ice sheets dig no troughs (M14's lake districts
 stand for their scour). Fjords: rare, because few glaciated coasts have
-mountains. Cirques, arêtes, horns, moraines and drumlins not yet.
+mountains. Cirques at every glacier's head (version 14); end moraines
+along the ice age's margin and drumlins behind it on low ground (version
+15), aligned along Z. Arêtes and horns are left to emerge between cirques
+and troughs.
 
 ## Weathering — inselbergs
 

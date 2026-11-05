@@ -106,10 +106,24 @@ and mountain rivers had sawtooth wedges along their banks (every steep
 stretch held its water level to its end; now only a reach's highest step
 is a waterfall and the others cascade). Gallery `ice-trough-…-v11-before`
 and `-v13`. **Fjords:** kept rare (recommended, not overruled by the
-owner, 2026-11-05). **Next in task 3:**
-cirques at trough heads, arêtes and horns, moraines and drumlins, and
-fjords where there are coastal mountains (or a decision that they stay
-rare).
+owner, 2026-11-05). **Cirques (3b,
+version 14):** a glacier's head is a bowl ~240 across, flat-floored and
+overdeepened below its lip, its headwall 3:1 (1 773 on the default seed);
+tarns where the network's 128-block cells see the bowl. **End moraines
+and drumlins (3c, version 15):** `landform::deposits`, before the
+network, raise-only, on low ground: moraine ridges 4–12 high along the
+contour where the smooth (unjittered) ice-age weight is ½, broken by
+meltwater gaps about half their length (0.8% of land); drumlin swarms
+behind it (weights 0.55–0.95), ~260 long and ~110 apart along Z (2.1%).
+Tests: cirques in `ice_carves_a_valley_into_a_u`,
+`drumlins_lie_along_the_ice_flow`. **Arêtes and horns** are left to
+emerge where cirques and troughs cut both sides of a divide — not built
+or measured separately. **Closed basins are chaotic:** small changes
+reroute whole basins, so seeds move both ways — over three seeds 33.0%
+at version 11, 33.5% at version 15 (31.9 → 34.1, 39.7 → 38.4,
+27.4 → 27.9); task 5 must aim at them directly. **Task 3 is built**,
+waiting on the owner's flight with task 2. **Next: task 4** — inselbergs
+and rain-dissected hills.
 
 ## Why this milestone exists
 
