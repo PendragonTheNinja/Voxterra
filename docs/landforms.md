@@ -183,8 +183,12 @@ Caprock covers at most about a third of an upland so it stands in islands.
 A per-mesa "way up" is approximated by a 450-block noise that widens walls
 into ramps — about half of all wall length, not a choice per mesa. Bench
 levels are whole 3-block beds, but walls show the beds only in their top
-12 blocks (the profile depth); below is stone until geology. Canyons not
-yet.
+12 blocks (the profile depth); below is stone until geology.
+
+**Canyons (task 2c, version 11)** are cut in the erosion stage: harder
+incision and walls up to 3:1 on flash-flood ground. 40–95 blocks deep
+where a river crosses a plateau, but rare — dry uplands seldom carry a
+through-flowing river.
 
 ## Ice — glacial valleys and coasts
 

@@ -62,12 +62,22 @@ found two M14 lake-shore seams, fixed with failing tests first: a channel
 on ground level with a lake runs on into it; a column hard against a
 lake's region always gets its bank. Cost: `ground()` ~+10% across the
 world (noisy), ~2.7× inside mesa country. Test:
-`mesas_stand_only_on_flash_flood_uplands`; `mesa_survey`. **Still open in
-task 2:** canyons — rivers crossing flash-flood uplands cut 50–200 deep
-(with M14's carried shallow valleys, in the erosion stage); walls banded
-below their top 12 blocks (deep strata are geology's — the 12-block
-profile keeps the stone-chunk fast path). Then the owner's flight over
-the dry lands.
+`mesas_stand_only_on_flash_flood_uplands`; `mesa_survey`. **Canyons
+built (2c, `GENERATOR_VERSION` 11)** — in the erosion stage: on
+flash-flood ground (the weight passed in with the ground,
+`DrainageMap::build_on`) incision is up to 4× and valley sides may stand
+at 3:1 instead of 0.6. Measured (`mesa_survey`, rivers of 0.1+ m³/s):
+40–95 blocks deep on flash-flood ground against 8–9 (p50) elsewhere — but
+on only 1–4 sampled cells a world, because few rivers cross flash-flood
+uplands (they are dry and mostly drain inward; no world has an "exotic"
+river like the Colorado fed from wet mountains). Closed basins unchanged.
+Tests: `caprock_cuts_canyons`, `caprock_holds_walls_steep`. **Task 2 is
+built**; it waits on the owner's flight over the dry lands (the owner
+chose to test everything together after, 2026-11-05). Carried: walls
+banded only in their top 12 blocks (deep strata are geology's — the
+12-block profile keeps the stone-chunk fast path); canyons rare, for
+lack of rivers crossing the plateaus; `ground()` ~+10% (re-check with the
+owner's `--bench`). **Next: task 3** — ice.
 
 ## Why this milestone exists
 
