@@ -1180,7 +1180,13 @@ mod ice_survey {
                 }
             }
         }
-        for (name, (x, z, cut)) in [("trough", inland), ("fjord", coast)] {
+        // The deepest cirque.
+        let heads = d.glacier_heads();
+        let cirques = heads.iter().filter(|h| h.2 >= 8.0).count();
+        let deepest = heads.iter().copied().max_by(|a, b| a.2.total_cmp(&b.2));
+        println!("glacier heads {}, cirques {cirques}", heads.len());
+        let cirque = deepest.map_or((0, 0, 0.0), |(x, z, c)| (x as i64, z as i64, c));
+        for (name, (x, z, cut)) in [("trough", inland), ("fjord", coast), ("cirque", cirque)] {
             if cut == 0.0 {
                 continue;
             }

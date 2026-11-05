@@ -132,6 +132,27 @@ const SEARCH: i64 = 3;
 const TROUGH_WALL: f32 = 3.0;
 const TROUGH_EDGE: f32 = 32.0;
 
+/// Cirques (M15 task 3): the bowl at a glacier's head — radius (blocks),
+/// depth below the head as a share of the rim's height above it, and the
+/// most and least it is cut.
+const CIRQUE_RADIUS: f32 = 120.0;
+const CIRQUE_RELIEF_SHARE: f32 = 0.35;
+const CIRQUE_MAX_DEPTH: f32 = 80.0;
+const CIRQUE_MIN_DEPTH: f32 = 8.0;
+
+/// A cirque's height above its floor at `r` blocks from its centre: flat
+/// (quartic) across the floor, the trough's steep walls beyond, and the
+/// same rise past any ground at the search's edge.
+fn cirque_profile(r: f32, depth: f32, reach: f32) -> f32 {
+    let e = (r / CIRQUE_RADIUS).min(1.0);
+    let mut h = depth * e * e * e * e + TROUGH_WALL * (r - CIRQUE_RADIUS).max(0.0);
+    let edge = r - (reach - TROUGH_EDGE);
+    if edge > 0.0 {
+        h += 100.0 * edge;
+    }
+    h
+}
+
 /// A trough's height above its floor at `d` blocks from its line: a
 /// parabola over the floor (`depth` at `half`), steep walls beyond, and a
 /// rise past any ground in the last [`TROUGH_EDGE`] blocks of `reach`.
@@ -270,6 +291,27 @@ impl Erosion {
     }
 }
 
+impl Erosion {
+    /// Glacier heads: node and cirque depth (tests and surveys).
+    #[cfg(test)]
+    pub(super) fn glacier_heads(&self) -> Vec<(f64, f64, f32)> {
+        let (nx, _, cx, cz) = self.troughs.grid;
+        self.troughs
+            .cells
+            .iter()
+            .filter(|t| t.head)
+            .map(|t| {
+                let c = t.cell as usize;
+                let (i, j) = ((c % nx) as i64, (c / nx) as i64);
+                let a = super::rivers::node(c, i, j, (cx, cz));
+                let head = t.floor + t.depth;
+                let cut = (CIRQUE_RELIEF_SHARE * (t.rim - head)).min(CIRQUE_MAX_DEPTH);
+                (a.0, a.1, cut)
+            })
+            .collect()
+    }
+}
+
 impl Troughs {
     /// The troughs from their cells (ascending), with the index and the
     /// search flags rebuilt.
@@ -365,6 +407,20 @@ impl Troughs {
                 if t.head {
                     // Nothing behind a glacier's head; it deepens from there.
                     depth *= if raw_u <= 0.0 { 0.0 } else { u };
+                    // And its head is a cirque: a bowl about the node, its
+                    // flat floor below the lip where the trough leaves it
+                    // (a tarn's basin), its headwall cut steep into the
+                    // mountain behind.
+                    let head = t.floor + t.depth;
+                    let cut = (CIRQUE_RELIEF_SHARE * (t.rim - head)).min(CIRQUE_MAX_DEPTH);
+                    if cut >= CIRQUE_MIN_DEPTH {
+                        let (rx, rz) = (x - a.0, z - a.1);
+                        let r = (rx * rx + rz * rz).sqrt() as f32;
+                        let bowl = head - cut + cirque_profile(r, cut, reach);
+                        if best.is_none_or(|b| bowl < b) {
+                            best = Some(bowl);
+                        }
+                    }
                 }
                 if depth <= 0.0 {
                     continue;
@@ -678,6 +734,21 @@ mod tests {
             u >= 3 * v,
             "floor within 10 blocks of the bottom: {u} blocks wide against the V's {v}"
         );
+        // Its heads are cirques: at each node the ground is cut deep (at
+        // least half the depth measured from the cell centre's ground)
+        // below what the rivers left.
+        let heads = glacier.glacier_heads();
+        assert!(heads.iter().any(|h| h.2 >= CIRQUE_MIN_DEPTH));
+        for &(hx, hz, cut) in heads.iter().filter(|h| h.2 >= CIRQUE_MIN_DEPTH) {
+            let (i, j) = ((hx / 128.0) as usize, (hz / 128.0) as usize);
+            let rivers = river.apply(hx, hz, i64::from(base[j * fnx + i]));
+            let carved = glacier.apply(hx, hz, i64::from(base[j * fnx + i]));
+            assert!(
+                rivers - carved >= (cut * 0.5) as i64,
+                "a cirque {} deep, cut {cut}",
+                rivers - carved
+            );
+        }
         for w in zs.windows(2) {
             assert!(after(w[0]) <= before(w[0]));
             let step = (after(w[1]) - after(w[0])).abs();

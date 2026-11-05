@@ -641,6 +641,13 @@ impl DrainageMap {
         self.erosion.at(x, z)
     }
 
+    /// Glacier heads (M15, for surveys): each head trough's node and how
+    /// far its cirque's floor lies below the head, blocks.
+    #[cfg(test)]
+    pub(crate) fn glacier_heads(&self) -> Vec<(f64, f64, f32)> {
+        self.erosion.glacier_heads()
+    }
+
     /// The ground at a column after the erosion stage, from its ground `h`
     /// before (the landformed elevation): cut by the rivers, then by any
     /// glacial trough (M15). On any lap of the world.

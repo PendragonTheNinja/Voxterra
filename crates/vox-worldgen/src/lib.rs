@@ -222,7 +222,9 @@ pub enum DrainageSource {
 /// grid showed as squares), and only a reach's highest step held as a
 /// waterfall, the others cascading (every steep stretch had held its banks
 /// level: a sawtooth of wedges along mountain rivers).
-pub const GENERATOR_VERSION: u32 = 13;
+/// 14 — cirques (M15 task 3): a glacier's head is a bowl ~240 across, its
+/// floor overdeepened below the lip, its headwall steep.
+pub const GENERATOR_VERSION: u32 = 14;
 
 impl Generator {
     /// A generator for one world: its seed and its size. The size is part of
@@ -2122,7 +2124,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (13, 0x7a74_e623_107c_a2cb);
+        const PINNED: (u32, u64) = (14, 0xcd9b_b0f3_f3d0_b13d);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),
