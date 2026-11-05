@@ -217,6 +217,14 @@ decides what lies in them (ice sheet, tundra, forest, a lake).
 - **Fjord walls are rocky coast** (biome 19, already); their sill makes
   their mouths shallow.
 
+**Built so far (M15 task 3a, version 12).** U-troughs along glaciated
+valleys with relief (100–250+ blocks) to channel the ice, as lines along
+the network's nodes evaluated at full resolution; overdeepened floors
+fill as lakes through M14's routing; tributaries cut less deep hang above
+the main trough. Lowland ice sheets dig no troughs (M14's lake districts
+stand for their scour). Fjords: rare, because few glaciated coasts have
+mountains. Cirques, arêtes, horns, moraines and drumlins not yet.
+
 ## Weathering — inselbergs
 
 | Landform | Earth analogues | Earth size | Ours | Walking | Where |

@@ -117,6 +117,15 @@ caprock over unchanged floors left the share as it was. Terracing keeps
 heights in order, so it adds no pits either. Every later layer before the
 network should hold to the same rule: raise, or reorder nothing.
 
+**Glacial troughs are lines, not a grid (task 3a).** Step 3 runs inside
+the network's build, after the rivers' erosion and before routing, so
+lakes fill the overdeepened basins and long profiles are seated on the
+trough floors. A trough is stored per glaciated drainage cell as a line
+along the network's own jittered nodes and evaluated at full resolution
+(the ground is the lower of its own and the U's), never interpolated
+from a grid of carved heights: at 128 blocks that grid showed through as
+squares. Troughs only where valleys have relief to channel the ice.
+
 The climate map and the process weights read the base elevation (step 0),
 never steps 1–3: landforms are smaller than climate cells and would only
 add noise to rain, and reading them back would make weights depend on

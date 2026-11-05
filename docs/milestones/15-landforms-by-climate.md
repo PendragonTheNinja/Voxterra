@@ -78,6 +78,33 @@ banded only in their top 12 blocks (deep strata are geology's — the
 12-block profile keeps the stone-chunk fast path); canyons rare, for
 lack of rivers crossing the plateaus; `ground()` ~+10% (re-check with the
 owner's `--bench`). **Next: task 3** — ice.
+**Task 3 progress (2026-11-05):** **glacial troughs built (3a,
+`GENERATOR_VERSION` 12, drainage cache format 5)** — in the erosion
+stage, on the drainage grid: ice flux is the glaciated catchment routed
+down the valleys the rivers cut; a trough's depth grows with √flux (to
+400, at most 0.6 of the valley's relief), its half-width with flux^¼ (to
+200); stored as lines along the network's own jittered nodes (so rivers
+run on the floors) and evaluated at full resolution as a U — parabolic
+floor, 3:1 walls — the ground the lower of its own and the U's. Only
+where a valley has 100–250+ blocks of relief to channel the ice; troughs
+taper in from nothing at a glacier's head. Three rejected first tries,
+kept in the gallery's notes: a per-cell carved grid (128-block squares
+showed through), a cut-off at the rim (sheer 300-block steps), and
+troughs on low ground (a lattice of grooves and bowls on every gentle
+glaciated slope). Measured: troughs up to ~560 blocks below the original
+valley in the highest glaciated ranges, floors ~200 wide; lakes and
+closed basins unchanged; world creation +1–2 s (network build 5.1 →
+6.8 s, noisy); `ground()` unchanged across the world, ~+35% inside trough
+country. Test: `ice_carves_a_valley_into_a_u` (with the existing water
+tests all passing). **Fjords rare:** few glaciated coasts in these worlds
+have mountains to channel ice, so troughs seldom reach the sea (the
+deepest glaciated cut at a coast, default seed: 26 blocks). **Found, not
+fixed (M14's):** in steep mountains the river erosion stage's 256-block
+grid shows through as squares, and mountain rivers have sawtooth notches
+along their banks (gallery `ice-trough-…-v11-before`). **Next in task 3:**
+cirques at trough heads, arêtes and horns, moraines and drumlins, and
+fjords where there are coastal mountains (or a decision that they stay
+rare).
 
 ## Why this milestone exists
 
