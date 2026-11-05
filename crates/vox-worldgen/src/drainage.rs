@@ -1193,7 +1193,10 @@ mod tests {
             }
         }
         eprintln!("steepest slope erosion adds: {steepest:.2}");
-        assert!(steepest < 1.0, "erosion adds a slope of {steepest:.2}");
+        // Catmull–Rom (M15, for the squares) curves a valley's flank where
+        // bilinear ran it straight: its steepest point ~10% steeper
+        // (1.08 here, against 0.96).
+        assert!(steepest < 1.15, "erosion adds a slope of {steepest:.2}");
     }
 
     /// Criterion 10: rivers differ as Earth's do — every kind appears;

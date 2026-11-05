@@ -217,7 +217,12 @@ pub enum DrainageSource {
 /// a U about the network's line, deeper and wider with the glaciated
 /// catchment; overdeepened floors fill as lakes, small valleys hang above
 /// large ones; drainage cache format 5.
-pub const GENERATOR_VERSION: u32 = 12;
+/// 13 — two M14 artefacts in steep mountains (the owner's request): the
+/// rivers' erosion interpolated by Catmull–Rom, not bilinear (its 256-block
+/// grid showed as squares), and only a reach's highest step held as a
+/// waterfall, the others cascading (every steep stretch had held its banks
+/// level: a sawtooth of wedges along mountain rivers).
+pub const GENERATOR_VERSION: u32 = 13;
 
 impl Generator {
     /// A generator for one world: its seed and its size. The size is part of
@@ -2117,7 +2122,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (12, 0x99fd_8bd8_b68c_1105);
+        const PINNED: (u32, u64) = (13, 0x7a74_e623_107c_a2cb);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),

@@ -243,16 +243,19 @@ impl Erosion {
         erosion
     }
 
-    /// The rivers' change at a point, blocks (never positive): bilinear
+    /// The rivers' change at a point, blocks (never positive): smooth
     /// between cell centres, on any lap of the world.
     pub(super) fn at(&self, x: f64, z: f64) -> f32 {
-        bilinear(
+        // Never above the ground: the curve can overshoot a little beside a
+        // deep cut, and erosion only lowers.
+        interpolate(
             &self.delta,
             self.nx,
             self.nz,
             x / self.cell_x,
             z / self.cell_z,
         )
+        .min(0.0)
     }
 
     /// The ground at a point after erosion, from its ground `h` before:
@@ -378,19 +381,37 @@ impl Troughs {
     }
 }
 
-/// Bilinear between the centres of a wrapping `nx`×`nz` grid, at `(u, v)`
-/// in cells.
-fn bilinear(field: &[f32], nx: usize, nz: usize, u: f64, v: f64) -> f32 {
+/// Catmull–Rom between the centres of a wrapping `nx`×`nz` grid, at
+/// `(u, v)` in cells: through every centre's value and smooth across cell
+/// edges. Bilinear was continuous but creased at every edge, and in steep
+/// mountains the 256-block grid showed through as squares (M15, found in
+/// the glaciated ranges).
+fn interpolate(field: &[f32], nx: usize, nz: usize, u: f64, v: f64) -> f32 {
     let (u, v) = (u - 0.5, v - 0.5);
     let (fu, fv) = (u.floor(), v.floor());
     let (tu, tv) = ((u - fu) as f32, (v - fv) as f32);
-    let wrap = |a: f64, n: usize| (a as i64).rem_euclid(n as i64) as usize;
-    let (i0, j0) = (wrap(fu, nx), wrap(fv, nz));
-    let (i1, j1) = ((i0 + 1) % nx, (j0 + 1) % nz);
-    let d = |i: usize, j: usize| field[j * nx + i];
-    let top = d(i0, j0) + (d(i1, j0) - d(i0, j0)) * tu;
-    let bottom = d(i0, j1) + (d(i1, j1) - d(i0, j1)) * tu;
-    top + (bottom - top) * tv
+    let wrap = |a: i64, n: usize| a.rem_euclid(n as i64) as usize;
+    let (i0, j0) = (fu as i64, fv as i64);
+    let weights = |t: f32| {
+        let (t2, t3) = (t * t, t * t * t);
+        [
+            0.5 * (-t3 + 2.0 * t2 - t),
+            0.5 * (3.0 * t3 - 5.0 * t2 + 2.0),
+            0.5 * (-3.0 * t3 + 4.0 * t2 + t),
+            0.5 * (t3 - t2),
+        ]
+    };
+    let (wu, wv) = (weights(tu), weights(tv));
+    let mut sum = 0.0;
+    for (b, wb) in wv.iter().enumerate() {
+        let j = wrap(j0 - 1 + b as i64, nz);
+        let mut row = 0.0;
+        for (a, wa) in wu.iter().enumerate() {
+            row += wa * field[j * nx + wrap(i0 - 1 + a as i64, nx)];
+        }
+        sum += wb * row;
+    }
+    sum
 }
 
 /// Find the glacial troughs on the drainage grid's ground (M15 task 3):
@@ -662,6 +683,27 @@ mod tests {
             let step = (after(w[1]) - after(w[0])).abs();
             assert!(step <= 4, "a step of {step} at z = {}", w[0]);
         }
+    }
+
+    /// The rivers' erosion has no crease on its grid (M15: the 256-block
+    /// grid showed as squares in steep mountains): the slope just either
+    /// side of a cell's centre is nearly the same.
+    #[test]
+    fn erosion_is_smooth_across_its_grid() {
+        // One deep cell among shallow ones.
+        let (nx, nz) = (8usize, 8usize);
+        let mut field = vec![-5.0f32; nx * nz];
+        field[4 * nx + 4] = -300.0;
+        let at = |u: f64| interpolate(&field, nx, nz, u, 4.5);
+        // Bilinear creased at every cell centre: at cell 3's (u = 3.5),
+        // beside the deep cell, it ran flat on one side and fell on the other.
+        let e = 1e-3;
+        let left = (at(3.5 - e) - at(3.5 - 2.0 * e)) / e as f32;
+        let right = (at(3.5 + 2.0 * e) - at(3.5 + e)) / e as f32;
+        assert!(
+            (left - right).abs() < 0.01 * left.abs().max(1.0),
+            "{left} against {right}"
+        );
     }
 
     /// Canyon walls (M15): beside a cut 500 deep, a valley side retreats to

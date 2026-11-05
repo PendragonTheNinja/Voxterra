@@ -244,7 +244,15 @@ impl Reach {
         let k = (at as usize).min(PROFILE_STEPS - 1);
         let here = self.steps[k];
         let next = self.steps.get(k + 1).copied().unwrap_or(self.level.1);
-        if here - next >= FALL_FROM {
+        // Held level and dropped at once only at the reach's waterfall, its
+        // highest step: on a steep mountain stream every stretch dropped
+        // FALL_FROM or more, and each held its banks at its own level to its
+        // end — a sawtooth of raised and cut wedges along the river (M15,
+        // found in the glaciated ranges). The others cascade.
+        let is_fall = self
+            .fall
+            .is_some_and(|f| ((f * PROFILE_STEPS as f32).round() as usize) == k + 1);
+        if is_fall && here - next >= FALL_FROM {
             here
         } else {
             here + (next - here) * (at - k as f32)
@@ -998,4 +1006,45 @@ fn segment(x: f64, z: f64, a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
     let (px, pz) = (a.0 + vx * t, a.1 + vz * t);
     let (dx, dz) = (x - px, z - pz);
     ((dx * dx + dz * dz).sqrt(), t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A steep mountain stream (M15): only its highest step is a waterfall,
+    /// held level to the lip; the others cascade, sloping through their
+    /// stretch — each held level had stood its banks up in a wedge.
+    #[test]
+    fn only_the_highest_step_is_a_waterfall() {
+        // Eight stretches each dropping 15 (all over FALL_FROM), the fifth
+        // 30.
+        let mut steps = [0.0f32; PROFILE_STEPS];
+        let mut h = 300.0;
+        for (k, s) in steps.iter_mut().enumerate() {
+            *s = h;
+            h -= if k == 4 { 30.0 } else { 15.0 };
+        }
+        let reach = Reach {
+            out: 10.0,
+            from: (0.0, 0.0),
+            to: (160.0, 0.0),
+            level: (300.0, h),
+            width: (4.0, 4.0),
+            depth: (1.0, 1.0),
+            wander: (0.0, 0.0),
+            slope: 1.0,
+            discharge: 0.1,
+            mouth: false,
+            kind: RiverKind::Torrent,
+            steps,
+            fall: Some(5.0 / PROFILE_STEPS as f32),
+            len: 160.0,
+        };
+        let mid = |k: usize| reach.level_at((k as f32 + 0.5) / PROFILE_STEPS as f32);
+        // Stretch 1 slopes: half way along it, half its drop.
+        assert_eq!(mid(1), steps[1] - 7.5);
+        // Stretch 4, the waterfall's, is held to its lip.
+        assert_eq!(mid(4), steps[4]);
+    }
 }
