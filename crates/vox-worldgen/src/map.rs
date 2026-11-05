@@ -1255,3 +1255,51 @@ mod ice_survey {
         }
     }
 }
+
+/// Inselbergs and tors (M15 task 4): their share of land and close-ups of
+/// one of each. `cargo test -p vox-worldgen --release rock_survey --
+/// --ignored --nocapture`; env as `world_map`.
+#[cfg(test)]
+mod rock_survey {
+    #[test]
+    #[ignore]
+    fn rock_survey() {
+        let (g, _, dir) = super::tests::map_world();
+        let shape = g.shape();
+        let (mut land, mut domes, mut tors) = (0u32, 0u32, 0u32);
+        let (mut dome_at, mut tor_at) = (None, None);
+        let step = 40;
+        let n = shape.size_x() / step;
+        for j in 0..n {
+            for i in 0..n {
+                let (x, z) = (i * step + 3, j * step + 1);
+                if g.surface_height(x, z) <= 0 {
+                    continue;
+                }
+                land += 1;
+                match g.landform(x, z) {
+                    Some("inselberg") => {
+                        domes += 1;
+                        dome_at.get_or_insert((x, z));
+                    }
+                    Some("tor") => {
+                        tors += 1;
+                        tor_at.get_or_insert((x, z));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        println!(
+            "inselbergs on {:.3}% of land, tors on {:.3}%",
+            100.0 * f64::from(domes) / f64::from(land),
+            100.0 * f64::from(tors) / f64::from(land)
+        );
+        for (name, at) in [("inselberg", dome_at), ("tor", tor_at)] {
+            if let Some((x, z)) = at {
+                println!("{name} at ({x}, {z}), {:.1}°", shape.latitude_degrees(z));
+                super::dune_survey::closeup(&g, &dir, &format!("{name}-{:x}", g.seed()), x, z);
+            }
+        }
+    }
+}

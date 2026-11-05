@@ -78,6 +78,9 @@ pub struct Generator {
     dunes: Dunes,
     mesas: Mesas,
     deposits: landform::Deposits,
+    inselbergs: landform::Inselbergs,
+    /// The noise that roughens inselbergs' outlines (~150 blocks).
+    outline: elevation::LandformNoise,
 }
 
 /// The LOD's mark for a dry cell (`vox_mesh::LOD_DRY`; vox-worldgen does not
@@ -93,6 +96,15 @@ fn wet_top(w: &Water) -> i64 {
         Body::Dry | Body::SaltFlat | Body::Wetland | Body::Floodplain | Body::Delta => i64::MIN,
     }
 }
+
+/// Tors on temperate uplands (M15, owner's decision 4): from these heights
+/// (blocks) with this share of the rain weight.
+const TOR_UPLAND: (f32, f32) = (150.0, 250.0);
+const TOR_UPLAND_WEIGHT: f32 = 0.3;
+/// Margins of the inselberg layer's cheap test: °C of warmth and blocks
+/// of height a site's centre may differ by from a column it reaches.
+const ROCK_WARMTH_MARGIN_C: f32 = 3.0;
+const TOR_UPLAND_MARGIN: f32 = 40.0;
 
 /// Blocks over which the mesa layer measures the base's slope (M15).
 const SLOPE_STEP: i64 = 8;
@@ -228,7 +240,10 @@ pub enum DrainageSource {
 /// 15 — end moraines and drumlins (M15 task 3): ridges 5–20 high along
 /// the ice age's ice margin and swarms of streamlined hills behind it, on
 /// low ground, before the drainage network.
-pub const GENERATOR_VERSION: u32 = 15;
+/// 16 — inselbergs and tors (M15 task 4): bare-rock domes 40–150 high on
+/// savanna and dry-forest plains, rock piles there and on temperate
+/// uplands, whole and before the network.
+pub const GENERATOR_VERSION: u32 = 16;
 
 impl Generator {
     /// A generator for one world: its seed and its size. The size is part of
@@ -245,6 +260,8 @@ impl Generator {
             dunes: Dunes::new(shape),
             mesas: Mesas::new(shape),
             deposits: landform::Deposits::new(shape),
+            inselbergs: landform::Inselbergs::new(seed, shape),
+            outline: elevation::LandformNoise::new(shape, 150, 0xB0_0010),
         }
     }
 
@@ -408,7 +425,39 @@ impl Generator {
         if let Some((h, _)) = self.deposit(wx, wz, base) {
             formed.height += h.round() as i64;
         }
+        if let Some((h, _)) = self.rock(wx, wz, base) {
+            formed.height += h.round() as i64;
+            formed.rock = true;
+        }
         (base, formed, part, flood)
+    }
+
+    /// The inselberg or tor raising a column (M15 task 4), if any: from
+    /// the weathering weight at each site's centre (and, for tors, a
+    /// temperate upland's), asked only where a site's rock could reach.
+    fn rock(&self, wx: i64, wz: i64, base: elevation::Surface) -> Option<(f32, landform::Rock)> {
+        if base.height <= 0 {
+            return None;
+        }
+        // Cheap first: domes need the tropics' warmth (with a margin for
+        // the climate at a dome's centre and the boundary noise), tors on
+        // temperate ground an upland.
+        let (sea_c, _) = self.climate().sample(wx, wz);
+        let warm = climate::temperature_at(sea_c + ROCK_WARMTH_MARGIN_C, base.height)
+            >= landform::WEATHERING_FROM_C;
+        if !warm && (base.height as f32) < TOR_UPLAND.0 - TOR_UPLAND_MARGIN {
+            return None;
+        }
+        let wobble = self.elevation.noise(wx, wz, &self.outline);
+        self.inselbergs.at(wx, wz, wobble, |sx, sz| {
+            let p = self.processes(sx, sz);
+            let h = self.elevation.height(sx, sz) as f32;
+            let upland = climate::smoothstep(TOR_UPLAND.0, TOR_UPLAND.1, h);
+            (
+                p.weathering,
+                p.weathering.max(TOR_UPLAND_WEIGHT * p.rain * upland),
+            )
+        })
     }
 
     /// What the last ice age's ice left at a column (M15): an end moraine
@@ -514,6 +563,9 @@ impl Generator {
         let (s, w) = self.ground(wx, wz);
         if s.sand == 0 {
             let base = self.elevation.surface(wx, wz);
+            if let Some((_, r)) = self.rock(wx, wz, base) {
+                return Some(r.name());
+            }
             if let Some((_, d)) = self.deposit(wx, wz, base) {
                 return Some(d.name());
             }
@@ -1699,6 +1751,38 @@ mod tests {
         );
     }
 
+    /// Inselbergs as Earth's are (M15 criterion 3): bare rock, standing
+    /// up to 40–150 above the plain they rise from. (Where they stand is
+    /// the weathering weight at each dome's centre: `rock_survey` and the
+    /// process map show it.)
+    #[test]
+    fn inselbergs_stand_on_weathered_plains() {
+        let shape = WorldShape::DEFAULT;
+        let g = Generator::new(0x7e22ac0de, shape);
+        let (mut domes, mut tallest) = (0u32, 0i64);
+        for j in 0..500i64 {
+            for i in 0..500i64 {
+                let (x, z) = (i * 409 + 3, j * 409 + 1);
+                let name = g.landform(x, z);
+                if name != Some("inselberg") && name != Some("tor") {
+                    continue;
+                }
+                let (b, f, _) = g.landformed(x, z);
+                assert!(f.rock && f.height > b.height, "({x}, {z})");
+                let top = g.surface(x, z).height;
+                if g.ground(x, z).1.body == Body::Dry {
+                    assert_eq!(g.block_at(x, top, z), vox_core::registry::STONE);
+                }
+                if name == Some("inselberg") {
+                    domes += 1;
+                    tallest = tallest.max(f.height - b.height);
+                }
+            }
+        }
+        assert!(domes >= 10, "only {domes} dome samples");
+        assert!((40..=160).contains(&tallest), "tallest {tallest}");
+    }
+
     /// Transverse ridges run across the dune wind (M15 criterion 3): in the
     /// trades' core, ground changes far more along the wind (over crests
     /// and lee faces) than across it (along a crest).
@@ -2226,7 +2310,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (15, 0xe927_ede1_91f2_4f56);
+        const PINNED: (u32, u64) = (16, 0xaf16_8131_9ddd_fcf0);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),

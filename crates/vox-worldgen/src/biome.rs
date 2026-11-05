@@ -389,6 +389,7 @@ mod tests {
             relief: 0.1,
             uplift: 0.0,
             sand: 0,
+            rock: false,
         }
     }
 
@@ -447,6 +448,7 @@ mod tests {
             relief: 0.2,
             uplift: 0.5 * MAX_UPLIFT,
             sand: 0,
+            rock: false,
         };
         // Mid-latitude: sea level 12 °C. Snow from ~470.
         assert_eq!(at(peak(600), 12.0, 1_000.0), Biome::AlpineRock);

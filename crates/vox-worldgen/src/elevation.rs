@@ -283,6 +283,9 @@ pub struct Surface {
     /// `landform::dunes`): 0 from the elevation field; the generator sets
     /// it. Counted in `height`.
     pub sand: i64,
+    /// Bare rock on top (M15: an inselberg's dome or a tor), no soil: the
+    /// generator sets it.
+    pub rock: bool,
 }
 
 /// Wavelengths of the biome-boundary noise, blocks: edges wander over a
@@ -564,6 +567,7 @@ impl Elevation {
             relief,
             uplift: massif,
             sand: 0,
+            rock: false,
         }
     }
 
@@ -783,7 +787,7 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 /// round per input: the inputs are already decorrelated by odd-constant
 /// multiplication before mixing, and this is the hottest function in worldgen.
 /// Deterministic and platform-independent.
-fn mix64(mut z: u64) -> u64 {
+pub(crate) fn mix64(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)

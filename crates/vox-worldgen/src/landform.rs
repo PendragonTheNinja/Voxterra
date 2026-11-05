@@ -36,6 +36,7 @@
 
 mod deposits;
 mod dunes;
+mod inselbergs;
 mod mesas;
 
 use rayon::prelude::*;
@@ -49,6 +50,7 @@ use crate::elevation::{Elevation, Surface};
 
 pub use deposits::{Deposit, Deposits};
 pub use dunes::{Dune, DuneKind, Dunes};
+pub use inselbergs::{Inselbergs, Rock};
 pub use mesas::{MesaPart, Mesas};
 
 // --- The ice-age climate ----------------------------------------------------
@@ -141,6 +143,8 @@ const FLOOD_SMOOTH_SHARE: f32 = 0.5;
 /// dry forest (rising, then falling); relief over which plains are too
 /// rough.
 const WEATHERING_TEMPERATURE_C: (f32, f32) = (18.0, 21.0);
+/// The temperature (°C) below which deep weathering never acts.
+pub const WEATHERING_FROM_C: f32 = WEATHERING_TEMPERATURE_C.0;
 const WEATHERING_ARIDITY_RISE: (f32, f32) = (0.5, 0.7);
 const WEATHERING_ARIDITY_FALL: (f32, f32) = (1.8, 2.6);
 const WEATHERING_RELIEF: (f32, f32) = (0.3, 0.55);
@@ -568,6 +572,7 @@ mod tests {
             relief,
             uplift,
             sand: 0,
+            rock: false,
         }
     }
 

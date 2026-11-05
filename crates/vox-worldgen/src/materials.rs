@@ -83,6 +83,10 @@ pub fn block_in(col: &Column, wy: i64, strata: impl Fn(i64) -> BlockId) -> Block
             return block;
         }
     }
+    // Bare rock (M15): an inselberg's dome, a tor — no soil.
+    if wy <= h && col.surface.rock {
+        return r::STONE;
+    }
     // Dune sand (M15): the dune's own body, and one block under it.
     if wy <= h && h - wy <= col.surface.sand && col.surface.sand > 0 {
         return r::SAND;
@@ -240,6 +244,7 @@ mod tests {
                 relief: 0.1,
                 uplift: 0.0,
                 sand: 0,
+                rock: false,
             },
             temperature: 10.0,
             sea_level_temperature: 10.0,
