@@ -26,8 +26,9 @@ pub mod elevation;
 mod map;
 pub mod materials;
 
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use biome::Column;
 use climate::ClimateMap;
@@ -72,6 +73,88 @@ pub struct Generator {
     elevation: Elevation,
     climate: Arc<OnceLock<ClimateMap>>,
     drainage: Arc<OnceLock<DrainageMap>>,
+    /// Recently generated chunk columns' ground, shared by every clone
+    /// ([`GroundCache`]): a speed-up only, never a source of truth.
+    grounds: Arc<GroundCache>,
+}
+
+/// How many chunk columns [`GroundCache`] remembers: 64 KB each, so ~16 MB.
+/// Sized for the streamer's frontier — the columns whose layers are still
+/// arriving, a ring one or two chunks thick at the load radius — at the
+/// largest radius the settings allow.
+const GROUND_CACHE_COLUMNS: usize = 256;
+
+/// One chunk column's ground: [`Generator::ground`] at each of its 32x32
+/// block columns, indexed `x + z * 32`, with the bounds every chunk of the
+/// stack is first tested against.
+#[derive(Debug)]
+struct ColumnGround {
+    cells: Box<[(elevation::Surface, Water)]>,
+    /// The lowest ground in the column.
+    min_surface: i64,
+    /// The highest ground or standing water in the column.
+    max_surface: i64,
+}
+
+/// The ground of the chunk columns generated most recently.
+///
+/// A chunk's contents follow from the ground of its 1 024 block columns,
+/// and that ground is the same for every chunk of a vertical stack — but
+/// the streamer asks for a stack's chunks one at a time (seven or so per
+/// column: the surface and its margins), and each used to work the ground
+/// out again before it could tell it was all air or all stone. That was
+/// most of generation: 0.48 ms of a uniform chunk's 0.48, and of a mixed
+/// chunk's 1.0 (2026-11 audit, dev build). Remembering the column makes
+/// every chunk after the first in its stack nearly free.
+///
+/// **Only a cache.** Any chunk still generates alone, from the seed, in any
+/// order (CLAUDE.md): a miss computes the column, and a hit returns what
+/// that same computation returned before. `ground` is a pure function of
+/// the world, so the two cannot differ —
+/// `the_ground_cache_never_changes_a_chunk` holds them to it.
+///
+/// Bounded first-in-first-out: generation arrives nearest-first, so a
+/// column's chunks come close together and recency is all that matters.
+/// The lock is held for a lookup or an insert, never while computing; two
+/// workers that miss the same column at once both compute it, and agree.
+#[derive(Default)]
+struct GroundCache {
+    inner: Mutex<GroundCacheInner>,
+}
+
+#[derive(Default)]
+struct GroundCacheInner {
+    columns: HashMap<(i64, i64), Arc<ColumnGround>>,
+    /// Keys in insertion order, oldest first.
+    order: VecDeque<(i64, i64)>,
+}
+
+impl std::fmt::Debug for GroundCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // A poisoned lock only means a worker panicked mid-insert; the map
+        // is still a map of whole entries.
+        let len = self.inner.lock().map_or(0, |inner| inner.columns.len());
+        write!(f, "GroundCache({len} columns)")
+    }
+}
+
+impl GroundCache {
+    fn get(&self, key: (i64, i64)) -> Option<Arc<ColumnGround>> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.columns.get(&key).cloned()
+    }
+
+    fn insert(&self, key: (i64, i64), column: Arc<ColumnGround>) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.columns.insert(key, column).is_none() {
+            inner.order.push_back(key);
+            while inner.order.len() > GROUND_CACHE_COLUMNS {
+                if let Some(old) = inner.order.pop_front() {
+                    inner.columns.remove(&old);
+                }
+            }
+        }
+    }
 }
 
 /// The LOD's mark for a dry cell (`vox_mesh::LOD_DRY`; vox-worldgen does not
@@ -198,7 +281,38 @@ impl Generator {
             elevation: Elevation::new(seed, shape),
             climate: Arc::new(OnceLock::new()),
             drainage: Arc::new(OnceLock::new()),
+            grounds: Arc::new(GroundCache::default()),
         }
+    }
+
+    /// The ground of chunk column `(cx, cz)`, from the cache or computed
+    /// and remembered ([`GroundCache`]).
+    fn column_ground(&self, cx: i64, cz: i64) -> Arc<ColumnGround> {
+        if let Some(column) = self.grounds.get((cx, cz)) {
+            return column;
+        }
+        let n = CHUNK_SIZE as i64;
+        let (ox, oz) = (cx * n, cz * n);
+        let mut cells = Vec::with_capacity((n * n) as usize);
+        let mut min_surface = i64::MAX;
+        let mut max_surface = i64::MIN;
+        for lz in 0..n {
+            for lx in 0..n {
+                let g = self.ground(ox + lx, oz + lz);
+                min_surface = min_surface.min(g.0.height);
+                // Rivers and lakes stand above the ground: a chunk is not
+                // all air below their surface.
+                max_surface = max_surface.max(g.0.height).max(wet_top(&g.1));
+                cells.push(g);
+            }
+        }
+        let column = Arc::new(ColumnGround {
+            cells: cells.into_boxed_slice(),
+            min_surface,
+            max_surface,
+        });
+        self.grounds.insert((cx, cz), Arc::clone(&column));
+        column
     }
 
     /// The world's stage-1 climate map, built on first use (~0.5 s at the
@@ -531,23 +645,13 @@ impl Generator {
         let chunk_min_y = origin.y;
         let chunk_max_y = origin.y + CHUNK_SIZE as i64 - 1;
 
-        // Fast rejection: find the surface range over this chunk's columns.
-        // If the whole chunk is above the highest surface, it's all air (or
-        // sea); if wholly below every column's surface profile, all stone.
-        let n = CHUNK_SIZE as i64;
-        let mut surfaces = Vec::with_capacity((n * n) as usize);
-        let mut min_surface = i64::MAX;
-        let mut max_surface = i64::MIN;
-        for lz in 0..n {
-            for lx in 0..n {
-                let g = self.ground(origin.x + lx, origin.z + lz);
-                min_surface = min_surface.min(g.0.height);
-                // Rivers and lakes stand above the ground: the chunk is not
-                // all air below their surface.
-                max_surface = max_surface.max(g.0.height).max(wet_top(&g.1));
-                surfaces.push(g);
-            }
-        }
+        // Fast rejection: the surface range over this chunk's columns, which
+        // every chunk of the stack shares ([`GroundCache`]). If the whole
+        // chunk is above the highest surface, it's all air (or sea); if
+        // wholly below every column's surface profile, all stone.
+        let ground = self.column_ground(pos.x, pos.z);
+        let surfaces = &ground.cells;
+        let (min_surface, max_surface) = (ground.min_surface, ground.max_surface);
 
         // Wholly above the ground: sky, or open sea below its surface layer
         // (which can freeze, so the chunk holding it is never uniform).
@@ -742,6 +846,87 @@ mod tests {
         let b = worldgen.generate_chunk(pos);
         for p in LocalPos::iter() {
             assert_eq!(a.get(p), b.get(p), "nondeterministic at {p:?}");
+        }
+    }
+
+    /// A generator sharing `g`'s stage-1 maps but remembering no ground:
+    /// what any chunk generates as when it is the first of its column.
+    fn cold(g: &Generator) -> Generator {
+        Generator {
+            grounds: Arc::new(GroundCache::default()),
+            ..g.clone()
+        }
+    }
+
+    /// The ground cache is only a cache (CLAUDE.md: any chunk generates
+    /// alone, in any order). Chunks generated through a warm cache — their
+    /// column's ground remembered from another chunk of the stack, evicted
+    /// and recomputed, visited in either order — are byte-identical to the
+    /// same chunks generated cold.
+    #[test]
+    fn the_ground_cache_never_changes_a_chunk() {
+        let shape = WorldShape::new(32_768, 32_768).unwrap();
+        let warm = Generator::new(0x00C0_FFEE, shape);
+        // More columns than the cache holds, so the second pass meets
+        // columns that were evicted, and some that were not.
+        let columns: Vec<(i64, i64)> = (0..GROUND_CACHE_COLUMNS as i64 + 40)
+            .map(|i| (i * 3 - 200, (i * 7) % 97 - 40))
+            .collect();
+        let mut mixed = 0;
+        for pass in 0..2 {
+            for (i, &(cx, cz)) in columns.iter().enumerate() {
+                let (lo, hi) = warm.surface_span_chunks(cx, cz);
+                let mut layers = [hi + 2, lo - 2, lo, hi];
+                if pass == 1 {
+                    layers.reverse();
+                }
+                for y in layers {
+                    let pos = ChunkPos::new(cx, y, cz);
+                    let chunk = warm.generate_chunk(pos);
+                    mixed += usize::from(!chunk.is_uniform());
+                    // Every warm chunk is generated; one column in eight is
+                    // also generated cold and compared, to keep this quick.
+                    if i % 8 == pass {
+                        assert_eq!(
+                            chunk.serialize(),
+                            cold(&warm).generate_chunk(pos).serialize(),
+                            "chunk {pos:?} differs through the cache (pass {pass})"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            mixed > 100,
+            "only {mixed} mixed chunks: the test saw no terrain"
+        );
+        let inner = warm.grounds.inner.lock().unwrap();
+        assert_eq!(
+            inner.columns.len(),
+            GROUND_CACHE_COLUMNS,
+            "the cache is bounded"
+        );
+        assert_eq!(inner.order.len(), GROUND_CACHE_COLUMNS);
+    }
+
+    /// A remembered column is exactly `ground` at each of its block columns,
+    /// in negative coordinates too.
+    #[test]
+    fn a_cached_column_is_the_ground_of_its_columns() {
+        let g = Generator::new(7, WorldShape::new(32_768, 32_768).unwrap());
+        for (cx, cz) in [(0, 0), (-1, -1), (-37, 12), (500, -500)] {
+            let column = g.column_ground(cx, cz);
+            let n = CHUNK_SIZE as i64;
+            let (mut lo, mut hi) = (i64::MAX, i64::MIN);
+            for lz in 0..n {
+                for lx in 0..n {
+                    let want = g.ground(cx * n + lx, cz * n + lz);
+                    assert_eq!(column.cells[(lx + lz * n) as usize], want);
+                    lo = lo.min(want.0.height);
+                    hi = hi.max(want.0.height).max(wet_top(&want.1));
+                }
+            }
+            assert_eq!((column.min_surface, column.max_surface), (lo, hi));
         }
     }
 
