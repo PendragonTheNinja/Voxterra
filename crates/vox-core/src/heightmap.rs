@@ -44,7 +44,11 @@ const S: i64 = CHUNK_SIZE as i64;
 /// per relight, a third of all relight time).
 #[derive(Debug)]
 struct Column {
-    residents: u32,
+    /// The chunk-Y of each resident chunk of the column, in arrival order.
+    /// A list rather than a count so that "the loaded chunks of this stack"
+    /// is a lookup here instead of a scan of every loaded chunk
+    /// ([`ColumnHeights::resident_layers`]). A handful of entries.
+    layers: Vec<i64>,
     /// Heights indexed `x + z * 32` within the column; [`UNKNOWN`] until
     /// reported.
     heights: Box<[i64]>,
@@ -55,8 +59,8 @@ struct Column {
 /// Per-column highest-solid heights for the resident world.
 #[derive(Debug, Default)]
 pub struct ColumnHeights {
-    /// Chunk column `(cx, cz)` → its heights and resident-chunk count. A
-    /// column is here exactly while that count is non-zero.
+    /// Chunk column `(cx, cz)` → its heights and resident chunks. A column
+    /// is here exactly while it has a resident chunk.
     columns: HashMap<(i64, i64), Column>,
     /// Known heights across all columns.
     known: usize,
@@ -131,11 +135,28 @@ impl ColumnHeights {
         self.columns
             .entry((pos.x, pos.z))
             .or_insert_with(|| Column {
-                residents: 0,
+                layers: Vec::new(),
                 heights: vec![UNKNOWN; (S * S) as usize].into_boxed_slice(),
                 known: 0,
             })
-            .residents += 1;
+            .layers
+            .push(pos.y);
+    }
+
+    /// The chunk-Y of every resident chunk in chunk column `(cx, cz)`, in no
+    /// particular order; empty for a column with none.
+    ///
+    /// This is "the loaded chunks of this stack" — what must relight when a
+    /// column's height becomes known or rises, and what an edit's rescan
+    /// must read. Both used to find the stack by walking every loaded chunk
+    /// (thousands, once per arriving chunk, on the frame thread), or by
+    /// asking the streamer which layers it *loads*, which misses a chunk
+    /// held only by the unload hysteresis. The heightmap is told of every
+    /// chunk that comes and goes, so it simply knows.
+    pub fn resident_layers(&self, cx: i64, cz: i64) -> &[i64] {
+        self.columns
+            .get(&(cx, cz))
+            .map_or(&[], |col| col.layers.as_slice())
     }
 
     /// A chunk stopped being resident. When it was its column's last, the
@@ -146,8 +167,18 @@ impl ColumnHeights {
         let Some(col) = self.columns.get_mut(&key) else {
             return;
         };
-        col.residents -= 1;
-        if col.residents == 0 {
+        // The chunk's own layer if it is listed; an unload that matches no
+        // load of that layer still releases one, as the count it replaces
+        // did, so the column cannot outlive its chunks.
+        match col.layers.iter().position(|&y| y == pos.y) {
+            Some(i) => {
+                col.layers.swap_remove(i);
+            }
+            None => {
+                col.layers.pop();
+            }
+        }
+        if col.layers.is_empty() {
             self.known -= col.known;
             self.columns.remove(&key);
         }
@@ -430,5 +461,32 @@ mod tests {
         h.chunk_unloaded(cp(9, 0, 9));
         assert_eq!(h.resident_columns(), 0);
         assert!(h.is_empty());
+    }
+
+    /// The heightmap knows a column's resident chunks: every layer loaded
+    /// and not yet unloaded, whatever order they came and went in, and
+    /// nothing of any other column.
+    #[test]
+    fn resident_layers_are_exactly_the_loaded_chunks() {
+        let mut h = ColumnHeights::new();
+        let sorted = |h: &ColumnHeights, cx, cz| {
+            let mut v = h.resident_layers(cx, cz).to_vec();
+            v.sort_unstable();
+            v
+        };
+        assert!(h.resident_layers(4, -2).is_empty());
+        for y in [3, -1, 7, 0] {
+            h.chunk_loaded(cp(4, y, -2));
+        }
+        h.chunk_loaded(cp(5, 3, -2)); // a neighbouring column
+        assert_eq!(sorted(&h, 4, -2), [-1, 0, 3, 7]);
+        assert_eq!(sorted(&h, 5, -2), [3]);
+        h.chunk_unloaded(cp(4, 3, -2));
+        h.chunk_unloaded(cp(4, 0, -2));
+        assert_eq!(sorted(&h, 4, -2), [-1, 7]);
+        h.chunk_unloaded(cp(4, 7, -2));
+        h.chunk_unloaded(cp(4, -1, -2));
+        assert!(h.resident_layers(4, -2).is_empty());
+        assert_eq!(h.resident_columns(), 1, "only the neighbour remains");
     }
 }

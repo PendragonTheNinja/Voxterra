@@ -448,6 +448,9 @@ pub fn chunk_light_plane(chunk: &Chunk, face: usize) -> Vec<u8> {
     let n = CHUNK_SIZE;
     let last = (n - 1) as u8;
     let mut plane = vec![0u8; n * n];
+    if !chunk.has_light() {
+        return plane; // fully dark: most neighbours underground
+    }
     for v in 0..n {
         for u in 0..n {
             let (lu, lv) = (u as u8, v as u8);
@@ -624,6 +627,9 @@ pub fn chunk_sky_plane(chunk: &Chunk, face: usize) -> Vec<u8> {
     let n = CHUNK_SIZE;
     let last = (n - 1) as u8;
     let mut plane = vec![0u8; n * n];
+    if !chunk.has_light() {
+        return plane; // fully dark: most neighbours underground
+    }
     for v in 0..n {
         for u in 0..n {
             let (lu, lv) = (u as u8, v as u8);
@@ -715,10 +721,15 @@ pub fn compute_chunk_light_2ch(
             let mut out = vec![0u8; CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE];
             if do_sky && !solid {
                 // All-air: each column carries its top_sky straight down (the
-                // no-attenuation-down rule keeps 15 at 15; 0 stays 0).
-                for pos in LocalPos::iter() {
-                    let col = pos.x() as usize + pos.z() as usize * CHUNK_SIZE;
-                    out[pos.index()] = top_sky[col] << 4;
+                // no-attenuation-down rule keeps 15 at 15; 0 stays 0). A
+                // horizontal layer of the buffer is laid out exactly as
+                // `top_sky` is (`x + z * 32`), so every layer is one copy of it.
+                let mut layer = [0u8; CHUNK_SIZE * CHUNK_SIZE];
+                for (cell, &sky) in layer.iter_mut().zip(top_sky) {
+                    *cell = sky << 4;
+                }
+                for out_layer in out.chunks_exact_mut(CHUNK_SIZE * CHUNK_SIZE) {
+                    out_layer.copy_from_slice(&layer);
                 }
             }
             // (All-solid stays fully 0: light can't enter solid cells.)
@@ -732,18 +743,22 @@ pub fn compute_chunk_light_2ch(
     let solid_map = padded_solidity(chunk, registry);
 
     // --- Block light (low nibble) ---
-    let block = {
-        let mut vol = PaddedChunk::build(chunk, registry, block_borders, solid_map.clone());
-        propagate_block_light(&mut vol);
-        let mut out = vec![0u8; CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE];
-        for pos in LocalPos::iter() {
-            out[pos.index()] = vol.light[PaddedChunk::idx(
-                pos.x() as usize + 1,
-                pos.y() as usize + 1,
-                pos.z() as usize + 1,
-            )];
-        }
-        out
+    //
+    // Block light has two sources only: an emitter inside the chunk, and
+    // light arriving on a neighbour's border. With neither, the flood would
+    // seed nothing and write zeros — and that is nearly every chunk of a
+    // world the player has not yet lit, each of which used to pay for the
+    // whole 34^3 flood to find it out (about a third of a surface chunk's
+    // relight, 2026-11 audit). `may_contain` asks the palette, so a stale
+    // emitter entry only costs the flood it would have run anyway.
+    let block_dark = !chunk.may_contain(|b| registry.emission(b) > 0)
+        && block_borders
+            .iter()
+            .all(|p| p.as_ref().is_none_or(|plane| plane.iter().all(|&v| v == 0)));
+    let block = if block_dark {
+        vec![0u8; CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE]
+    } else {
+        flood_block_light(chunk, registry, block_borders, solid_map.clone())
     };
 
     // --- Sky light (high nibble) ---
@@ -763,9 +778,27 @@ pub fn compute_chunk_light_2ch(
     (out, changed)
 }
 
-/// Sky-light flood over a chunk's padded volume. Seeds the border ring from
-/// neighbor sky planes; the +Y border defaults to 15 (open sky) wherever no
-/// neighbor-above plane is supplied. Returns the center 32³ sky buffer.
+/// The block-light flood over a chunk's padded volume, from its emitters and
+/// its neighbours' border light: the centre 32³ block-light buffer.
+fn flood_block_light(
+    chunk: &Chunk,
+    registry: &BlockRegistry,
+    block_borders: &NeighborLight,
+    solid_map: Vec<bool>,
+) -> Vec<u8> {
+    let mut vol = PaddedChunk::build(chunk, registry, block_borders, solid_map);
+    propagate_block_light(&mut vol);
+    let mut out = vec![0u8; CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE];
+    for pos in LocalPos::iter() {
+        out[pos.index()] = vol.light[PaddedChunk::idx(
+            pos.x() as usize + 1,
+            pos.y() as usize + 1,
+            pos.z() as usize + 1,
+        )];
+    }
+    out
+}
+
 /// Sky-light flood over a chunk's padded volume.
 ///
 /// The **top boundary** comes from `top_sky` (per-column, `CHUNK_SIZE²`,
@@ -789,14 +822,17 @@ pub fn compute_chunk_light_2ch(
 /// non-uniform chunk, so paying 32k decodes up front is a large net win.
 fn padded_solidity(chunk: &Chunk, registry: &BlockRegistry) -> Vec<bool> {
     let mut solid = vec![false; PAD * PAD * PAD];
-    for pos in LocalPos::iter() {
-        // Light-blocking: OPAQUE, not the physical `solid` (ADR-0011).
-        if registry.is_opaque(chunk.get(pos)) {
-            solid[PaddedChunk::idx(
-                pos.x() as usize + 1,
-                pos.y() as usize + 1,
-                pos.z() as usize + 1,
-            )] = true;
+    // Row by row (`Chunk::decode_row`), as the mesher's snapshot reads a
+    // chunk: a row's 32 cells are consecutive in the padded map too.
+    let mut row = [crate::BlockId::AIR; CHUNK_SIZE];
+    for z in 0..CHUNK_SIZE {
+        for y in 0..CHUNK_SIZE {
+            chunk.decode_row(y, z, &mut row);
+            let start = PaddedChunk::idx(1, y + 1, z + 1);
+            for (cell, &b) in solid[start..start + CHUNK_SIZE].iter_mut().zip(&row) {
+                // Light-blocking: OPAQUE, not the physical `solid` (ADR-0011).
+                *cell = registry.is_opaque(b);
+            }
         }
     }
     solid
@@ -968,19 +1004,12 @@ fn interior_mask() -> &'static [bool] {
 
 /// Apply a packed light buffer (from [`compute_chunk_light_2ch`]) to a
 /// chunk's storage: high nibble → sky light, low nibble → block light.
+///
+/// The buffer is already in the chunk's own layout, so this is one pass
+/// (`Chunk::set_light_packed`) rather than 65 536 nibble writes — and it runs
+/// on the frame thread, for every chunk whose light changed.
 pub fn apply_chunk_light(chunk: &mut Chunk, light: &[u8]) {
-    chunk.clear_light();
-    for pos in LocalPos::iter() {
-        let packed = light[pos.index()];
-        let block = packed & 0x0F;
-        let sky = (packed >> 4) & 0x0F;
-        if block > 0 {
-            chunk.set_block_light(pos, block);
-        }
-        if sky > 0 {
-            chunk.set_sky_light(pos, sky);
-        }
-    }
+    chunk.set_light_packed(light);
 }
 
 /// Whether the outgoing border planes of a packed `new_light` (32³) buffer
@@ -996,10 +1025,7 @@ pub fn packed_border_changed_faces(chunk: &Chunk, new_light: &[u8]) -> u8 {
     let n = CHUNK_SIZE;
     let last = (n - 1) as u8;
     let idx = |x: u8, y: u8, z: u8| LocalPos::new(x, y, z).index();
-    let current = |i: usize| {
-        let p = LocalPos::from_index(i);
-        (chunk.sky_light(p) << 4) | (chunk.block_light(p) & 0x0F)
-    };
+    let current = |i: usize| chunk.packed_light(i);
     let mut mask = 0u8;
     for v in 0..n {
         for u in 0..n {
@@ -1026,10 +1052,7 @@ fn packed_border_changed(chunk: &Chunk, new_light: &[u8]) -> bool {
     let n = CHUNK_SIZE;
     let last = (n - 1) as u8;
     let idx = |x: u8, y: u8, z: u8| LocalPos::new(x, y, z).index();
-    let current = |i: usize| {
-        let p = LocalPos::from_index(i);
-        (chunk.sky_light(p) << 4) | (chunk.block_light(p) & 0x0F)
-    };
+    let current = |i: usize| chunk.packed_light(i);
     for v in 0..n {
         for u in 0..n {
             let (lu, lv) = (u as u8, v as u8);
@@ -2544,5 +2567,196 @@ mod tests {
             total,
             total.as_secs_f64() * 1e6 / iters as f64
         );
+    }
+
+    // ---- Shortcuts must equal the work they skip (2026-11 audit) ----
+
+    /// Terrain-like chunks: rolling ground with holes and scattered blocks,
+    /// from a seed.
+    fn rough_chunk(seed: u64) -> Chunk {
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let mut chunk = Chunk::new_air();
+        for z in 0..CHUNK_SIZE as u8 {
+            for x in 0..CHUNK_SIZE as u8 {
+                let top = 8 + (next() % 16) as u8;
+                for y in 0..top {
+                    if next() % 9 != 0 {
+                        let b = if next() % 4 == 0 {
+                            crate::registry::DIRT
+                        } else {
+                            STONE
+                        };
+                        chunk.set(LocalPos::new(x, y, z), b);
+                    }
+                }
+            }
+        }
+        chunk
+    }
+
+    /// The padded opacity map read by rows is the one read cell by cell.
+    #[test]
+    fn padded_solidity_matches_per_cell_reads() {
+        let reg = BlockRegistry::default_set();
+        for seed in 0..6 {
+            let mut chunk = rough_chunk(seed);
+            // Water is not opaque; the map must ask the registry, not `is_air`.
+            chunk.set(LocalPos::new(3, 30, 3), crate::registry::WATER);
+            let solid = padded_solidity(&chunk, &reg);
+            for z in 0..PAD {
+                for y in 0..PAD {
+                    for x in 0..PAD {
+                        let want = PaddedChunk::center_local(x, y, z)
+                            .is_some_and(|p| reg.is_opaque(chunk.get(p)));
+                        assert_eq!(solid[PaddedChunk::idx(x, y, z)], want, "at {x},{y},{z}");
+                    }
+                }
+            }
+        }
+        let stone = Chunk::filled(STONE);
+        assert_eq!(
+            padded_solidity(&stone, &reg).iter().filter(|&&s| s).count(),
+            CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE
+        );
+    }
+
+    /// The block-light flood is skipped when a chunk holds no emitter and no
+    /// border brings light in. Skipping must equal flooding: with neither
+    /// source the flood writes zeros, and with either one the flood runs.
+    #[test]
+    fn skipping_the_block_flood_equals_running_it() {
+        let reg = BlockRegistry::default_set();
+        let top = open_sky_top();
+        for seed in 0..8 {
+            let chunk = rough_chunk(seed);
+            // No emitter, dark borders: the flood itself finds nothing...
+            let flooded =
+                flood_block_light(&chunk, &reg, &no_borders(), padded_solidity(&chunk, &reg));
+            assert!(
+                flooded.iter().all(|&v| v == 0),
+                "seed {seed}: a flood with no source lit something"
+            );
+            // ...so the shortcut's zeros are what it would have written.
+            let (light, _) = compute_chunk_light_2ch(
+                &chunk,
+                &reg,
+                &no_borders(),
+                &NEIGHBOR_SKY_NONE,
+                &top,
+                true,
+            );
+            assert!(light.iter().all(|&b| b & 0x0F == 0));
+            assert!(
+                light.iter().any(|&b| b >> 4 != 0),
+                "skylight still computed"
+            );
+
+            // A bright border must still flood in.
+            let mut borders = no_borders();
+            borders[2] = Some(vec![12u8; CHUNK_SIZE * CHUNK_SIZE]);
+            let (light, _) =
+                compute_chunk_light_2ch(&chunk, &reg, &borders, &NEIGHBOR_SKY_NONE, &top, true);
+            let want = flood_block_light(&chunk, &reg, &borders, padded_solidity(&chunk, &reg));
+            assert!(
+                want.iter().any(|&v| v != 0),
+                "seed {seed}: border light reached nothing"
+            );
+            for i in 0..want.len() {
+                assert_eq!(
+                    light[i] & 0x0F,
+                    want[i],
+                    "seed {seed}: border light differs at {i}"
+                );
+            }
+
+            // And so must a lamp inside the chunk.
+            let mut lit = rough_chunk(seed);
+            lit.set(LocalPos::new(16, 28, 16), LAMP);
+            let (light, _) =
+                compute_chunk_light_2ch(&lit, &reg, &no_borders(), &NEIGHBOR_SKY_NONE, &top, true);
+            let want = flood_block_light(&lit, &reg, &no_borders(), padded_solidity(&lit, &reg));
+            assert_eq!(
+                want[LocalPos::new(16, 28, 16).index()],
+                crate::registry::LAMP_EMISSION
+            );
+            for i in 0..want.len() {
+                assert_eq!(
+                    light[i] & 0x0F,
+                    want[i],
+                    "seed {seed}: lamp light differs at {i}"
+                );
+            }
+        }
+    }
+
+    /// A lamp that was placed and then mined leaves its palette entry behind.
+    /// `may_contain` then says "maybe", the flood runs, and finds darkness —
+    /// conservative, never wrong.
+    #[test]
+    fn a_mined_lamp_leaves_the_chunk_dark() {
+        let reg = BlockRegistry::default_set();
+        let mut chunk = rough_chunk(3);
+        let p = LocalPos::new(16, 28, 16);
+        chunk.set(p, LAMP);
+        chunk.set(p, crate::BlockId::AIR);
+        let (light, _) = compute_chunk_light_2ch(
+            &chunk,
+            &reg,
+            &no_borders(),
+            &NEIGHBOR_SKY_NONE,
+            &open_sky_top(),
+            true,
+        );
+        assert!(light.iter().all(|&b| b & 0x0F == 0));
+    }
+
+    /// `apply_chunk_light` stores exactly the buffer it is given, whatever
+    /// representation the chunk ends up in, and the border comparison reads
+    /// it back the same.
+    #[test]
+    fn applied_light_reads_back_and_compares_equal() {
+        let reg = BlockRegistry::default_set();
+        let air = Chunk::new_air();
+        let cases = [(rough_chunk(1), open_sky_top()), (air, open_sky_top())];
+        for (mut chunk, top) in cases {
+            let (light, changed) = compute_chunk_light_2ch(
+                &chunk,
+                &reg,
+                &no_borders(),
+                &NEIGHBOR_SKY_NONE,
+                &top,
+                true,
+            );
+            assert!(changed, "a dark chunk gaining daylight changes its border");
+            assert_ne!(packed_border_changed_faces(&chunk, &light), 0);
+            apply_chunk_light(&mut chunk, &light);
+            assert!(chunk.light_matches(&light));
+            for pos in LocalPos::iter() {
+                let b = light[pos.index()];
+                assert_eq!(
+                    (chunk.sky_light(pos), chunk.block_light(pos)),
+                    (b >> 4, b & 0x0F)
+                );
+            }
+            assert_eq!(packed_border_changed_faces(&chunk, &light), 0);
+            let (again, changed) = compute_chunk_light_2ch(
+                &chunk,
+                &reg,
+                &no_borders(),
+                &NEIGHBOR_SKY_NONE,
+                &top,
+                true,
+            );
+            assert!(
+                !changed && again == light,
+                "relighting a settled chunk is a no-op"
+            );
+        }
     }
 }
