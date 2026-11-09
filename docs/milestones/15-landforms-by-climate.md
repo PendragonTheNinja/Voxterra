@@ -23,7 +23,14 @@ for geology, the dune wind tilted, tors on temperate uplands too, about
 half the mesas with a way up). **Still open in task 0:** (a) the owner's
 one-line confirmation that the catalogue as a whole is approved; (b) the
 owner's re-bench of M14 at `GENERATOR_VERSION` 8 (`cargo run -p vox-app --
---bench`, result committed under `bench/`). The process-weight map layer
+--bench`; it runs in its own world now, so no need to move `world/`
+aside; copy the report from `bench/` to `docs/bench/` and commit it there —
+`bench/` is git-ignored). **Take it on a build that includes the 2026-11
+audit's engine changes** (generation, relight and threading all got
+cheaper there, `docs/notes/code-audit-2026-11.md`): criterion 9 compares
+M15's terrain against M14's on the same engine, and a baseline from before
+the audit would hide a real M15 cost behind the audit's gains. The
+process-weight map layer
 needs task 1's weights and lands with them. **Next after that: task 1** —
 process weights and the ice-age climate in stage 1 (targets in the
 catalogue's *process weights* and *ice-age climate* sections), the
