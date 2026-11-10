@@ -343,6 +343,19 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   tests) and D1 (ADR-0021 accepted; one edit path). Still the owner's to
   decide: D2 (world versions). D3 (block names in saves) is approved in
   principle and needs its ADR.
+- **Geology is designed, not built (2026-11-10, draft for the owner's
+  review):** `docs/geology.md` — the checklist a geologist would test the
+  world against, the plate-framework decision, provinces, six ages, strata
+  in structural coordinates, the rock catalogue, caves, mineral systems,
+  and the five milestones it becomes — and the draft spec for the first,
+  `docs/milestones/16-tectonics-and-bedrock.md`. Six questions for the
+  owner at the end of `geology.md`; the first (how the terrain gets a
+  tectonic cause) decides the shape of milestone 16. It follows M15.
+- **Open decision records (2026-11-10):** ADR-0022 (relight and mesh off
+  the frame — proposed, and gated on the owner's bench); ADR-0023
+  (landform processes — proposed, built as M15 task 1); ADR-0024 (block
+  names in saves — approved in principle, not built, wanted before
+  geology's first block).
 - **Instruments (from M11):** the P key logs a `VIEW` line (exact position,
   angles, window, settings) and a `hole_census` — the frame re-rendered six
   ways on the player's GPU with pinholes counted per variant. In the cloud
