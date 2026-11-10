@@ -112,6 +112,11 @@ someone else plays.
 
 ### D3 — Block names in the save, not numbers · M · ADR
 
+**Status (2026-11-10): approved in principle by the owner; designed in
+`docs/decisions/0024-block-names-in-saves.md`; not built.** Build it
+before the geology milestone's first block is added. The ADR lists the
+tests it must come with.
+
 **Finding.** Chunks store numeric `BlockId`s, and the registry's order is
 therefore the save format (`registry.rs`, *Stable IDs*). Audit finding D3.
 
