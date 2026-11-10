@@ -375,6 +375,34 @@ including the seam on the torus.
 
 ### A1 — A headless world session · L · do before P1
 
+**Status: done 2026-11-10** (steps 1 and 3; step 2's further split of
+`main.rs` — camera, LOD pipeline, telemetry — is not, and is now optional).
+`crates/vox-app/src/session.rs` holds `Session`; `main.rs` went from 3 561
+lines to 2 558. The move was mechanical and the live run settles to the
+same state as before (1 398 chunks, 256 meshes, 0.60 M triangles, 202 MB).
+Five system tests, each checked against a deliberately broken engine:
+
+| Test | What it holds | Breaks when |
+|---|---|---|
+| `a_flight_ends_lit_meshed_and_consistent` | after outrunning the loader, the streamer, world and heightmap agree chunk for chunk; everything is meshed; the light is a fixed point | a changed border stops re-queueing its neighbour |
+| `arrival_order_does_not_change_the_world` | a saved world with a sealed room, a shaft and an overhang, approached with chunks prompt, or shuffled and late: identical blocks and light in every voxel; the room dark | same |
+| `the_sea_surface_is_lit_whatever_arrives_first` | over deep ocean from high up (three separate groups of chunks per column), top-down, bottom-up and shuffled | a risen column stops relighting its stack |
+| `a_deep_shaft_stays_dark_whatever_arrives_first` | a shaft far underground, open at the top of what is loaded, the surface arriving after it | that, or it together with "an unknown column is open" |
+| `edits_across_a_seam_light_correctly_and_survive_a_restart` | a pit and a roof across a chunk border; then save, restart, and the same blocks and the same light | a changed border stops re-queueing its neighbour |
+
+Two things learned writing them, both recorded in CLAUDE.md. Random
+arrival order is a weak test: the engine heals most ordering mistakes when
+some neighbour happens to arrive later, so the orders that matter are the
+systematic ones nearest-first streaming produces — top-down for a camera
+in the air, bottom-up for one underground. And "an unknown column is
+covered" cannot be broken alone in any final state these tests can reach:
+the stack relight repairs it. The two rules are a belt and braces, as the
+M05 history says.
+
+Not covered, honestly: the *transient* invariants (never mesh a chunk
+still queued for relight — a flash and wasted work, not a wrong final
+state), and anything about the LOD ring, which is still in `App`.
+
 **Finding.** Everything that streams, lights and meshes the world is a
 method on `App`, which needs a window; none of it is tested as a system.
 Audit finding A1.
