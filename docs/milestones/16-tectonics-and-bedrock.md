@@ -11,10 +11,14 @@ This is the first of five geology milestones. The design all five are
 written against is `docs/geology.md`; read it first. This spec is the
 part of it built now.
 
-**Status: draft for the owner's review (2026-11-10).** Nothing is built.
-It cannot start until M15 is complete and ADR-0024 (block names in saves)
-is built, and it assumes the owner's answer to `docs/geology.md` §16
-question 1 is option C; if not, this spec is rewritten.
+**Status: draft; its deciding questions are answered (2026-11-10).**
+Nothing is built. The owner chose option C, the plate framework, and
+answered every question in `docs/geology.md` §16; ADR-0024 (block names
+in saves) is built. How the framework is made is ADR-0025 (proposed),
+which also proposes an order: this milestone's tasks 1 and 2 *before*
+M15's tasks 2–6, so that landforms are tuned once, on the terrain they
+ship on. That reordering awaits the owner's word; the spec as a whole
+awaits his approval.
 
 ## Why this milestone exists
 
@@ -51,7 +55,11 @@ From `docs/geology.md`:
   flint, coal, rock salt, gypsum, banded iron), the basement suite
   (granite, gneiss, schist, slate, quartzite, marble), the ocean-floor
   and volcanic-province rocks (basalt, gabbro, peridotite, serpentinite,
-  chert), and till and loess — about thirty.
+  chert), and till and loess — about thirty; and the fossil-bearing
+  versions of limestone, chalk, shale and coal, and stromatolitic
+  dolostone, placed by age (`docs/geology.md` §7, *Fossils*).
+- **§5, the floor**: the heat gradient per province, and plastic rock
+  below it (the heat *mechanic* is the survival milestone's).
 
 It does not yet build volcanoes, intrusions as bodies, metamorphic zones,
 caves, ore, or rock's effect on erosion (milestones 17–20).
@@ -61,7 +69,9 @@ caves, ore, or rock's effect on erosion (milestones 17–20).
 1. **ADRs first**: the tectonic framework and how terrain is placed by it
    (superseding the placement parts of ADR-0010, keeping its scale);
    strata in structural coordinates; the block additions. Accepted with
-   the retrospective.
+   the retrospective. (The first is drafted: ADR-0025.) Every tunable
+   the milestone adds is a per-world option (`docs/geology.md` §3,
+   *World options*).
 2. **Instruments first**: world maps of plates and boundaries, provinces,
    bedrock at the surface, and a cross-section tool (a vertical slice
    along any line, as a geologist draws one); the readout names the

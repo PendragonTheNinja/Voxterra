@@ -346,20 +346,26 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   packages with an order; they are proposals until the owner picks them.
   **Done since:** A1 (the world pipeline is `session.rs`, with six system
   tests) and D1 (ADR-0021 accepted; one edit path). Still the owner's to
-  decide: D2 (world versions). D3 (block names in saves) is approved in
-  principle and needs its ADR.
-- **Geology is designed, not built (2026-11-10, draft for the owner's
-  review):** `docs/geology.md` — the checklist a geologist would test the
+  decide: D2 (world versions). D3 (block names in saves) is done
+  (ADR-0024).
+- **Geology is designed and agreed, not built (2026-11-10):** `docs/geology.md` — the checklist a geologist would test the
   world against, the plate-framework decision, provinces, six ages, strata
   in structural coordinates, the rock catalogue, caves, mineral systems,
   and the five milestones it becomes — and the draft spec for the first,
-  `docs/milestones/16-tectonics-and-bedrock.md`. Its §16 lists what the
-  owner has answered and what is open; the open question that decides
-  the shape of milestone 16 is how the terrain gets a tectonic cause. It follows M15.
+  `docs/milestones/16-tectonics-and-bedrock.md`. The owner answered all
+  of its questions (§16): the terrain gets a plate framework (ADR-0025,
+  proposed: terranes at walking scale, plates at world scale, replacing
+  the noise *gates* and keeping ADR-0010's shapes); caves only where
+  Earth has them; a floor of heat and plastic rock instead of bedrock;
+  every tunable a per-world option. **One thing awaits him:** ADR-0025
+  proposes doing milestone 16's tasks 1–2 (the framework, terrain placed
+  by it) BEFORE M15's tasks 2–6, so landforms are tuned once. Until he
+  says, M15 task 2 is next as written.
 - **Open decision records (2026-11-10):** ADR-0022 (relight and mesh off
   the frame — proposed, and gated on the owner's bench); ADR-0023
   (landform processes — proposed, built as M15 task 1); ADR-0024 (block
-  names in saves) is accepted and built.
+  names in saves) is accepted and built; ADR-0025 (the tectonic
+  framework) is proposed.
 - **Instruments (from M11):** the P key logs a `VIEW` line (exact position,
   angles, window, settings) and a `hole_census` — the frame re-rendered six
   ways on the player's GPU with pinholes counted per variant. In the cloud
