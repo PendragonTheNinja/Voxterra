@@ -139,9 +139,9 @@ waits (`relight_chunks_parallel`, `mesh_chunks_parallel`). Audit finding
 P1; background in the audit's headline.
 
 **Measure.** `--bench`, sprint phases: worst frame and 1% low; relight and
-mesh milliseconds per second. Add first (step 1) a CPU-time counter for
-relight beside the wall-clock one — the bench already has one for meshing
-(`mesh_cpu_ms_total`) — so "work" and "waiting" can be told apart at last.
+mesh milliseconds per second (wall) against `Relit /s × Relight µs/chunk`
+and `Meshed /s × Mesh µs/chunk` (CPU) — the audit added the relight pair,
+so "work" and "waiting" can be told apart.
 
 **Design to propose in the ADR.** Jobs take what they read by value, run on
 a pool, and return results over a channel that the frame drains — the shape
@@ -154,7 +154,7 @@ copy-on-write on edit — decide in the ADR). Results that arrive for a chunk
 that has since changed are dropped by a per-chunk generation counter.
 
 **Steps.**
-1. Relight CPU-time telemetry; record the before.
+1. Record the before (the owner's bench on the audited build).
 2. ADR. The invariants it must keep, each of which has a regression test
    that must stay green: never mesh a chunk queued for relight; a changed
    border re-meshes neighbours; the first-mesh gate; nearest-first.

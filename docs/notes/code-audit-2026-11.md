@@ -45,8 +45,8 @@ Measured headless: a 32-chunk relight batch takes **6.3 ms** on an idle pool
 and **42.7 ms** queued behind one frame's worth of spawns.
 
 The telemetry books that wait as relight time, because `lt` is the batch's
-wall clock (meshing has had a CPU-time counter since M12; relight never
-did). This is very likely the answer to two open questions in the
+wall clock (meshing has had a CPU-time counter since M12; relight had none
+until this audit added one to the bench report). This is very likely the answer to two open questions in the
 retrospectives: why relight "doubled" from M09 to M10 and again from M11 to
 M12 with no change to the lighting code. Worldgen got heavier each time
 (terrain in M10, climate in M13, rivers in M14), so the jobs relight queued
@@ -59,7 +59,7 @@ fix — relight and mesh never blocking the frame at all — is work package
 ## What was fixed in this audit
 
 All behaviour-preserving unless marked. Tests: vox-core 288 → 298,
-vox-worldgen 72 → 74; clippy and fmt clean; the terrain fingerprint is
+vox-worldgen 72 → 74, vox-app 11 → 12; clippy and fmt clean; the terrain fingerprint is
 unchanged, so `GENERATOR_VERSION` stays 8.
 
 | # | Change | Measured |
@@ -74,16 +74,39 @@ unchanged, so `GENERATOR_VERSION` stays 8.
 | 8 | **`--bench` runs in its own world folder** *(new behaviour)*, `bench/world-v<generator version>`. It opened the player's world, so it measured that world's edits and refused to run when the world was a version old — which stopped the M14 re-bench on 2026-11-04. | — |
 | 9 | **An edit's height rescan reads exactly the resident chunks** *(bug fix, rare)*. It scanned the layers the streamer *loads*; the streamer *keeps* one more around the camera. A roof in that band was invisible to the scan, the height was set below the real top, and daylight was invented under it. | — |
 | 10 | **A block can no longer be placed into a chunk that is still streaming in** *(bug fix, rare)*. `World::set_block` created the chunk; the real one then replaced it, the block vanished, and the column's resident count was left one short. | — |
-| 11 | Two `powi(2)` calls in drainage generation replaced by multiplication, as `climate.rs`'s determinism rule requires (bit-identical here; fingerprint unchanged). A stray `git diff` output committed as a file named `-files release` removed from the repository root. | — |
+| 11 | **The bench reports relight's CPU time** (`Relit /s`, `Relight µs/chunk (CPU)`, two new columns at the end of the second table), beside the wall-clock `Relight ms/s` it always had. Work and waiting can now be told apart on the owner's machine: wall ms/s far above `relit/s × µs/chunk ÷ cores` is waiting. | — |
+| 12 | Two `powi(2)` calls in drainage generation replaced by multiplication, as `climate.rs`'s determinism rule requires (bit-identical here; fingerprint unchanged). A stray `git diff` output committed as a file named `-files release` removed from the repository root. | — |
 
 **The live run agrees.** Old and new builds, started at spawn under the
 software GPU, end in the same state to the digit — 1 398 chunks loaded,
 256 meshes, 0.60 M triangles drawn, 202 MB of GPU buffers — which is the
 best evidence available here that nothing visible changed. Relight's share
 of the frame thread over that start-up fell from ~1 260 ms to ~410 ms, and
-the world settled in ~11 s against ~13 s. (At 11 fps on a software
-rasteriser those are indicative only; the owner's `--bench` is the real
-measurement.)
+the world settled in ~11 s against ~13 s.
+
+**So does `--bench`**, run on both builds in the cloud
+(`docs/bench/2026-11-audit-cloud-before.md` and `-after.md`). It runs at
+~5 fps there, so its fps columns say nothing; the streaming columns do:
+
+| | Before | After |
+|---|---|---|
+| Settle time, the five standing phases at spawn, ocean and rivers | 24.7 – 32.0 s | 18.4 – 26.4 s (−18% to −28%) |
+| Relight on the frame thread, the five sprint phases | 50 – 63 ms/s | 20 – 26 ms/s (−55% to −60%) |
+| Worst frame, sprint phases | 338 – 477 ms | 293 – 367 ms |
+| Chunks meshed per second, sprint phases | 72 – 147 | 119 – 185 |
+| Chunks resident at the end of a sprint | 526 – 723 | 719 – 973 |
+| Every standing phase's final LOD nodes, GPU MB, triangles, chunks loaded | — | identical |
+
+One number went the other way, and should be watched on a real GPU: the
+mesh backlog during a sprint peaked higher (about 760–850 before, 770–1 090
+after). Chunks now arrive faster than before, and at 5 fps the mesher —
+which is budgeted per *frame* — takes ~150 a second whatever arrives. At
+hundreds of frames a second that budget is not the limit, so this should
+not appear natively; if the owner's sprint backlog is higher than M14's
+~200, the mesh budget is the next thing to look at.
+
+At 5–11 fps on a software rasteriser all of this is indicative. The
+owner's `--bench` is the measurement.
 
 **What the owner should check**, because nothing here can: that the game
 looks and feels the same or better in flight; that breaking and placing

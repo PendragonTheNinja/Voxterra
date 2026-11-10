@@ -280,9 +280,9 @@ authoritative.
   frame thread hands its relight and mesh batches to rayon's global pool and
   waits; anything spawned on that pool is queued ahead of them. Generation
   and LOD jobs there made a 6 ms relight batch take 43 ms (2026-11 audit).
-- **The telemetry's `lt` is wall-clock**, so it includes any waiting. Until
-  relight has a CPU-time counter (backlog P1), a rise in `lt` is not
-  evidence that lighting got slower.
+- **The telemetry's `lt` is wall-clock**, so it includes any waiting. A rise
+  in `lt` is not evidence that lighting got slower: compare the bench's
+  `Relit /s` and `Relight µs/chunk (CPU)` columns, which are the work.
 
 ## Intentionally deferred (do not build these yet)
 
@@ -322,8 +322,8 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   rivers as ribbons, reservoirs with the water simulation.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 298, vox-mesh 71, vox-worldgen 74, vox-render 21, vox-app 11
-  passing (288 and 72 before the 2026-11 audit), plus the ignored
+  vox-core 298, vox-mesh 71, vox-worldgen 74, vox-render 21, vox-app 12
+  passing (288, 72 and 11 before the 2026-11 audit), plus the ignored
   `every_biome_in_every_world` and `biome_survey`, run in release), then
   start the first unchecked item.
 - **Code audit, 2026-11-09:** `docs/notes/code-audit-2026-11.md` — what was
