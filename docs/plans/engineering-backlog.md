@@ -140,6 +140,12 @@ not move it.
 
 ### P1 — Relight and mesh never block the frame · L · ADR · after A1
 
+**Status (2026-11-10): designed, gated on a measurement.** The design is
+`docs/decisions/0022-relight-and-mesh-off-the-frame.md` (Proposed), with
+the gate it must pass first: the owner's bench on the audited build,
+wall time against work, in the sprint phases. A1 is done, so the tests
+this needs exist. Do not build before the numbers.
+
 **Finding.** The frame thread hands relight and mesh batches to a pool and
 waits (`relight_chunks_parallel`, `mesh_chunks_parallel`). Audit finding
 P1; background in the audit's headline.
