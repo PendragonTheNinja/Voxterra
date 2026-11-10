@@ -233,6 +233,37 @@ Over many seeds, conditioned on the process weights:
 - **Every landform in every legal world size** whose climates allow it
   (criterion 7), as `every_biome_in_every_world` does for biomes.
 
+## As built — the process weights (M15 task 1, 2026-11-10)
+
+`vox_worldgen::process` (ADR-0023). The table under *The process weights*
+is implemented as written, with three things the draft did not say:
+
+- **Sand is carried, not placed.** "Downwind of sand, in a basin" is
+  computed: sand is taken up from bare dry ground along each latitude row
+  in the climate's own winds and set down where the ground falls away
+  below what the wind has just crossed. Dune seas come out as patches in
+  desert basins — over six seeds, 20–24% of hot-desert land and 9–14% of
+  cold — and most of every desert is bare, as most of the Sahara is.
+- **Ice needs snow, unless nothing melts.** Cold, dry ground was not
+  glaciated (ice-age Siberia); ground too cold ever to thaw was, however
+  dry (Antarctica). In the worlds surveyed everything poleward of ~47° is
+  still glaciated, as the table says: the storm track there is wet.
+- **Dry-land processes need thawed ground.** A polar desert is as dry as
+  the Sahara and has neither flash floods nor dunes; below about −1 °C
+  the wind and flash-flood weights are zero.
+
+Measured (six seeds, default size, share of the climate each belongs to):
+flash-flood uplands 3–5% of dry land; weathering plains 23–37% of savanna
+and dry forest; rain-shaped ground 47–64% of humid land; glaciated land
+4–6% between 0° and 20° (the highest ranges), 6–13% at 20–40°, 86–95% at
+40–50°, essentially all of it beyond. No process anywhere outside its climate. The
+map: `docs/gallery/m15/process-weights-7e22ac0de.jpg`.
+
+Not yet built from the table: "downwind of desert rivers' beds" as a sand
+source (the network comes after the landforms — ADR-0023 §6), and the dune
+wind's tilt and seasonal swing (Decisions 1 and 3), which belong to the
+dunes themselves in task 2.
+
 ## Decisions (owner, 2026-11-04)
 
 The five questions the draft asked, and the owner's answers.

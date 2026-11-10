@@ -1,9 +1,12 @@
 # ADR-0021: An edit sets a column's height to its true top
 
-- **Status:** Proposed (2026-11-10), for the owner's decision. Resolves
-  finding D1 of the 2026-11 code audit. If accepted it supersedes the
-  "raise-only" rule for edits in CLAUDE.md's lighting invariants (added
-  after M05); chunk *arrival* stays raise-only, exactly as it is.
+- **Status:** Accepted (2026-11-10). The owner, on being shown the two
+  rules: "If you place a block and it casts whatever small shadow a single
+  block would cast, the lighting should update again after the block is
+  removed. A shadow should not remain." Resolves finding D1 of the 2026-11
+  code audit and supersedes the "raise-only" rule for edits in CLAUDE.md's
+  lighting invariants (added after M05); chunk *arrival* stays raise-only,
+  exactly as it was.
 - **Context:** The skylight heightmap (ADR-0005) holds, per block column,
   the highest opaque block among resident chunks. Two things write it:
 
@@ -46,7 +49,7 @@ low camera, a scaffold: every building game does this constantly.
 Raise-only is safe in the direction it was written to protect (it cannot
 invent daylight) and wrong in the other.
 
-## Decision (proposed)
+## Decision
 
 **An edit sets the column's height to the highest opaque block among the
 chunks resident in that column — up or down.** Chunk arrival is unchanged.
@@ -66,23 +69,23 @@ relights its whole stack (CLAUDE.md; held by
 `the_sea_surface_is_lit_whatever_arrives_first` and
 `a_deep_shaft_stays_dark_whatever_arrives_first`).
 
-## Consequences, if accepted
+## Consequences
 
-- CLAUDE.md's invariant becomes: *arrival raises; an edit sets to the true
-  resident top; neither may ever set a height from a scan that can miss a
-  resident chunk.* The "UNRESOLVED" note added by the audit is removed.
-- The two edit functions become one, in `vox-core` on `ColumnHeights`
-  (given the world and the registry), with the seam test from the
-  backlog's D1 package: a top block in a chunk held only by the unload
-  hysteresis must be seen.
-- `recompute_height_column`'s second job — queueing the column's chunks
-  and their horizontal neighbours for relight after an edit — is kept; it
-  was never about the height.
+- CLAUDE.md's invariant is now: *arrival raises; an edit sets to the true
+  resident top; a height is never set from a scan that can miss a
+  resident chunk.*
+- The two edit functions are one: `ColumnHeights::rescan` in `vox-core`
+  (given the world and the registry), called by `Session::column_edited`.
+  Its tests include the seam this turns on — the column's top in a
+  resident chunk far above the edit, with unloaded layers between
+  (`rescan_sees_every_resident_chunk_across_gaps`).
+- The old raise-only edit pass's second job — queueing the column's chunks
+  and their horizontal neighbours for relight after an edit — is kept in
+  `column_edited`; it was never about the height.
 
-## If rejected
+## The alternative, for the record
 
-Then the code must change to match CLAUDE.md: remove the `set` call, and
-accept that the test above fails — or find another way for a column to
-forget a block above it that is gone (for instance, dropping a column's
-height whenever a chunk of it unloads and rebuilding it from what is
-left, which is a rescan by another name).
+Raise-only for edits would have needed some other way for a column to
+forget a block above it that is gone — dropping a column's height
+whenever one of its chunks unloads and rebuilding it from what is left,
+say, which is a rescan by another name, at a worse moment.

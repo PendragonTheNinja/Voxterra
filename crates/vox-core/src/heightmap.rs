@@ -28,7 +28,9 @@
 
 use std::collections::HashMap;
 
-use crate::coords::{CHUNK_SIZE, ChunkPos};
+use crate::coords::{CHUNK_SIZE, ChunkPos, WorldPos};
+use crate::registry::BlockRegistry;
+use crate::world::World;
 
 /// A height slot no resident chunk has reported yet. `i64::MIN` cannot serve:
 /// it already means "known, and nothing solid".
@@ -54,6 +56,17 @@ struct Column {
     heights: Box<[i64]>,
     /// How many slots are not [`UNKNOWN`], for [`ColumnHeights::len`].
     known: usize,
+}
+
+/// The tops of one block column among its resident chunks
+/// ([`ColumnHeights::rescan`]). Two, because they answer different questions
+/// (ADR-0011): light stops at the highest OPAQUE block, the ground is the
+/// highest SOLID one — under an ocean, the seabed. `None`: no such block
+/// in any resident chunk of the column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnTops {
+    pub opaque: Option<i64>,
+    pub solid: Option<i64>,
 }
 
 /// Per-column highest-solid heights for the resident world.
@@ -127,6 +140,63 @@ impl ColumnHeights {
             }
             col.heights[i] = h;
         }
+    }
+
+    /// After an edit: rescan block column `(x, z)` and SET its height to
+    /// the highest opaque block among the column's resident chunks — up or
+    /// down (ADR-0021). Returns both tops it found. Does nothing but report
+    /// `None`s for a column with no resident chunk.
+    ///
+    /// Chunk arrival only ever raises a height; an edit must be able to
+    /// lower one, or the column keeps the shadow of a block that has been
+    /// taken away for as long as any of its chunks stay loaded.
+    ///
+    /// The one way lowering goes wrong is a scan that misses a chunk: the
+    /// height then drops below the real top, and a too-low height invents
+    /// daylight. So the scan reads this map's own record of the column's
+    /// resident chunks — every one of them, in whatever window the streamer
+    /// holds them — and not a caller's idea of which layers ought to be
+    /// loaded. (The game's scan once read the layers the streamer LOADS;
+    /// it KEEPS one more around the camera, and a roof there was missed.)
+    /// `world` must be the world whose chunks were reported here.
+    ///
+    /// Top-down by layer, so the walk stops at the first chunk that settles
+    /// both tops: a handful of block reads for an edit at the surface.
+    pub fn rescan(
+        &mut self,
+        world: &World,
+        registry: &BlockRegistry,
+        x: i64,
+        z: i64,
+    ) -> ColumnTops {
+        let mut tops = ColumnTops {
+            opaque: None,
+            solid: None,
+        };
+        let mut layers = self
+            .resident_layers(x.div_euclid(S), z.div_euclid(S))
+            .to_vec();
+        if layers.is_empty() {
+            return tops;
+        }
+        layers.sort_unstable_by(|a, b| b.cmp(a));
+        'scan: for cy in layers {
+            for y in (cy * S..(cy + 1) * S).rev() {
+                let block = world.get_block(WorldPos::new(x, y, z));
+                if tops.opaque.is_none() && registry.is_opaque(block) {
+                    tops.opaque = Some(y);
+                }
+                if tops.solid.is_none() && registry.is_solid(block) {
+                    tops.solid = Some(y);
+                }
+                if tops.opaque.is_some() && tops.solid.is_some() {
+                    break 'scan;
+                }
+            }
+        }
+        // `i64::MIN`: known, and nothing there — a column mined out entirely.
+        self.set(x, z, tops.opaque.unwrap_or(i64::MIN));
+        tops
     }
 
     /// A chunk became resident. Call once per chunk actually inserted into
@@ -488,5 +558,96 @@ mod tests {
         h.chunk_unloaded(cp(4, -1, -2));
         assert!(h.resident_layers(4, -2).is_empty());
         assert_eq!(h.resident_columns(), 1, "only the neighbour remains");
+    }
+
+    // ---- The edit rescan (ADR-0021) ----
+
+    use crate::block::BlockId;
+    use crate::registry::{STONE, WATER};
+
+    /// A world and its heightmap with chunks of column (0, 0) at `layers`,
+    /// all air, each reported resident.
+    fn world_with_layers(layers: &[i64]) -> (World, ColumnHeights) {
+        let (mut world, mut h) = (World::new(), ColumnHeights::new());
+        for &y in layers {
+            world.insert_chunk(cp(0, y, 0), crate::Chunk::new_air());
+            h.chunk_loaded(cp(0, y, 0));
+        }
+        (world, h)
+    }
+
+    /// The rescan sets the height to the column's real top: down when the
+    /// top block goes, up when one is placed, and to "known, nothing" when
+    /// the column is emptied.
+    #[test]
+    fn rescan_sets_the_true_top_up_and_down() {
+        let reg = BlockRegistry::default_set();
+        let (mut world, mut h) = world_with_layers(&[0, 1]);
+        let at = |y| WorldPos::new(5, y, 9);
+        world.set_block(at(10), STONE);
+        world.set_block(at(40), STONE);
+        let tops = h.rescan(&world, &reg, 5, 9);
+        assert_eq!((tops.opaque, tops.solid), (Some(40), Some(40)));
+        assert_eq!(h.get(5, 9), Some(40));
+
+        world.set_block(at(40), BlockId::AIR);
+        assert_eq!(h.rescan(&world, &reg, 5, 9).opaque, Some(10));
+        assert_eq!(h.get(5, 9), Some(10), "the height came down with the block");
+
+        world.set_block(at(10), BlockId::AIR);
+        let tops = h.rescan(&world, &reg, 5, 9);
+        assert_eq!((tops.opaque, tops.solid), (None, None));
+        assert_eq!(h.get(5, 9), Some(i64::MIN), "known, and nothing there");
+        // The daylight rule follows: the column is open above.
+        assert_eq!(h.sky_top(cp(0, 0, 0))[5 + 9 * 32], crate::MAX_LIGHT);
+    }
+
+    /// The seam that ADR-0021 turns on: the column's top is in a chunk far
+    /// above the one being edited, with unloaded layers between — a roof
+    /// held by the streamer's unload hysteresis, a build reached by the
+    /// camera's window. Every resident chunk is read, so the height never
+    /// drops below a block that is still there.
+    #[test]
+    fn rescan_sees_every_resident_chunk_across_gaps() {
+        let reg = BlockRegistry::default_set();
+        let (mut world, mut h) = world_with_layers(&[-2, 0, 7]);
+        let roof = WorldPos::new(3, 7 * 32 + 4, 3);
+        world.set_block(roof, STONE);
+        world.set_block(WorldPos::new(3, 20, 3), STONE);
+        world.set_block(WorldPos::new(3, -40, 3), STONE);
+        assert_eq!(h.rescan(&world, &reg, 3, 3).opaque, Some(roof.y));
+
+        // Dig near the ground: the roof far above is still the top.
+        world.set_block(WorldPos::new(3, 20, 3), BlockId::AIR);
+        assert_eq!(h.rescan(&world, &reg, 3, 3).opaque, Some(roof.y));
+        assert_eq!(h.get(3, 3), Some(roof.y));
+        assert_eq!(
+            h.sky_top(cp(0, 0, 0))[3 + 3 * 32],
+            0,
+            "still under the roof"
+        );
+
+        // Once the roof's chunk unloads, the column is what remains of it.
+        world.remove_chunk(cp(0, 7, 0));
+        h.chunk_unloaded(cp(0, 7, 0));
+        assert_eq!(h.rescan(&world, &reg, 3, 3).opaque, Some(-40));
+    }
+
+    /// Opaque and solid are different questions (ADR-0011): water is
+    /// neither, so under a sea both tops are the seabed.
+    #[test]
+    fn rescan_reports_opaque_and_solid_tops_separately() {
+        let reg = BlockRegistry::default_set();
+        let (mut world, mut h) = world_with_layers(&[0]);
+        world.set_block(WorldPos::new(1, 4, 1), STONE);
+        for y in 5..=12 {
+            world.set_block(WorldPos::new(1, y, 1), WATER);
+        }
+        let tops = h.rescan(&world, &reg, 1, 1);
+        assert_eq!((tops.opaque, tops.solid), (Some(4), Some(4)));
+        // A column nobody has loaded: nothing found, nothing written.
+        let tops = h.rescan(&world, &reg, 500, 500);
+        assert_eq!((tops.opaque, tops.solid), (None, None));
+        assert_eq!(h.get(500, 500), None);
     }
 }

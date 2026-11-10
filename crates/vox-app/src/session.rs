@@ -37,8 +37,8 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 use vox_core::{
-    BlockId, BlockRegistry, Chunk, ChunkPos, ColumnHeights, EditedColumns, LocalPos, Streamer,
-    World, WorldPos, WorldStore,
+    BlockId, BlockRegistry, Chunk, ChunkPos, ColumnHeights, EditedColumns, Streamer, World,
+    WorldPos, WorldStore,
 };
 use vox_mesh::{mesh_chunk, ChunkNeighbors, MeshData};
 use vox_worldgen::Generator;
@@ -440,17 +440,14 @@ impl Session {
         }
     }
 
-    /// Change one block as the player does: write it, refresh the column's
-    /// height both ways (see `recompute_height_column` and
-    /// `recompute_column_height` — the two rules of audit finding D1, in the
-    /// order the game has always run them), and queue the relight and
-    /// re-mesh. The caller still owes the LOD its invalidation: that ring is
-    /// not the session's.
+    /// Change one block as the player does: write it, bring the column's
+    /// height, LOD record and light queue up to date (`column_edited`), and
+    /// queue the re-mesh. The caller still owes the LOD its invalidation:
+    /// that ring is not the session's.
     pub(crate) fn set_block(&mut self, pos: WorldPos, block: BlockId) {
         self.world.set_block(pos, block);
-        self.recompute_height_column(pos.x, pos.z);
+        self.column_edited(pos.x, pos.z);
         self.mark_dirty_with_neighbors(pos.chunk());
-        self.recompute_column_height(pos.x, pos.z);
     }
 
     /// Whether nothing is left to do for the camera where it is: no chunk
@@ -518,80 +515,44 @@ impl Session {
         }
     }
 
-    /// Recompute one world column's height by scanning the loaded chunks in
-    /// that column from the top down (used after an edit, which can raise OR
-    /// lower a column). Updates the heightmap and queues the column's loaded
-    /// chunks for relight so shadows appear/clear correctly.
-    /// Recompute one world column's height by scanning the loaded chunks in
-    /// that column from the top down (used after an edit, which can raise OR
-    /// lower a column). Updates the heightmap, then re-relights the affected
-    /// region so player builds cast correct shadows.
+    /// After an edit in block column `(x, z)`: bring everything that is
+    /// derived from the column's contents up to date.
     ///
-    /// This is only ever called from an edit (place/break), which always
-    /// changes block topology, so we relight unconditionally — NOT only when
-    /// the column's max height moved. A build can change interior light
-    /// (hollowing a room, roofing an area) without changing the column max, and
-    /// those cells still need recomputing. We relight:
-    ///   - every loaded chunk in the edited column (the vertical shadow), and
-    ///   - their ±X/±Z horizontal neighbors, because skylight under an overhang
-    ///     is fed by diffuse light bleeding in from open sides; if those
-    ///     neighbors aren't relit, level-15 sky keeps leaking under the build.
-    ///
-    /// Border-change convergence in `stream_tick` then carries any further
-    /// ripple, but only where light actually changes.
-    /// Re-relight the region affected by an edit at world column (wx, wz), and
-    /// RAISE the heightmap if the edit added solid above the recorded surface.
-    ///
-    /// Crucially this never LOWERS the heightmap. The heightmap models the
-    /// natural sky surface (highest solid that has open sky above it); digging
-    /// down must NOT mark the column "open" below the dig, or daylight would
-    /// flood the shaft floor and bleed into side tunnels (the old bug). Below
-    /// the surface, skylight is computed honestly by downward propagation from
-    /// the chunk above (the +Y sky plane), so a dug shaft stays correctly lit
-    /// while sealed/side regions go dark — no heightmap lowering required.
-    pub(crate) fn recompute_height_column(&mut self, wx: i64, wz: i64) {
-        let lx = wx.rem_euclid(CHUNK_SIZE_I) as u8;
-        let lz = wz.rem_euclid(CHUNK_SIZE_I) as u8;
-        let cx = wx.div_euclid(CHUNK_SIZE_I);
-        let cz = wz.div_euclid(CHUNK_SIZE_I);
+    /// - The skylight heightmap takes the column's true top among its
+    ///   resident chunks, up or down (ADR-0021: an edit SETS the height;
+    ///   only chunk arrival is raise-only). Lowering is what gives the
+    ///   ground its daylight back when something above it is removed.
+    /// - The LOD's edit overlay records the column's solid top, so distant
+    ///   terrain shows the edit this session and every later one. Sparse,
+    ///   never pruned, saved with the world. Clamped to the world floor: a
+    ///   fully mined column has no top at all.
+    /// - The column's chunks and their horizontal neighbours are queued for
+    ///   relight. Always, not only when the top moved: hollowing a room or
+    ///   roofing an area changes the light inside without changing the
+    ///   column's height, and skylight under an overhang is fed from its
+    ///   open sides, so the neighbours' light depends on this column too.
+    ///   Border-change convergence in `tick` carries any further ripple.
+    fn column_edited(&mut self, x: i64, z: i64) {
+        let tops = self
+            .column_heights
+            .rescan(&self.world, &self.registry, x, z);
+        Arc::make_mut(&mut self.edited_columns).record(
+            x,
+            z,
+            tops.solid
+                .unwrap_or(i64::MIN)
+                .max(vox_core::WORLD_Y_MIN_BLOCKS) as i32,
+        );
+        self.edits_unsaved = true;
 
-        let mut highest: Option<i64> = None;
-        let mut column_chunks: Vec<ChunkPos> = Vec::new();
-        // The column's resident chunks, from the heightmap's own record of
-        // them rather than a walk of every loaded chunk.
+        let (cx, cz) = (x.div_euclid(CHUNK_SIZE_I), z.div_euclid(CHUNK_SIZE_I));
         let layers = self.column_heights.resident_layers(cx, cz).to_vec();
         for cy in layers {
-            let cpos = ChunkPos::new(cx, cy, cz);
-            let Some(chunk) = self.world.chunk(cpos) else {
-                continue;
-            };
-            column_chunks.push(cpos);
-            for ly in (0..CHUNK_SIZE_I as u8).rev() {
-                let p = LocalPos::new(lx, ly, lz);
-                // The skylight heightmap: where light stops, so OPAQUE
-                // (ADR-0011), not solid.
-                if self.registry.is_opaque(chunk.get(p)) {
-                    let wy = cpos.origin().y + ly as i64;
-                    highest = Some(highest.map_or(wy, |h| h.max(wy)));
-                    break;
-                }
-            }
-        }
-
-        // Raise-only: a placed block above the surface extends it; a break can
-        // only lower the physical top, which we deliberately ignore here.
-        if let Some(h) = highest {
-            self.column_heights.raise(wx, wz, h);
-        }
-
-        // Relight the edited column's chunks plus their horizontal neighbors so
-        // shafts/caves resolve via honest propagation. Border-change
-        // convergence in stream_tick carries any further vertical ripple.
-        for p in column_chunks {
+            let p = ChunkPos::new(cx, cy, cz);
             self.relight.insert(p);
             for (dx, dy, dz) in NEIGHBOR_OFFSETS {
                 if dy != 0 {
-                    continue; // horizontal neighbors only
+                    continue; // horizontal neighbours only
                 }
                 let n = ChunkPos::new(p.x + dx, p.y + dy, p.z + dz);
                 if self.world.chunk(n).is_some() {
@@ -1060,68 +1021,6 @@ impl Session {
             }
         }
         sealed
-    }
-
-    /// Recompute one column's surface height from the world.
-    ///
-    /// `update_heightmap_for` only ever RAISES a column (correct for
-    /// streaming, where chunks arrive in any order and the max wins), so it
-    /// cannot see a block being mined away. Without this the heightmap keeps
-    /// the pre-edit surface, and anything derived from it — LOD nodes, skylight
-    /// — rebuilds the terrain the player just removed: a "ghost block".
-    pub(crate) fn recompute_column_height(&mut self, x: i64, z: i64) {
-        // Scan exactly the chunks that ARE resident in this column, top
-        // down. Against the world band this would be a 20 000-block walk on
-        // every block break, and blocks that are not loaded would read as
-        // air anyway.
-        //
-        // The heightmap's own record of the column's chunks, not the layers
-        // the streamer LOADS (`column_window_chunks`, which this used until
-        // the 2026-11 audit): the streamer KEEPS one layer more than it
-        // loads around the camera (its unload hysteresis), and a block in
-        // such a chunk — a roof built just above, the player having stepped
-        // down a layer since — was invisible to the scan. The height was then
-        // set BELOW the real top, which is the one direction the skylight
-        // must never err in (CLAUDE.md: a too-low height invents daylight).
-        //
-        // TWO tops, because they answer different questions (ADR-0011): the
-        // skylight heightmap wants the highest OPAQUE block (where light
-        // stops), the LOD's terrain the highest SOLID one (the ground, which
-        // under an ocean is the seabed). Identical for every block today.
-        let mut layers = self
-            .column_heights
-            .resident_layers(x.div_euclid(CHUNK_SIZE_I), z.div_euclid(CHUNK_SIZE_I))
-            .to_vec();
-        layers.sort_unstable_by(|a, b| b.cmp(a));
-        let (mut opaque_top, mut solid_top) = (None, None);
-        'scan: for cy in layers {
-            for y in (cy * CHUNK_SIZE_I..(cy + 1) * CHUNK_SIZE_I).rev() {
-                let b = self.world.get_block(WorldPos::new(x, y, z));
-                if opaque_top.is_none() && self.registry.is_opaque(b) {
-                    opaque_top = Some(y);
-                }
-                if solid_top.is_none() && self.registry.is_solid(b) {
-                    solid_top = Some(y);
-                }
-                if opaque_top.is_some() && solid_top.is_some() {
-                    break 'scan;
-                }
-            }
-        }
-        // i64::MIN: known, and nothing there — a column mined out entirely.
-        self.column_heights
-            .set(x, z, opaque_top.unwrap_or(i64::MIN));
-        // Sparse, never pruned and saved with the world, so every LOD level
-        // sees the edit, this session and every later one. Clamped to the
-        // world floor: a fully mined column has no top at all.
-        Arc::make_mut(&mut self.edited_columns).record(
-            x,
-            z,
-            solid_top
-                .unwrap_or(i64::MIN)
-                .max(vox_core::WORLD_Y_MIN_BLOCKS) as i32,
-        );
-        self.edits_unsaved = true;
     }
 
     /// Chunk columns whose full-resolution terrain is DRAWN: every layer of

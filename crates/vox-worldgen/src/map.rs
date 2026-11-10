@@ -188,7 +188,7 @@ pub(crate) fn precipitation_colour(mm: f32) -> [u8; 3] {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::Generator;
     use crate::climate::{ClimateMap, temperature_at};

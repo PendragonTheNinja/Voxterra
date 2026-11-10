@@ -21,7 +21,7 @@ pub mod world;
 pub use block::BlockId;
 pub use chunk::{CHUNK_FORMAT_VERSION, Chunk, ChunkDecodeError};
 pub use coords::{CHUNK_BITS, CHUNK_SIZE, CHUNK_VOLUME, ChunkPos, LocalPos, WorldPos};
-pub use heightmap::ColumnHeights;
+pub use heightmap::{ColumnHeights, ColumnTops};
 pub use light::{
     ColumnMap, LightVolume, MAX_LIGHT, NeighborLight, NeighborSky, apply_chunk_light,
     chunk_column_heights, chunk_column_occludes, chunk_light_plane, chunk_sky_plane, column_index,

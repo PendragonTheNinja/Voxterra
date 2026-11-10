@@ -46,11 +46,11 @@ none of it delays M15 by more than a session or two.
 
 ### D1 — One heightmap rule for edits · S · needs the owner
 
-**Status (2026-11-10): decided on evidence, awaiting the owner's yes.**
-`docs/decisions/0021-edits-set-the-heightmap.md` (Proposed) recommends
-(a). Both rules were run against the session tests: (b) fails
-`removing_a_high_block_returns_daylight_to_the_ground`. On acceptance, do
-steps 2, 3 and 5 below.
+**Status: done 2026-11-10.** ADR-0021 accepted — rule (a), on evidence:
+both rules were run against the session tests and (b) fails
+`removing_a_high_block_returns_daylight_to_the_ground`. One edit path now
+(`ColumnHeights::rescan`, called by `Session::column_edited`), with the
+seam test; CLAUDE.md's invariant rewritten.
 
 **Finding.** CLAUDE.md says the skylight heightmap is raise-only; the code
 lowers it on every edit (`App::recompute_column_height` →
@@ -112,6 +112,11 @@ someone else plays.
 
 ### D3 — Block names in the save, not numbers · M · ADR
 
+**Status (2026-11-10): approved in principle by the owner; designed in
+`docs/decisions/0024-block-names-in-saves.md`; not built.** Build it
+before the geology milestone's first block is added. The ADR lists the
+tests it must come with.
+
 **Finding.** Chunks store numeric `BlockId`s, and the registry's order is
 therefore the save format (`registry.rs`, *Stable IDs*). Audit finding D3.
 
@@ -139,6 +144,12 @@ not move it.
 ## Performance
 
 ### P1 — Relight and mesh never block the frame · L · ADR · after A1
+
+**Status (2026-11-10): designed, gated on a measurement.** The design is
+`docs/decisions/0022-relight-and-mesh-off-the-frame.md` (Proposed), with
+the gate it must pass first: the owner's bench on the audited build,
+wall time against work, in the sprint phases. A1 is done, so the tests
+this needs exist. Do not build before the numbers.
 
 **Finding.** The frame thread hands relight and mesh batches to a pool and
 waits (`relight_chunks_parallel`, `mesh_chunks_parallel`). Audit finding

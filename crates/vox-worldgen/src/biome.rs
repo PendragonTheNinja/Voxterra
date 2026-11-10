@@ -215,7 +215,7 @@ const DEEP_OCEAN_BELOW: i64 = 120;
 const WARM_SEA_ABOVE_C: f32 = 20.0;
 
 /// Share of `MAX_UPLIFT` from which ground counts as mountain.
-const MOUNTAIN_UPLIFT: f32 = 0.06;
+pub(crate) const MOUNTAIN_UPLIFT: f32 = 0.06;
 /// Mean annual temperature, °C, at the treeline (mountains only).
 const TREELINE_C: f32 = 1.0;
 /// Mean annual temperature below which lowland is ice sheet, and tundra.

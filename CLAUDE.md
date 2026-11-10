@@ -308,7 +308,7 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   (`docs/milestones/15-landforms-by-climate.md`): **spec approved
   2026-11-03** — all five families; glacial landforms wherever last-ice-age
   ice lay; real cliffs, not all walkable (traversal is later gameplay);
-  dunes 6–30 high, 100–250 apart; dry lands first. No code yet. **Handoff (2026-11-04):** the landform catalogue (`docs/landforms.md`) is drafted and its five questions are answered (its *Decisions* section). **The catalogue was approved by the owner on 2026-11-10.** Next: the owner's M14 re-bench at version 8 on the audited build (the baseline; it does not block starting), and task 1 (process weights + ice-age climate in stage 1, the world-map layer, the ADR) — see the spec's *Task 0 progress* note. Dune
+  dunes 6–30 high, 100–250 apart; dry lands first. No code yet. **Handoff (2026-11-04):** the landform catalogue (`docs/landforms.md`) is drafted and its five questions are answered (its *Decisions* section). **The catalogue was approved by the owner on 2026-11-10.** **Task 1 is done (2026-11-10):** the process-weight map (`vox_worldgen::process`, ADR-0023 proposed), not yet read by generation, so still `GENERATOR_VERSION` 8. Next: the owner's M14 re-bench at version 8 on the audited build (the baseline), and task 2 (dry lands: dunes, benches, mesas, canyons) — see the spec's *Task 0 progress* note and ADR-0023's *Consequences* for task 2's first decision. Dune
   seas, mesas and canyons, glacial valleys and fjords, inselbergs, dissected
   humid hills, as height layers weighted by a stage-1 process map, applied
   before the drainage network so water still fits the ground (M14's lesson).
@@ -330,7 +330,7 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   rivers as ribbons, reservoirs with the water simulation.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 298, vox-mesh 71, vox-worldgen 74, vox-render 21, vox-app 18
+  vox-core 301, vox-mesh 71, vox-worldgen 81, vox-render 21, vox-app 18
   passing (288, 72 and 11 before the 2026-11 audit), plus the ignored
   `every_biome_in_every_world` and `biome_survey`, run in release), then
   start the first unchecked item.
@@ -339,9 +339,23 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   the frame no longer queued behind background jobs, autosave), and what
   is open. The open work is `docs/plans/engineering-backlog.md`, as
   packages with an order; they are proposals until the owner picks them.
-  Three need the owner's decision (D1 the heightmap rule, D2 world
-  versions, D3 block names in saves). **A1 is done (2026-11-10):** the
-  world pipeline is `session.rs`, with five system tests.
+  **Done since:** A1 (the world pipeline is `session.rs`, with six system
+  tests) and D1 (ADR-0021 accepted; one edit path). Still the owner's to
+  decide: D2 (world versions). D3 (block names in saves) is approved in
+  principle and needs its ADR.
+- **Geology is designed, not built (2026-11-10, draft for the owner's
+  review):** `docs/geology.md` — the checklist a geologist would test the
+  world against, the plate-framework decision, provinces, six ages, strata
+  in structural coordinates, the rock catalogue, caves, mineral systems,
+  and the five milestones it becomes — and the draft spec for the first,
+  `docs/milestones/16-tectonics-and-bedrock.md`. Six questions for the
+  owner at the end of `geology.md`; the first (how the terrain gets a
+  tectonic cause) decides the shape of milestone 16. It follows M15.
+- **Open decision records (2026-11-10):** ADR-0022 (relight and mesh off
+  the frame — proposed, and gated on the owner's bench); ADR-0023
+  (landform processes — proposed, built as M15 task 1); ADR-0024 (block
+  names in saves — approved in principle, not built, wanted before
+  geology's first block).
 - **Instruments (from M11):** the P key logs a `VIEW` line (exact position,
   angles, window, settings) and a `hole_census` — the frame re-rendered six
   ways on the player's GPU with pinholes counted per variant. In the cloud
@@ -461,17 +475,18 @@ was a real shipped bug. Regression tests exist for all of them (vox-core).
 - **A changed border must re-mesh neighbors, not just re-light them.**
   Neighbor meshes sample this chunk's border cells; relight alone leaves
   stale dark seam faces.
-- **The heightmap is raise-only** (edits/digging never lower it). This is a
-  deliberate conservative choice: a too-high height only makes columns darker
-  than truth (honest propagation from the overhead plane still lights them);
-  a too-low height invents daylight. Preserve this asymmetry.
-  **UNRESOLVED (2026-11 audit, D1): the code does not do this.** Since M09
-  every edit also runs `App::recompute_column_height`, which LOWERS the
-  height to the column's true resident top (`ColumnHeights::set`). Chunk
-  arrival is raise-only, as written; edits are not. Until the owner decides
-  which rule stands, change neither path, and do not "fix" one to match
-  this paragraph. ADR-0021 (Proposed, 2026-11-10) recommends keeping what
-  the code does, with a test that fails under raise-only.
+- **Chunk arrival only RAISES a column's height; an edit SETS it to the
+  column's true top, up or down (ADR-0021, 2026-11-10).** Arrival is
+  raise-only because a column's chunks stream in any order and the highest
+  wins. An edit must be able to lower: otherwise the column keeps the
+  shadow of a block that has been removed for as long as any of its chunks
+  stay loaded (the owner: "a shadow should not remain"). What must never
+  happen is a height set BELOW the truth — a too-low height invents
+  daylight — so an edit's height comes only from `ColumnHeights::rescan`,
+  which reads every resident chunk of the column from the heightmap's own
+  record of them. Never set a height from a scan of "the layers that ought
+  to be loaded". (This paragraph said "raise-only, edits never lower it"
+  from M05 until the 2026-11 audit found the code had lowered since M09.)
 - The live relight entry point is `compute_chunk_light_2ch` via
   `relight_chunks_parallel`. Older single-channel functions in light.rs are
   legacy — do not extend them.
