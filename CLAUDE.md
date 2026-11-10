@@ -330,7 +330,7 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   rivers as ribbons, reservoirs with the water simulation.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 298, vox-mesh 71, vox-worldgen 74, vox-render 21, vox-app 17
+  vox-core 298, vox-mesh 71, vox-worldgen 74, vox-render 21, vox-app 18
   passing (288, 72 and 11 before the 2026-11 audit), plus the ignored
   `every_biome_in_every_world` and `biome_survey`, run in release), then
   start the first unchecked item.
@@ -470,7 +470,8 @@ was a real shipped bug. Regression tests exist for all of them (vox-core).
   height to the column's true resident top (`ColumnHeights::set`). Chunk
   arrival is raise-only, as written; edits are not. Until the owner decides
   which rule stands, change neither path, and do not "fix" one to match
-  this paragraph.
+  this paragraph. ADR-0021 (Proposed, 2026-11-10) recommends keeping what
+  the code does, with a test that fails under raise-only.
 - The live relight entry point is `compute_chunk_light_2ch` via
   `relight_chunks_parallel`. Older single-channel functions in light.rs are
   legacy — do not extend them.

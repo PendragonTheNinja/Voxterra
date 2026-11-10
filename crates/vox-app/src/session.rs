@@ -1831,6 +1831,78 @@ mod tests {
         }
     }
 
+    /// A block placed high above the ground shades the ground under it, and
+    /// taking it away gives the daylight back — at once, and still after the
+    /// player has come down and the chunks that held it have unloaded.
+    ///
+    /// This is the case that decides audit finding D1. The heightmap is the
+    /// only thing that knows what is above a column once the chunks up
+    /// there are gone, so if removing the block does not LOWER the height
+    /// (the "raise-only" rule CLAUDE.md states for edits), the column keeps
+    /// the shadow of a block that no longer exists for as long as any of
+    /// its chunks stay loaded. The code lowers it; with that one line
+    /// removed, this test fails at the last assertion.
+    #[test]
+    fn removing_a_high_block_returns_daylight_to_the_ground() {
+        let ground_camera = land_camera();
+        // Six layers up: the camera's window reaches well above the
+        // ground's, and still touches it.
+        let high_camera = ChunkPos::new(ground_camera.x, ground_camera.y + 6, ground_camera.z);
+        let mut rig = Rig::new("high-block");
+        rig.settle(high_camera, Delivery::Prompt);
+
+        let origin = ground_camera.origin();
+        let (x, z) = (origin.x + 16, origin.z + 16);
+        let ground = top_solid(&rig, x, z);
+        let above_ground = WorldPos::new(x, ground.y + 1, z);
+        assert_eq!(
+            rig.sky_at(above_ground),
+            15,
+            "open ground starts in daylight"
+        );
+
+        let high = WorldPos::new(x, (high_camera.y + 2) * CHUNK_SIZE_I + 5, z);
+        assert!(
+            rig.session.world.chunk(high.chunk()).is_some(),
+            "the high chunk is resident"
+        );
+        assert!(
+            high.y > ground.y + 4 * CHUNK_SIZE_I,
+            "well above the ground's own window"
+        );
+        rig.session.set_block(high, vox_core::registry::STONE);
+        rig.settle(high_camera, Delivery::Prompt);
+        rig.assert_consistent(high_camera);
+        assert_eq!(
+            rig.sky_at(above_ground),
+            14,
+            "directly under the block: lit from beside"
+        );
+
+        rig.session.set_block(high, BlockId::AIR);
+        rig.settle(high_camera, Delivery::Prompt);
+        rig.assert_consistent(high_camera);
+        assert_eq!(
+            rig.sky_at(above_ground),
+            15,
+            "the block is gone: daylight is back"
+        );
+
+        // Come down. The chunk that held the block unloads; the ground's
+        // chunks stay, and so does their column's height.
+        rig.settle(ground_camera, Delivery::Prompt);
+        assert!(
+            rig.session.world.chunk(high.chunk()).is_none(),
+            "the high chunk unloaded"
+        );
+        rig.assert_consistent(ground_camera);
+        assert_eq!(
+            rig.sky_at(above_ground),
+            15,
+            "no shadow is left by a block that no longer exists"
+        );
+    }
+
     /// The highest solid block of world column `(x, z)` among resident
     /// chunks, with its position.
     fn top_solid(rig: &Rig, x: i64, z: i64) -> WorldPos {

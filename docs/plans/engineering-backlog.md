@@ -46,6 +46,12 @@ none of it delays M15 by more than a session or two.
 
 ### D1 — One heightmap rule for edits · S · needs the owner
 
+**Status (2026-11-10): decided on evidence, awaiting the owner's yes.**
+`docs/decisions/0021-edits-set-the-heightmap.md` (Proposed) recommends
+(a). Both rules were run against the session tests: (b) fails
+`removing_a_high_block_returns_daylight_to_the_ground`. On acceptance, do
+steps 2, 3 and 5 below.
+
 **Finding.** CLAUDE.md says the skylight heightmap is raise-only; the code
 lowers it on every edit (`App::recompute_column_height` →
 `ColumnHeights::set`), and also runs a second, raise-only pass
