@@ -272,6 +272,11 @@ authoritative.
   `crates/vox-core/src/lib.rs` (`pub use light::{…}`). Any new `pub fn` that
   `vox-app` calls must be added there; the sandbox can't catch the omission
   because it never compiles `vox-app`.
+- **A new block needs a permanent `key`** (ADR-0024), and
+  `M14_BLOCK_KEYS` is frozen: it is the block table of every world saved
+  before worlds kept one. Never reorder or edit it; append new blocks to
+  the registry after it. A renamed block keeps its key or gets an entry
+  in `KEY_ALIASES`; a block is never removed without one.
 - **Verify file writes by reading back.** A generation script that reports
   success but skips the actual write has shipped a mismatched signature.
 - `NEIGHBOR_OFFSETS.iter()` yields `&(i64,i64,i64)`; arithmetic auto-derefs
@@ -330,7 +335,7 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   rivers as ribbons, reservoirs with the water simulation.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 301, vox-mesh 71, vox-worldgen 81, vox-render 21, vox-app 18
+  vox-core 306, vox-mesh 71, vox-worldgen 81, vox-render 21, vox-app 18
   passing (288, 72 and 11 before the 2026-11 audit), plus the ignored
   `every_biome_in_every_world` and `biome_survey`, run in release), then
   start the first unchecked item.
@@ -348,14 +353,13 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   world against, the plate-framework decision, provinces, six ages, strata
   in structural coordinates, the rock catalogue, caves, mineral systems,
   and the five milestones it becomes — and the draft spec for the first,
-  `docs/milestones/16-tectonics-and-bedrock.md`. Six questions for the
-  owner at the end of `geology.md`; the first (how the terrain gets a
-  tectonic cause) decides the shape of milestone 16. It follows M15.
+  `docs/milestones/16-tectonics-and-bedrock.md`. Its §16 lists what the
+  owner has answered and what is open; the open question that decides
+  the shape of milestone 16 is how the terrain gets a tectonic cause. It follows M15.
 - **Open decision records (2026-11-10):** ADR-0022 (relight and mesh off
   the frame — proposed, and gated on the owner's bench); ADR-0023
   (landform processes — proposed, built as M15 task 1); ADR-0024 (block
-  names in saves — approved in principle, not built, wanted before
-  geology's first block).
+  names in saves) is accepted and built.
 - **Instruments (from M11):** the P key logs a `VIEW` line (exact position,
   angles, window, settings) and a `hole_census` — the frame re-rendered six
   ways on the player's GPU with pinholes counted per variant. In the cloud

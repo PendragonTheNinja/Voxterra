@@ -202,6 +202,22 @@ impl Chunk {
         self.unsaved = false;
     }
 
+    /// Replace every block id in the chunk by `map` of it, by rewriting the
+    /// palette: the save layer's translation from a world's ids to this
+    /// build's on load (ADR-0024). `map` must send different ids to
+    /// different ids. Not an edit — the chunk's contents mean what they
+    /// meant — so neither `modified` nor `unsaved` changes. Returns the
+    /// first id `map` has no answer for, having changed nothing.
+    pub fn remap_blocks(
+        &mut self,
+        map: impl Fn(BlockId) -> Option<BlockId>,
+    ) -> Result<(), BlockId> {
+        let mapped: Result<Vec<BlockId>, BlockId> =
+            self.palette.iter().map(|&b| map(b).ok_or(b)).collect();
+        self.palette = mapped?;
+        Ok(())
+    }
+
     /// Whether any block type this chunk holds satisfies `pred` — asked of
     /// the palette, so a handful of tests rather than 32 768. Conservative:
     /// the palette can keep an entry no voxel uses any more (until
@@ -437,6 +453,14 @@ impl Chunk {
 
     /// Serialize this chunk to the versioned on-disk format.
     pub fn serialize(&self) -> Vec<u8> {
+        self.serialize_mapped(|b| b)
+    }
+
+    /// [`Chunk::serialize`] with every block id passed through `map` on its
+    /// way out — the save layer's translation from this build's ids to the
+    /// world's own (ADR-0024). Only the palette is touched: a handful of
+    /// entries, whatever the chunk holds.
+    pub fn serialize_mapped(&self, map: impl Fn(BlockId) -> BlockId) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&CHUNK_MAGIC);
         out.push(CHUNK_FORMAT_VERSION);
@@ -444,7 +468,7 @@ impl Chunk {
         let n = self.palette.len();
         out.extend_from_slice(&(n as u16).to_le_bytes());
         for b in &self.palette {
-            out.extend_from_slice(&b.0.to_le_bytes());
+            out.extend_from_slice(&map(*b).0.to_le_bytes());
         }
 
         if n > 1 {
