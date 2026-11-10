@@ -20,9 +20,9 @@ Task 0 starts with the owner's re-bench of M14 at `GENERATOR_VERSION` 8.
 `docs/landforms.md`; the owner answered its five questions (its Decisions
 section: linear dunes from a seasonal dune-wind swing, slot canyons left
 for geology, the dune wind tilted, tors on temperate uplands too, about
-half the mesas with a way up). **Still open in task 0:** (a) the owner's
-one-line confirmation that the catalogue as a whole is approved; (b) the
-owner's re-bench of M14 at `GENERATOR_VERSION` 8 (`cargo run -p vox-app --
+half the mesas with a way up). **The catalogue was approved by the owner
+on 2026-11-10** (criterion 1's first half is met; the ADR is task 1's).
+**Still open in task 0:** the owner's re-bench of M14 at `GENERATOR_VERSION` 8 (`cargo run -p vox-app --
 --bench`; it runs in its own world now, so no need to move `world/`
 aside; copy the report from `bench/` to `docs/bench/` and commit it there —
 `bench/` is git-ignored). **Take it on a build that includes the 2026-11
