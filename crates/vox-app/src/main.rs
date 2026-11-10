@@ -161,6 +161,31 @@ const RELIGHT_TIME_MS: f32 = 3.0;
 /// Chunk side length as i64, for heightmap/world-coordinate math.
 const CHUNK_SIZE_I: i64 = vox_core::CHUNK_SIZE as i64;
 
+/// The player's world folder, beside the executable's working directory.
+const WORLD_DIR: &str = "world";
+
+/// The benchmark's world folder, suffixed with the generator version.
+///
+/// `--bench` used to open the player's own world. So it measured whatever
+/// that world had become — every edit ever made in it is a saved chunk to
+/// load and a column for the LOD overlay — and it refused to run at all
+/// when that world was made by an older generator, which is how the M14
+/// re-bench stopped the owner on 2026-11-04. A benchmark needs the same
+/// world every time: this one is created from the default seed on first
+/// use, never edited (the benchmark flies; it does not dig), and a new
+/// generator version simply gets a new folder. It sits under `bench/`,
+/// which git ignores, with the reports.
+const BENCH_WORLD_DIR: &str = "bench/world";
+
+/// Seconds between autosaves of edited chunks ([`App::save_unsaved`]).
+///
+/// Edits used to reach the disk only when their chunk unloaded or the game
+/// closed cleanly, so a crash — a panic, a lost GPU device, the power — took
+/// every block placed or broken near the player since they arrived. A
+/// minute is short enough to lose little and long enough that the write
+/// (only chunks changed since the last one) is never felt.
+const AUTOSAVE_SECS: f32 = 60.0;
+
 /// How far (world units / blocks) the targeting raycast reaches from the
 /// camera for break/place interaction (M03).
 const REACH: f64 = 6.0;
@@ -208,6 +233,34 @@ fn top_sky_from_heightmap(heights: &ColumnHeights, pos: ChunkPos) -> Vec<u8> {
     heights.sky_top(pos)
 }
 
+/// The thread pool for chunk generation and LOD node building.
+///
+/// Those jobs used to be `rayon::spawn`ed onto the GLOBAL pool — the same
+/// pool the frame thread hands its relight and mesh batches to and then
+/// waits on. A batch submitted from outside the pool joins rayon's queue
+/// BEHIND everything already spawned, so each frame's relight waited for up
+/// to a hundred generation and LOD jobs (each ~1–7 ms) to be picked up
+/// first. Measured headless (2026-11 audit, 4 cores, dev build): a
+/// 32-chunk relight batch took 6 ms on an idle pool and 43 ms behind one
+/// frame's worth of spawns — a stall the telemetry booked as relight time,
+/// since it reports the batch's wall clock.
+///
+/// With its own pool, background work is scheduled against the frame's
+/// work by the operating system instead of ahead of it. It gets two
+/// threads fewer than the machine has cores, at least one: the same
+/// measurement gave 11 ms for that batch beside a 2-thread background
+/// pool, against 22–26 ms beside a 3- or 4-thread one.
+fn background_pool() -> rayon::ThreadPool {
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let threads = cores.saturating_sub(2).max(1);
+    log::info!("background pool: {threads} threads for generation and LOD ({cores} cores)");
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|i| format!("vox-background-{i}"))
+        .build()
+        .expect("failed to start the background thread pool")
+}
+
 /// Compute both light channels for many chunks in parallel (rayon),
 /// read-only. Each worker builds its own heightmap-derived `top_sky` (so that
 /// work is parallel, not serial), reads neighbor borders, and returns the
@@ -221,17 +274,27 @@ fn top_sky_from_heightmap(heights: &ColumnHeights, pos: ChunkPos) -> Vec<u8> {
 /// supplies its sky plane from the heightmap instead of nothing: over deep
 /// ocean only the seabed and the sea surface are resident, and the seabed
 /// would otherwise be dark under water that passes light (M10 A1).
+///
+/// Also returns the summed CPU time of the jobs, milliseconds, as
+/// `mesh_chunks_parallel` does. The pass's wall time — the telemetry's `lt`
+/// — includes whatever the frame thread waited for, and for two milestones
+/// that waiting was read as lighting getting slower (2026-11 audit).
 #[allow(clippy::type_complexity)]
 fn relight_chunks_parallel(
     world: &World,
     registry: &BlockRegistry,
     heights: &ColumnHeights,
     jobs: &[(ChunkPos, u8)],
-) -> Vec<(ChunkPos, Vec<u8>, bool, u8)> {
+) -> (Vec<(ChunkPos, Vec<u8>, bool, u8)>, f64) {
     const OPPOSITE: [usize; 6] = [1, 0, 3, 2, 5, 4];
     const POS_Y: usize = 2; // NEIGHBOR_OFFSETS[2] == (0, 1, 0)
-    jobs.par_iter()
+                            // The workers' own time, summed: what relighting COSTS, as against how
+                            // long the frame waited for it (see the return value's docs).
+    let cpu_nanos = std::sync::atomic::AtomicU64::new(0);
+    let lit = jobs
+        .par_iter()
         .filter_map(|&(pos, sealed)| {
+            let started = Instant::now();
             let chunk = world.chunk(pos)?;
             let top_sky = top_sky_from_heightmap(heights, pos);
             let mut block_borders: vox_core::NeighborLight = [None, None, None, None, None, None];
@@ -259,11 +322,7 @@ fn relight_chunks_parallel(
                 &top_sky,
                 true,
             );
-            let interior_changed = (0..light.len()).any(|i| {
-                let p = LocalPos::from_index(i);
-                let cur = (chunk.sky_light(p) << 4) | (chunk.block_light(p) & 0x0F);
-                cur != light[i]
-            });
+            let interior_changed = !chunk.light_matches(&light);
             // Which faces actually changed — so the consumer requeues only the
             // neighbor across a changed face, not all six (up to 6x less
             // relight/remesh cascade during streaming convergence).
@@ -272,9 +331,15 @@ fn relight_chunks_parallel(
             } else {
                 0
             };
+            cpu_nanos.fetch_add(
+                started.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             Some((pos, light, interior_changed, border_faces))
         })
-        .collect()
+        .collect();
+    let cpu_ms = cpu_nanos.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1.0e6;
+    (lit, cpu_ms)
 }
 
 /// The world's climate map as texels for `Renderer::set_climate` (M13,
@@ -659,6 +724,8 @@ struct App {
     keys: HashSet<KeyCode>,
     cursor_captured: bool,
     last_frame: Instant,
+    /// Seconds since edited chunks were last written ([`AUTOSAVE_SECS`]).
+    autosave_accum: f32,
 
     // --- Streaming (M02 task 3) ---
     generator: Generator,
@@ -730,6 +797,10 @@ struct App {
 
     /// Async generation results arrive here from the rayon pool.
     gen_tx: Sender<(ChunkPos, Chunk)>,
+    /// The thread pool for work nobody waits on: chunk generation and LOD
+    /// node building ([`background_pool`]). Relighting and meshing, which
+    /// the frame DOES wait on, stay on rayon's global pool.
+    background: Arc<rayon::ThreadPool>,
     gen_rx: Receiver<(ChunkPos, Chunk)>,
 
     /// Async LOD-node gen+mesh results (M08): coarse generation and meshing run
@@ -775,6 +846,9 @@ struct App {
     /// (`mesh_chunks_parallel`) — the benchmark's per-chunk mesh cost.
     meshed_total: u64,
     mesh_cpu_ms_total: f64,
+    /// Chunks relit and the workers' CPU time doing it, as for meshing.
+    relit_total: u64,
+    relight_cpu_ms_total: f64,
     /// `--bench` was given: run the benchmark script once the renderer is up.
     bench_requested: bool,
     bench: Option<bench::Bench>,
@@ -800,8 +874,11 @@ struct App {
     time_fast: bool,
 }
 
-impl Default for App {
-    fn default() -> Self {
+impl App {
+    /// Open the world and stand the player in it. `bench_requested` is
+    /// `--bench`: the benchmark runs in a world folder of its own
+    /// ([`BENCH_WORLD_DIR`]).
+    fn new(bench_requested: bool) -> Self {
         let (gen_tx, gen_rx) = std::sync::mpsc::channel();
         let (lod_tx, lod_rx) = std::sync::mpsc::channel();
 
@@ -818,8 +895,13 @@ impl Default for App {
         };
         // Display, not `expect`: `expect` prints the error's Debug form, which
         // turns "this world predates…; move or delete it" into `LegacyWorld`.
-        let store = WorldStore::open("world", new_world)
-            .unwrap_or_else(|e| panic!("cannot open the world at \"world\": {e}"));
+        let world_dir = if bench_requested {
+            format!("{BENCH_WORLD_DIR}-v{}", vox_worldgen::GENERATOR_VERSION)
+        } else {
+            WORLD_DIR.to_string()
+        };
+        let store = WorldStore::open(&world_dir, new_world)
+            .unwrap_or_else(|e| panic!("cannot open the world at \"{world_dir}\": {e}"));
         let seed = store.seed();
         let shape = store.shape();
         // The LOD's record of every edit ever made in this world. A corrupt
@@ -908,6 +990,7 @@ impl Default for App {
             keys: HashSet::new(),
             cursor_captured: false,
             last_frame: Instant::now(),
+            autosave_accum: 0.0,
 
             generator,
             // Cylindrical horizontally, surface-following vertically.
@@ -938,6 +1021,7 @@ impl Default for App {
             selected_block: vox_core::registry::STONE,
             gen_tx,
             gen_rx,
+            background: Arc::new(background_pool()),
             lod_tx,
             lod_rx,
             lod_in_flight: HashSet::new(),
@@ -955,7 +1039,9 @@ impl Default for App {
             mesh_ms_total: 0.0,
             meshed_total: 0,
             mesh_cpu_ms_total: 0.0,
-            bench_requested: false,
+            relit_total: 0,
+            relight_cpu_ms_total: 0.0,
+            bench_requested,
             bench: None,
             bench_started: None,
             census_requested: false,
@@ -1167,17 +1253,13 @@ impl App {
             // rule) has stale light that only a recompute can correct — this
             // is what un-freezes the sealed-hole daylight leak. All changed
             // columns lie within this chunk's own footprint, so the affected
-            // chunks are exactly those with matching chunk (x,z); the check is
-            // two integer compares per loaded chunk (the chunk directly below,
-            // which the new surface may now shadow, is in the stack too).
-            let mut to_relight: Vec<ChunkPos> = Vec::new();
-            for (cpos, _) in self.world.chunks() {
-                if cpos.x == pos.x && cpos.z == pos.z {
-                    to_relight.push(cpos);
-                }
-            }
-            for c in to_relight {
-                self.relight.insert(c);
+            // chunks are exactly those with matching chunk (x,z) (the chunk
+            // directly below, which the new surface may now shadow, is in the
+            // stack too). The heightmap lists them: walking every loaded
+            // chunk to find them cost thousands of visits per arriving chunk,
+            // on the frame thread (2026-11 audit).
+            for &cy in self.column_heights.resident_layers(pos.x, pos.z) {
+                self.relight.insert(ChunkPos::new(pos.x, cy, pos.z));
             }
         }
     }
@@ -1221,10 +1303,14 @@ impl App {
 
         let mut highest: Option<i64> = None;
         let mut column_chunks: Vec<ChunkPos> = Vec::new();
-        for (cpos, chunk) in self.world.chunks() {
-            if cpos.x != cx || cpos.z != cz {
+        // The column's resident chunks, from the heightmap's own record of
+        // them rather than a walk of every loaded chunk.
+        let layers = self.column_heights.resident_layers(cx, cz).to_vec();
+        for cy in layers {
+            let cpos = ChunkPos::new(cx, cy, cz);
+            let Some(chunk) = self.world.chunk(cpos) else {
                 continue;
-            }
+            };
             column_chunks.push(cpos);
             for ly in (0..CHUNK_SIZE_I as u8).rev() {
                 let p = LocalPos::new(lx, ly, lz);
@@ -1261,22 +1347,37 @@ impl App {
         }
     }
 
-    /// Save every loaded chunk that's been modified, and the LOD edit overlay —
-    /// called on exit so edits to chunks still resident (not yet unloaded)
-    /// aren't lost.
-    fn save_all_modified(&mut self) {
+    /// Save every loaded chunk holding edits that are not on disk yet, and
+    /// the LOD edit overlay — on exit and every [`AUTOSAVE_SECS`], so edits
+    /// to chunks still resident (not yet unloaded) survive a crash.
+    ///
+    /// "Not on disk yet" is `Chunk::is_unsaved`, not `is_modified`: a chunk
+    /// stays modified for as long as it differs from generation, and writing
+    /// every such chunk on every save would rewrite the player's whole base
+    /// once a minute. A chunk whose write fails stays unsaved, so the next
+    /// save retries it.
+    fn save_unsaved(&mut self, why: &str) {
+        let unsaved: Vec<ChunkPos> = self
+            .world
+            .chunks()
+            .filter(|(_, chunk)| chunk.is_unsaved())
+            .map(|(pos, _)| pos)
+            .collect();
         let mut saved = 0;
-        for (pos, chunk) in self.world.chunks() {
-            if chunk.is_modified() {
-                if let Err(e) = self.store.save_chunk(pos, chunk) {
-                    log::error!("exit save failed for {:?}: {e}", (pos.x, pos.y, pos.z));
-                } else {
+        for pos in unsaved {
+            let Some(chunk) = self.world.chunk_mut(pos) else {
+                continue;
+            };
+            match self.store.save_chunk(pos, chunk) {
+                Ok(()) => {
+                    chunk.mark_saved();
                     saved += 1;
                 }
+                Err(e) => log::error!("{why}: saving {:?} failed: {e}", (pos.x, pos.y, pos.z)),
             }
         }
         if saved > 0 {
-            log::info!("saved {saved} modified chunks on exit");
+            log::info!("{why}: saved {saved} edited chunks");
         }
         self.save_edit_overlay();
     }
@@ -1335,15 +1436,6 @@ impl App {
         }
     }
 
-    /// Every chunk layer resident for a column right now: the surface window
-    /// plus the camera's own neighbourhood (M10 A3). A scan for "what is in
-    /// this column" must cover both, or it misses what the player built
-    /// above the terrain window.
-    fn column_window_chunks(&self, cx: i64, cz: i64) -> vox_core::ColumnWindow {
-        self.streamer
-            .column_window(self.camera.block_pos().chunk(), cx, cz, self.span(cx, cz))
-    }
-
     /// One streaming step, run every frame. Keeps the resident chunk set
     /// centered on the camera and the GPU meshes in sync, within per-frame
     /// budgets so the frame never stalls.
@@ -1372,7 +1464,9 @@ impl App {
         let mut saved_any = false;
         for pos in &update.to_unload {
             if let Some(chunk) = self.world.chunk(*pos) {
-                if chunk.is_modified() {
+                // Only what is not on disk already: a chunk that came from
+                // disk and was not touched since has nothing to write.
+                if chunk.is_unsaved() {
                     saved_any = true;
                     if let Err(e) = self.store.save_chunk(*pos, chunk) {
                         log::error!("failed to save chunk {:?}: {e}", (pos.x, pos.y, pos.z));
@@ -1414,7 +1508,7 @@ impl App {
             let generator = self.generator.clone();
             let store = self.store.clone();
             let tx = self.gen_tx.clone();
-            rayon::spawn(move || {
+            self.background.spawn(move || {
                 // Generate-or-load: a saved (edited) chunk takes precedence
                 // over regeneration; otherwise generate from the seed. A
                 // load error falls back to generation so a corrupt file can't
@@ -1508,12 +1602,14 @@ impl App {
                     .iter()
                     .map(|&p| (p, self.sealed_faces(p, camera_chunk)))
                     .collect();
-                let lit = relight_chunks_parallel(
+                let (lit, cpu_ms) = relight_chunks_parallel(
                     &self.world,
                     &self.registry,
                     &self.column_heights,
                     &jobs,
                 );
+                self.relight_cpu_ms_total += cpu_ms;
+                self.relit_total += jobs.len() as u64;
                 for (pos, light, interior_changed, border_faces) in lit {
                     if interior_changed {
                         if let Some(chunk) = self.world.chunk_mut(pos) {
@@ -1876,6 +1972,8 @@ impl App {
             mesh_ms_total: self.mesh_ms_total,
             meshed_total: self.meshed_total,
             mesh_cpu_ms_total: self.mesh_cpu_ms_total,
+            relit_total: self.relit_total,
+            relight_cpu_ms_total: self.relight_cpu_ms_total,
             dirty_split: self
                 .bench
                 .as_ref()
@@ -1964,22 +2062,31 @@ impl App {
     /// the pre-edit surface, and anything derived from it — LOD nodes, skylight
     /// — rebuilds the terrain the player just removed: a "ghost block".
     fn recompute_column_height(&mut self, x: i64, z: i64) {
-        // Scan only what can be resident for this column: its surface window
-        // and the camera's neighbourhood, top down, skipping the gap between
-        // them. Against the world band this would be a 20 000-block walk on
-        // every block break; blocks outside the window are not loaded, so
-        // scanning them would find nothing anyway. The camera part matters: a
-        // block placed above the surface window is only visible to this scan
-        // through it.
+        // Scan exactly the chunks that ARE resident in this column, top
+        // down. Against the world band this would be a 20 000-block walk on
+        // every block break, and blocks that are not loaded would read as
+        // air anyway.
+        //
+        // The heightmap's own record of the column's chunks, not the layers
+        // the streamer LOADS (`column_window_chunks`, which this used until
+        // the 2026-11 audit): the streamer KEEPS one layer more than it
+        // loads around the camera (its unload hysteresis), and a block in
+        // such a chunk — a roof built just above, the player having stepped
+        // down a layer since — was invisible to the scan. The height was then
+        // set BELOW the real top, which is the one direction the skylight
+        // must never err in (CLAUDE.md: a too-low height invents daylight).
         //
         // TWO tops, because they answer different questions (ADR-0011): the
         // skylight heightmap wants the highest OPAQUE block (where light
         // stops), the LOD's terrain the highest SOLID one (the ground, which
         // under an ocean is the seabed). Identical for every block today.
-        let window =
-            self.column_window_chunks(x.div_euclid(CHUNK_SIZE_I), z.div_euclid(CHUNK_SIZE_I));
+        let mut layers = self
+            .column_heights
+            .resident_layers(x.div_euclid(CHUNK_SIZE_I), z.div_euclid(CHUNK_SIZE_I))
+            .to_vec();
+        layers.sort_unstable_by(|a, b| b.cmp(a));
         let (mut opaque_top, mut solid_top) = (None, None);
-        'scan: for cy in window.layers().rev() {
+        'scan: for cy in layers {
             for y in (cy * CHUNK_SIZE_I..(cy + 1) * CHUNK_SIZE_I).rev() {
                 let b = self.world.get_block(WorldPos::new(x, y, z));
                 if opaque_top.is_none() && self.registry.is_opaque(b) {
@@ -2353,7 +2460,7 @@ impl App {
                 let edits = Arc::clone(&self.edited_columns);
                 let merge = self.lod_merge;
                 let layers = Arc::clone(&layers);
-                rayon::spawn(move || {
+                self.background.spawn(move || {
                     let (mut heights, tops, mut water) =
                         generator.lod_surface(origin.x, origin.z, stride, sampling);
                     // Fold in player edits. The seed always reads higher than
@@ -2433,6 +2540,15 @@ impl App {
         // Reject if the cell would overlap the player's box.
         let (min, max) = self.player_aabb();
         if cell_overlaps_aabb(pos, min, max) {
+            return;
+        }
+        // Only into a chunk that is resident. `World::set_block` creates a
+        // missing chunk, and one created here is known to neither the
+        // streamer nor the heightmap: when the real chunk arrives it replaces
+        // this one — the block silently vanishes — and the column's resident
+        // count is left one short (2026-11 audit). Reach is 6 blocks, so this
+        // only ever refuses a cell in a chunk still streaming in.
+        if self.world.chunk(pos.chunk()).is_none() {
             return;
         }
         self.world.set_block(pos, self.selected_block);
@@ -2603,7 +2719,7 @@ impl ApplicationHandler for App {
 
         match event {
             WindowEvent::CloseRequested => {
-                self.save_all_modified();
+                self.save_unsaved("exit");
                 event_loop.exit();
             }
 
@@ -2872,6 +2988,16 @@ impl ApplicationHandler for App {
                     }
                 }
 
+                // Autosave. Not while benchmarking: nothing is edited there,
+                // and a write would land in a measured frame.
+                if self.bench.is_none() {
+                    self.autosave_accum += raw_dt;
+                    if self.autosave_accum >= AUTOSAVE_SECS {
+                        self.autosave_accum = 0.0;
+                        self.save_unsaved("autosave");
+                    }
+                }
+
                 // Camera's current chunk drives both streaming and the
                 // floating-origin render origin.
                 let origin_chunk = self.camera.block_pos().chunk();
@@ -2931,7 +3057,7 @@ impl ApplicationHandler for App {
                 };
                 // "Save and Quit" from the pause screen.
                 if self.ui.as_ref().is_some_and(|u| u.quit_requested) {
-                    self.save_all_modified();
+                    self.save_unsaved("exit");
                     event_loop.exit();
                     return;
                 }
@@ -3118,10 +3244,7 @@ fn main() {
     event_loop.set_control_flow(ControlFlow::Poll);
 
     // `cargo run -p vox-app -- --bench`: the fixed performance run (bench.rs).
-    let mut app = App {
-        bench_requested: std::env::args().any(|a| a == "--bench"),
-        ..Default::default()
-    };
+    let mut app = App::new(std::env::args().any(|a| a == "--bench"));
     event_loop.run_app(&mut app).expect("event loop error");
 }
 

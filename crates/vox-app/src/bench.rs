@@ -172,6 +172,11 @@ pub struct Sample {
     pub mesh_ms_total: f64,
     pub meshed_total: u64,
     pub mesh_cpu_ms_total: f64,
+    /// Chunks relit, and the workers' summed time relighting them: with
+    /// `relight_ms_total` (the frame thread's wall time in the pass) this
+    /// separates what relighting costs from what the frame waited for.
+    pub relit_total: u64,
+    pub relight_cpu_ms_total: f64,
     /// Only on a phase's last frame ([`Bench::ends_this_frame`]): judging
     /// every dirty chunk's neighbours costs real main-thread time.
     pub dirty_split: Option<DirtySplit>,
@@ -207,6 +212,9 @@ pub struct PhaseStats {
     pub meshed_per_s: f64,
     /// Worker CPU time per chunk meshed, microseconds; 0 if none were.
     pub mesh_us_per_chunk: f64,
+    pub relit_per_s: f64,
+    /// Worker CPU time per chunk relit, microseconds; 0 if none were.
+    pub relight_us_per_chunk: f64,
     pub encode_ms_median: f64,
     pub encode_ms_p99: f64,
     pub draws_median: usize,
@@ -279,6 +287,11 @@ pub fn summarize(
             0 => 0.0,
             n => (last.mesh_cpu_ms_total - first.mesh_cpu_ms_total) * 1000.0 / n as f64,
         },
+        relit_per_s: per_s(first.relit_total as f64, last.relit_total as f64),
+        relight_us_per_chunk: match last.relit_total - first.relit_total {
+            0 => 0.0,
+            n => (last.relight_cpu_ms_total - first.relight_cpu_ms_total) * 1000.0 / n as f64,
+        },
         encode_ms_median: quantile(&encode, 0.5),
         encode_ms_p99: quantile(&encode, 0.99),
         draws_median: median_of(|s| s.draws),
@@ -319,8 +332,9 @@ pub fn report(header: &[String], results: &[PhaseStats]) -> String {
     }
     out.push_str(
         "\n| Phase | Meshed /s | Mesh µs/chunk (CPU) | Encode ms median / p99 | Draws \
-         | Tris submitted M | Tris drawn M | Zero-area % | Dirty end: ready / relight / neighbours |\n\
-         |---|---|---|---|---|---|---|---|---|\n",
+         | Tris submitted M | Tris drawn M | Zero-area % | Dirty end: ready / relight / neighbours \
+         | Relit /s | Relight µs/chunk (CPU) |\n\
+         |---|---|---|---|---|---|---|---|---|---|---|\n",
     );
     for r in results {
         let padding = if r.tris_median > 0 {
@@ -329,7 +343,7 @@ pub fn report(header: &[String], results: &[PhaseStats]) -> String {
             0.0
         };
         out.push_str(&format!(
-            "| {} | {:.0} | {:.0} | {:.2} / {:.2} | {} | {:.2} | {:.2} | {:.0} | {} |\n",
+            "| {} | {:.0} | {:.0} | {:.2} / {:.2} | {} | {:.2} | {:.2} | {:.0} | {} | {:.0} | {:.0} |\n",
             r.label,
             r.meshed_per_s,
             r.mesh_us_per_chunk,
@@ -343,6 +357,8 @@ pub fn report(header: &[String], results: &[PhaseStats]) -> String {
                 "{} / {} / {}",
                 d.ready, d.relight, d.neighbours
             )),
+            r.relit_per_s,
+            r.relight_us_per_chunk,
         ));
     }
     out
@@ -578,6 +594,23 @@ mod tests {
         // Standing still meshes nothing, and that is not a division by zero.
         let s = summarize("x".into(), 0.0, false, &[b, b], 4.0);
         assert_eq!((s.meshed_per_s, s.mesh_us_per_chunk), (0.0, 0.0));
+    }
+
+    /// Relight has the same two numbers: how much work, apart from how long
+    /// the frame waited for it.
+    #[test]
+    fn relight_cost_per_chunk_is_worker_time_over_chunks_relit() {
+        let mut a = sample(5.0, 0);
+        a.relit_total = 1_000;
+        a.relight_cpu_ms_total = 100.0;
+        let mut b = a;
+        b.relit_total = 3_000;
+        b.relight_cpu_ms_total = 700.0;
+        let s = summarize("x".into(), 0.0, false, &[a, b], 4.0);
+        assert_eq!(s.relit_per_s, 500.0);
+        assert_eq!(s.relight_us_per_chunk, 300.0, "600 ms over 2 000 chunks");
+        let s = summarize("x".into(), 0.0, false, &[b, b], 4.0);
+        assert_eq!((s.relit_per_s, s.relight_us_per_chunk), (0.0, 0.0));
     }
 
     #[test]

@@ -1,0 +1,41 @@
+# Proposed CI for Voxterra (docs/plans/engineering-backlog.md, T1).
+#
+# NOT ACTIVE here: GitHub only runs workflows under .github/workflows/.
+# To adopt it, copy this file to .github/workflows/ci.yml and push.
+#
+# It runs the headless part of the gauntlet (CLAUDE.md) on every push and
+# pull request: formatting, clippy with warnings as errors, and the tests.
+# The whole workspace compiles on a stock Linux runner, vox-render and
+# vox-app included; nothing here needs a GPU.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gauntlet:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      # Uses rust-toolchain.toml once T2 adds one; until then, stable.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace

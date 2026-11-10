@@ -38,11 +38,63 @@ pub struct Chunk {
     /// saving; unmodified chunks regenerate from the seed for free. Runtime
     /// state, NOT serialized (see [`Chunk::serialize`]).
     modified: bool,
-    /// Per-voxel light, one packed byte each (high nibble sky, low nibble
-    /// block; ADR-0004). `None` means fully dark (the common case) and costs
-    /// nothing — allocated lazily on first nonzero light. Runtime-derived
-    /// from blocks, NOT serialized (recomputed on load).
-    light: Option<Box<[u8; CHUNK_VOLUME]>>,
+    /// Whether the chunk has changed since it was last written to disk (or
+    /// read from it): what an autosave must write. Narrower than `modified`,
+    /// which stays set for as long as the chunk differs from generation — a
+    /// chunk loaded from disk and never touched is modified but has nothing
+    /// to save. Runtime state, NOT serialized.
+    unsaved: bool,
+    /// Per-voxel light (ADR-0004). Runtime-derived from blocks, NOT
+    /// serialized (recomputed on load).
+    light: Light,
+}
+
+/// A chunk's light: one packed byte per voxel, high nibble sky, low nibble
+/// block (ADR-0004), stored as cheaply as its contents allow.
+///
+/// Most lit chunks are not lit *variously*. Open air under the sky is 15
+/// sky, 0 block, in every voxel — and there are several such chunks above
+/// every column of ground. As a full array each cost 32 KB to hold one
+/// value 32 768 times: ~20 MB at the default radius, ~200 MB at the
+/// largest (2026-11 audit). `Uniform` holds the value once. Like the
+/// palette's uniform case this is an internal representation; nothing
+/// outside this module can tell which one a chunk is in.
+enum Light {
+    /// Fully dark: every voxel 0 in both channels.
+    Dark,
+    /// Every voxel holds this packed byte. Never 0 — that is `Dark`.
+    Uniform(u8),
+    /// One packed byte per voxel, in [`LocalPos::index`] order.
+    Full(Box<[u8; CHUNK_VOLUME]>),
+}
+
+impl Light {
+    #[inline]
+    fn packed(&self, index: usize) -> u8 {
+        match self {
+            Light::Dark => 0,
+            Light::Uniform(b) => *b,
+            Light::Full(arr) => arr[index],
+        }
+    }
+
+    /// Write one voxel's packed byte, leaving a uniform representation only
+    /// when the write actually differs from it.
+    fn set_packed(&mut self, index: usize, value: u8) {
+        let fill = match self {
+            Light::Full(arr) => {
+                arr[index] = value;
+                return;
+            }
+            Light::Dark => 0,
+            Light::Uniform(b) => *b,
+        };
+        if value != fill {
+            let mut arr = Box::new([fill; CHUNK_VOLUME]);
+            arr[index] = value;
+            *self = Light::Full(arr);
+        }
+    }
 }
 
 impl Chunk {
@@ -52,7 +104,8 @@ impl Chunk {
             palette: vec![block],
             indices: None,
             modified: false,
-            light: None,
+            unsaved: false,
+            light: Light::Dark,
         }
     }
 
@@ -78,6 +131,7 @@ impl Chunk {
         // Any write that reaches here changes (or may change) the chunk's
         // contents relative to generation — treat it as an edit.
         self.modified = true;
+        self.unsaved = true;
 
         let palette_index = self.palette_index_or_insert(block);
 
@@ -130,38 +184,53 @@ impl Chunk {
     /// after generating a chunk, and after saving one.
     pub fn mark_unmodified(&mut self) {
         self.modified = false;
+        self.unsaved = false;
+    }
+
+    /// Whether the chunk holds changes that are not on disk yet: it was
+    /// edited since it was generated, loaded or last saved. What a save
+    /// pass writes. Always false for an unmodified chunk.
+    pub fn is_unsaved(&self) -> bool {
+        self.unsaved
+    }
+
+    /// Record that the chunk's current contents are on disk — after writing
+    /// it, or on reading it back. It stays [`modified`](Chunk::is_modified):
+    /// it still differs from generation, so it must still be loaded from
+    /// disk rather than regenerated.
+    pub fn mark_saved(&mut self) {
+        self.unsaved = false;
+    }
+
+    /// Whether any block type this chunk holds satisfies `pred` — asked of
+    /// the palette, so a handful of tests rather than 32 768. Conservative:
+    /// the palette can keep an entry no voxel uses any more (until
+    /// [`Chunk::compact`]), so `true` means "may contain", `false` means
+    /// "certainly does not".
+    pub fn may_contain(&self, pred: impl Fn(BlockId) -> bool) -> bool {
+        self.palette.iter().any(|&b| pred(b))
     }
 
     // ---- Light (Milestone 04, ADR-0004) ----
     //
-    // One packed byte per voxel: high nibble sky (M05, unused here), low
-    // nibble block light. Stored lazily — `None` means fully dark. Light is
-    // derived from blocks and never serialized; setting it does not mark the
-    // chunk modified.
+    // One packed byte per voxel: high nibble sky, low nibble block light,
+    // held as cheaply as its contents allow (see `Light`). Light is derived
+    // from blocks and never serialized; setting it does not mark the chunk
+    // modified.
 
     /// Block-light level (0..=15) at `pos`. Dark (0) when no light array is
     /// allocated.
     #[inline]
     pub fn block_light(&self, pos: LocalPos) -> u8 {
-        match &self.light {
-            Some(arr) => arr[pos.index()] & 0x0F,
-            None => 0,
-        }
+        self.light.packed(pos.index()) & 0x0F
     }
 
     /// Set the block-light level (clamped to 0..=15) at `pos`, preserving the
     /// sky nibble. Allocates the light array on first nonzero write.
     pub fn set_block_light(&mut self, pos: LocalPos, level: u8) {
-        let level = level.min(15);
-        if self.light.is_none() {
-            if level == 0 {
-                return; // already dark; no need to allocate
-            }
-            self.light = Some(Box::new([0u8; CHUNK_VOLUME]));
-        }
-        let arr = self.light.as_mut().unwrap();
         let i = pos.index();
-        arr[i] = (arr[i] & 0xF0) | level;
+        let packed = (self.light.packed(i) & 0xF0) | level.min(15);
+        self.light.set_packed(i, packed);
     }
 
     /// Sky-light level (0..=15) at `pos`, from the high nibble (ADR-0005).
@@ -170,25 +239,58 @@ impl Chunk {
     /// pass — storage default 0 is correct; daylight comes from propagation.
     #[inline]
     pub fn sky_light(&self, pos: LocalPos) -> u8 {
-        match &self.light {
-            Some(arr) => (arr[pos.index()] >> 4) & 0x0F,
-            None => 0,
-        }
+        self.light.packed(pos.index()) >> 4
     }
 
     /// Set the sky-light level (clamped to 0..=15) at `pos`, preserving the
     /// block-light nibble. Allocates the light array on first nonzero write.
     pub fn set_sky_light(&mut self, pos: LocalPos, level: u8) {
-        let level = level.min(15);
-        if self.light.is_none() {
-            if level == 0 {
-                return; // already dark; no need to allocate
-            }
-            self.light = Some(Box::new([0u8; CHUNK_VOLUME]));
-        }
-        let arr = self.light.as_mut().unwrap();
         let i = pos.index();
-        arr[i] = (arr[i] & 0x0F) | (level << 4);
+        let packed = (self.light.packed(i) & 0x0F) | (level.min(15) << 4);
+        self.light.set_packed(i, packed);
+    }
+
+    /// Both channels of one voxel as the packed byte they are stored in —
+    /// high nibble sky, low nibble block — by [`LocalPos::index`].
+    #[inline]
+    pub fn packed_light(&self, index: usize) -> u8 {
+        self.light.packed(index)
+    }
+
+    /// Replace all of the chunk's light with `light`: one packed byte per
+    /// voxel in [`LocalPos::index`] order, the buffer the relight pass
+    /// produces. One pass over the buffer, and a buffer that holds a single
+    /// value throughout — dark rock, open air under the sky — is stored as
+    /// that value alone.
+    ///
+    /// Panics if `light` is not exactly [`CHUNK_VOLUME`] bytes.
+    pub fn set_light_packed(&mut self, light: &[u8]) {
+        assert_eq!(light.len(), CHUNK_VOLUME, "light buffer must be 32^3");
+        let first = light[0];
+        self.light = if light.iter().all(|&b| b == first) {
+            if first == 0 {
+                Light::Dark
+            } else {
+                Light::Uniform(first)
+            }
+        } else {
+            let arr: Box<[u8; CHUNK_VOLUME]> = Box::<[u8]>::from(light)
+                .try_into()
+                .expect("length checked above");
+            Light::Full(arr)
+        };
+    }
+
+    /// Whether the chunk's light equals `light`, voxel for voxel (the
+    /// layout [`Chunk::set_light_packed`] takes): how the relight pass
+    /// tells that a recomputation changed nothing, without 32 768 nibble
+    /// reads.
+    pub fn light_matches(&self, light: &[u8]) -> bool {
+        match &self.light {
+            Light::Dark => light.iter().all(|&b| b == 0),
+            Light::Uniform(v) => light.iter().all(|b| b == v),
+            Light::Full(arr) => arr[..] == *light,
+        }
     }
 
     /// The 32 blocks of one X row — `x` 0..32 at (`y`, `z`) — into `out`, in
@@ -219,29 +321,36 @@ impl Chunk {
     /// Sky and block light of one X row, as [`Chunk::decode_row`] does for
     /// blocks. Returns `false`, writing nothing, when the chunk is fully dark.
     pub fn light_row(&self, y: usize, z: usize, sky: &mut [u8; 32], block: &mut [u8; 32]) -> bool {
-        let Some(arr) = &self.light else {
-            return false;
-        };
-        let start = LocalPos::new(0, y as u8, z as u8).index();
-        for (k, &b) in arr[start..start + 32].iter().enumerate() {
-            sky[k] = b >> 4;
-            block[k] = b & 0x0F;
+        match &self.light {
+            Light::Dark => false,
+            Light::Uniform(b) => {
+                sky.fill(b >> 4);
+                block.fill(b & 0x0F);
+                true
+            }
+            Light::Full(arr) => {
+                let start = LocalPos::new(0, y as u8, z as u8).index();
+                for (k, &b) in arr[start..start + 32].iter().enumerate() {
+                    sky[k] = b >> 4;
+                    block[k] = b & 0x0F;
+                }
+                true
+            }
         }
-        true
     }
 
     /// Whether any light storage is allocated (i.e. the chunk may be lit).
     /// A `false` result guarantees the chunk is fully dark (both channels).
     #[inline]
     pub fn has_light(&self) -> bool {
-        self.light.is_some()
+        !matches!(self.light, Light::Dark)
     }
 
     /// Clear all light back to dark, releasing the storage. Used when
     /// relighting from scratch (recompute-on-load) or when light is fully
     /// removed.
     pub fn clear_light(&mut self) {
-        self.light = None;
+        self.light = Light::Dark;
     }
 
     /// Number of palette entries. After many overwrites this can include
@@ -392,7 +501,8 @@ impl Chunk {
                 palette,
                 indices: None,
                 modified: false,
-                light: None,
+                unsaved: false,
+                light: Light::Dark,
             });
         }
 
@@ -415,7 +525,8 @@ impl Chunk {
             palette,
             indices: Some(packed),
             modified: false,
-            light: None,
+            unsaved: false,
+            light: Light::Dark,
         })
     }
 }
@@ -1037,5 +1148,138 @@ mod tests {
         }
         chunk.compact();
         assert_roundtrip(&chunk);
+    }
+
+    // ---- Light representations and the save flag (2026-11 audit) ----
+
+    const STONE: BlockId = BlockId(1);
+    const DIRT: BlockId = BlockId(2);
+
+    /// A reference copy of what a chunk's light should read as, cell by cell.
+    fn assert_light_reads_as(chunk: &Chunk, want: &[u8]) {
+        assert!(chunk.light_matches(want));
+        assert_eq!(chunk.has_light(), want.iter().any(|&b| b != 0));
+        for (i, &b) in want.iter().enumerate() {
+            let p = LocalPos::from_index(i);
+            assert_eq!(chunk.packed_light(i), b, "packed at {i}");
+            assert_eq!(
+                (chunk.sky_light(p), chunk.block_light(p)),
+                (b >> 4, b & 0x0F)
+            );
+        }
+        let (mut sky, mut block) = ([0u8; 32], [0u8; 32]);
+        for z in 0..32 {
+            for y in 0..32 {
+                if chunk.light_row(y, z, &mut sky, &mut block) {
+                    for x in 0..32 {
+                        let b = want[LocalPos::new(x as u8, y as u8, z as u8).index()];
+                        assert_eq!((sky[x], block[x]), (b >> 4, b & 0x0F));
+                    }
+                }
+            }
+        }
+    }
+
+    /// However a chunk's light is held — dark, one value, or an array — it
+    /// reads back exactly as the buffer it was set from.
+    #[test]
+    fn set_light_packed_reads_back_in_every_representation() {
+        let mut rng = SplitMix64::new(0x11_2026);
+        let mut chunk = Chunk::new_air();
+        let dark = vec![0u8; CHUNK_VOLUME];
+        let open_sky = vec![0xF0u8; CHUNK_VOLUME];
+        let lamp_room = vec![0x0Eu8; CHUNK_VOLUME];
+        let mixed: Vec<u8> = (0..CHUNK_VOLUME).map(|_| rng.next() as u8).collect();
+        let mut one_off = open_sky.clone();
+        one_off[CHUNK_VOLUME - 1] = 0xE0; // uniform but for the last voxel
+        // Each after each, so every transition between representations runs.
+        for want in [
+            &open_sky, &mixed, &dark, &lamp_room, &one_off, &open_sky, &dark, &mixed,
+        ] {
+            chunk.set_light_packed(want);
+            assert_light_reads_as(&chunk, want);
+        }
+        assert!(
+            !chunk.is_modified(),
+            "light is derived: it never marks a chunk modified"
+        );
+    }
+
+    /// `light_matches` tells a chunk's light from every buffer that differs
+    /// from it in one voxel, in each representation.
+    #[test]
+    fn light_matches_notices_a_single_voxel() {
+        let mut rng = SplitMix64::new(77);
+        let mixed: Vec<u8> = (0..CHUNK_VOLUME).map(|_| rng.next() as u8).collect();
+        for base in [vec![0u8; CHUNK_VOLUME], vec![0xF0u8; CHUNK_VOLUME], mixed] {
+            let mut chunk = Chunk::new_air();
+            chunk.set_light_packed(&base);
+            for i in [0, 1, 12_345, CHUNK_VOLUME - 1] {
+                let mut other = base.clone();
+                other[i] ^= 0x10;
+                assert!(!chunk.light_matches(&other), "missed a change at {i}");
+            }
+            assert!(chunk.light_matches(&base));
+        }
+    }
+
+    /// Writing one voxel of a uniformly lit chunk changes that voxel only,
+    /// and writing the value it already holds changes nothing.
+    #[test]
+    fn a_write_into_uniform_light_touches_one_voxel() {
+        let mut chunk = Chunk::new_air();
+        let mut want = vec![0xF0u8; CHUNK_VOLUME];
+        chunk.set_light_packed(&want);
+        let p = LocalPos::new(3, 30, 17);
+        chunk.set_sky_light(p, 15); // already 15
+        chunk.set_block_light(p, 0); // already 0
+        assert_light_reads_as(&chunk, &want);
+        chunk.set_block_light(p, 9);
+        want[p.index()] = 0xF9;
+        assert_light_reads_as(&chunk, &want);
+        chunk.set_sky_light(LocalPos::new(0, 0, 0), 2);
+        want[0] = 0x20;
+        assert_light_reads_as(&chunk, &want);
+    }
+
+    /// `unsaved` is narrower than `modified`: set by an edit, cleared by a
+    /// save, while the chunk still differs from generation.
+    #[test]
+    fn unsaved_tracks_edits_since_the_last_save() {
+        let mut chunk = Chunk::new_air();
+        assert!(!chunk.is_unsaved());
+        chunk.set(LocalPos::new(0, 0, 0), BlockId::AIR); // no change
+        assert!(!chunk.is_unsaved() && !chunk.is_modified());
+        chunk.set(LocalPos::new(1, 2, 3), STONE);
+        assert!(chunk.is_unsaved() && chunk.is_modified());
+        chunk.mark_saved();
+        assert!(!chunk.is_unsaved(), "saved: nothing left to write");
+        assert!(chunk.is_modified(), "but still not what the seed generates");
+        chunk.set(LocalPos::new(1, 2, 4), STONE);
+        assert!(chunk.is_unsaved(), "a later edit needs saving again");
+        chunk.mark_unmodified();
+        assert!(!chunk.is_unsaved() && !chunk.is_modified());
+        // Read back from disk: modified (keep loading it), nothing to write.
+        let mut loaded = Chunk::deserialize(&chunk.serialize()).unwrap();
+        loaded.mark_modified();
+        assert!(loaded.is_modified() && !loaded.is_unsaved());
+        // Light never counts as an edit.
+        loaded.set_light_packed(&vec![0xF0u8; CHUNK_VOLUME]);
+        assert!(!loaded.is_unsaved());
+    }
+
+    /// `may_contain` is a palette question: never a false "no".
+    #[test]
+    fn may_contain_never_misses_a_block() {
+        let mut chunk = Chunk::filled(STONE);
+        assert!(chunk.may_contain(|b| b == STONE));
+        assert!(!chunk.may_contain(|b| b == DIRT));
+        chunk.set(LocalPos::new(4, 4, 4), DIRT);
+        assert!(chunk.may_contain(|b| b == DIRT));
+        // Overwritten: the palette may still list it (conservative) until
+        // compaction, after which it certainly does not.
+        chunk.set(LocalPos::new(4, 4, 4), STONE);
+        chunk.compact();
+        assert!(!chunk.may_contain(|b| b == DIRT));
     }
 }

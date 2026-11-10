@@ -354,7 +354,11 @@ impl DrainageMap {
                     );
                     let radius =
                         cell_x.min(cell_z) * (rivers::REGION_RADIUS + rivers::REGION_WOBBLE * w);
-                    if ((x - cx).powi(2) + (z - cz).powi(2)).sqrt() <= radius {
+                    // Squared by multiplication, as everywhere in generation:
+                    // only + − × ÷ and sqrt are bit-exact on every platform
+                    // (`climate.rs`), and `powi` promises nothing.
+                    let (dx, dz) = (x - cx, z - cz);
+                    if (dx * dx + dz * dz).sqrt() <= radius {
                         return i32::MAX;
                     }
                 }
@@ -399,8 +403,9 @@ impl DrainageMap {
         // the lowest of the line and points `belt` either side of it.
         let along = |c: usize, spacing: f64, belt: f64| -> Vec<i32> {
             let (a, b) = reach_line(c);
-            let len = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
-            let (ux, uz) = ((b.0 - a.0) / len, (b.1 - a.1) / len);
+            let (dx, dz) = (b.0 - a.0, b.1 - a.1);
+            let len = (dx * dx + dz * dz).sqrt();
+            let (ux, uz) = (dx / len, dz / len);
             let n = (len / spacing).ceil().max(2.0) as usize;
             (0..n)
                 .map(|k| {

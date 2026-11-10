@@ -29,12 +29,15 @@ This is a long-horizon solo project (multi-year). There are no deadlines.
 
 - **Custom engine.** No Unity, no Unreal, no engine forks. We use libraries for
   generic problems (see below) and write the voxel-specific core ourselves.
-- **Language: Rust.** Edition 2021+. Idiomatic Rust; no `unsafe` without an
+- **Language: Rust.** Edition 2024 (`vox-app` alone still inherits the
+  workspace's 2021 — backlog T2). Idiomatic Rust; no `unsafe` without an
   ADR-level justification and a `// SAFETY:` comment.
 - **Graphics: wgpu.** Windowing: winit. Parallelism: rayon for data
   parallelism, dedicated job/thread patterns where appropriate.
-- **Voxels are 1m³.** Realistic player jump height (~0.5m) with auto-step for
-  half-block heights; slopes/stairs matter. No sub-meter voxel grid.
+- **Voxels are 1m³.** The player's jump clears a full block (~1.25, the
+  code's `JUMP_SPEED`), with auto-step for half-block heights once block
+  shapes exist; slopes/stairs matter. No sub-meter voxel grid. (This line
+  said "~0.5m" until the 2026-11 audit; the code never did.)
 - **Chunks are 32×32×32 and CUBIC.** The world is a 3D grid of cube chunks in
   all axes, including Y. There are no column-based chunks anywhere. Never write
   code that assumes a vertical column, a global sea-level-relative heightmap in
@@ -64,7 +67,11 @@ voxterra/
 ├── CLAUDE.md             # this file
 ├── docs/
 │   ├── decisions/        # ADRs: numbered, immutable once accepted
-│   └── milestones/       # one spec per milestone, written BEFORE building
+│   ├── milestones/       # one spec per milestone, written BEFORE building
+│   ├── plans/            # proposed work not yet chosen (engineering backlog)
+│   ├── notes/            # audits, clippy lints, debugging write-ups
+│   ├── bench/            # bench reports worth keeping (bench/ is ignored)
+│   └── gallery/          # every image, per milestone
 ├── crates/
 │   ├── vox-core          # voxel/block types, chunk storage, palette, coords
 │   ├── vox-mesh          # meshing algorithms; headless, unit-testable
@@ -202,8 +209,27 @@ vox-app included — compiles, so `cargo test` on the headless crates,
 `cargo clippy --workspace --all-targets -- -D warnings` and
 `cargo fmt --all -- --check` run as they do natively, and the `fixcheck` and
 clippy workarounds below are unnecessary there. vox-render's tests run too
-(no GPU needed), including naga validation of every shader. Running the game, the GPU and
-every visual check are still Nathan's alone.
+(no GPU needed), including naga validation of every shader. Every visual
+check, and every performance number that counts, is still Nathan's alone.
+
+**The game itself runs in the cloud container, slowly** (from the 2026-11
+audit): a software GPU under a virtual display runs the real binary at
+~10 fps — enough to see it start, stream, settle and not panic, and to run
+`--bench` for a rough before/after. Once per container:
+
+    apt-get update && apt-get install -y mesa-vulkan-drivers xvfb libxkbcommon-x11-0
+    export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json
+
+then, from a scratch directory (it creates `world/` where it runs):
+
+    timeout 40 xvfb-run -a -s "-screen 0 1280x720x24" <repo>/target/debug/vox-app
+    timeout 1500 xvfb-run -a -s "-screen 0 1280x720x24" <repo>/target/debug/vox-app --bench
+
+Read the telemetry lines: the world has settled when `gen`, `dirty` and
+`relight` are 0, and two builds that settle to the same `loaded`, `drawn`,
+`tris` and `MB gpu` at spawn draw the same world. A change to vox-app's
+streaming, lighting or meshing should be run this way, old build against
+new, before it is handed over. It cannot judge how anything looks or feels.
 
 **Headless test setup (`fixcheck`).** The sandbox's stock toolchain is older
 than the project's Rust 1.96 / edition 2024, so to run `vox-core`/`vox-mesh`
@@ -250,6 +276,13 @@ authoritative.
 - `NEIGHBOR_OFFSETS.iter()` yields `&(i64,i64,i64)`; arithmetic auto-derefs
   (`pos.x + dx` is fine) but building an array for element `+=` needs explicit
   deref (`[*dx, *dy, *dz]`).
+- **Background work goes on `App::background`, never `rayon::spawn`.** The
+  frame thread hands its relight and mesh batches to rayon's global pool and
+  waits; anything spawned on that pool is queued ahead of them. Generation
+  and LOD jobs there made a 6 ms relight batch take 43 ms (2026-11 audit).
+- **The telemetry's `lt` is wall-clock**, so it includes any waiting. A rise
+  in `lt` is not evidence that lighting got slower: compare the bench's
+  `Relit /s` and `Relight µs/chunk (CPU)` columns, which are the work.
 
 ## Intentionally deferred (do not build these yet)
 
@@ -289,9 +322,17 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   rivers as ribbons, reservoirs with the water simulation.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 288, vox-mesh 71, vox-worldgen 72, vox-render 21, vox-app 11
-  passing (vox-worldgen was 54 at the M13 close), plus the ignored `every_biome_in_every_world`
-  and `biome_survey`, run in release), then start the first unchecked item.
+  vox-core 298, vox-mesh 71, vox-worldgen 74, vox-render 21, vox-app 12
+  passing (288, 72 and 11 before the 2026-11 audit), plus the ignored
+  `every_biome_in_every_world` and `biome_survey`, run in release), then
+  start the first unchecked item.
+- **Code audit, 2026-11-09:** `docs/notes/code-audit-2026-11.md` — what was
+  measured, what was fixed (generation 3× cheaper per column, relight 2×,
+  the frame no longer queued behind background jobs, autosave), and what
+  is open. The open work is `docs/plans/engineering-backlog.md`, as
+  packages with an order; they are proposals until the owner picks them.
+  Three need the owner's decision (D1 the heightmap rule, D2 world
+  versions, D3 block names in saves).
 - **Instruments (from M11):** the P key logs a `VIEW` line (exact position,
   angles, window, settings) and a `hole_census` — the frame re-rendered six
   ways on the player's GPU with pinholes counted per variant. In the cloud
@@ -302,7 +343,10 @@ The owner's ideas for all of them, and a proposed order, are recorded in
 - **Performance numbers come from `cargo run -p vox-app -- --bench`** (from
   M11): a fixed script over land and ocean at 6 and 8 LOD levels that writes
   `bench/bench-<time>.md` and quits. Compare runs from it, not hand-timed
-  flights; close other heavy programs first.
+  flights; close other heavy programs first. It runs in its own world,
+  `bench/world-v<generator version>`, never the player's `world/`. `bench/`
+  is git-ignored: copy a report worth keeping to `docs/bench/` and commit
+  it there.
 - **Roadmap after M12:** 13 — Climate & Biomes (spec not yet written; start
   from `docs/vision.md` §10's lessons on biomes and terrain shape). The
   longer-range order, and the owner's ideas for the whole game, are in
@@ -412,6 +456,12 @@ was a real shipped bug. Regression tests exist for all of them (vox-core).
   deliberate conservative choice: a too-high height only makes columns darker
   than truth (honest propagation from the overhead plane still lights them);
   a too-low height invents daylight. Preserve this asymmetry.
+  **UNRESOLVED (2026-11 audit, D1): the code does not do this.** Since M09
+  every edit also runs `App::recompute_column_height`, which LOWERS the
+  height to the column's true resident top (`ColumnHeights::set`). Chunk
+  arrival is raise-only, as written; edits are not. Until the owner decides
+  which rule stands, change neither path, and do not "fix" one to match
+  this paragraph.
 - The live relight entry point is `compute_chunk_light_2ch` via
   `relight_chunks_parallel`. Older single-channel functions in light.rs are
   legacy — do not extend them.
