@@ -183,7 +183,7 @@ fn vertical_motion(abs_s: f32) -> f32 {
 /// Share of the wind blowing east (the westerlies, ~30–60°); the rest blows
 /// west (trades and polar easterlies). Blended across ~±5° at the boundaries,
 /// where Earth's winds are light and variable.
-fn eastward_share(abs_s: f32) -> f32 {
+pub(crate) fn eastward_share(abs_s: f32) -> f32 {
     // sin 25° = 0.423, sin 35° = 0.574, sin 55° = 0.819, sin 65° = 0.906.
     smoothstep(0.423, 0.574, abs_s) * (1.0 - smoothstep(0.819, 0.906, abs_s))
 }
@@ -469,7 +469,7 @@ fn sweep(g: &Grid, east: bool) -> (Vec<f32>, Vec<f32>) {
 }
 
 /// Three passes of a [1 4 6 4 1] blur on each axis, wrapping.
-fn blur(field: &mut [f32], nx: usize, nz: usize) {
+pub(crate) fn blur(field: &mut [f32], nx: usize, nz: usize) {
     const K: [f32; 5] = [1.0 / 16.0, 4.0 / 16.0, 6.0 / 16.0, 4.0 / 16.0, 1.0 / 16.0];
     let mut tmp = vec![0.0f32; field.len()];
     for _ in 0..3 {
@@ -517,7 +517,7 @@ pub fn exp(x: f32) -> f32 {
     p * pow2(half) * pow2(n as i32 - half)
 }
 
-fn smoothstep(lo: f32, hi: f32, v: f32) -> f32 {
+pub(crate) fn smoothstep(lo: f32, hi: f32, v: f32) -> f32 {
     let t = ((v - lo) / (hi - lo)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }

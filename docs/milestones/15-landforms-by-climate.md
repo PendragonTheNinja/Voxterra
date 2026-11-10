@@ -31,10 +31,15 @@ cheaper there, `docs/notes/code-audit-2026-11.md`): criterion 9 compares
 M15's terrain against M14's on the same engine, and a baseline from before
 the audit would hide a real M15 cost behind the audit's gains. The
 process-weight map layer
-needs task 1's weights and lands with them. **Next after that: task 1** —
-process weights and the ice-age climate in stage 1 (targets in the
-catalogue's *process weights* and *ice-age climate* sections), the
-world-map layer, and the ADR proposed.
+needs task 1's weights and lands with them. **Task 1 is done (2026-11-10):** the
+process weights and the ice-age climate are a stage-1 map
+(`vox_worldgen::process`, `Generator::process`), with its tests, the
+survey (`process_survey`) and the map layer (`process_map`,
+`docs/gallery/m15/`); ADR-0023 is proposed and fixes the pipeline order.
+Nothing in generation reads the map yet, so the generator is still
+version 8. **Next: task 2**, dry lands — and its first decision is what
+the drainage network samples once the ground has dunes and benches on it
+(ADR-0023, *Consequences*).
 
 ## Why this milestone exists
 

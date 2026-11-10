@@ -25,6 +25,7 @@ pub mod elevation;
 #[cfg(test)]
 mod map;
 pub mod materials;
+pub mod process;
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -73,6 +74,8 @@ pub struct Generator {
     elevation: Elevation,
     climate: Arc<OnceLock<ClimateMap>>,
     drainage: Arc<OnceLock<DrainageMap>>,
+    /// Stage-1 landform processes (M15, ADR-0023), built on first use.
+    process: Arc<OnceLock<process::ProcessMap>>,
     /// Recently generated chunk columns' ground, shared by every clone
     /// ([`GroundCache`]): a speed-up only, never a source of truth.
     grounds: Arc<GroundCache>,
@@ -281,8 +284,19 @@ impl Generator {
             elevation: Elevation::new(seed, shape),
             climate: Arc::new(OnceLock::new()),
             drainage: Arc::new(OnceLock::new()),
+            process: Arc::new(OnceLock::new()),
             grounds: Arc::new(GroundCache::default()),
         }
+    }
+
+    /// The world's landform-process map (M15, ADR-0023): where wind, flash
+    /// floods, ice, deep weathering and rain each shape the land. Built on
+    /// first use after the climate it reads (a fraction of a second at the
+    /// default size) and shared by every clone. Nothing in generation reads
+    /// it yet — the landform layers (M15 tasks 2–4) will.
+    pub fn process(&self) -> &process::ProcessMap {
+        self.process
+            .get_or_init(|| process::ProcessMap::build(&self.elevation, self.climate(), self.shape))
     }
 
     /// The ground of chunk column `(cx, cz)`, from the cache or computed

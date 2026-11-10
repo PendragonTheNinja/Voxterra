@@ -308,7 +308,7 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   (`docs/milestones/15-landforms-by-climate.md`): **spec approved
   2026-11-03** — all five families; glacial landforms wherever last-ice-age
   ice lay; real cliffs, not all walkable (traversal is later gameplay);
-  dunes 6–30 high, 100–250 apart; dry lands first. No code yet. **Handoff (2026-11-04):** the landform catalogue (`docs/landforms.md`) is drafted and its five questions are answered (its *Decisions* section). **The catalogue was approved by the owner on 2026-11-10.** Next: the owner's M14 re-bench at version 8 on the audited build (the baseline; it does not block starting), and task 1 (process weights + ice-age climate in stage 1, the world-map layer, the ADR) — see the spec's *Task 0 progress* note. Dune
+  dunes 6–30 high, 100–250 apart; dry lands first. No code yet. **Handoff (2026-11-04):** the landform catalogue (`docs/landforms.md`) is drafted and its five questions are answered (its *Decisions* section). **The catalogue was approved by the owner on 2026-11-10.** **Task 1 is done (2026-11-10):** the process-weight map (`vox_worldgen::process`, ADR-0023 proposed), not yet read by generation, so still `GENERATOR_VERSION` 8. Next: the owner's M14 re-bench at version 8 on the audited build (the baseline), and task 2 (dry lands: dunes, benches, mesas, canyons) — see the spec's *Task 0 progress* note and ADR-0023's *Consequences* for task 2's first decision. Dune
   seas, mesas and canyons, glacial valleys and fjords, inselbergs, dissected
   humid hills, as height layers weighted by a stage-1 process map, applied
   before the drainage network so water still fits the ground (M14's lesson).
@@ -330,7 +330,7 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   rivers as ribbons, reservoirs with the water simulation.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 301, vox-mesh 71, vox-worldgen 74, vox-render 21, vox-app 18
+  vox-core 301, vox-mesh 71, vox-worldgen 81, vox-render 21, vox-app 18
   passing (288, 72 and 11 before the 2026-11 audit), plus the ignored
   `every_biome_in_every_world` and `biome_survey`, run in release), then
   start the first unchecked item.
