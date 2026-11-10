@@ -274,17 +274,27 @@ fn background_pool() -> rayon::ThreadPool {
 /// supplies its sky plane from the heightmap instead of nothing: over deep
 /// ocean only the seabed and the sea surface are resident, and the seabed
 /// would otherwise be dark under water that passes light (M10 A1).
+///
+/// Also returns the summed CPU time of the jobs, milliseconds, as
+/// `mesh_chunks_parallel` does. The pass's wall time — the telemetry's `lt`
+/// — includes whatever the frame thread waited for, and for two milestones
+/// that waiting was read as lighting getting slower (2026-11 audit).
 #[allow(clippy::type_complexity)]
 fn relight_chunks_parallel(
     world: &World,
     registry: &BlockRegistry,
     heights: &ColumnHeights,
     jobs: &[(ChunkPos, u8)],
-) -> Vec<(ChunkPos, Vec<u8>, bool, u8)> {
+) -> (Vec<(ChunkPos, Vec<u8>, bool, u8)>, f64) {
     const OPPOSITE: [usize; 6] = [1, 0, 3, 2, 5, 4];
     const POS_Y: usize = 2; // NEIGHBOR_OFFSETS[2] == (0, 1, 0)
-    jobs.par_iter()
+                            // The workers' own time, summed: what relighting COSTS, as against how
+                            // long the frame waited for it (see the return value's docs).
+    let cpu_nanos = std::sync::atomic::AtomicU64::new(0);
+    let lit = jobs
+        .par_iter()
         .filter_map(|&(pos, sealed)| {
+            let started = Instant::now();
             let chunk = world.chunk(pos)?;
             let top_sky = top_sky_from_heightmap(heights, pos);
             let mut block_borders: vox_core::NeighborLight = [None, None, None, None, None, None];
@@ -321,9 +331,15 @@ fn relight_chunks_parallel(
             } else {
                 0
             };
+            cpu_nanos.fetch_add(
+                started.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             Some((pos, light, interior_changed, border_faces))
         })
-        .collect()
+        .collect();
+    let cpu_ms = cpu_nanos.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1.0e6;
+    (lit, cpu_ms)
 }
 
 /// The world's climate map as texels for `Renderer::set_climate` (M13,
@@ -830,6 +846,9 @@ struct App {
     /// (`mesh_chunks_parallel`) — the benchmark's per-chunk mesh cost.
     meshed_total: u64,
     mesh_cpu_ms_total: f64,
+    /// Chunks relit and the workers' CPU time doing it, as for meshing.
+    relit_total: u64,
+    relight_cpu_ms_total: f64,
     /// `--bench` was given: run the benchmark script once the renderer is up.
     bench_requested: bool,
     bench: Option<bench::Bench>,
@@ -1020,6 +1039,8 @@ impl App {
             mesh_ms_total: 0.0,
             meshed_total: 0,
             mesh_cpu_ms_total: 0.0,
+            relit_total: 0,
+            relight_cpu_ms_total: 0.0,
             bench_requested,
             bench: None,
             bench_started: None,
@@ -1581,12 +1602,14 @@ impl App {
                     .iter()
                     .map(|&p| (p, self.sealed_faces(p, camera_chunk)))
                     .collect();
-                let lit = relight_chunks_parallel(
+                let (lit, cpu_ms) = relight_chunks_parallel(
                     &self.world,
                     &self.registry,
                     &self.column_heights,
                     &jobs,
                 );
+                self.relight_cpu_ms_total += cpu_ms;
+                self.relit_total += jobs.len() as u64;
                 for (pos, light, interior_changed, border_faces) in lit {
                     if interior_changed {
                         if let Some(chunk) = self.world.chunk_mut(pos) {
@@ -1949,6 +1972,8 @@ impl App {
             mesh_ms_total: self.mesh_ms_total,
             meshed_total: self.meshed_total,
             mesh_cpu_ms_total: self.mesh_cpu_ms_total,
+            relit_total: self.relit_total,
+            relight_cpu_ms_total: self.relight_cpu_ms_total,
             dirty_split: self
                 .bench
                 .as_ref()
