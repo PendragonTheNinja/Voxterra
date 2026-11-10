@@ -77,7 +77,8 @@ voxterra/
 │   ├── vox-mesh          # meshing algorithms; headless, unit-testable
 │   ├── vox-worldgen      # generation pipeline
 │   ├── vox-render        # wgpu renderer, camera, chunk render pipeline
-│   └── vox-app           # binary: winit window, game loop, wiring
+│   └── vox-app           # binary: winit window, game loop, wiring;
+│                         #   session.rs = the world pipeline, headless
 ```
 
 Dependency direction: `vox-app` → everything; `vox-render`/`vox-mesh`/
@@ -276,7 +277,14 @@ authoritative.
 - `NEIGHBOR_OFFSETS.iter()` yields `&(i64,i64,i64)`; arithmetic auto-derefs
   (`pos.x + dx` is fine) but building an array for element `+=` needs explicit
   deref (`[*dx, *dy, *dz]`).
-- **Background work goes on `App::background`, never `rayon::spawn`.** The
+- **Streaming, lighting and meshing live in `vox-app/src/session.rs`** and
+  have system tests (`session::tests`): a real world, a scripted camera,
+  chunks delivered in an order the test picks. A change to that pipeline
+  gets a test there, and the order it must survive is top-down or
+  bottom-up — random arrival heals most ordering bugs by luck, nearest-
+  first streaming does not.
+- **Background work goes on the background pool (`Spawner::Pool`,
+  `App::background`), never `rayon::spawn`.** The
   frame thread hands its relight and mesh batches to rayon's global pool and
   waits; anything spawned on that pool is queued ahead of them. Generation
   and LOD jobs there made a 6 ms relight batch take 43 ms (2026-11 audit).
@@ -300,7 +308,7 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   (`docs/milestones/15-landforms-by-climate.md`): **spec approved
   2026-11-03** — all five families; glacial landforms wherever last-ice-age
   ice lay; real cliffs, not all walkable (traversal is later gameplay);
-  dunes 6–30 high, 100–250 apart; dry lands first. No code yet. **Handoff (2026-11-04):** the landform catalogue (`docs/landforms.md`) is drafted and its five questions are answered (its *Decisions* section). Next: get the owner's one-line approval of the catalogue and the M14 re-bench at version 8, then task 1 (process weights + ice-age climate in stage 1, the world-map layer, the ADR) — see the spec's *Task 0 progress* note. Dune
+  dunes 6–30 high, 100–250 apart; dry lands first. No code yet. **Handoff (2026-11-04):** the landform catalogue (`docs/landforms.md`) is drafted and its five questions are answered (its *Decisions* section). **The catalogue was approved by the owner on 2026-11-10.** Next: the owner's M14 re-bench at version 8 on the audited build (the baseline; it does not block starting), and task 1 (process weights + ice-age climate in stage 1, the world-map layer, the ADR) — see the spec's *Task 0 progress* note. Dune
   seas, mesas and canyons, glacial valleys and fjords, inselbergs, dissected
   humid hills, as height layers weighted by a stage-1 process map, applied
   before the drainage network so water still fits the ground (M14's lesson).
@@ -322,7 +330,7 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   rivers as ribbons, reservoirs with the water simulation.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 298, vox-mesh 71, vox-worldgen 74, vox-render 21, vox-app 12
+  vox-core 298, vox-mesh 71, vox-worldgen 74, vox-render 21, vox-app 18
   passing (288, 72 and 11 before the 2026-11 audit), plus the ignored
   `every_biome_in_every_world` and `biome_survey`, run in release), then
   start the first unchecked item.
@@ -332,7 +340,8 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   is open. The open work is `docs/plans/engineering-backlog.md`, as
   packages with an order; they are proposals until the owner picks them.
   Three need the owner's decision (D1 the heightmap rule, D2 world
-  versions, D3 block names in saves).
+  versions, D3 block names in saves). **A1 is done (2026-11-10):** the
+  world pipeline is `session.rs`, with five system tests.
 - **Instruments (from M11):** the P key logs a `VIEW` line (exact position,
   angles, window, settings) and a `hole_census` — the frame re-rendered six
   ways on the player's GPU with pinholes counted per variant. In the cloud
@@ -461,7 +470,8 @@ was a real shipped bug. Regression tests exist for all of them (vox-core).
   height to the column's true resident top (`ColumnHeights::set`). Chunk
   arrival is raise-only, as written; edits are not. Until the owner decides
   which rule stands, change neither path, and do not "fix" one to match
-  this paragraph.
+  this paragraph. ADR-0021 (Proposed, 2026-11-10) recommends keeping what
+  the code does, with a test that fails under raise-only.
 - The live relight entry point is `compute_chunk_light_2ch` via
   `relight_chunks_parallel`. Older single-channel functions in light.rs are
   legacy — do not extend them.
