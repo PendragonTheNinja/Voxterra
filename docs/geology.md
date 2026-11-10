@@ -1,0 +1,601 @@
+# Geology — the design
+
+*Draft 2026-11-10, for the owner's review. Nothing here is built. This is
+the design every geology milestone is written against, as `docs/biomes.md`
+was for climate and `docs/landforms.md` for the shape of the land; the
+first milestone's spec is `docs/milestones/16-tectonics-and-bedrock.md`.
+Pillar 2 (CLAUDE.md) is this document's subject: "geology-driven worldgen:
+tectonic-informed terrain, real stratigraphy, associative ore generation".*
+
+**The bar** (owner, 2026-11-10): "so realistic to Earth processes that a
+geologist could take a look at how the world generates in this game and
+find little fault in it."
+
+## 1. What that bar means
+
+A geologist does not look at a rock and ask whether it is pretty. They ask
+*how it got there*. Granite is not "a stone that occurs underground": it is
+magma that cooled slowly, kilometres down, usually in the root of a
+volcanic arc, and is at the surface only because everything above it has
+been eroded away — so the country around it should be old, uplifted and
+deeply worn, and the rock touching it should be baked. A world can have
+perfect-looking granite and fail at once on where it put it.
+
+So the design rests on three rules.
+
+1. **Rocks record history; the generator writes history, not rocks.** Each
+   region of the world is given a geological *story* — a sea that covered
+   it, a collision that folded it, a magma that rose through it — and the
+   rocks, their order, their tilt and their ores are read off the story.
+   Nothing is scattered by a noise field labelled "granite".
+2. **The geologist's first principles are the acceptance tests** (§2).
+   Superposition, cross-cutting, the right rocks in the right tectonic
+   setting: each is a property the generator has by construction, and a
+   headless test over many seeds, exactly as "deserts sit in the
+   subtropics" became a test in M13.
+3. **Mirror Earth's systems; choose the dimensions for play** (ADR-0010).
+   Every process real, sizes set by walking time — with one refinement
+   geology forces (§5): *small things are true size*. A dike is a metre
+   wide here as on Earth, because a block is a metre and a player is
+   human-sized. Only what is too large to walk across is scaled.
+
+And pillar 3 stands: when realism and fun conflict, fun wins. Every place
+this design departs from Earth is listed in §3, so that the departures are
+decisions and not mistakes.
+
+## 2. A geologist's checklist
+
+These are the things that will be checked, by a geologist and by tests.
+Each is a standard principle; the names are the ones in any textbook.
+
+| Principle | What it says | In this generator |
+|---|---|---|
+| **Superposition** (Steno) | In undisturbed layers, older is below younger | Every unit has an age; a column's layered units are in age order unless a named structure (an overturned fold, a thrust) says otherwise |
+| **Original horizontality** | Sediments are laid down flat; tilted beds were tilted later | Beds are flat in undeformed provinces and tilt, fold and break only where the province's history deformed them — never draped over hills |
+| **Lateral continuity** | A bed extends until it thins out or meets the edge of its basin | Units are continuous sheets across a province; the same bed is found on both sides of a valley, at the same level (corrected for dip) |
+| **Cross-cutting relationships** | A feature that cuts another is younger | Intrusions, dikes, veins and faults cut every unit older than themselves and no unit younger |
+| **Inclusions and baked contacts** | An intrusion bakes the rock it enters | Plutons carry a contact aureole of hornfels, marble or quartzite in the older rock, and none in beds laid down on top later |
+| **Unconformities** | A gap in the record: erosion, then deposition | Between sequences: flat beds on tilted ones (angular), sediment on eroded granite or gneiss (nonconformity) — the Great Unconformity at the base of platform cover |
+| **Walther's law** | Environments that lay side by side end up stacked as the sea moves | A sea advancing over land leaves beach sandstone, then offshore shale, then limestone, in that order, everywhere it went |
+| **Rocks belong to tectonic settings** | Andesite above subduction; basalt at rifts and ridges; granite in arc roots and collisions; ophiolites at sutures | Every province type has its own rock suite (§6); nothing occurs outside one that can make it |
+| **Metamorphism has a geography** | Grade rises toward heat and burial: slate → phyllite → schist → gneiss toward an orogen's core; blueschist only in subduction zones | Grade is a field over each orogen and around each pluton, and the rock is the protolith at that grade |
+| **Structure matches stress** | Compression folds and thrusts; extension drops grabens on normal faults; sliding plates leave straight strike-slip valleys | Structural style is the province's: fold trains in fold-thrust belts, tilted fault blocks in rifts, flat beds on cratons |
+| **Isostasy** | Mountains have roots; thick crust stands high | Crustal thickness follows the tectonic framework, and the depth to the mantle with it |
+| **Landscape reflects rock** | Hard beds make ridges and cliffs, soft ones valleys; granite makes domes; limestone makes karst | Rock resistance feeds the erosion stage and the landform layers (§9) |
+| **Caves need a reason** | Almost all caves are dissolved out of limestone, dolostone, gypsum or salt, or are lava tubes or sea caves | Caves form only by those processes, where those rocks and that water are (§10) |
+| **Ore deposits are systems** | A source of metal, a fluid to carry it, a trap to drop it — each in a known setting | Every deposit type is generated only in its setting, with its host rock and its halo (§12) |
+| **Provenance** | A river's gravel is the rock upstream | Placer gold lies downstream of gold-bearing bedrock; river gravels carry their catchment's rocks |
+
+## 3. Where we depart from Earth, deliberately
+
+- **Scale.** The default world is 204.8 km around; Earth is 40 000. Plates
+  are tens of kilometres across here, not thousands. Mountains are ~1/7
+  Earth's height, oceans ~1/16 as deep (ADR-0010). The crust is thinned
+  to match (§5).
+- **Time is an order, not a clock.** Nothing is simulated through millions
+  of years. Each province has a short ordered list of events; what matters
+  is which came first. There are no radiometric ages and, until creatures
+  have ancestors, no fossils to date beds by.
+- **One tectonic present, a remembered past.** Plates do not move while
+  the game runs. The framework is a snapshot — today's boundaries — plus
+  the scars of two or three earlier arrangements (old sutures, worn-down
+  ranges, failed rifts), which is how Earth's continents read too.
+- **The world is a torus** (ADR-0012). Plates slide; they do not rotate
+  about Euler poles.
+- **About sixty rocks stand for thousands.** One "granite", one "schist".
+  The catalogue (§7) keeps every rock whose *presence means something* —
+  that marks a setting, makes a landform, hosts an ore or was a material
+  of human history — and merges the rest.
+- **Ore is richer and shallower than on Earth.** Real ore bodies are rare
+  and mostly invisible at the surface; a player on foot must be able to
+  find one by reading the land. Deposits are generated in the right
+  settings with the right indicators, more often than Earth would.
+- **Hazards are options.** Collapse, gas, flooding and heat underground
+  are realistic and are toggles (pillar 3), designed with the mining
+  milestone, not here.
+
+## 4. The foundation: plates
+
+### What exists today, honestly
+
+The terrain is four noise fields (ADR-0010, `elevation.rs`): continents
+from low-frequency noise, mountain belts from ridged noise *unrelated to
+the continents' edges*, ocean trenches from a third field unrelated to
+either. It is tuned beautifully to walking time and it is not tectonics:
+ranges do not follow plate boundaries because there are no plates, a
+trench has no volcanic arc behind it, and nothing distinguishes a
+continent's ancient core from its young margin. Everything a geologist
+checks first — why is that range *there*? — has no answer.
+
+Geology built on that would be a story with no first chapter. Three ways
+forward:
+
+| | What | For | Against |
+|---|---|---|---|
+| **A. Infer** | Keep the terrain exactly. Read a tectonic story back out of it: call each ridge-noise belt a collision, each coast with a belt an active margin | No terrain change; every tuned number survives | The story is fiction where the noise is arbitrary: trenches with no arc, belts ending in mid-plain, no reason for any basin. It satisfies no one who looks twice |
+| **B. Simulate** | A full plate simulation over geological time (moving plates, subduction, rifting, erosion), terrain from scratch | The most defensible result | Months of work, slow world creation, hard to keep deterministic and to tune to walking time; every M10–M15 number re-derived |
+| **C. Framework** *(recommended)* | A tectonic **framework** in stage 1 — plates, their boundaries and kinds, each continent's internal ages — that says *where* things are. ADR-0010's fields keep saying *what shape* they are. Belts follow convergent boundaries; trenches follow subduction zones; ridges, rifts, arcs and hotspots become possible | Geology with a first chapter. The tuning that makes the world good to walk survives, because amplitudes and wavelengths are untouched — only placement changes | The terrain changes for every seed (a new `GENERATOR_VERSION`); M13–M15's statistical tests must be re-run and their tunings checked; one milestone of work before any rock is laid |
+
+**C is recommended**, as the first geology milestone, before a single
+rock type is added. It is the difference between geology that *explains*
+the world and geology painted onto it.
+
+### The framework (option C)
+
+Computed once per world in stage 1, before climate (which needs the
+mountains), from the seed and world size alone.
+
+- **Plates.** A dozen or so at the default size (scaling with area, with
+  a floor so the smallest world still has several): cells of a warped
+  tessellation of the torus, each with a drift direction and speed.
+- **Crust.** Each plate is oceanic, or carries one or more **continents**
+  — rafts of continental crust that need not reach the plate's edge. That
+  gap is what makes a *passive margin*: a coast in the middle of a plate,
+  quiet, with a wide shelf and a thick wedge of sediment (the Atlantic
+  coasts). A coast *at* a convergent boundary is an *active margin*:
+  trench, mountains, volcanoes (the Andes).
+- **Boundaries**, classified by the plates' relative motion and what
+  meets:
+
+  | Boundary | Meeting | Makes |
+  |---|---|---|
+  | Convergent | ocean under ocean | A deep trench; behind it an arc of volcanic islands |
+  | Convergent | ocean under continent | Offshore trench; a coastal range with a line of volcanoes set back from the coast; a foreland basin inland of the range |
+  | Convergent | continent into continent | The highest, widest range, no volcanoes; a suture marked by slivers of ocean floor; a high plateau behind; foreland basins on both sides |
+  | Divergent | in ocean | A mid-ocean ridge: a broad rise with a rift along its crest, youngest sea floor at the centre |
+  | Divergent | in continent | A rift valley: down-dropped floor between fault scarps, long lakes, volcanoes — and, where it succeeded long ago, a new ocean with passive margins facing each other |
+  | Transform | any | A straight fault valley, offset streams, no volcanoes |
+
+- **Inside each continent: its own past.** Continents are built over
+  several cycles of collision, and keep the seams. Each gets:
+  - one to three **cratons** — the oldest cores, worn flat, either bare
+    crystalline *shield* or shield under a thin flat *platform* of
+    sediment;
+  - **old orogens** between and around them — the sutures of earlier
+    collisions, long since worn down to low, rounded hill belts (the
+    Appalachians, the Urals, the Scottish Highlands) with their
+    metamorphic cores exposed;
+  - **basins** — broad sags within cratons that kept filling (Michigan,
+    Paris), and a **failed rift** or two (an old rift that never became an
+    ocean: a buried trough of thick sediment and basalt).
+- **Hotspots.** A few fixed plumes: where a plate has drifted over one, a
+  chain of volcanoes ageing along the drift direction (Hawaii), or on a
+  continent a track of old calderas and a province of flood basalt.
+
+From the framework come the fields the terrain is made from — and each
+replaces a noise field's *placement* while keeping ADR-0010's shape:
+
+| Field | Today | From the framework |
+|---|---|---|
+| Continents | Noise | The continents' outlines, with the same fractal coast and the same per-world land calibration (42%) |
+| Mountain belts | Ridged noise, anywhere | Along convergent boundaries (height by kind: collision > continental arc > island arc), and subdued along old sutures; the same ridge texture, amplitude and "height earned by extent" |
+| Trenches | Noise in the ocean | Along subduction zones, offshore of their arcs |
+| *New:* mid-ocean ridges, rift valleys, volcanic lines, hotspot chains, plateaus | — | From their boundaries |
+| *New:* crustal thickness | — | Thick under ranges (roots), thin under rifts and oceans |
+
+Climate, rivers and landforms then run on the new terrain unchanged in
+mechanism. Rain shadows fall behind real ranges; rivers drain from real
+divides into real basins — M14's "closed basins 29% against Earth's 18%"
+problem is largely a symptom of terrain with no tectonic reason for its
+interiors to drain, and should improve on its own.
+
+## 5. The crust in blocks
+
+Large things are scaled to be walkable; small things are true size.
+
+| | Earth | Voxterra | Note |
+|---|---|---|---|
+| Highest peaks | 8.8 km | ~1 150 | ADR-0010 |
+| Ocean floor | −4.3 km | −260 | ADR-0010 |
+| Trenches | −11 km | to −600 | ADR-0010 |
+| Soil and regolith | 0.5–30 m (to 100 m in the deep tropics) | 1–12 (to ~30 of saprolite in weathering provinces) | True size; M13's profiles |
+| Sedimentary cover on a platform | 0.5–3 km | 40–250 | |
+| Deep sedimentary basin | 5–15 km | 300–800 | |
+| Passive-margin wedge | to 10–15 km | to ~600, thickening seaward | |
+| Sediment on ocean floor | 0–1 km (thin at ridges) | 0–40 | |
+| Oceanic crust | 7 km | ~450 | So the mantle is ~700 below sea level under oceans |
+| Continental crust | 35–40 km (to 70 under ranges) | ~2 500 (to ~4 500 under the highest ranges) | Isostatic roots |
+| World floor | — | −11 264 | Mantle from the Moho down |
+| Geothermal gradient | ~25 °C/km | ~0.2 °C/block | For the later "deep mining is hot" mechanic; not built here |
+| **True size:** beds, dikes, veins, caves, lava tubes, coal seams, cinder cones, sinkholes | | | Anything a player meets at arm's length |
+
+The mantle is real and reachable only by extraordinary digging — or at
+the surface, where collisions have thrust slivers of it up (§6,
+*suture*), which is where Earth's are found too.
+
+## 6. Provinces
+
+A **province** is a region with one story. The framework assigns every
+place to one; its story fixes the rock sequence, the structure, the
+landscape and the resources. These are Earth's.
+
+| Province | Where | Landscape | Rocks, bottom to top | Structure | Earth |
+|---|---|---|---|---|---|
+| **Shield** | Exposed craton | Low, rolling, ice-scoured or deeply weathered; lakes | Gneiss and granite; *greenstone belts* (old sea-floor lavas turned to greenschist, with banded iron formation) | Complex, steep, very old; flat erosion surface | Canadian Shield, Yilgarn, Baltic |
+| **Platform** | Craton under cover | Plains, low plateaus, mesas where dry | The shield, then — above the Great Unconformity — flat sequences: sandstone, shale, limestone, repeated; evaporite and coal in some | Flat-lying; gentle arches and domes | US Midcontinent, Russian Platform |
+| **Intracratonic basin** | A sag in a craton | A plain; rock rings at its rim | As platform but several times thicker, beds dipping gently to the centre, youngest in the middle | A shallow bowl | Michigan, Paris, Williston |
+| **Passive margin** | A coast inside a plate | Coastal plain, wide shelf | Rift fill at the base (redbeds, basalt, salt), then a seaward-thickening wedge: sandstone, shale, shelf limestone | Beds dip gently seaward; salt domes | US Atlantic and Gulf coasts |
+| **Rift** | Divergent boundary in a continent | A valley floor between fault scarps; long deep lakes; volcanoes | Redbeds and conglomerate off the scarps, lake shale, evaporite, basalt flows | Tilted fault blocks; normal faults | East African Rift, Rhine Graben |
+| **Foreland basin** | Beside an orogen, inland | A plain rising toward the mountains | Deep-water shale and thin sandstones (*flysch*), then coarsening up to redbeds and conglomerate shed from the range (*molasse*); coal | A wedge thickening toward the range, gently tilted | Ganges plain, Alberta, the Alpine Molasse |
+| **Fold-and-thrust belt** | An orogen's outer flank | Parallel ridges and valleys | The platform's own cover, crumpled | Trains of folds, thrust slices stacked toward the foreland | Valley and Ridge, Jura, Zagros |
+| **Orogen core** | An orogen's axis | The high peaks | Schist, gneiss, marble, quartzite, migmatite; granite plutons | Grade rising to the axis (slate → phyllite → schist → gneiss); steep foliation | Alps, Himalaya |
+| **Suture** | Where an ocean closed | A narrow belt inside a range | *Ophiolite*: serpentinite, gabbro, pillow basalt, chert — ocean floor on dry land; blueschist; chaotic *mélange* | Slivers between thrusts | The Indus–Tsangpo suture; the ophiolites of Oman and Cyprus |
+| **Continental arc** | Above subduction, on a continent | A coastal range crowned by stratovolcanoes | Andesite and dacite lavas, tuff; beneath, granodiorite batholiths (exposed where the arc is old and eroded) | Volcanic piles on deformed basement | Andes, Cascades, Sierra Nevada (the eroded root) |
+| **Island arc** | Above subduction, in ocean | A curved chain of volcanic islands | Basalt and andesite, volcanic sandstone, reef limestone | Young, simple | Japan (in part), Aleutians, Lesser Antilles |
+| **Ocean floor** | Oceanic plates | Abyssal plain, ridge, seamounts | Peridotite, gabbro, sheeted dikes, pillow basalt, then a thin drape of clay, chert and chalk thickening with age | Layered; faulted at the ridge | Every ocean |
+| **Flood-basalt province** | A hotspot's first eruption, or a rift | Stepped plateau ("traps") | Flow upon flow of basalt, each 5–30 thick, with red weathered tops between | Flat; columnar jointing | Deccan, Columbia River, Siberian Traps |
+| **Hotspot chain** | A plate drifting over a plume | Shield volcanoes in a line, oldest most eroded; on a continent, calderas | Basalt (ocean); rhyolite, tuff and obsidian (continent) | Age progression along the chain | Hawaii; Yellowstone–Snake River |
+| **Old orogen** | An ancient suture inside a continent | Low rounded ranges and uplands | An orogen core's rocks, worn down: schist, gneiss, granite, slate; outliers of folded cover | As an orogen, eroded to its roots | Appalachians, Caledonides, Urals |
+
+**Shares.** Earth's land surface is about two-thirds sedimentary rock at
+outcrop and one-third crystalline, the crystalline third roughly half
+metamorphic and a quarter each plutonic and volcanic. The survey test
+(§14) holds the generated worlds near that, over many seeds and every
+legal size.
+
+## 7. History: one world, six ages
+
+Every rock unit carries an **age**, and the checklist's first six
+principles are all statements about ages. The world has one relative
+timescale, six ages long. The names are placeholders — they are the
+owner's to name, and worth naming well, since players will read them on
+maps and in the lore:
+
+| # | Age (placeholder) | What happened | Its rocks | Earth's equivalent |
+|---|---|---|---|---|
+| 1 | **Deep Time** | The first crust; greenstone seas | Gneiss, granite, greenstone, banded iron | Archean |
+| 2 | **First Assembly** | Cratons welded together; first great platforms | Quartzite, dolostone, redbeds; old mobile belts | Proterozoic |
+| 3 | **Old Seas** | Shallow seas over the continents, again and again; the old ranges raised | Sandstone–shale–limestone cycles, coal, salt; the old orogens' schist and granite | Palaeozoic |
+| 4 | **Breaking** | A supercontinent rifts apart | Rift redbeds, flood basalt, salt; then chalk and passive-margin wedges | Mesozoic |
+| 5 | **Young Mountains** | Today's collisions and arcs | Flysch and molasse; arc volcanics and batholiths; today's high ranges | Cenozoic |
+| 6 | **Ice and Now** | The ice age and since | Till, loess, alluvium, dunes, peat, laterite, reefs, fresh lava | Quaternary |
+
+A province's story is a subset of these, in order. A platform might read:
+*age 1 gneiss — eroded flat — age 3 sandstone, shale, limestone — eroded
+— age 4 chalk — age 6 till*. The gaps are its unconformities.
+
+**Sequences.** Marine cover is laid down in cycles, each a sea's advance
+and retreat, each bounded by an erosion surface. Within one, Walther's
+law fixes the order: sandstone at the base (the beach passing over),
+shale (offshore mud), limestone (clear water far from shore), and often
+the reverse on the retreat. A platform holds two to five such sequences;
+a basin holds the same ones thicker. The *same* sequence is recognisable
+across a whole continent — which is what makes a geological map possible,
+and what lets a player who learns "the coal is under the grey shale" use
+it a day's walk away.
+
+## 8. From history to blocks
+
+How a column of blocks is computed. Any chunk still generates alone
+(CLAUDE.md): everything below is a pure function of position and stage-1
+maps.
+
+1. **Province and its neighbours.** The framework gives the province at
+   `(x, z)` and, near a boundary, the blend toward the next — provinces
+   interfinger at their edges, they do not meet at a line.
+2. **The structural datum.** *Strata do not follow the ground.* This is
+   the single most common mistake in generated worlds: layers draped
+   parallel to the surface, so that every hill is an onion. Real beds are
+   sheets laid flat and then tilted and bent as a whole, and the
+   *landscape is cut into them*. So each province has a smooth reference
+   surface — where the top of its youngest bed lay before erosion — and
+   every unit's top and base are measured down from that, not from the
+   ground. Where a valley has been cut (M14) or a canyon (M15), it cuts
+   into older beds, and the same bed appears on both walls. Where a
+   mountain has been raised and worn, its core shows the oldest rock.
+3. **Structure bends the datum.** By province: a regional dip of a degree
+   or two on a platform; a bowl in a basin; trains of folds in a
+   fold-and-thrust belt, 300–900 across (a ridge every one to three
+   minutes' walk), their crests the ridges; tilted blocks between normal
+   faults in a rift, each dropped 20–200 against the next. Faults offset
+   every unit older than themselves.
+4. **Units fill down from the datum**, each with a thickness that varies
+   slowly across the province (thickening toward a basin's centre, a
+   foreland's mountain side, a margin's seaward edge) and pinches out at
+   its edge.
+5. **Intrusions cut across.** Plutons, stocks, dikes and sills are
+   bodies in three dimensions with their own age; they replace whatever
+   older rock they cut and leave younger beds alone.
+6. **Metamorphism overprints.** A grade field — highest along an orogen's
+   axis, in a shell around each pluton — turns each rock into its
+   metamorphic equivalent: shale to slate, phyllite, schist, gneiss;
+   limestone to marble; sandstone to quartzite; basalt to greenschist,
+   amphibolite.
+7. **Volcanoes and surficial deposits sit on top**, the youngest things in
+   the column: lava and ash on the old surface; till, loess, alluvium and
+   soil over everything (M13's and M14's surface materials are this layer
+   already).
+8. **The ground cuts the stack.** Whatever unit is at the surface is the
+   bedrock there. That is a geological map, produced the way a real one
+   is.
+
+**The LOD** shows bare rock in its own colour from any distance, since
+the column function is the same near and far (ADR-0018 did this for
+biomes); cliffs and canyon walls show their beds as bands, as M13's
+badlands already do.
+
+**What it costs the engine.** Underground is no longer uniform stone. The
+streamer loads only a few layers below the surface, and flat beds thicker
+than a chunk leave most of those layers uniform still — but dipping beds
+make most underground chunks two- or three-rock. Two engine changes come
+with the first geology milestone: the mesher's "hidden uniform chunk"
+shortcut must become "hidden fully-opaque chunk" (any palette), and
+generation must stay cheap per column (the unit boundaries are computed
+once per column, as the ground cache does for the surface). Both are
+measured by `--bench` before and after.
+
+## 9. The rock catalogue
+
+About sixty blocks. Kept: every rock whose presence *marks a setting*,
+*makes a landform*, *hosts an ore*, or *was a material of human history*.
+"Strength" is how hard it is to break and how it stands in a cliff or a
+tunnel (strong / medium / weak / loose); "resists" is how it stands up to
+erosion in a landscape, which is not the same thing (limestone is strong
+and dissolves; shale is weak and makes valleys).
+
+### Igneous — plutonic (cooled slowly, at depth; coarse crystals)
+
+| Rock | Forms | Strength · resists | Landscape and use |
+|---|---|---|---|
+| **Granite** | Arc roots, collision cores; pale, quartz-rich | Strong · high | Domes, tors, inselbergs (M15's bornhardts are granite); building stone; tin, tungsten, pegmatite gems at its margins |
+| **Granodiorite** | The commonest batholith rock of arcs | Strong · high | As granite; the host of porphyry copper |
+| **Diorite** | Arc intrusions, darker | Strong · high | — |
+| **Gabbro** | Lower ocean crust; layered intrusions | Strong · high | Dark building stone; chromite, platinum, nickel in layered bodies |
+| **Peridotite** | The mantle; at the surface only in ophiolites | Strong · weathers fast | Barren, reddish, toxic-soiled hills; chromite; nickel laterite when weathered in the tropics |
+| **Pegmatite** | Last, water-rich melt at a granite's edge; giant crystals | Strong | Veins and pods: gems, lithium, mica, feldspar |
+
+### Igneous — volcanic (erupted; fine-grained or glassy)
+
+| Rock | Forms | Strength · resists | Landscape and use |
+|---|---|---|---|
+| **Basalt** | Ocean floor, rifts, hotspots, flood provinces | Strong · high | Stepped plateaus, columnar cliffs, lava tubes; native copper in old flows |
+| **Andesite** | Arc volcanoes | Strong · medium | Stratovolcano flanks |
+| **Dacite / rhyolite** | Arc and continental-hotspot volcanoes; stiff, explosive | Strong · medium | Domes, calderas; epithermal gold and silver |
+| **Obsidian** | Rhyolite chilled to glass | Brittle | Flows and dome margins — the Stone Age's best blade |
+| **Tuff** | Volcanic ash, settled or welded | Weak to medium | Thick soft sheets, easily carved (Cappadocia); marks an eruption across a whole region — a time marker in the strata |
+| **Pumice / scoria** | Frothy lava | Weak | Cinder cones; abrasive, lightweight |
+
+### Sedimentary — clastic (broken rock, carried and laid down)
+
+| Rock | Forms | Strength · resists | Landscape and use |
+|---|---|---|---|
+| **Conglomerate** | Gravel: fans at mountain fronts, river beds | Medium · high | Molasse cliffs; *fossil placers* (gold, uranium) in the oldest |
+| **Sandstone** | Beaches, rivers, dunes, deltas | Medium · high | Caprocks, cliffs, arches, mesas; the best aquifer; building stone |
+| **Red sandstone** | Rivers and deserts on land (iron-stained) | Medium · high | Rift and molasse redbeds; sediment-hosted copper at its contact with shale |
+| **Siltstone** | Floodplains, lake margins | Weak–medium · medium | — |
+| **Shale / mudstone** | Quiet water: offshore, lakes, lagoons | Weak · low | Valleys and slopes; seals aquifers and oil; black shale carries metals |
+| **Claystone / clay** | Weathering, lakes | Weak / loose | Pottery, brick |
+
+### Sedimentary — chemical and organic
+
+| Rock | Forms | Strength · resists | Landscape and use |
+|---|---|---|---|
+| **Limestone** | Warm shallow seas: shells, reefs, lime mud | Strong · high when dry, **dissolves** when wet | Karst: caves, sinkholes, towers, gorges; lime, cement, flux; lead-zinc |
+| **Dolostone** | Limestone altered by magnesium brines | Strong · high, dissolves slowly | Cliffs; hosts lead-zinc (MVT) |
+| **Chalk** | Deep clear seas: microscopic plankton | Weak · medium | White cliffs, rolling downs, dry valleys; **flint** nodules |
+| **Chert / flint** | Silica: nodules in chalk and limestone, beds on ocean floor | Very hard, brittle | The Stone Age's toolstone; resistant ledges |
+| **Coal** (lignite → bituminous → anthracite) | Swamp peat, buried; rank rises with burial and heat | Weak · low | Seams 1–4 thick in forelands and basins; anthracite only in folded belts |
+| **Rock salt** | A drying sea or lake | Weak, **dissolves**, *flows* | Beds in basins and rifts; salt domes rising through younger beds; essential to life and trade |
+| **Gypsum** | The stage before salt | Weak, dissolves | Plaster; gypsum karst |
+| **Banded iron formation** | The oldest seas (ages 1–2 only) | Strong · high | Red-and-grey striped ridges on shields; the great iron ores |
+| **Ironstone / bog iron** | Shallow seas; today's wetlands | Medium | Small, everywhere, early iron |
+| **Phosphorite** | Upwelling margins | Medium | Fertiliser (later) |
+
+### Metamorphic (older rock, changed by heat and pressure)
+
+| Rock | From | Where | Strength · resists | Landscape and use |
+|---|---|---|---|---|
+| **Slate** | Shale, low grade | Outer orogen, old orogens | Medium, splits flat · medium | Roofing; craggy hills |
+| **Phyllite** | Shale, a little hotter | Between slate and schist | Medium | — |
+| **Schist** | Shale, medium grade | Orogen cores | Medium, splits · medium | Garnet, kyanite; glittering crags |
+| **Gneiss** | Anything, high grade | Shields, deep cores | Strong · high | Banded cliffs, shield country |
+| **Migmatite** | Gneiss beginning to melt | The deepest cores | Strong | Marks the hottest zone |
+| **Marble** | Limestone | Orogen cores, aureoles | Medium, **dissolves** | Statuary and building; marble karst |
+| **Quartzite** | Sandstone | Cores, aureoles, old platforms | Very strong · highest | The sharpest ridges; a range's last survivor |
+| **Greenschist / greenstone** | Basalt, low grade | Greenstone belts, sutures | Medium | Gold-bearing shear zones |
+| **Amphibolite** | Basalt, medium grade | Cores | Strong | — |
+| **Blueschist** | Basalt, high pressure and *low* temperature | Subduction zones only | Medium | The signature of a subduction zone. With the hot, low-pressure rocks under the arc inland of it, it makes a *paired metamorphic belt* — cold-and-squeezed beside hot-and-shallow, the fingerprint of an old subduction zone long after the ocean is gone |
+| **Eclogite** | Basalt, deepest | Rare lenses in sutures | Very strong | Garnet-and-green; a prize |
+| **Serpentinite** | Peridotite plus water | Sutures, ophiolites | Weak, slick | Green, sheared, barren ground; asbestos, soapstone, jade; nickel |
+| **Hornfels** | Anything, baked at a contact | Aureoles round plutons | Very hard | A dark rind round every intrusion |
+
+### Loose and surficial (age 6; mostly present already)
+
+Soil, sand, gravel, river gravel, clay, silt, mud, peat, salt crust (M13,
+M14); new: **till** (unsorted glacial debris, wherever the ice weight is
+high), **loess** (wind-blown silt downwind of ice margins and deserts:
+the best farmland), **volcanic ash**, **talus** (M15), **laterite** and
+**bauxite** (the red, iron- and aluminium-rich crust on M15's weathering
+plains), **saprolite** (rock rotted in place beneath it), **caliche**
+(lime crust in dry soils).
+
+## 10. Landscape from rock
+
+M14 and M15 shape the land from climate alone, because no rock existed.
+With rock, each gains a cause — and three couplings are part of geology's
+own milestones:
+
+- **Differential erosion.** The erosion stage (ADR-0019) gets a rock
+  resistance per cell from the bedrock map. Hard beds then stand as
+  ridges and soft ones are cut into valleys *by the existing mechanism*:
+  cuestas and hogbacks where beds dip, valley-and-ridge country in fold
+  belts, quartzite spines, waterfalls where a river crosses a hard bed
+  (M14 draws them at steps already).
+- **M15's layers find their rock.** Benches and mesas step at real
+  resistant beds — the caprock is a sandstone or limestone unit of the
+  platform, and the riser the shale under it. Inselbergs are the tops of
+  granite plutons. Dune sand is quartz because quartz is what survives.
+  The catalogue of landforms does not change; their positions snap to
+  their causes.
+- **New landforms that need rock** (M15's non-goals): **karst** —
+  sinkholes, disappearing streams, dry valleys, gorges, limestone
+  pavement, and in the wet tropics cones and towers; **volcanoes** —
+  stratovolcanoes, shields, calderas with lakes, cinder cones, lava
+  fields, columnar cliffs; **salt domes** and glaciers of salt in deserts;
+  **fault scarps** fronting rift valleys.
+
+## 11. Caves
+
+The checklist's hardest line for a game. In voxel games caves are
+everywhere, in every rock, because they are fun. On Earth nearly all
+caves are in a few rocks, for a few reasons:
+
+| Kind | Rock | How | Form | Ours |
+|---|---|---|---|---|
+| **Solution caves** (the great majority) | Limestone, dolostone, marble; gypsum, salt | Rainwater, made acid by soil, enlarges joints and bedding planes on its way down to the water table and out to a spring | Shafts and canyons above the water table; long, gently sloping passages along it, in *levels* — each an old water table, abandoned as the valley cut deeper; rooms where passages cross; streams, sumps, lakes | Systems of 0.5–5 km of passage per karst area; passages 2–15 across, chambers to 80; levels at the M14 network's present and former base levels; entrances at sinkholes and springs |
+| **Lava tubes** | Basalt flows | A flow's skin sets; the lava inside drains away | Smooth tunnels just under the surface, running downslope; collapsed skylights | 3–10 across, hundreds long, in young lava fields |
+| **Sea caves** | Any rock at a rocky coast | Waves working a weakness at sea level | Short, at sea level, widening seaward; arches and stacks beyond | At M13's rocky coasts |
+| **Talus and fissure caves** | Any strong rock | Gaps between fallen blocks; cracks pulled open on a slope | Small, irregular | Under cliffs (M15's talus) |
+| **Glacier caves** | Ice | Meltwater | Blue tunnels at a glacier's foot | With ice sheets and alpine ice |
+| **Rock shelters** | Sandstone, limestone | A soft bed weathering back under a hard one | Shallow overhangs along a cliff | In canyon walls — the first human homes |
+
+**Proposed: caves only by these processes** — and karst made generous
+enough to carry the underground game: limestone and dolostone are a fifth
+of all sedimentary rock and belong to every platform, basin, margin and
+fold belt, so most regions have caving country within a walk. The rest of
+the underground belongs to mining: a tunnel in granite is one the player
+dug.
+
+This is a decision for the owner (§15, question 3), because it is the
+largest single place where "a geologist finds little fault" and "fun
+wins" might pull apart. The case for realism: caves become *places* —
+named systems with a logic a player can learn (follow the water; the big
+passage is at the old water table; the stream comes out at the spring
+below) — instead of noise. The alternative is a world-creation option for
+unrealistic extra caves, off by default.
+
+Cave decoration is true to cause as well: flowstone, stalactites and
+stalagmites where water drips through limestone above the water table;
+none in lava tubes; gypsum crystals in dry upper levels.
+
+## 12. Water underground
+
+Designed here so caves and springs are right; built with the water
+simulation later.
+
+- **The water table** is a subdued copy of the land surface, meeting it
+  at rivers, lakes and springs — M14's network *is* its outcrop.
+- **Aquifers and aquitards.** Sandstone, gravel, fractured limestone and
+  basalt hold and carry water; shale, clay, unfractured granite and salt
+  stop it.
+- **Springs** rise where an aquifer resting on an aquitard is cut by a
+  valley side — a line of springs along a contact — and where a karst
+  system discharges, often as a river emerging whole from a cliff. Hot
+  springs rise along faults in rifts and arcs.
+- **Mining meets it.** Below the water table a shaft floods (a toggle,
+  with the mining milestone).
+
+## 13. Mineral systems
+
+Ore is not a rock type; it is the result of a *system* — a source of
+metal, a fluid that moves it, a trap that drops it. Each deposit type
+below is generated only where its system can operate, in its host rock,
+with its geometry — and with the **indicators** that let it be found from
+the surface, which is where realism becomes gameplay: prospecting is
+reading the land.
+
+| Deposit | Setting (province) | Host and form | Indicators at the surface | Metals | Earth |
+|---|---|---|---|---|---|
+| **Placer** | Rivers and beaches downstream of a lode | Heavy grains in gravel: inside bends, behind bars, on bedrock under the gravel | Black sand; colour in the pan; richer upstream until the source is passed — *pan upstream to the lode* | Gold, tin (cassiterite), platinum, gems | Klondike, Malaya's tin |
+| **Bog iron** | Wetlands (M14) on iron-bearing ground | Rusty crust and nodules in peat and at springs | Orange scum on still water | Iron (the first, worst and commonest) | Viking-age Scandinavia |
+| **Native copper** | Old basalt flows (flood-basalt, rift) | Metal in the bubbly tops of flows and the gravels between them | Green stain; copper nuggets in streams | Copper, no smelting needed — the first metal | Michigan's Keweenaw |
+| **Flint and obsidian** | Chalk and limestone; rhyolite domes | Nodule bands; glassy flows | Nodules weathering out of white cliffs; black glass scree | Toolstone | Grime's Graves; Obsidian Cliff |
+| **Sediment-hosted copper** | Rift and basin fill | A thin sheet at the contact of redbeds below and grey shale above, over tens of kilometres | Green and blue stains along one bed | Copper, silver, cobalt | Kupferschiefer, the Copperbelt |
+| **Porphyry copper** | Continental and island arcs | A shell of disseminated ore round the top of a granodiorite stock, 150–400 across | A bleached, rusty hill; a **gossan** (iron-red cap); altered rock in rings (green outside, pale and clay-rich inside) | Copper, molybdenum, gold | Bingham, Chuquicamata |
+| **Epithermal veins** | Above arc and hotspot intrusions, near the old surface | Banded quartz veins, 1–3 thick, in swarms along faults | White quartz ribs standing out of weathered slopes; hot springs and silica terraces near young ones | Gold, silver | Comstock, Hishikari |
+| **Skarn** | Where a pluton meets limestone | Garnet-rich pods at the contact | The contact itself: marble on one side, granite on the other | Copper, iron, tungsten, tin | — |
+| **Tin–tungsten greisen and pegmatite** | The tops and margins of granites in collision belts | Veins and altered granite; pegmatite pods | Tin in streams draining a granite; coarse mica and quartz float | Tin, tungsten; lithium, gems | Cornwall, Erzgebirge |
+| **Orogenic gold** | Greenstone belts in shields; slate belts in old orogens | Quartz veins in shear zones, near the greenschist–amphibolite boundary | Quartz float; gold in every stream crossing the belt | Gold | Kalgoorlie, the Mother Lode, Victoria |
+| **Volcanogenic massive sulphide (VMS)** | Old sea-floor volcanic piles: greenstone belts, island arcs, ophiolites | Lenses 20–80 across on one old sea-floor level, with a feeder zone beneath | Gossan; several lenses along one horizon | Copper, zinc, lead, silver | Kidd Creek, Cyprus (which gave copper its name) |
+| **Banded iron formation** | Shields and old platforms, ages 1–2 | Beds 5–30 thick, kilometres long; enriched to rich ore near the old surface | Red-and-grey striped ridges | Iron | Hamersley, Lake Superior |
+| **Mississippi-Valley lead–zinc (MVT)** | Carbonate platforms at basin edges | Pods and cave fillings in dolostone, 10–40 across | Lead-grey cubes in limestone; old solution collapse | Lead, zinc | Tri-State, Pine Point |
+| **Layered intrusion / ophiolite chromite** | Large gabbro bodies in shields; sutures | Thin black seams, laterally persistent (intrusion); pods in serpentinite (ophiolite) | Black sand; barren serpentine soils | Chromium, platinum, nickel | Bushveld; Oman |
+| **Laterite** | M15's weathering plains over the right rock | A crust 3–8 thick: **bauxite** over granite and clay, **nickel laterite** over peridotite | Red, pisolitic ground; flat-topped plateaus | Aluminium; nickel | Weipa; New Caledonia |
+| **Evaporites** | Rifts, basins, passive margins | Beds of gypsum, salt, potash; domes | Salt springs, salt flats (M14), dissolution hollows | Salt, gypsum, potash | Zechstein, Gulf Coast |
+| **Coal** | Forelands, basins, passive margins of ages 3–5, laid down in humid latitudes | Seams between sandstone and shale, in repeated cycles | Black bands in valley sides; burnt red "clinker" where a seam caught fire | Fuel | Appalachia, the Ruhr |
+| **Kimberlite** | The oldest cratons only | Carrot-shaped pipes 30–80 across | A round, clay-filled hollow; red garnets in streams | Diamond | Kimberley |
+
+**Progression is geography.** The order of metals in human history was
+set by exactly these geologies, and the game inherits it without a rule
+being written: flint and obsidian first; native copper where old basalts
+are; bog iron in any marsh; then smelted copper from arcs and tin from
+granites — which almost never occur together, so *bronze needs travel or
+trade*, as it did; then iron in quantity from the shields, coal from the
+basins, and the industrial metals after.
+
+**How ore is stored** is a decision for the ores milestone, noted here: a
+deposit is its host rock carrying a mineral. Storing "chalcopyrite in
+granodiorite" as a block *state* (host × mineral × grade) rather than
+sixty-times-twenty block types is what CLAUDE.md's block-state note
+anticipates, and the palette makes it cheap.
+
+## 14. What the tests check
+
+Over many seeds and every legal world size, headless, as M13's and M14's
+surveys do:
+
+- **Order.** In every sampled column, layered units are in age order
+  except across a structure that says otherwise; no intrusion cuts a
+  younger unit; every pluton has its aureole and no younger bed is baked.
+- **Continuity.** A unit's top is a smooth surface across its province —
+  the same bed on both walls of every valley.
+- **Setting.** Every rock at the surface or at depth lies in a province
+  that can make it: no andesite off an arc, no blueschist off a
+  subduction zone, no banded iron younger than age 2, no coal in beds
+  laid down in a desert.
+- **Shares.** Outcrop areas near Earth's (§6); every province type
+  present in every world large enough to hold it; a stated minimum set in
+  the smallest.
+- **Framework.** Every range lies on a convergent boundary or an old
+  suture; every trench has an arc; every continent has a craton; passive
+  and active margins both exist.
+- **Landscape.** With resistance in the erosion stage: ridges are
+  statistically harder rock than the valleys beside them.
+- **Caves.** Every cave cell is in a rock and place that can form one;
+  solution passages cluster at the network's base levels.
+- **Ore.** Every deposit is in its setting and host; every lode above a
+  size has an indicator at the surface or a placer downstream; every
+  progression metal is reachable from any spawn within a stated walking
+  time (the fun guarantee).
+- **The earlier milestones still hold.** Every biome in every world;
+  water still fits the ground; landforms where the catalogue puts them;
+  `--bench` within budget.
+
+## 15. The milestones this becomes
+
+Geology is too large for one milestone. Proposed, in order, each with its
+own spec and ADRs when its turn comes:
+
+| # | Milestone | What it adds | Depends on |
+|---|---|---|---|
+| **16** | **Tectonics & Bedrock** | The plate framework; terrain placed by it; provinces; the six ages; strata, structure and the first ~30 rocks in the chunks and the LOD; bedrock maps | M15 complete; ADR-0024 (block names) built first |
+| 17 | **Fire and Pressure** | Intrusions and aureoles, the metamorphic rocks and grade zones, volcanoes and volcanic landforms, hot springs | 16 |
+| 18 | **Rock Shapes the Land** | Rock resistance in the erosion stage; M15's landforms anchored to their rocks; karst landforms | 16 (17 for granite domes) |
+| 19 | **Caves and Groundwater** | Solution caves by level, lava tubes, sea caves, springs; the 3D pass and its LOD (the ADR `docs/vision.md` §10.1 says is needed) | 18 |
+| 20 | **Mineral Systems** | The deposit catalogue, indicators, ore storage, the prospecting loop | 17, 19; inventory and tools from the gameplay track |
+
+Milestone 16 alone changes the terrain. 17–20 add to it.
+
+## 16. Questions for the owner
+
+1. **The foundation.** Option C — a plate framework that re-places the
+   continents, ranges and trenches (same shapes, tectonic positions), as
+   the first geology milestone, accepting that every world's terrain
+   changes and M13–M15's tunings are re-checked? Or A (keep the terrain,
+   infer a story), or B (full simulation)?
+2. **The six ages** want real names. Placeholders are in §7. Do you want
+   to name them, or shall I propose a set?
+3. **Caves only where Earth has them** (§11), with karst made generous —
+   or also "unrealistic" caves, as a world option or everywhere?
+4. **How deep is the game?** The design gives the crust ~2 500 blocks and
+   puts the mantle below it. Is digging that deep ever meant to matter
+   (heat, pressure, deep ores), or is the deep crust scenery for a later
+   decision?
+5. **Fossils.** They are how real beds are dated and a delight to find.
+   They need creatures with ancestors. Park them until the creature
+   catalogue exists, or reserve a place for them now (decorative fossil
+   blocks in limestone and shale)?
+6. **Ore richness.** §3 says deposits are commoner and shallower than
+   Earth's so that prospecting on foot works. How rare should a major
+   deposit feel — one within an hour's walk of anywhere, or a real
+   expedition?
