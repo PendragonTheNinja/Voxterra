@@ -199,8 +199,13 @@ const MANGROVE_FROM_C: f32 = 20.0;
 
 /// Land this close to sea level, blocks, is shore.
 pub const SHORE_HEIGHT: i64 = 3;
-/// Region roughness ([`Surface::relief`]) above which a shore is rocky.
+/// Region roughness ([`Surface::relief`]) above which a shore is rocky —
+/// on its headlands; its bays ([`Surface::headland`] below the second
+/// number) keep beaches. Where the region is a little less rough, its
+/// strongest headlands (above the third) are rocky too.
 const ROCKY_SHORE_RELIEF: f32 = 0.30;
+const BAY_BELOW: f32 = -0.15;
+const ROCKY_HEADLAND_ABOVE: f32 = 0.35;
 /// Shingle, not sand: on cold coasts (sea-level °C below this, where
 /// glaciers left the gravel) and on rough ones (relief above this, where
 /// waves break up cliffs) — the Baltic and the English Channel both.
@@ -319,7 +324,9 @@ fn biome_of(s: Surface, sea_c: f32, t: f32, p: f32, coastal: bool) -> Biome {
         };
     }
     if h <= SHORE_HEIGHT && coastal && t >= ICE_SHEET_BELOW_C {
-        return if s.relief >= ROCKY_SHORE_RELIEF {
+        let rocky = (s.relief >= ROCKY_SHORE_RELIEF && s.headland >= BAY_BELOW)
+            || (s.relief >= SHINGLE_RELIEF && s.headland >= ROCKY_HEADLAND_ABOVE);
+        return if rocky {
             Biome::RockyCoast
         } else if sea_c < SHINGLE_BELOW_C || s.relief >= SHINGLE_RELIEF {
             Biome::ShingleBeach
@@ -388,6 +395,7 @@ mod tests {
             height,
             relief: 0.1,
             uplift: 0.0,
+            headland: 0.0,
         }
     }
 
@@ -445,6 +453,7 @@ mod tests {
             height: h,
             relief: 0.2,
             uplift: 0.5 * MAX_UPLIFT,
+            headland: 0.0,
         };
         // Mid-latitude: sea level 12 °C. Snow from ~470.
         assert_eq!(at(peak(600), 12.0, 1_000.0), Biome::AlpineRock);

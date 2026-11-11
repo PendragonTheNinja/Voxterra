@@ -258,6 +258,7 @@ mod tests {
                 height,
                 relief: 0.1,
                 uplift: 0.0,
+                headland: 0.0,
             },
             temperature: 10.0,
             sea_level_temperature: 10.0,

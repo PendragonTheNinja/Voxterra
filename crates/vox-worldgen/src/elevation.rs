@@ -122,6 +122,18 @@ const COAST_HI: f32 = 0.05;
 const COASTAL_CALM_BLOCKS: f32 = 60.0;
 const COASTAL_CALM_FLOOR: f32 = 0.22;
 
+/// Along the coast, whether it is a headland or a bay
+/// ([`Surface::headland`]): a noise at these wavelengths. A rough coast is
+/// rocky on its headlands and keeps beaches in its bays (`biome.rs`) —
+/// Earth's pattern: the sea cuts the points and drops sand in the bays.
+/// (The owner's first version 9 flight found a rough shore all one
+/// material, in bands parallel to the water. Shaping headlands and bays
+/// in the ground itself — cliffs, coves — is a landform family, proposed
+/// for M15's catalogue; three tries at it here are recorded in milestone
+/// 16's spec, task 2b.)
+const COVE_WAVELENGTHS: [i64; 2] = [320, 110];
+const COVE_WEIGHTS: [f32; 2] = [1.0, 0.4];
+
 /// Gentle continental rise from coast to interior, in blocks. Lowlands, not
 /// mountains — those come from orogeny.
 const LOWLAND_RISE: f32 = 70.0;
@@ -299,6 +311,7 @@ pub struct Elevation {
     /// too few ranges; 1 in most worlds. See [`MIN_RANGE_SHARE`].
     belt_gain: f32,
     coast: [Octave; 3],
+    cove: [Octave; 2],
     relief: [Octave; 2],
     orogeny: [Octave; 2],
     along_strike: Octave,
@@ -327,6 +340,9 @@ pub struct Surface {
     /// Blocks of the height raised by mountain building (0 off the ranges,
     /// up to `MAX_UPLIFT`).
     pub uplift: f32,
+    /// Near the sea, whether the coast here is a headland (toward 1) or a
+    /// bay (toward −1); 0 inland. See [`COVE_WAVELENGTHS`].
+    pub headland: f32,
 }
 
 /// Wavelengths of the biome-boundary noise, blocks: edges wander over a
@@ -354,6 +370,7 @@ impl Elevation {
             continent_offset: 0.0,
             belt_gain: 1.0,
             coast: COAST_WAVELENGTHS.map(oct),
+            cove: COVE_WAVELENGTHS.map(oct),
             relief: RELIEF_WAVELENGTHS.map(oct),
             orogeny: OROGENY_WAVELENGTHS.map(oct),
             along_strike: oct(ALONG_STRIKE_WAVELENGTH),
@@ -648,6 +665,12 @@ impl Elevation {
             * lerp(DETAIL_OCEAN_SCALE, 1.0, land)
             * lerp(COASTAL_CALM_FLOOR, 1.0, calm);
 
+        // Only near the sea is it asked (`biome.rs`, coasts).
+        let headland = if calm < 1.0 {
+            self.fbm(x, z, &self.cove, &COVE_WEIGHTS)
+        } else {
+            0.0
+        };
         let h = base + massif + self.detail_c(x, z) * amplitude;
         Surface {
             height: (h.round() as i64).clamp(
@@ -656,6 +679,7 @@ impl Elevation {
             ),
             relief,
             uplift: massif,
+            headland,
         }
     }
 
@@ -1262,6 +1286,40 @@ mod tests {
         assert!(
             worst < 600,
             "a {worst}-block step over 16 blocks — something is discontinuous"
+        );
+    }
+
+    /// Coasts are not speckled: along lines across them, land and sea runs
+    /// shorter than 24 blocks — the "speckle of one-minute ponds and
+    /// inlets" that damping detail near sea level was introduced to stop
+    /// (M10) — stay a small share of all crossings. Nothing guarded this
+    /// until milestone 16's polish (0.9% then).
+    #[test]
+    fn coasts_are_never_speckled() {
+        let e = Elevation::new(SEED, WorldShape::DEFAULT);
+        let size = e.shape.size_x();
+        let (mut runs, mut short) = (0u32, 0u32);
+        for k in 0..400i64 {
+            let z = k * 104_729 % size;
+            let x0 = k * 7_919 % size;
+            let mut run = 0i64;
+            let mut last = e.height(x0, z) > 0;
+            for x in x0 + 1..x0 + 6_000 {
+                let land = e.height(x, z) > 0;
+                if land != last {
+                    runs += 1;
+                    short += u32::from(run < 24);
+                    run = 0;
+                }
+                run += 1;
+                last = land;
+            }
+        }
+        let speckle = f64::from(short) / f64::from(runs.max(1));
+        eprintln!("{runs} coast crossings, {speckle:.3} of them speckle");
+        assert!(
+            runs > 80 && speckle < 0.03,
+            "{speckle:.3} of {runs} crossings are speckle"
         );
     }
 

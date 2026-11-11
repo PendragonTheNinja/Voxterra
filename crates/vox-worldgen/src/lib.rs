@@ -1950,6 +1950,38 @@ mod tests {
         );
     }
 
+    /// A rough coast alternates (the owner's first version 9 flight,
+    /// `docs/gallery/m16/flight1-1-sand-curve.jpg`): rocky on its headlands,
+    /// beaches in its bays — not one material along the whole shore in
+    /// bands parallel to the water. Of the shore where the region is rough,
+    /// neither rock nor beach is under a fifth.
+    #[test]
+    fn rough_coasts_alternate_rock_and_beach() {
+        use crate::biome::Biome;
+        let g = Generator::new(0x0007_E22A_C0DE, WorldShape::DEFAULT);
+        let size = WorldShape::DEFAULT.size_x();
+        let (mut rock, mut beach) = (0u32, 0u32);
+        for k in 0..3_000_000i64 {
+            let (x, z) = (k * 7_919 % size, k * 104_729 % size);
+            let s = g.surface(x, z);
+            if !(1..=3).contains(&s.height) || s.relief < 0.3 {
+                continue;
+            }
+            match g.column(x, z).biome {
+                Biome::RockyCoast => rock += 1,
+                Biome::SandBeach | Biome::ShingleBeach => beach += 1,
+                _ => {}
+            }
+        }
+        let shore = f64::from(rock + beach);
+        eprintln!("rough shore: {rock} rock, {beach} beach");
+        assert!(shore > 300.0, "only {shore} rough shore columns");
+        assert!(
+            f64::from(rock) > 0.2 * shore && f64::from(beach) > 0.2 * shore,
+            "rough shore is {rock} rock and {beach} beach"
+        );
+    }
+
     /// The sea is only by the sea (the owner's third flight, M14): a lake at
     /// sea level in a hot desert, far from the coast, had a ring of "rocky
     /// coast" stone round it, coast and sea being classed by height alone;
