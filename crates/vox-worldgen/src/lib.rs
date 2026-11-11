@@ -77,9 +77,6 @@ pub struct Generator {
     drainage: Arc<OnceLock<DrainageMap>>,
     /// Stage-1 landform processes (M15, ADR-0023), built on first use.
     process: Arc<OnceLock<process::ProcessMap>>,
-    /// The tectonic framework (milestone 16, ADR-0025): a table over a few
-    /// hundred terranes, so it is built with the generator.
-    tectonics: Arc<tectonics::Tectonics>,
     /// Recently generated chunk columns' ground, shared by every clone
     /// ([`GroundCache`]): a speed-up only, never a source of truth.
     grounds: Arc<GroundCache>,
@@ -275,7 +272,11 @@ pub enum DrainageSource {
 /// blocks of the sea, land below sea level farther inland a lake at sea
 /// level; rivers end at any ground below sea level; a braided river's bars
 /// only in its middle, never across it.
-pub const GENERATOR_VERSION: u32 = 8;
+/// 9 — milestone 16: the tectonic framework places the terrain (ADR-0025).
+/// Continents are continental crust, mountain belts stand along
+/// collisions, arcs and old welds, trenches lie off subduction zones; new
+/// are mid-ocean ridges and rift valleys. Every world's ground moved.
+pub const GENERATOR_VERSION: u32 = 9;
 
 impl Generator {
     /// A generator for one world: its seed and its size. The size is part of
@@ -289,17 +290,16 @@ impl Generator {
             climate: Arc::new(OnceLock::new()),
             drainage: Arc::new(OnceLock::new()),
             process: Arc::new(OnceLock::new()),
-            tectonics: Arc::new(tectonics::Tectonics::new(seed, shape)),
             grounds: Arc::new(GroundCache::default()),
         }
     }
 
     /// The world's tectonic framework (milestone 16, ADR-0025): its
     /// terranes and plates, and what every boundary between them is.
-    /// Nothing in generation reads it yet — milestone 16's task 2 places
-    /// the continents, mountain belts and trenches by it.
+    /// The terrain's continents, mountain belts, trenches, ocean ridges
+    /// and rifts are placed by it (`Elevation`).
     pub fn tectonics(&self) -> &tectonics::Tectonics {
-        &self.tectonics
+        self.elevation.tectonics()
     }
 
     /// The world's landform-process map (M15, ADR-0023): where wind, flash
@@ -1666,20 +1666,52 @@ mod tests {
                 banks += 1;
                 // A 45° bank from a block above the water rises ~3 here;
                 // uneven ground and stepping water allow a few more.
-                if s.height > n.level + 8 {
+                if s.height <= n.level + 8 {
+                    continue;
+                }
+                // Beside a waterfall the bank of the water above stands
+                // that far over the water below, and should: it is what
+                // holds the upper river. A slot is ground high above ALL
+                // the water near it. (Milestone 16 gave rivers mountain
+                // chains to come down, and torrents with falls every few
+                // blocks went from rare to common.)
+                let highest = (-3..=3)
+                    .flat_map(|dz| (-3..=3).map(move |dx| (dx, dz)))
+                    .map(|(dx, dz)| wet_top(&g.ground(x + dx, z + dz).1))
+                    .max()
+                    .unwrap_or(i64::MIN);
+                if s.height > highest + 8 {
                     slots.push((x, z, s.height - n.level));
                 }
             }
             (banks, slots)
         };
-        // The owner's view.
+        // The default world's largest rivers. (Until generator version 9
+        // this was the owner's own view of the slot, at a place the
+        // tectonic framework has since moved.)
         let g = Generator::new(0x0007_E22A_C0DE, WorldShape::DEFAULT);
-        let mut here = (-82_300..-82_180).flat_map(|z| (-51_730..-51_610).map(move |x| (x, z)));
+        let d = g.drainage();
+        let (nx, nz) = d.cells();
+        let (cw, ch) = d.cell_blocks();
+        let mut largest: Vec<(f32, usize, usize)> = (0..nz)
+            .flat_map(|j| (0..nx).map(move |i| (i, j)))
+            .filter(|&(i, j)| !d.is_sea(i, j) && !d.is_lake(i, j))
+            .map(|(i, j)| (d.cell(i, j).2, i, j))
+            .collect();
+        largest.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let mut here = largest.iter().take(6).flat_map(|&(_, i, j)| {
+            let (x0, z0) = ((i as f64 * cw) as i64, (j as f64 * ch) as i64);
+            (z0..z0 + ch as i64).flat_map(move |z| (x0..x0 + cw as i64).map(move |x| (x, z)))
+        });
         let (banks, found) = slots(&g, &mut here);
-        assert!(banks > 100, "only {banks} bank columns at the owner's view");
         assert!(
-            found.is_empty(),
-            "slots at the owner's view: {:?}",
+            banks > 100,
+            "only {banks} bank columns on the largest rivers"
+        );
+        assert!(
+            found.len() * 200 < banks as usize,
+            "{} of {banks} banks on the largest rivers stand 9+ above them, e.g. {:?}",
+            found.len(),
             &found[..found.len().min(8)]
         );
         // Rivers of every size.
@@ -1717,30 +1749,52 @@ mod tests {
     /// sea level in a hot desert, far from the coast, had a ring of "rocky
     /// coast" stone round it, coast and sea being classed by height alone;
     /// and an inland basin below sea level, which the sea's rule fills with
-    /// water, had a dry river carried across it on a causeway. At the
-    /// owner's two VIEWs: no coast or sea biome inland, and no ground below
-    /// sea level raised.
+    /// water, had a dry river carried across it on a causeway.
+    ///
+    /// Until generator version 9 this looked at the owner's two VIEWs.
+    /// The tectonic framework moved those places, and gave the world many
+    /// more like the first — a rift's floor drops below sea level far
+    /// inland — so now it looks everywhere deep inside a continent, at all
+    /// ground that began below sea level: no coast or sea biome there.
+    ///
+    /// The second view's check, that ground below sea level is never
+    /// raised, was true of that basin and is not true in general: M14
+    /// fills hollows with sediment to their river's grade, and a rift is
+    /// a hollow. What it guarded — a river built out across standing
+    /// water as a causeway — is `rivers_end_at_still_water_and_flats_are_cut`
+    /// and `rivers_build_no_walls`, which look at every river.
     #[test]
     fn the_sea_is_only_by_the_sea() {
         let g = Generator::new(0x0007_E22A_C0DE, WorldShape::DEFAULT);
-        // The desert lake's shore, (−28 830, 22 030..22 090).
-        let shore: Vec<_> = (22_030..22_090)
-            .step_by(2)
-            .map(|z| (z, g.column(-28_830, z).biome))
-            .filter(|(_, b)| b.is_coast() || b.is_sea())
-            .collect();
-        assert!(shore.is_empty(), "coast or sea inland: {shore:?}");
-        // The inland basin the river crossed, (−43 950..−43 860, 26 260).
-        let raised: Vec<_> = (-43_950..-43_860)
-            .filter_map(|x| {
-                let nat = g.eroded_surface(x, 26_260).height;
-                let h = g.surface_height(x, 26_260);
-                (nat < 0 && h > nat).then_some((x, nat, h))
-            })
-            .collect();
+        let size = WorldShape::DEFAULT.size_x();
+        let (mut inland, mut below) = (0u32, 0u32);
+        let mut by_the_sea = Vec::new();
+        for k in 0..400_000i64 {
+            let (x, z) = (k * 7_919 % size, k * 104_729 % size);
+            // Three kilometres inside continental crust: farther than any
+            // coast wanders from its edge.
+            if g.tectonics().continentalness(x, z) < 3_000.0 {
+                continue;
+            }
+            inland += 1;
+            if g.eroded_surface(x, z).height >= 0 {
+                continue;
+            }
+            below += 1;
+            let biome = g.column(x, z).biome;
+            if biome.is_coast() || biome.is_sea() {
+                by_the_sea.push((x, z, biome));
+            }
+        }
         assert!(
-            raised.is_empty(),
-            "ground below sea level raised: {raised:?}"
+            inland > 20_000 && below > 100,
+            "{below} of {inland} inland columns began below the sea"
+        );
+        assert!(
+            by_the_sea.is_empty(),
+            "{} of {below}: coast or sea inland: {:?}",
+            by_the_sea.len(),
+            &by_the_sea[..by_the_sea.len().min(8)]
         );
     }
 
@@ -1845,7 +1899,7 @@ mod tests {
     /// Noise stays in range so heights are bounded and sane.
     #[test]
     fn stages_stay_in_their_ranges() {
-        let e = *Generator::new(123, WorldShape::DEFAULT).elevation();
+        let e = Generator::new(123, WorldShape::DEFAULT).elevation().clone();
         for x in (-4_000..4_000).step_by(37) {
             for z in (-4_000..4_000).step_by(211) {
                 for v in [e.continent(x, z), e.detail(x, z)] {
@@ -1959,7 +2013,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (8, 0x409a_bb6d_efe2_4f67);
+        const PINNED: (u32, u64) = (9, 0x4737_e9b9_0af8_1d01);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),

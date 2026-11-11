@@ -71,14 +71,20 @@ const JITTER: (f64, f64) = (0.12, 0.88);
 /// two rings; one ring is not enough.
 const SEARCH: i64 = 2;
 /// How far a boundary may bend from the straight line between its seeds,
-/// in cells, and the wavelengths of the bending, in cells.
-const WARP_CELLS: f64 = 0.16;
-const WARP_WAVELENGTHS: [f64; 2] = [1.3, 0.45];
-const WARP_WEIGHTS: [f64; 2] = [1.0, 0.35];
+/// in cells, and the wavelengths of the bending, in cells: four octaves,
+/// from two terranes' width down to a short walk, so that an edge is
+/// crooked at every scale and a coast or a range drawn along it is not a
+/// polygon's side. Each octave's amplitude is about an eighth of its
+/// wavelength: together they bend the mosaic hard without (often)
+/// folding it over itself.
+const WARP_WAVELENGTHS: [f64; 4] = [2.6, 1.3, 0.45, 0.15];
+const WARP_AMPLITUDES: [f64; 4] = [0.32, 0.18, 0.06, 0.018];
 
 /// The share of terranes that are continental crust: the land target (42%,
-/// ADR-0012) and the shelves beyond the coast.
-pub const CONTINENTAL_SHARE: f64 = 0.46;
+/// ADR-0012), near enough that the coastline's own calibration has little
+/// left to move. (The shore falls a few hundred blocks seaward of the
+/// crust's edge, so the land is a little more than the crust.)
+pub const CONTINENTAL_SHARE: f64 = 0.41;
 /// Hotspots per plate, on average: a few in a world, never none.
 const HOTSPOTS_PER_PLATE: f64 = 0.4;
 /// The share of its plate a continent covers, least and most. Less than
@@ -94,9 +100,19 @@ const CLOSING: f64 = 0.15;
 /// zone to a rift and back within a terrane's width.
 const TREND_WEIGHT: f64 = 2.0;
 
-/// Half the width of a mountain belt, blocks: ADR-0010's range is 7 000
-/// across.
-pub const BELT_HALF_WIDTH: f64 = 3_500.0;
+/// How far from a boundary anything it shapes can reach, blocks — a
+/// mountain belt's half-width (ADR-0010's range is 7 000 across), and the
+/// most a trench, an ocean ridge or a rift may be from its line.
+pub const BOUNDARY_REACH: f64 = 3_500.0;
+/// Half the width of a mountain belt, blocks.
+pub const BELT_HALF_WIDTH: f64 = BOUNDARY_REACH;
+/// The share of a belt's half-width over which it is at full strength
+/// before it falls away: a range has a broad crest, not a knife edge.
+const BELT_CREST: f64 = 0.5;
+/// How far onto the overriding plate an arc's range is centred, as a
+/// share of the belt's half-width: the trench is offshore, the mountains
+/// set back from it.
+const ARC_SETBACK: f64 = 0.35;
 /// How far either side of a coast [`Tectonics::continentalness`] runs
 /// before it is clamped, blocks. The coastal profile — lowland, shelf,
 /// slope — is a blend about 4 200 blocks wide in today's terrain, two
@@ -228,26 +244,38 @@ pub enum Boundary {
 
 impl Boundary {
     /// How much mountain this boundary raises, as a share of the most
-    /// (ADR-0025 §4). A collision is the measure; a suture has worn down
-    /// with its age, from high ground to hills.
+    /// (ADR-0025 §4). A collision is the measure. The numbers are chosen
+    /// for the summits they give once the terrain has shaped them (uplift
+    /// is the square of a smoothstep, so it falls much faster than this
+    /// does): about 1 150 blocks at 1.0, 900 at 0.8, 380 at 0.55, 90 at
+    /// 0.35 and nothing to speak of below 0.2.
+    ///
+    /// - **Collisions and continental arcs**: the high ranges.
+    /// - **An Orean suture** is an old weld being squeezed again by a
+    ///   plate closing on its continent today — the Tien Shan, the
+    ///   Rockies — and stands nearly as high.
+    /// - **A Thalassian suture** is an old range worn down to rounded
+    ///   mountains (the Appalachians, the Urals); a **Ferrian** or
+    ///   **Eoan** one to a line of hills.
+    /// - **Seams** were never ranges.
     pub fn belt_strength(self) -> f64 {
         match self {
             Boundary::Convergent { kind, .. } => match kind {
                 Convergence::Collision => 1.0,
-                Convergence::ContinentalArc => 0.75,
-                Convergence::IslandArc => 0.35,
+                Convergence::ContinentalArc => 0.9,
+                Convergence::IslandArc => 0.6,
             },
             Boundary::Suture(age) => match age {
-                Age::Orean | Age::Nivean => 0.6,
-                Age::Rhexian => 0.45,
-                Age::Thalassian => 0.35,
-                Age::Ferrian => 0.15,
-                Age::Eoan => 0.1,
+                Age::Orean | Age::Nivean => 0.8,
+                Age::Rhexian => 0.6,
+                Age::Thalassian => 0.55,
+                Age::Ferrian => 0.35,
+                Age::Eoan => 0.3,
             },
             Boundary::Seam(age) => match age {
-                Age::Orean | Age::Nivean => 0.2,
-                Age::Rhexian | Age::Thalassian => 0.1,
-                Age::Ferrian | Age::Eoan => 0.05,
+                Age::Orean | Age::Nivean => 0.3,
+                Age::Rhexian | Age::Thalassian => 0.15,
+                Age::Ferrian | Age::Eoan => 0.1,
             },
             Boundary::Quiet
             | Boundary::PassiveMargin
@@ -255,6 +283,32 @@ impl Boundary {
             | Boundary::Rift
             | Boundary::Transform => 0.0,
         }
+    }
+
+    /// The mountain-belt envelope of this boundary, in `[0, 1]`, for a
+    /// column `over` blocks from its line (see [`Column::boundaries`]):
+    /// its strength across a broad crest, falling to nothing at
+    /// [`BELT_HALF_WIDTH`]. A weld's belt is centred on its line; an
+    /// arc's stands on the overriding plate, set back from the trench.
+    pub fn belt(self, over: f64) -> f64 {
+        let t = match self {
+            Boundary::Convergent {
+                kind: Convergence::ContinentalArc | Convergence::IslandArc,
+                ..
+            } => (over / BELT_HALF_WIDTH - ARC_SETBACK) / (1.0 - ARC_SETBACK),
+            _ => over / BELT_HALF_WIDTH,
+        };
+        self.belt_strength() * (1.0 - smoothstep(BELT_CREST, 1.0, t.abs()))
+    }
+
+    /// Whether this boundary shapes the ground at all. A quiet line, a
+    /// passive margin and a transform do not (the coast itself is the
+    /// continent field's).
+    fn shapes_ground(self) -> bool {
+        !matches!(
+            self,
+            Boundary::Quiet | Boundary::PassiveMargin | Boundary::Transform
+        )
     }
 }
 
@@ -304,13 +358,14 @@ struct Window {
     sea2: u64,
 }
 
-/// What a column needs to know about two seeds of its window: the belt
-/// strength of the boundary between their terranes, and one over twice
-/// the distance between the seeds — which turns the difference of two
-/// squared distances into the distance from the line between them.
+/// What a column needs to know about two seeds of its window: what the
+/// boundary between their terranes is (the first seed's terrane first),
+/// and one over twice the distance between the seeds — which turns the
+/// difference of two squared distances into the distance from the line
+/// between them.
 #[derive(Clone, Copy, PartialEq)]
 struct Pair {
-    strength: f64,
+    boundary: Boundary,
     half_inverse: f64,
 }
 
@@ -328,8 +383,8 @@ struct Warp {
 
 /// One column's search of the mosaic, from which terrain reads what it
 /// is placed by (ADR-0025 §4): [`Column::continentalness`] always, and
-/// [`Column::belt`] — the dearer of the two — only where there is land
-/// for mountains to stand on.
+/// [`Column::boundaries`] — the dearer of the two — only where there is
+/// something for a boundary to shape.
 pub struct Column<'a> {
     tectonics: &'a Tectonics,
     window: Window,
@@ -344,6 +399,86 @@ impl Column<'_> {
     /// See [`Tectonics::belt`].
     pub fn belt(&self) -> f64 {
         self.tectonics.envelope(&self.window)
+    }
+
+    /// Every boundary within [`BOUNDARY_REACH`] of the column that shapes
+    /// the ground, each with:
+    ///
+    /// - `over`: the column's distance from the boundary's line, blocks.
+    ///   For a convergent boundary it is positive on the **overriding**
+    ///   plate and negative on the one going under; for any other the
+    ///   sign says only which side, and the shapes are symmetric.
+    /// - `fade`: 1 along the boundary, falling to 0 past its end, where a
+    ///   third terrane comes between the two. Multiply by it.
+    ///
+    /// Every pair of terranes near the column is a candidate boundary,
+    /// and its line is the two seeds' bisector — which runs on for ever,
+    /// while the boundary itself stops at a junction. `fade` is how far
+    /// past that end the column is: the most that any third terrane is
+    /// nearer than one of the pair, measured across *their* bisector.
+    /// Without it, belts would cross the insides of terranes; with it a
+    /// belt ends in a rounded cap.
+    ///
+    /// Anything made from these by a continuous shape that is nothing at
+    /// `|over| = BOUNDARY_REACH` is continuous everywhere, and that takes
+    /// care. Every term is a property of a set of terranes and the
+    /// column, never of the order the terranes come in; and the terranes
+    /// considered are all those within two reaches of being nearest — a
+    /// terrane farther than that can neither be half of a boundary that
+    /// reaches the column nor come between two that are (the continuity
+    /// test found both mistakes in simpler versions of this).
+    pub fn boundaries(&self, mut each: impl FnMut(Boundary, f64, f64)) {
+        let (t, window) = (self.tectonics, &self.window);
+        // The seeds within two reaches of being nearest.
+        let limit = window.d2[window.first].sqrt() + 2.0 * BOUNDARY_REACH;
+        let limit = limit * limit;
+        let mut near = [0usize; WINDOW];
+        let mut count = 0;
+        for k in 0..WINDOW {
+            // Written every time and kept only if wanted: no branch.
+            near[count] = k;
+            count += usize::from(window.d2[k] < limit);
+        }
+        let near = &near[..count];
+        for (at, &a) in near.iter().enumerate() {
+            for &b in &near[at + 1..] {
+                let pair = t.pair(window, a, b);
+                if !pair.boundary.shapes_ground() {
+                    continue;
+                }
+                // How far the column is from the line between the two,
+                // on the first one's side.
+                let across = (window.d2[b] - window.d2[a]) * pair.half_inverse;
+                if across.abs() >= BOUNDARY_REACH {
+                    continue;
+                }
+                // And how far past the end of their boundary.
+                let mut beyond = 0.0f64;
+                for &j in near.iter().filter(|&&j| j != a && j != b) {
+                    for of in [a, b] {
+                        let past =
+                            (window.d2[of] - window.d2[j]) * t.pair(window, j, of).half_inverse;
+                        if past > beyond {
+                            beyond = past;
+                        }
+                    }
+                }
+                if beyond >= BOUNDARY_REACH {
+                    continue;
+                }
+                let over = match pair.boundary {
+                    Boundary::Convergent {
+                        first_over: false, ..
+                    } => -across,
+                    _ => across,
+                };
+                each(
+                    pair.boundary,
+                    over,
+                    1.0 - smoothstep(0.0, BOUNDARY_REACH, beyond),
+                );
+            }
+        }
     }
 }
 
@@ -415,7 +550,7 @@ fn lattice_cells(size: i64, terrane_blocks: i64) -> i64 {
 fn window_holds_every_belt(cell_x: f64, cell_z: f64) -> bool {
     let diagonal = (cell_x * cell_x + cell_z * cell_z).sqrt();
     (SEARCH as f64 + JITTER.0) * cell_x.min(cell_z)
-        > JITTER.1 * diagonal + 2.0 * BELT_HALF_WIDTH.max(COAST_REACH)
+        > JITTER.1 * diagonal + 2.0 * BOUNDARY_REACH.max(COAST_REACH)
 }
 
 /// A number in `[0, 1)` from a hash's top bits.
@@ -475,14 +610,15 @@ impl Tectonics {
         // A seed outside the inner nine cells is more than a cell away
         // along one axis.
         let inner =
-            (1.0 + JITTER.0) * t.cell_x.min(t.cell_z) - 2.0 * BELT_HALF_WIDTH.max(COAST_REACH);
+            (1.0 + JITTER.0) * t.cell_x.min(t.cell_z) - 2.0 * BOUNDARY_REACH.max(COAST_REACH);
         t.inner_enough = inner.max(0.0) * inner.max(0.0);
         for c in 0..n as u64 {
             let at = |salt: u64| JITTER.0 + (JITTER.1 - JITTER.0) * unit(t.hash(salt, c, 0));
             t.jitter.push((at(0x7EC7_0001), at(0x7EC7_0002)));
         }
-        let mut norm = 0.0;
-        for (k, (&wavelength, &weight)) in WARP_WAVELENGTHS.iter().zip(&WARP_WEIGHTS).enumerate() {
+        for (k, (&wavelength, &amplitude)) in
+            WARP_WAVELENGTHS.iter().zip(&WARP_AMPLITUDES).enumerate()
+        {
             let cells = |n: i64| ((n as f64 / wavelength + 0.5).floor() as i64).max(MIN_CELLS);
             let cells = (cells(nx) as usize, cells(nz) as usize);
             let at = |salt: u64, i: usize, j: usize| {
@@ -494,16 +630,16 @@ impl Tectonics {
                     (at(0x7EC7_0060, i, j), at(0x7EC7_0061, i, j))
                 })
                 .collect();
-            norm += weight;
+            // A small world cannot fit the longest waves (every lattice
+            // keeps three cells round an axis); the wave it gets instead
+            // is shorter, and must be that much shallower or it folds.
+            let fitted = (nx as f64 / cells.0 as f64).min(nz as f64 / cells.1 as f64) / wavelength;
             t.warp.push(Warp {
                 cells,
                 scale: (cells.0 as f64 / t.size_x, cells.1 as f64 / t.size_z),
-                weight,
+                weight: amplitude * fitted.min(1.0),
                 values,
             });
-        }
-        for octave in &mut t.warp {
-            octave.weight *= WARP_CELLS / norm;
         }
 
         // Plates: well-spread centres, grown outward unevenly.
@@ -564,7 +700,7 @@ impl Tectonics {
                 );
                 let other = (j * nx + i) as usize;
                 Pair {
-                    strength: t.boundary(c as u32, other as u32).belt_strength(),
+                    boundary: t.boundary(c as u32, other as u32),
                     half_inverse: t.half_inverse(c, other, di, dj),
                 }
             })
@@ -1113,7 +1249,7 @@ impl Tectonics {
             self.pairs[ta * WINDOW + ((dj + SEARCH) * SIDE as i64 + di + SEARCH) as usize]
         } else {
             Pair {
-                strength: self.boundary(ta as u32, tb as u32).belt_strength(),
+                boundary: self.boundary(ta as u32, tb as u32),
                 half_inverse: self.half_inverse(ta, tb, di, dj),
             }
         }
@@ -1170,33 +1306,15 @@ impl Tectonics {
     }
 
     /// How strongly mountains are raised at a column, in `[0, 1]`: the
-    /// strongest of the boundaries near it, each falling away across
-    /// [`BELT_HALF_WIDTH`] (ADR-0025 §4 — the envelope that replaces the
-    /// belt-gate noise).
-    ///
-    /// Every pair of terranes near the column is a candidate boundary,
-    /// and its line is the two seeds' bisector — which runs on for ever,
-    /// while the boundary itself stops where a third terrane comes
-    /// between the two. So each pair is also weighted by how far past
-    /// that end the column is: the most that any third terrane is nearer
-    /// than one of the pair, measured across *their* bisector. Without
-    /// that, belts would cross the insides of terranes; with it a belt
-    /// ends in a rounded cap at each junction.
-    ///
-    /// The field is continuous everywhere, and that takes care. Every
-    /// term is a property of a set of terranes and the column, never of
-    /// the order the terranes come in; and the terranes considered are
-    /// all those within two half-widths of being nearest — a terrane
-    /// farther than that can neither be half of a boundary that reaches
-    /// the column nor come between two that are (the continuity test
-    /// found both mistakes in simpler versions of this function).
+    /// strongest [`Boundary::belt`] of the boundaries near it (ADR-0025
+    /// §4 — the envelope that replaces the belt-gate noise). Continuous
+    /// everywhere: see [`Column::boundaries`].
     pub fn belt(&self, x: i64, z: i64) -> f64 {
-        let (x, z) = self.canonical(x, z);
-        self.envelope(&self.window(x, z, false))
+        self.column(x, z).belt()
     }
 
     /// One search of the mosaic for a column, for both
-    /// [`Tectonics::continentalness`] and [`Tectonics::belt`].
+    /// [`Tectonics::continentalness`] and the boundaries near it.
     pub fn column(&self, x: i64, z: i64) -> Column<'_> {
         let (x, z) = self.canonical(x, z);
         self.column_canonical(x, z)
@@ -1205,53 +1323,25 @@ impl Tectonics {
     /// [`Tectonics::column`] for a column already on the world's first
     /// lap, as the terrain's own are when it asks.
     pub(crate) fn column_canonical(&self, x: i64, z: i64) -> Column<'_> {
+        self.searched(x, z, false)
+    }
+
+    fn searched(&self, x: i64, z: i64, whole: bool) -> Column<'_> {
         Column {
             tectonics: self,
-            window: self.window(x, z, false),
+            window: self.window(x, z, whole),
         }
     }
 
     fn envelope(&self, window: &Window) -> f64 {
-        // The seeds within two half-widths of being nearest.
-        let limit = window.d2[window.first].sqrt() + 2.0 * BELT_HALF_WIDTH;
-        let limit = limit * limit;
-        let mut near = [0usize; WINDOW];
-        let mut count = 0;
-        for k in 0..WINDOW {
-            // Written every time and kept only if wanted: no branch.
-            near[count] = k;
-            count += usize::from(window.d2[k] < limit);
-        }
-        let near = &near[..count];
+        let column = Column {
+            tectonics: self,
+            window: Window { ..*window },
+        };
         let mut strongest = 0.0f64;
-        for (at, &a) in near.iter().enumerate() {
-            for &b in &near[at + 1..] {
-                let pair = self.pair(window, a, b);
-                if pair.strength <= strongest {
-                    continue;
-                }
-                // How far the column is from the line between the two.
-                let across = ((window.d2[b] - window.d2[a]) * pair.half_inverse).abs();
-                if across >= BELT_HALF_WIDTH {
-                    continue;
-                }
-                // And how far past the end of their boundary: the most
-                // that any third seed is nearer than either.
-                let mut beyond = 0.0f64;
-                for &j in near.iter().filter(|&&j| j != a && j != b) {
-                    for of in [a, b] {
-                        let past =
-                            (window.d2[of] - window.d2[j]) * self.pair(window, j, of).half_inverse;
-                        if past > beyond {
-                            beyond = past;
-                        }
-                    }
-                }
-                let here = (1.0 - smoothstep(0.0, BELT_HALF_WIDTH, across))
-                    * (1.0 - smoothstep(0.0, BELT_HALF_WIDTH, beyond));
-                strongest = strongest.max(pair.strength * here);
-            }
-        }
+        column.boundaries(|boundary, over, fade| {
+            strongest = strongest.max(boundary.belt(over) * fade);
+        });
         strongest
     }
 }
@@ -1687,14 +1777,14 @@ mod tests {
                         assert_eq!(belt, 0.0, "{where_}: a belt inside a terrane");
                     }
                     if site.edge < 2.0 {
-                        let strength = site.boundary.belt_strength();
+                        let strength = site.boundary.belt(0.0);
                         assert!(
-                            belt >= 0.999 * strength,
+                            belt >= strength - 0.01,
                             "{where_}: {belt} on a {strength} line"
                         );
                     }
                     assert!(
-                        (belt - last.1).abs() < 0.012,
+                        (belt - last.1).abs() < 0.03,
                         "{where_}: the belt jumps {} to {belt}",
                         last.1
                     );
@@ -1705,7 +1795,7 @@ mod tests {
                         t.terranes()[site.terrane as usize].crust
                     );
                     assert!(
-                        (inland - last.2).abs() < 2.0 * STEP as f64,
+                        (inland - last.2).abs() < 4.0 * STEP as f64,
                         "{where_}: continentalness jumps {} to {inland}",
                         last.2
                     );
@@ -1841,13 +1931,21 @@ mod tests {
         let (g, px, dir) = crate::map::tests::map_world();
         let shape = g.shape();
         let t = g.tectonics();
-        let step = shape.size_x() as f64 / f64::from(px);
-        let to_px = |x: f64, z: f64| (x / step, z / step);
+        // `WORLD_MAP_AT=x,z,span` maps a square of the world, not all.
+        let region: Vec<f64> = std::env::var("WORLD_MAP_AT")
+            .map(|s| s.split(',').filter_map(|v| v.trim().parse().ok()).collect())
+            .unwrap_or_default();
+        let (x0, z0, span) = match region[..] {
+            [x, z, span] => (x, z, span),
+            _ => (0.0, 0.0, shape.size_x() as f64),
+        };
+        let step = span / f64::from(px);
+        let to_px = |x: f64, z: f64| ((x - x0) / step, (z - z0) / step);
         let mut panels = [(); 3].map(|()| vec![0u8; (px * px * 3) as usize]);
         for j in 0..px {
-            let z = (f64::from(j) * step) as i64;
+            let z = (z0 + f64::from(j) * step) as i64;
             for i in 0..px {
-                let x = (f64::from(i) * step) as i64;
+                let x = (x0 + f64::from(i) * step) as i64;
                 let at = ((j * px + i) * 3) as usize;
                 let site = t.site(x, z);
                 let terrane = t.terranes()[site.terrane as usize];

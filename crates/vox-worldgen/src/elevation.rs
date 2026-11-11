@@ -17,6 +17,17 @@
 //!    rather than blobs.
 //! 4. [`Elevation::detail`] — local texture, scaled by relief.
 //!
+//! ## Where things are is the tectonic framework's (milestone 16, ADR-0025)
+//!
+//! Until generator version 9 the continents, the mountain belts and the
+//! trenches were each placed by a noise field of their own, and nothing
+//! was where it was for a reason. Now [`crate::tectonics`] places them:
+//! land is continental crust, ranges stand along collisions, arcs and old
+//! welds, a trench lies off every subduction zone, and the sea floor
+//! rises to a ridge where plates part. Every *shape* here — the coastal
+//! profile, the ridged ranges and their heights, relief, detail — is as
+//! ADR-0010 tuned it; what changed is the question "where?".
+//!
 //! Erosion and hydrology (a later milestone) slot in as another stage over
 //! this one's output. That is why the composition lives in one function
 //! instead of being smeared through `surface_height`.
@@ -44,15 +55,41 @@
 //! nothing, because there is nothing flat to contrast them against. Earth is
 //! mostly abyssal plain, shelf, steppe and lowland.
 
+use std::sync::Arc;
+
 use vox_core::{WORLD_Y_MAX_BLOCKS, WORLD_Y_MIN_BLOCKS, WorldShape};
+
+use crate::tectonics::{
+    BOUNDARY_REACH, Boundary, COAST_REACH, Convergence, PLATE_BLOCKS, Tectonics,
+};
 
 // --- Continental shape -----------------------------------------------------
 
-/// Wavelengths (blocks) of the continent field. The coarse octave sets
-/// continent size against a 200 000-block world; the fine one breaks up
-/// coastlines so they are not ellipses.
-const CONTINENT_WAVELENGTHS: [i64; 3] = [56_000, 21_000, 7_500];
-const CONTINENT_WEIGHTS: [f32; 3] = [1.0, 0.30, 0.09];
+/// Blocks of distance from the edge of continental crust per unit of the
+/// continent field, on the land side and on the sea side. The first is
+/// the slope the field had at a coast when it was noise (measured on
+/// version 8), so the rise from the shore to the lowlands is as wide as
+/// it was. The second is twice that: the noise field ran nearly level
+/// along many coasts and gave them broad shallows, and a field that is a
+/// distance cannot, so the shelf and slope are stretched instead — as
+/// far as they can be while the sea floor still reaches the abyss within
+/// the framework's reach.
+const COAST_BLOCKS_PER_UNIT: (f32, f32) = (23_000.0, 46_000.0);
+/// Wavelengths (blocks) of the noise that breaks the crust's edge into a
+/// coast: bays and headlands, and islands and inlets within a walk of the
+/// shore. The tectonic framework gives the outline at ten kilometres and
+/// up; these give it below that, so that a coast is not a polygon.
+const COAST_WAVELENGTHS: [i64; 3] = [6_100, 2_300, 850];
+const COAST_WEIGHTS: [f32; 3] = [1.0, 0.8, 0.5];
+/// How far that noise can move the field, in its own units — about 2 300
+/// blocks of coastline either way at the very most, a third of that
+/// typically.
+const COAST_NOISE: f32 = 0.10;
+/// The share of it left far from any coast. The framework's distance
+/// stops counting 3 500 blocks from the crust's edge; out there the field
+/// is a plateau, and noise at full strength could carry it back across
+/// the shoreline — lakes of sea in the heart of a continent.
+const COAST_NOISE_FAR: f32 = 0.3;
 
 /// Continent value at which land begins and at which it is fully inland. The
 /// gap is the coastal blend.
@@ -100,19 +137,43 @@ const ABYSSAL_DEPTH: f32 = 260.0;
 
 // --- Trenches --------------------------------------------------------------
 
-const TRENCH_WAVELENGTH: i64 = 6_000;
-/// Ridge value above which a trench forms. High, because trenches are rare.
-const TRENCH_THRESHOLD: f32 = 0.94;
-/// A second, independent low-frequency gate. A threshold on the ridge alone
-/// cannot make trenches rare AND wide — the band where a ridge exceeds a
-/// threshold is a fixed fraction of the map, so rarity has to be bought by
-/// narrowing it into a crack. Gating on a separate field instead restricts
-/// trenches to a few stretches of the line, leaving those stretches full width.
-const TRENCH_GATE_WAVELENGTH: i64 = 12_000;
-const TRENCH_GATE_LO: f32 = 0.56;
-const TRENCH_GATE_HI: f32 = 0.80;
+/// A trench lies on the plate going under, this far from the boundary's
+/// line (which is the edge of the overriding crust: a coast or an arc)
+/// and this wide either side of its axis. Far enough out to be in deep
+/// water, near enough to end within the framework's reach.
+const TRENCH_OFFSET: f32 = 2_200.0;
+const TRENCH_HALF_WIDTH: f32 = 800.0;
 /// Extra depth below the abyssal plain, in blocks.
 const TRENCH_EXTRA: f32 = 340.0;
+/// A trench, a ridge and a rift all vary along their length: this is the
+/// wavelength of that, and the least share of the full shape anywhere
+/// along it. Trenches have deeps and sills; rifts have lakes and dry
+/// floors.
+const ALONG_STRIKE_WAVELENGTH: i64 = 12_000;
+const ALONG_STRIKE_FLOOR: f32 = 0.4;
+
+// --- Ocean ridges and rifts (milestone 16) ---------------------------------
+
+/// Where two plates part under the sea, new floor is made hot and stands
+/// high, and sinks as it cools and moves away: a broad rise, steepest at
+/// the crest, falling as the square root of distance — the real curve.
+const RIDGE_RISE: f32 = 100.0;
+/// Along the crest runs the rift the plates are parting at: a valley this
+/// deep, this wide either side.
+const RIDGE_RIFT_DEPTH: f32 = 60.0;
+const RIDGE_RIFT_HALF_WIDTH: f32 = 300.0;
+/// Where a continent is being pulled apart, a strip of it drops between
+/// faults: a flat floor this wide either side of the line, walls out to
+/// the second distance, and the most and least the floor drops along its
+/// length. The deepest stretches go below sea level and hold long lakes.
+const RIFT_FLOOR_HALF_WIDTH: f32 = 380.0;
+const RIFT_WALL_HALF_WIDTH: f32 = 800.0;
+const RIFT_DEPTH: (f32, f32) = (30.0, 110.0);
+/// How far a rift's valley may wander from the boundary's line, blocks.
+const RIFT_WANDER: f32 = 900.0;
+/// The shoulders either side of a rift are pushed up as the floor goes
+/// down, and fall away over the rest of the framework's reach.
+const RIFT_SHOULDER: f32 = 60.0;
 
 // --- Relief ----------------------------------------------------------------
 
@@ -131,33 +192,32 @@ const OROGENY_WEIGHTS: [f32; 2] = [1.0, 0.25];
 /// rarity by narrowing them: only a thin strip near each ridge crest clears the
 /// bar, so the whole rise is crammed into a few thousand blocks and the flanks
 /// come out at 2:1. Rarity has to be bought somewhere that does not cost
-/// extent — see [`OROGENY_GATE_WAVELENGTH`].
+/// extent: the tectonic framework's belts (`tectonics::Boundary::belt`).
 const OROGENY_FLOOR: f32 = 0.42;
 
-/// An independent low-frequency gate on mountain building.
+/// Every world has mountains (M13, the owner's choice, 2026-11-01), and
+/// about as many as the terrain had when ADR-0010 tuned it (5.0–7.6% of
+/// land at the default size, version 8): at least this share of its land
+/// under ranges with [`RANGE_UPLIFT`] blocks of uplift or more, or its
+/// alpine biomes — and the rain shadows behind them — would be missing.
 ///
-/// This is where rarity is bought. Orogeny is a belt phenomenon — crust is
-/// being shortened along a few plate boundaries and nowhere else — so gating on
-/// a separate wide field restricts ranges to a handful of belts while leaving
-/// each belt its full width. Rare AND broad, which a threshold on the ridge
-/// field alone cannot give you.
-const OROGENY_GATE_WAVELENGTH: i64 = 13_000;
-const OROGENY_GATE_LO: f32 = 0.10;
-const OROGENY_GATE_HI: f32 = 0.52;
-
-/// Every world has mountains (M13, the owner's choice, 2026-11-01): at
-/// least this share of its land under ranges with [`RANGE_UPLIFT`] blocks of
-/// uplift or more, or its alpine biomes — and the rain shadows behind them —
-/// would be missing. Worlds of the default size and larger always have it
-/// (≥ 4.6% over 48 seeds), so they are untouched; a small world, whose
-/// mountain-belt field has only a few lattice cells around it, can miss its
-/// land entirely, and widens its belts until it has this much
-/// ([`Elevation::calibrate_ranges`]) — shrinking the room between ranges
-/// only where it is needed (`docs/vision.md` §1.1).
-const MIN_RANGE_SHARE: f32 = 0.025;
+/// Mountains stand where the tectonic framework's belts are
+/// (`tectonics::Boundary::belt`), and a world's belts are what its plates
+/// happened to do. A world short of ranges has its belts strengthened
+/// until it has this much ([`Elevation::calibrate_ranges`]): its old welds
+/// stand higher, as old ranges do where a continent is being squeezed
+/// again. A world with more keeps them.
+const MIN_RANGE_SHARE: f32 = 0.05;
 const RANGE_UPLIFT: f32 = 400.0;
-/// The most the belt gate may be lowered by.
-const MAX_GATE_SHIFT: f32 = 0.6;
+/// The most a world's belts may be strengthened by.
+const MAX_BELT_GAIN: f32 = 3.0;
+/// A strong belt has a spine: along its crest the ground is raised whether
+/// or not the ridged field is high there, by this share of the rest of
+/// the way to full uplift, times the square of the belt's strength. So a
+/// collision or an arc is one continuous range with passes in it — a
+/// cordillera — while an old weld, whose belt is weak, is left as the
+/// ridged field picks it out: separate worn-down massifs.
+const BELT_SPINE: f32 = 0.5;
 /// Uplift at full orogeny, in blocks. The ceiling a summit can reach, and only
 /// where the field saturates across a very wide region.
 pub(crate) const MAX_UPLIFT: f32 = 1_150.0;
@@ -223,22 +283,25 @@ impl Octave {
 }
 
 /// The elevation field for one world: its seed and its size.
-#[derive(Clone, Copy, Debug)]
+///
+/// `Clone`, cheaply: the tectonic framework is shared behind an `Arc`.
+#[derive(Clone, Debug)]
 pub struct Elevation {
     seed: u64,
     shape: WorldShape,
+    /// Where the continents, belts, trenches, ridges and rifts are
+    /// (milestone 16, ADR-0025).
+    tectonics: Arc<Tectonics>,
     /// Subtracted from the continent field so this world's land fraction lands
     /// on [`TARGET_LAND_FRACTION`]. See [`Elevation::calibrate_coastline`].
     continent_offset: f32,
-    /// Lowers the mountain-belt gate in a world that would otherwise have
-    /// too few ranges; 0 in almost every world. See [`MIN_RANGE_SHARE`].
-    gate_shift: f32,
-    continent: [Octave; 3],
+    /// Strengthens the mountain belts of a world that would otherwise have
+    /// too few ranges; 1 in most worlds. See [`MIN_RANGE_SHARE`].
+    belt_gain: f32,
+    coast: [Octave; 3],
     relief: [Octave; 2],
     orogeny: [Octave; 2],
-    orogeny_gate: Octave,
-    trench: Octave,
-    trench_gate: Octave,
+    along_strike: Octave,
     detail: [Octave; 3],
     /// Not part of the height: noise that lets biome boundaries wander
     /// (M13), kept here so it tiles with the world like every other field.
@@ -287,22 +350,26 @@ impl Elevation {
         let mut e = Self {
             seed,
             shape,
+            tectonics: Arc::new(Tectonics::new(seed, shape)),
             continent_offset: 0.0,
-            gate_shift: 0.0,
-            continent: CONTINENT_WAVELENGTHS.map(oct),
+            belt_gain: 1.0,
+            coast: COAST_WAVELENGTHS.map(oct),
             relief: RELIEF_WAVELENGTHS.map(oct),
             orogeny: OROGENY_WAVELENGTHS.map(oct),
-            orogeny_gate: oct(OROGENY_GATE_WAVELENGTH),
-            trench: oct(TRENCH_WAVELENGTH),
-            trench_gate: oct(TRENCH_GATE_WAVELENGTH),
+            along_strike: oct(ALONG_STRIKE_WAVELENGTH),
             detail: DETAIL_WAVELENGTHS.map(oct),
             boundary: BOUNDARY_WAVELENGTHS.map(oct),
             patch: PATCH_WAVELENGTHS.map(oct),
             meander: MEANDER_WAVELENGTHS.map(oct),
         };
         e.continent_offset = e.calibrate_coastline();
-        e.gate_shift = e.calibrate_ranges();
+        e.belt_gain = e.calibrate_ranges();
         e
+    }
+
+    /// The world's tectonic framework: what places everything here.
+    pub fn tectonics(&self) -> &Tectonics {
+        &self.tectonics
     }
 
     /// The continent-field shift that makes [`TARGET_LAND_FRACTION`] of this
@@ -313,6 +380,10 @@ impl Elevation {
     /// exceed. The coastline sits where [`coastal_profile`] crosses sea level —
     /// a fixed continent value, found once by bisection — so the offset moves
     /// the field until that crossing falls at the right quantile.
+    ///
+    /// The framework makes about that share of the world continental crust
+    /// to begin with (`tectonics::CONTINENTAL_SHARE`), so this moves the
+    /// shore a few hundred blocks, not a continent's width.
     ///
     /// Deterministic from the seed and size alone, so the chunk generator and
     /// the LOD sampler, which share this struct, always agree.
@@ -331,35 +402,40 @@ impl Elevation {
         samples[at] - shoreline_continent_value()
     }
 
-    /// The mountain-belt gate shift that gives this world at least
-    /// [`MIN_RANGE_SHARE`] of its land under ranges — 0 if it already has
-    /// that, which is almost every world, so their terrain is unchanged.
-    /// Bisection on a coarse grid, like the coastline; deterministic from
-    /// the seed and size.
+    /// The belt gain that gives this world at least [`MIN_RANGE_SHARE`] of
+    /// its land under ranges — 1 if it already has that. Bisection on a
+    /// coarse grid, like the coastline; deterministic from the seed and
+    /// size.
     fn calibrate_ranges(&self) -> f32 {
         let (sx, sz) = (self.shape.size_x(), self.shape.size_z());
-        let share = |shift: f32| {
-            let e = Self {
-                gate_shift: shift,
-                ..*self
-            };
-            let (mut land, mut ranges) = (0u32, 0u32);
-            for j in 0..CALIBRATION_GRID {
-                for i in 0..CALIBRATION_GRID {
-                    let s =
-                        e.surface_canonical(i * sx / CALIBRATION_GRID, j * sz / CALIBRATION_GRID);
-                    if s.height > 0 {
-                        land += 1;
-                        ranges += u32::from(s.uplift >= RANGE_UPLIFT);
-                    }
+        // What uplift is made from, at every land sample: the ridged
+        // field's share, and the framework's belt.
+        let mut land = Vec::new();
+        for j in 0..CALIBRATION_GRID {
+            for i in 0..CALIBRATION_GRID {
+                let (x, z) = (i * sx / CALIBRATION_GRID, j * sz / CALIBRATION_GRID);
+                let column = self.tectonics.column_canonical(x, z);
+                let c = self.continent_from(&column, x, z).0 - self.continent_offset;
+                let profile = coastal_profile(c);
+                if profile.base > 0.0 {
+                    land.push((self.ridged_c(x, z), profile.land, column.belt() as f32));
                 }
             }
-            ranges as f32 / land.max(1) as f32
-        };
-        if share(0.0) >= MIN_RANGE_SHARE {
-            return 0.0;
         }
-        let (mut lo, mut hi) = (0.0f32, MAX_GATE_SHIFT);
+        let share = |gain: f32| {
+            let ranges = land
+                .iter()
+                .filter(|&&(ridged, land, belt)| {
+                    let belt = (gain * belt).min(1.0);
+                    uplift(spined(ridged, belt) * land * belt) >= RANGE_UPLIFT
+                })
+                .count();
+            ranges as f32 / land.len().max(1) as f32
+        };
+        if share(1.0) >= MIN_RANGE_SHARE {
+            return 1.0;
+        }
+        let (mut lo, mut hi) = (1.0f32, MAX_BELT_GAIN);
         for _ in 0..12 {
             let mid = 0.5 * (lo + hi);
             if share(mid) >= MIN_RANGE_SHARE {
@@ -387,20 +463,15 @@ impl Elevation {
     }
 
     /// How large this world's continents are, against the default world's:
-    /// the coarsest continent octave's real wavelength over the default
-    /// size's. 1 at the default size; ~0.2 in the smallest world, where
-    /// every octave keeps at least three cells around the world (ADR-0012)
-    /// and continents shrink with it. Climate distances that are really
-    /// "how far into a continent" scale by this (ADR-0017).
+    /// the size of its plates over the default size's. 1 at the default
+    /// size and above (a plate is about [`PLATE_BLOCKS`] across wherever
+    /// there is room for more than three); ~0.34 in the smallest world,
+    /// whose three plates are all it can hold. Climate distances that are
+    /// really "how far into a continent" scale by this (ADR-0017).
     pub fn continent_scale(&self) -> f32 {
-        let wavelength = |size: i64, nx: u32| size as f32 / nx as f32;
-        let default = WorldShape::DEFAULT;
-        let here = wavelength(self.shape.size_x(), self.continent[0].nx);
-        let there = wavelength(
-            default.size_x(),
-            default.cells_around_x(CONTINENT_WAVELENGTHS[0]),
-        );
-        here / there
+        let area = self.shape.size_x() as f64 * self.shape.size_z() as f64;
+        let plate = (area / self.tectonics.plates().len() as f64).sqrt();
+        (plate / PLATE_BLOCKS as f64).min(1.0) as f32
     }
 
     /// Two independent noises in `[-1, 1]` for wandering biome boundaries
@@ -474,42 +545,90 @@ impl Elevation {
     /// The single composition point. Every stage feeds in here and nowhere
     /// else, so a future erosion pass has one place to attach.
     fn surface_canonical(&self, x: i64, z: i64) -> Surface {
-        let c = self.continent_c(x, z) - self.continent_offset;
+        let column = self.tectonics.column_canonical(x, z);
+        let (c, wander) = self.continent_from(&column, x, z);
+        let c = c - self.continent_offset;
         let CoastalProfile {
             mut base,
             land,
             deep,
         } = coastal_profile(c);
 
-        // Trenches: rare, linear, and only in genuinely deep water. Gated on
-        // `deep` so one cannot appear off a beach.
-        if deep > 0.0 {
-            let t = self.ridge(x, z, &self.trench);
-            let line = smoothstep01((t - TRENCH_THRESHOLD) / (1.0 - TRENCH_THRESHOLD));
-            if line > 0.0 {
-                let g = self.value_noise(x, z, &self.trench_gate);
-                let gate = smoothstep01((g - TRENCH_GATE_LO) / (TRENCH_GATE_HI - TRENCH_GATE_LO));
-                base -= line * gate * deep * TRENCH_EXTRA;
-            }
+        // What the boundaries near this column do to it: the mountain belt
+        // it is under, and — as heights — the trench, the ocean ridge or
+        // the rift it is in. The shelf, between land and deep water, has
+        // none of them, and is not asked.
+        let (mut belt, mut trench, mut ridge) = (0.0f32, 0.0f32, 0.0f32);
+        let (mut rift_floor, mut rift_shoulder) = (0.0f32, 0.0f32);
+        if land > 0.0 || deep > 0.0 {
+            column.boundaries(|boundary, over, fade| {
+                let (over, fade) = (over as f32, fade as f32);
+                belt = belt.max(boundary.belt(f64::from(over)) as f32 * fade);
+                match boundary {
+                    // The plate going under bends down into a trench off
+                    // the edge of the one above.
+                    Boundary::Convergent {
+                        kind: Convergence::ContinentalArc | Convergence::IslandArc,
+                        ..
+                    } => {
+                        let t = (-over - TRENCH_OFFSET) / TRENCH_HALF_WIDTH;
+                        trench = trench.max((1.0 - smoothstep01(t.abs())) * fade);
+                    }
+                    Boundary::Ridge => {
+                        let t = over.abs();
+                        let rise = RIDGE_RISE * (1.0 - (t / BOUNDARY_REACH as f32).sqrt());
+                        let cut =
+                            RIDGE_RIFT_DEPTH * (1.0 - smoothstep01(t / RIDGE_RIFT_HALF_WIDTH));
+                        ridge = ridge.max((rise - cut) * fade);
+                    }
+                    Boundary::Rift => {
+                        // The valley wanders either side of the line it
+                        // follows, by the noise that crinkles coasts: a
+                        // rift is a chain of basins, not a canal.
+                        let t = (over + wander * RIFT_WANDER).abs();
+                        let wall = smoothstep01(
+                            (t - RIFT_FLOOR_HALF_WIDTH)
+                                / (RIFT_WALL_HALF_WIDTH - RIFT_FLOOR_HALF_WIDTH),
+                        );
+                        let away = smoothstep01(
+                            (t - RIFT_WALL_HALF_WIDTH)
+                                / (BOUNDARY_REACH as f32 - RIFT_WALL_HALF_WIDTH),
+                        );
+                        // Down on the floor, up the wall to the shoulder,
+                        // then away to nothing.
+                        rift_floor = rift_floor.max((1.0 - wall) * fade);
+                        rift_shoulder = rift_shoulder.max(wall * (1.0 - away) * fade);
+                    }
+                    _ => {}
+                }
+            });
         }
+        // How much of a trench, a ridge's rift or a continental rift is
+        // here, of the most there could be: they vary along their length.
+        let along = if trench > 0.0 || rift_floor > 0.0 {
+            let n = self.value_noise(x, z, &self.along_strike) * 0.5 + 0.5;
+            ALONG_STRIKE_FLOOR + (1.0 - ALONG_STRIKE_FLOOR) * n
+        } else {
+            1.0
+        };
 
-        // Mountains. Cubing is the earned-by-extent rule: `orogeny` is
-        // low-frequency, so a high value implies a wide region, and cubing makes
-        // the payoff for width steep.
-        let massif = if land > 0.0 {
-            let raw = self.orogeny_c(x, z);
-            let g = self.value_noise(x, z, &self.orogeny_gate);
-            let lo = OROGENY_GATE_LO - self.gate_shift;
-            let belt = smoothstep01((g - lo) / (OROGENY_GATE_HI - OROGENY_GATE_LO));
-            let u = ((raw - OROGENY_FLOOR) / (1.0 - OROGENY_FLOOR)).clamp(0.0, 1.0) * land * belt;
-            // Squared smoothstep, not a raw cube. Both make high uplift rare,
-            // but a cube's slope keeps CLIMBING to the summit, so the crest
-            // ends up the steepest part of the mountain — and ridge noise puts
-            // a crease there already. Smoothstep flattens to zero slope at both
-            // ends: gentle foothills, a rounded crest, the steep ground in
-            // between where a mountain's steep ground belongs.
-            let shaped = smoothstep(u);
-            shaped * shaped * MAX_UPLIFT
+        // Sea floor: gated on `deep` so a trench cannot appear off a beach,
+        // nor a ridge stand on a shelf.
+        base += (ridge - trench * along * TRENCH_EXTRA) * deep;
+        // A rift's floor drops by an amount that varies along it; its
+        // shoulders stand the same all the way.
+        let rift_depth = lerp(
+            RIFT_DEPTH.0,
+            RIFT_DEPTH.1,
+            (along - ALONG_STRIKE_FLOOR) / (1.0 - ALONG_STRIKE_FLOOR),
+        );
+        base += (rift_shoulder * RIFT_SHOULDER - rift_floor * rift_depth) * land;
+
+        // Mountains: the ridged field, let through by the framework's
+        // belt. `uplift` is the earned-by-extent rule — see it.
+        let massif = if land > 0.0 && belt > 0.0 {
+            let belt = (self.belt_gain * belt).min(1.0);
+            uplift(spined(self.ridged_c(x, z), belt) * land * belt)
         } else {
             0.0
         };
@@ -544,7 +663,26 @@ impl Elevation {
     }
 
     fn continent_c(&self, x: i64, z: i64) -> f32 {
-        self.fbm(x, z, &self.continent, &CONTINENT_WEIGHTS)
+        self.continent_from(&self.tectonics.column_canonical(x, z), x, z)
+            .0
+    }
+
+    /// The continent field from a column's search of the framework: how
+    /// far inside continental crust it is, as the field's slope at a
+    /// coast, with the coast's own noise — which is what makes a shore of
+    /// a crust's edge. With the field comes that noise itself, in
+    /// `[-1, 1]`, for whatever else should wander as the coast does.
+    fn continent_from(&self, column: &crate::tectonics::Column, x: i64, z: i64) -> (f32, f32) {
+        let inland = column.continentalness() as f32;
+        let far = smoothstep01(inland.abs() / COAST_REACH as f32 * 2.0 - 1.0);
+        let wander = self.fbm(x, z, &self.coast, &COAST_WEIGHTS);
+        let noise = wander * COAST_NOISE * lerp(1.0, COAST_NOISE_FAR, far);
+        let per_unit = if inland >= 0.0 {
+            COAST_BLOCKS_PER_UNIT.0
+        } else {
+            COAST_BLOCKS_PER_UNIT.1
+        };
+        (inland / per_unit + noise, wander)
     }
 
     /// Stage 2 — how rough this region is, in `[0, 1]`, independent of height.
@@ -572,6 +710,12 @@ impl Elevation {
     /// isolated round lumps that read as noise rather than geology.
     pub fn orogeny(&self, x: i64, z: i64) -> f32 {
         self.orogeny_c(self.shape.canonical_x(x), self.shape.canonical_z(z))
+    }
+
+    /// [`Elevation::orogeny`] above its floor, as a share of the rest: what
+    /// uplift is made from, before the coast and the belt let it through.
+    fn ridged_c(&self, x: i64, z: i64) -> f32 {
+        ((self.orogeny_c(x, z) - OROGENY_FLOOR) / (1.0 - OROGENY_FLOOR)).clamp(0.0, 1.0)
     }
 
     fn orogeny_c(&self, x: i64, z: i64) -> f32 {
@@ -667,6 +811,26 @@ struct CoastalProfile {
     deep: f32,
 }
 
+/// Blocks of uplift for a share `u` of full mountain building.
+///
+/// Squared smoothstep, not a raw cube. Both make high uplift rare, but a
+/// cube's slope keeps CLIMBING to the summit, so the crest ends up the
+/// steepest part of the mountain — and ridge noise puts a crease there
+/// already. Smoothstep flattens to zero slope at both ends: gentle
+/// foothills, a rounded crest, the steep ground in between where a
+/// mountain's steep ground belongs. This is the earned-by-extent rule:
+/// the ridged field is low-frequency, so a high value implies a wide
+/// region, and squaring makes the payoff for width steep.
+fn uplift(u: f32) -> f32 {
+    let shaped = smoothstep(u);
+    shaped * shaped * MAX_UPLIFT
+}
+
+/// The ridged field with a belt's spine through it: see [`BELT_SPINE`].
+fn spined(ridged: f32, belt: f32) -> f32 {
+    ridged + (1.0 - ridged) * BELT_SPINE * belt * belt
+}
+
 fn coastal_profile(c: f32) -> CoastalProfile {
     let land = smoothstep01((c - COAST_LO) / (COAST_HI - COAST_LO));
     let sea = 1.0 - land;
@@ -759,11 +923,10 @@ pub(crate) fn mix64(mut z: u64) -> u64 {
 mod tests {
     use super::*;
 
-    /// Every world has ranges (M13): a small world short of them widens its
-    /// belts to the minimum, and a default-size world — which always has
-    /// enough — is untouched, so its terrain is exactly as before.
+    /// Every world has ranges (M13), of any size and whatever its plates
+    /// did: one short of them has its belts strengthened to the minimum.
     #[test]
-    fn every_world_has_mountain_ranges_and_only_small_ones_are_changed() {
+    fn every_world_has_mountain_ranges() {
         let range_share = |e: &Elevation| {
             let size = e.shape.size_x();
             let (mut land, mut ranges) = (0u32, 0u32);
@@ -778,28 +941,24 @@ mod tests {
             }
             ranges as f32 / land as f32
         };
-        let small = WorldShape::new(32_768, 32_768).unwrap();
-        let mut widened = 0;
-        for seed in 0..12u64 {
-            let e = Elevation::new(seed.wrapping_mul(0x9E37_79B9) ^ 0x7e22ac0de, small);
-            widened += u32::from(e.gate_shift > 0.0);
-            assert!(
-                range_share(&e) >= 0.6 * MIN_RANGE_SHARE,
-                "seed {seed}: {:.3} of land under ranges",
-                range_share(&e)
-            );
+        let mut strengthened = 0;
+        for size in [32_768, 65_536, WorldShape::DEFAULT.size_x()] {
+            let shape = WorldShape::new(size, size).unwrap();
+            for seed in 0..8u64 {
+                let e = Elevation::new(seed.wrapping_mul(0x9E37_79B9) ^ 0x7e22ac0de, shape);
+                strengthened += u32::from(e.belt_gain > 1.0);
+                assert!((1.0..=MAX_BELT_GAIN).contains(&e.belt_gain));
+                assert!(
+                    range_share(&e) >= 0.6 * MIN_RANGE_SHARE,
+                    "size {size}, seed {seed}: {:.3} of land under ranges (gain {})",
+                    range_share(&e),
+                    e.belt_gain
+                );
+            }
         }
-        assert!(
-            widened > 0,
-            "no small world needed widening: the test proves nothing"
-        );
-        for seed in [0x7e22ac0de, 1, 2, 3] {
-            let e = Elevation::new(seed, WorldShape::DEFAULT);
-            assert_eq!(
-                e.gate_shift, 0.0,
-                "seed {seed:#x} at the default size was changed"
-            );
-        }
+        // Most worlds have ranges enough from their plates alone; how many
+        // needed help is worth a line in the log.
+        eprintln!("{strengthened} of 24 worlds had their belts strengthened");
     }
 
     const SEED: u64 = 0x0007_E22A_C0DE;
@@ -1143,5 +1302,151 @@ mod tests {
             "the median 10 km walk spans only {median} blocks (need > {bound}) — \
              the world is monotonous"
         );
+    }
+
+    /// Tool: the numbers ADR-0010 tuned the terrain to, world by world —
+    /// what milestone 16 must hold while it moves where things are
+    /// (`cargo test -p vox-worldgen --release terrain_stats -- --ignored
+    /// --nocapture`; `SURVEY_SEEDS`, `WORLD_MAP_SIZE`).
+    ///
+    /// Sampled along east–west lines 16 blocks apart in x: land share;
+    /// the share of land under ranges and how uplift is spread over it;
+    /// land heights; how much ground a 3, 9 and 30-minute walk spans; how
+    /// wide a landmass, a sea, a range and the gap between ranges are;
+    /// how far the shore is from deep water and from the lowlands' full
+    /// height; and the share of the world in trenches.
+    #[test]
+    #[ignore]
+    fn terrain_stats() {
+        let env = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<i64>().ok());
+        let seeds = env("SURVEY_SEEDS").unwrap_or(6) as u64;
+        let size = env("WORLD_MAP_SIZE").unwrap_or(WorldShape::DEFAULT.size_x());
+        let shape = WorldShape::new(size, size).unwrap();
+        const STEP: i64 = 16;
+        let lines = 96i64;
+        let median = |v: &mut Vec<i64>| {
+            v.sort_unstable();
+            if v.is_empty() { 0 } else { v[v.len() / 2] }
+        };
+        let mean = |v: &[i64]| v.iter().sum::<i64>() as f64 / v.len().max(1) as f64;
+        println!(
+            "seed  land% | range% up>0 >100 >400 >800 | h50 h90 h99 max | walk 1k 3k 10k | flat% \
+             | landmass sea  range gap(mean) | shore>deep shore>low | trench%"
+        );
+        for seed in 0..seeds {
+            let seed = if seed == 0 { SEED } else { seed };
+            let e = Elevation::new(seed, shape);
+            let n = size / STEP;
+            let (mut land, mut total) = (0i64, 0i64);
+            let mut up = [0i64; 4];
+            let mut heights = Vec::new();
+            let mut walks = [Vec::new(), Vec::new(), Vec::new()];
+            let (mut flat, mut flat_of) = (0i64, 0i64);
+            let (mut land_runs, mut sea_runs, mut range_runs) =
+                (Vec::new(), Vec::new(), Vec::new());
+            let (mut ranges_met, mut land_length) = (0i64, 0i64);
+            let (mut to_deep, mut to_low) = (Vec::new(), Vec::new());
+            let mut trench = 0i64;
+            for line in 0..lines {
+                let z = line * size / lines + 37;
+                let row: Vec<Surface> = (0..n).map(|i| e.surface(i * STEP, z)).collect();
+                let at = |i: i64| row[i.rem_euclid(n) as usize];
+                // Start each line on a coast, so runs are whole.
+                let start = (0..n)
+                    .find(|&i| (at(i).height > 0) != (at(i - 1).height > 0))
+                    .unwrap_or(0);
+                let (mut run, mut range_run) = (0i64, 0i64);
+                for k in 0..n {
+                    let i = start + k;
+                    let s = at(i);
+                    let is_land = s.height > 0;
+                    total += 1;
+                    trench += i64::from((s.height as f32) < -(ABYSSAL_DEPTH + TRENCH_EXTRA * 0.5));
+                    if is_land != (at(i - 1).height > 0) && k > 0 {
+                        if is_land {
+                            sea_runs.push(run * STEP)
+                        } else {
+                            land_runs.push(run * STEP)
+                        }
+                        run = 0;
+                    }
+                    run += 1;
+                    if is_land != (at(i - 1).height > 0) {
+                        // A coast: how far out is deep water, how far in
+                        // the lowlands' full rise.
+                        let (out, inward) = if is_land { (-1, 1) } else { (1, -1) };
+                        let reach = |dir: i64, ok: &dyn Fn(i64) -> bool| {
+                            (0..n / 4)
+                                .find(|&d| ok(at(i + dir * d).height))
+                                .map(|d| d * STEP)
+                        };
+                        if let Some(d) = reach(out, &|h| h <= -130) {
+                            to_deep.push(d);
+                        }
+                        if let Some(d) = reach(inward, &|h| h >= 35) {
+                            to_low.push(d);
+                        }
+                    }
+                    if !is_land {
+                        continue;
+                    }
+                    land += 1;
+                    land_length += STEP;
+                    heights.push(s.height);
+                    for (slot, bar) in up.iter_mut().zip([0.5, 100.0, 400.0, 800.0]) {
+                        *slot += i64::from(s.uplift >= bar);
+                    }
+                    let in_range = s.uplift >= 200.0;
+                    if in_range {
+                        range_run += 1;
+                    } else if range_run > 0 {
+                        range_runs.push(range_run * STEP);
+                        ranges_met += 1;
+                        range_run = 0;
+                    }
+                    if k % 64 == 0 {
+                        flat_of += 1;
+                        flat += i64::from((at(i + 1).height - s.height).abs() <= 2);
+                        for (slot, span) in walks.iter_mut().zip([1_000, 3_000, 10_000]) {
+                            let (mut lo, mut hi) = (i64::MAX, i64::MIN);
+                            for j in 0..=span / STEP {
+                                let h = at(i + j).height;
+                                (lo, hi) = (lo.min(h), hi.max(h));
+                            }
+                            slot.push(hi - lo);
+                        }
+                    }
+                }
+            }
+            heights.sort_unstable();
+            let h = |q: f64| heights[((heights.len() - 1) as f64 * q) as usize];
+            let pct = |a: i64, b: i64| 100.0 * a as f64 / b.max(1) as f64;
+            println!(
+                "{:4x} {:5.1} | {:5.2} {:5.1} {:4.1} {:4.1} {:4.2} | {:3} {:3} {:4} {:4} | {:4} {:4} {:4} \
+                 | {:4.1} | {:6.0} {:6.0} {:5.0} {:6.0} | {:5} {:5} | {:.3}",
+                seed & 0xffff,
+                pct(land, total),
+                pct(up[2], land),
+                pct(up[0], land),
+                pct(up[1], land),
+                pct(up[2], land),
+                pct(up[3], land),
+                h(0.5),
+                h(0.9),
+                h(0.99),
+                h(1.0),
+                median(&mut walks[0]),
+                median(&mut walks[1]),
+                median(&mut walks[2]),
+                pct(flat, flat_of),
+                mean(&land_runs),
+                mean(&sea_runs),
+                mean(&range_runs),
+                land_length as f64 / ranges_met.max(1) as f64,
+                median(&mut to_deep),
+                median(&mut to_low),
+                pct(trench, total),
+            );
+        }
     }
 }

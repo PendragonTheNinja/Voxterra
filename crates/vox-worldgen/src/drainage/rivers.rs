@@ -318,6 +318,10 @@ impl DrainageMap {
         // levees had been built out across the open water — a dike (the
         // owner's walk): there only its channel is cut.
         let mut drowned = None;
+        // Whether the column is a braided river's dry bar, and the highest
+        // water any reach has within a block of it.
+        let mut on_bar = false;
+        let mut beside = f32::NEG_INFINITY;
         NEAR.with_borrow_mut(|near| {
             if (near.0, near.1, near.2) != (self.id, ci, cj) {
                 self.reaches_near(ci, cj, &mut near.3);
@@ -371,6 +375,9 @@ impl DrainageMap {
                 // The bank holds the water beside it — the highest within a
                 // few blocks upstream, where the profile steps down past it.
                 let held = reach.level_at(t - HELD_BACK / reach.len.max(1.0)).floor();
+                if out < 1.5 && !under && reach.kind != RiverKind::Wadi {
+                    beside = beside.max(held.max(level));
+                }
                 // Water is held by ground level with its surface; a bank a
                 // block above it raised flat ground beside every river into
                 // a little levee (the owner's walk).
@@ -420,6 +427,7 @@ impl DrainageMap {
                         RiverKind::Meandering => (Bed::Silt, false),
                     };
                     h = if bar { level } else { level - deep };
+                    on_bar = bar;
                     if under {
                         h = h.min(ground as f32);
                     }
@@ -433,6 +441,16 @@ impl DrainageMap {
                 }
             }
         });
+        // A bar is ground, and holds water as a bank does: it stands no
+        // lower than the water of ANY reach within a block of it — its
+        // own where the profile steps down past it, or the reach above's
+        // where that ends. A bar at its own river's level there left the
+        // higher water standing a block above it with nothing to hold it
+        // (found when milestone 16 moved the terrain under
+        // `water_is_never_held_by_air`).
+        if on_bar && drowned != Some(true) {
+            h = h.max(beside);
+        }
         if let Some((_, level, bed)) = best
             && drowned != Some(true)
         {
