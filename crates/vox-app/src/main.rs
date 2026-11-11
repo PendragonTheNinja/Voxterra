@@ -2256,7 +2256,18 @@ mod specks_scratch {
     #[ignore]
     fn bench_water_starts_on_the_default_world() {
         let g = vox_worldgen::Generator::new(0x7e22ac0de, WorldShape::default());
-        let (sx, sz) = (-19712, 20480);
+        // The bench starts where the game spawns (`App::new`); a fixed
+        // position here went stale when generator version 9 moved the land.
+        let (sx, sz) = vox_core::find_spawn(
+            WorldShape::default(),
+            0,
+            0,
+            SPAWN_SEARCH_STRIDE,
+            SPAWN_SEARCH_RINGS,
+            |x, z| g.surface_height(x, z) > vox_core::SEA_LEVEL_BLOCKS + 4,
+        )
+        .unwrap_or((0, 0));
+        println!("spawn ({sx}, {sz})");
         let path = (bench::SPRINT_SPEED * bench::SPRINT_SECS) as i64;
         let (rivers, fall) = bench_water_starts(&g, sx, sz, path, 40.0);
         println!("rivers {rivers:?}\nwaterfall {fall:?}");

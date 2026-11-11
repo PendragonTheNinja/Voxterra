@@ -15,3 +15,4 @@ shows.
 | `v8-v9-biomes-7e22ac0de.jpg` | task 2 | Its biomes, version 8 and 9 |
 | `v8-v9-rivers-7e22ac0de.jpg` | task 2 | Its rivers, version 8 and 9 (half resolution) |
 
+| `flight1-*.jpg` | task 2 (`e4b4beb`) | The owner's first flight on version 9 (2026-11-11), re-rendered headlessly from his `VIEW` lines (`specks`, full resolution, lit): **1** beach sand and a rocky-coast stone band following the shore's contours as smooth parallel curves; **2** shallow-sea sand meeting deep-ocean mud in one hard line on a steep slope; **3, 4** torrents running down mountain hillsides in straight one-block channels; **5** a river's banks built across a lake at exactly the lake's level, standing as green lines on the water; **6** the near LOD's colour and edge against full resolution; **7** a rift lake at sea level, 34 deep, its full-resolution water clear and its LOD water opaque |
