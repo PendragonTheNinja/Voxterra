@@ -19,6 +19,53 @@
 @group(3) @binding(4)
 var flow_tex: texture_2d<f32>;
 
+// --- Water darkens with depth (milestone 16's polish, the owner's first
+// version 9 flight: a flooded rift was as clear 100 blocks down as one block
+// down, `docs/gallery/m16/flight1-7-salt-lake.jpg`). The opaque world's
+// depth, copied after it is drawn, gives how far behind a water surface its
+// bed lies; light crossing that much water is absorbed (Beer–Lambert), so
+// shallows stay clear and deep water turns deep blue. Near and far alike,
+// since both water shaders call this.
+@group(3) @binding(5)
+var opaque_depth: texture_depth_2d;
+
+// Blocks of water that let through 1/e of the light from the bed; and the
+// colour deep water tends to, linear RGB.
+const WATER_CLARITY: f32 = 9.0;
+const DEEP_WATER: vec3<f32> = vec3<f32>(0.010, 0.040, 0.090);
+
+// Distance along the view axis for a depth value under reversed-Z
+// (ADR-0013): near at depth 1, far at 0.
+fn view_distance(depth: f32) -> f32 {
+    let n = sky.depth_range.x;
+    let f = sky.depth_range.y;
+    return n * f / (depth * (f - n) + n);
+}
+
+// How much water the eye looks through at this fragment, blocks along the
+// ray: from the surface to the bed behind it (or to the far plane, where
+// nothing is).
+fn water_depth(frag: vec4<f32>, world_rel: vec3<f32>) -> f32 {
+    if (sky.depth_range.y <= 0.0) {
+        return 0.0;
+    }
+    let bed = textureLoad(opaque_depth, vec2<i32>(frag.xy), 0);
+    let here = view_distance(frag.z);
+    let ray = length(world_rel - sky.cam_scale.xyz) / max(here, 1e-4);
+    return max(view_distance(bed) - here, 0.0) * ray;
+}
+
+// A water surface's colour and opacity once the water behind it has
+// absorbed its share: `c` is the surface as it would be over a bed right
+// beneath it.
+fn absorbed(c: vec4<f32>, thickness: f32) -> vec4<f32> {
+    let through = exp(-thickness / WATER_CLARITY);
+    return vec4<f32>(
+        mix(DEEP_WATER, c.rgb, through),
+        1.0 - (1.0 - c.a) * through,
+    );
+}
+
 // Mirrors: vox_core::registry::L_WATER, vox_render::FLOW_MAX (pinned by a
 // test).
 const WATER_LAYER: u32 = 8u;

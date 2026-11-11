@@ -84,6 +84,8 @@ struct SkyChunk {
     fullres: vec4<f32>,
     climate_a: vec4<f32>,
     climate_b: vec4<f32>,
+    // Near and far distances of the depth range (set_sky; flow.wgsl).
+    depth_range: vec4<f32>,
 };
 @group(3) @binding(0)
 var<uniform> sky: SkyChunk;
@@ -218,7 +220,11 @@ fn fs_lod_transparent(in: VsOut) -> @location(0) vec4<f32> {
     if (under_fullres(in.world_rel)) {
         discard;
     }
-    return vec4<f32>(lod_lit(in, tex.rgb), mix(tex.a, 1.0, grazing));
+    let c = vec4<f32>(lod_lit(in, tex.rgb), mix(tex.a, 1.0, grazing));
+    if (in.layer == WATER_LAYER && abs(normal.y) > 0.5) {
+        return absorbed(c, water_depth(in.clip_position, in.world_rel));
+    }
+    return c;
 }
 
 // Lighting and fog for a distant surface of colour `albedo`, shared by both

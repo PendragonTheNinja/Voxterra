@@ -58,6 +58,8 @@ struct SkyChunk {
     fullres: vec4<f32>,
     climate_a: vec4<f32>,
     climate_b: vec4<f32>,
+    // Near and far distances of the depth range (set_sky; flow.wgsl).
+    depth_range: vec4<f32>,
 };
 @group(3) @binding(0)
 var<uniform> sky: SkyChunk;
@@ -140,7 +142,13 @@ fn fs_transparent(in: VsOut) -> @location(0) vec4<f32> {
     let tex = water_sample(in.layer, in.uv, in.world_rel, normal);
     let to_eye = normalize(sky.cam_scale.xyz - in.world_rel);
     let grazing = pow(1.0 - abs(dot(normal, to_eye)), 5.0);
-    return vec4<f32>(lit(in, tex.rgb), mix(tex.a, 1.0, grazing));
+    let c = vec4<f32>(lit(in, tex.rgb), mix(tex.a, 1.0, grazing));
+    // Only a still surface looks down into water: a waterfall's sheet
+    // stands in front of a cliff, not over a bed.
+    if (in.layer == WATER_LAYER && abs(normal.y) > 0.5) {
+        return absorbed(c, water_depth(in.clip_position, in.world_rel));
+    }
+    return c;
 }
 
 // Lighting and fog for a surface of colour `albedo`, shared by both passes so
