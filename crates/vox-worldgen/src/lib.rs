@@ -1782,10 +1782,6 @@ mod tests {
         let d = g.drainage();
         let (nx, nz) = d.cells();
         let (cw, ch) = d.cell_blocks();
-        let pond = |x: i64, z: i64| {
-            let (_, w) = g.ground(x, z);
-            (w.body == Body::Lake).then_some(w.level)
-        };
         let (mut ponds, mut lines) = (0u32, Vec::new());
         let mut look = |x0: i64, z0: i64, span: i64| {
             for z in z0..z0 + span {
