@@ -313,13 +313,12 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   (`docs/milestones/15-landforms-by-climate.md`): **spec approved
   2026-11-03** — all five families; glacial landforms wherever last-ice-age
   ice lay; real cliffs, not all walkable (traversal is later gameplay);
-  dunes 6–30 high, 100–250 apart; dry lands first. No code yet. **Handoff (2026-11-04):** the landform catalogue (`docs/landforms.md`) is drafted and its five questions are answered (its *Decisions* section). **The catalogue was approved by the owner on 2026-11-10.** **Task 1 is done (2026-11-10):** the process-weight map (`vox_worldgen::process`, ADR-0023 proposed), not yet read by generation, so still `GENERATOR_VERSION` 8. Next, **in the owner's order (2026-11-10): milestone 16's task 2 comes before this milestone's task 2** (see *Geology* below); then the owner's M14 re-bench at version 8 on the audited build (the baseline), and task 2 (dry lands: dunes, benches, mesas, canyons) — see the spec's *Task 0 progress* note and ADR-0023's *Consequences* for task 2's first decision. Dune
+  dunes 6–30 high, 100–250 apart; dry lands first. No code yet. **Handoff (2026-11-04):** the landform catalogue (`docs/landforms.md`) is drafted and its five questions are answered (its *Decisions* section). **The catalogue was approved by the owner on 2026-11-10.** **Task 1 is done (2026-11-10):** the process-weight map (`vox_worldgen::process`, ADR-0023 proposed), not yet read by generation, so still `GENERATOR_VERSION` 8. Next, **in the owner's order (2026-11-10): milestone 16's task 2 comes before this milestone's task 2** (see *Geology* below); then task 2 (dry lands: dunes, benches, mesas, canyons). **The baseline is taken (2026-11-11):** `docs/bench/bench-1794373242.md`, version 8 on the audited build, and the owner's play-test of the audit changes was fine — see the spec's *Task 0 progress* note and ADR-0023's *Consequences* for task 2's first decision. Dune
   seas, mesas and canyons, glacial valleys and fjords, inselbergs, dissected
   humid hills, as height layers weighted by a stage-1 process map, applied
   before the drainage network so water still fits the ground (M14's lesson).
   Takes over M14's carried items: closed basins ~29% (Earth ~18%), shallow
-  valleys for large rivers. Task 0 starts with the owner re-benching M14 at
-  `GENERATOR_VERSION` 8 as the baseline. No low-end machine exists yet —
+  valleys for large rivers. No low-end machine exists yet —
   M12's spec says how to judge low-end performance by proxy.
 - **Last completed milestone:** 14 — Rivers, Lakes & Valleys (2026-11-03);
   retrospective at the end of `docs/milestones/14-rivers-lakes-and-valleys.md`,
@@ -373,8 +372,11 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   its first item is cost: one framework search per column is ~165 ns
   against ~112 ns for today's whole height, so it must be done per
   patch, not per column, before anything else.
-- **Open decision records (2026-11-10):** ADR-0022 (relight and mesh off
-  the frame — proposed, and gated on the owner's bench); ADR-0023
+- **Open decision records (2026-11-11):** ADR-0022 (relight and mesh off
+  the frame — proposed; **its gate is met** by the owner's bench: the two
+  passes hold the frame thread ~320 ms of every sprinting second and the
+  1% low is 72–77 fps against a median near 800 — worth building, not
+  urgent, and *when* is the owner's to choose); ADR-0023
   (landform processes — proposed, built as M15 task 1); ADR-0024 (block
   names in saves) is accepted and built; ADR-0025 (the tectonic
   framework) is proposed, its sections 1–3 built and corrected by the
