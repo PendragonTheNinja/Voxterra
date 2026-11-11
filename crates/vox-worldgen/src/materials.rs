@@ -19,6 +19,29 @@ use crate::biome::{Biome, Column};
 use crate::climate::SNOW_LINE_C;
 use crate::drainage::{Bed, Body};
 
+/// Depths, blocks, at which a seabed's sand or gravel gives way to silt,
+/// and silt to mud — waves sort a shelf's sediment, coarse near shore and
+/// finer outward (the owner's first version 9 flight: sand had met mud in
+/// one hard line where shallow sea became deep ocean, at 120). Each is
+/// moved up to [`SEABED_PATCH`] blocks either way by the surface-patch
+/// noise, so the bands are patches, not contour lines.
+const SILT_BELOW: f32 = 85.0;
+const MUD_BELOW: f32 = 175.0;
+const SEABED_PATCH: f32 = 35.0;
+
+/// The top of a seabed at its depth: `coarse` (the sea's own sand or
+/// gravel) near shore, silt beyond, mud in the deep.
+fn seabed(col: &Column, coarse: BlockId) -> BlockId {
+    let depth = -col.surface.height as f32 + SEABED_PATCH * col.patch;
+    if depth >= MUD_BELOW {
+        r::MUD
+    } else if depth >= SILT_BELOW {
+        r::SILT
+    } else {
+        coarse
+    }
+}
+
 /// No profile reaches deeper than this below the surface: below it every
 /// column is stone. Kept shallow on purpose — every block of it turns a
 /// layer of free uniform-stone chunks into classified mixed ones (24 cost a
@@ -101,11 +124,11 @@ pub fn block_in(col: &Column, wy: i64, strata: impl Fn(i64) -> BlockId) -> Block
     let p = col.patch;
     let pick = |cut: f32, above: BlockId, below: BlockId| if p > cut { above } else { below };
     match col.biome {
-        // --- Seabeds.
-        Biome::WarmShallowSea => layers(d, &[(r::SAND, 3), (r::SANDSTONE, 3)]),
-        Biome::TemperateSea => layers(d, &[(pick(0.3, r::GRAVEL, r::SAND), 3)]),
-        Biome::PolarSea => layers(d, &[(r::GRAVEL, 2)]),
-        Biome::DeepOcean => layers(d, &[(r::MUD, 1), (r::CLAY, 3)]),
+        // --- Seabeds, fining outward (`seabed`).
+        Biome::WarmShallowSea => layers(d, &[(seabed(col, r::SAND), 3), (r::SANDSTONE, 3)]),
+        Biome::TemperateSea => layers(d, &[(seabed(col, pick(0.3, r::GRAVEL, r::SAND)), 3)]),
+        Biome::PolarSea => layers(d, &[(seabed(col, r::GRAVEL), 2)]),
+        Biome::DeepOcean => layers(d, &[(seabed(col, r::SAND), 1), (r::CLAY, 3)]),
         // --- Water (M14): the body lays the top of a bed (river gravel,
         // sand or silt; silt; salt); these are what lies under it, and the
         // ground of the lowlands.

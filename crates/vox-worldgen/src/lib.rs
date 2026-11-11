@@ -1906,6 +1906,50 @@ mod tests {
         );
     }
 
+    /// The seabed fines outward (the owner's first version 9 flight,
+    /// `docs/gallery/m16/flight1-2-shore-drop.jpg`): sand and gravel near
+    /// shore, silt beyond, mud in the deep — as Earth's shelves are
+    /// sorted by the waves — never sand or gravel straight against mud.
+    /// They had met in one hard line where shallow sea became deep ocean.
+    #[test]
+    fn the_seabed_grades_from_sand_to_mud() {
+        use vox_core::registry as r;
+        let g = Generator::new(0x0007_E22A_C0DE, WorldShape::DEFAULT);
+        let size = WorldShape::DEFAULT.size_x();
+        let top = |x: i64, z: i64| {
+            let h = g.surface_height(x, z);
+            (h < -2).then(|| g.block_at(x, h, z))
+        };
+        let coarse = [r::SAND, r::GRAVEL];
+        let (mut beds, mut silt, mut seams) = (0u32, 0u32, Vec::new());
+        // Lines out from the coast: wherever a line crosses into the sea.
+        for k in 0..600i64 {
+            let z = k * 104_729 % size;
+            let x0 = k * 7_919 % size;
+            let mut last = top(x0, z);
+            for x in x0 + 1..x0 + 4_000 {
+                let here = top(x, z);
+                if let (Some(a), Some(b)) = (last, here) {
+                    beds += 1;
+                    silt += u32::from(b == r::SILT);
+                    if (coarse.contains(&a) && b == r::MUD) || (a == r::MUD && coarse.contains(&b))
+                    {
+                        seams.push((x, z, a, b));
+                    }
+                }
+                last = here;
+            }
+        }
+        eprintln!("{beds} seabed steps, {silt} silt, {} seams", seams.len());
+        assert!(beds > 100_000 && silt > 1_000, "{beds} beds, {silt} silt");
+        assert!(
+            seams.is_empty(),
+            "{} places where sand or gravel meets mud, e.g. {:?}",
+            seams.len(),
+            &seams[..seams.len().min(6)]
+        );
+    }
+
     /// The sea is only by the sea (the owner's third flight, M14): a lake at
     /// sea level in a hot desert, far from the coast, had a ring of "rocky
     /// coast" stone round it, coast and sea being classed by height alone;
@@ -2174,7 +2218,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (10, 0x56ac_fdb0_5454_0ef4);
+        const PINNED: (u32, u64) = (10, 0x16f0_ef61_040a_9ca0);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),
