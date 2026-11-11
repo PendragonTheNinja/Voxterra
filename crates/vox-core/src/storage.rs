@@ -6,6 +6,7 @@
 //! <world>/
 //!   world.meta            versioned metadata (magic, version, seed, world size,
 //!                         generator version)
+//!   blocks.table          the world's own block ids, by key (ADR-0024)
 //!   lod_edits.bin         the LOD's edit overlay (versioned; absent = none)
 //!   chunks/
 //!     c.<x>.<y>.<z>.vxc    one file per modified chunk
@@ -50,11 +51,14 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use crate::block::BlockId;
 use crate::chunk::{Chunk, ChunkDecodeError};
 use crate::coords::ChunkPos;
 use crate::lod::{EditedColumns, EditsDecodeError};
 use crate::planet::{WorldShape, WorldShapeError};
+use crate::registry::{BlockRegistry, M14_BLOCK_KEYS};
 
 const META_MAGIC: [u8; 4] = *b"VXTW";
 /// World-metadata format version. Independent of the chunk format version.
@@ -73,6 +77,84 @@ pub struct WorldStore {
     root: PathBuf,
     chunks_dir: PathBuf,
     meta: WorldMeta,
+    /// How this world numbers its blocks, against how this build does.
+    blocks: Arc<BlockTable>,
+}
+
+const BLOCKS_MAGIC: [u8; 4] = *b"VXTB";
+/// Block-table format version (`blocks.table`).
+pub const BLOCK_TABLE_VERSION: u8 = 1;
+
+/// A world's block ids and this build's, each way (ADR-0024).
+///
+/// A saved chunk stores numbers. Which block a number means is the WORLD's
+/// business, recorded once in `blocks.table` as a list of permanent keys;
+/// this build's registry may list its blocks in another order, or have
+/// more of them. Chunks are translated here, at the save layer, and
+/// nothing above it ever sees a world id.
+#[derive(Debug)]
+struct BlockTable {
+    /// World id → this build's id.
+    to_build: Vec<BlockId>,
+    /// This build's id → world id.
+    to_world: Vec<BlockId>,
+    /// The two numberings are the same: no chunk needs translating. True
+    /// for every world until the registry is first reordered.
+    identity: bool,
+}
+
+impl BlockTable {
+    /// Reconcile a world's keys (in world-id order) with a build's
+    /// registry. Returns the table and the world's keys as they must now
+    /// be saved: the same, with any block the build has and the world
+    /// lacked appended. An id, once given to a key, is never moved.
+    fn reconcile(
+        mut keys: Vec<String>,
+        registry: &BlockRegistry,
+    ) -> Result<(Self, Vec<String>), StoreError> {
+        if keys.first().map(String::as_str) != Some("air") {
+            return Err(StoreError::BadBlockTable); // id 0 is air, always
+        }
+        let mut to_build = Vec::with_capacity(keys.len());
+        let mut unknown = Vec::new();
+        for key in &keys {
+            match registry.id_of_key(key) {
+                Some(id) => to_build.push(id),
+                None => unknown.push(key.clone()),
+            }
+        }
+        if !unknown.is_empty() {
+            return Err(StoreError::UnknownBlocks(unknown));
+        }
+        // Two world keys naming one block (a key and its alias both in an
+        // old table) would make saving ambiguous; refuse rather than guess.
+        let mut to_world = vec![None; registry.len()];
+        for (world, build) in to_build.iter().enumerate() {
+            let slot = &mut to_world[build.0 as usize];
+            if slot.is_some() {
+                return Err(StoreError::BadBlockTable);
+            }
+            *slot = Some(BlockId(world as u16));
+        }
+        // Blocks this build has and the world has not met: next free ids.
+        for (build, slot) in to_world.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(BlockId(keys.len() as u16));
+                to_build.push(BlockId(build as u16));
+                keys.push(registry.key(BlockId(build as u16)).to_string());
+            }
+        }
+        let to_world: Vec<BlockId> = to_world.into_iter().flatten().collect();
+        let identity = to_build.iter().enumerate().all(|(i, b)| b.0 as usize == i);
+        Ok((
+            Self {
+                to_build,
+                to_world,
+                identity,
+            },
+            keys,
+        ))
+    }
 }
 
 /// What `world.meta` records about a world.
@@ -107,6 +189,13 @@ pub enum StoreError {
     },
     /// The recorded world size is not a legal size.
     BadShape(WorldShapeError),
+    /// `blocks.table` is not one, is truncated, or does not start with air.
+    BadBlockTable,
+    /// The world uses blocks this build does not have (their keys): it was
+    /// saved by a newer build, and this one must not save over them.
+    UnknownBlocks(Vec<String>),
+    /// A chunk holds a block id its world's table has no entry for.
+    UnknownBlockId(u16),
     /// A chunk file failed to decode.
     Chunk(ChunkDecodeError),
     /// The LOD edit overlay failed to decode.
@@ -132,6 +221,19 @@ impl std::fmt::Display for StoreError {
                  generates v{current}; opening it would mix old and new terrain"
             ),
             Self::BadShape(e) => write!(f, "corrupt world metadata: {e}"),
+            Self::BadBlockTable => write!(f, "corrupt block table (blocks.table)"),
+            Self::UnknownBlocks(keys) => write!(
+                f,
+                "this world uses blocks this build does not have ({}); it was saved by a \
+                 newer version of the game",
+                keys.join(", ")
+            ),
+            Self::UnknownBlockId(id) => {
+                write!(
+                    f,
+                    "a chunk holds block id {id}, which its world's table lacks"
+                )
+            }
             Self::Chunk(e) => write!(f, "chunk decode error: {e}"),
             Self::Edits(e) => write!(f, "LOD edit overlay: {e}"),
         }
@@ -158,11 +260,31 @@ impl WorldStore {
     ///   `new_world.generator_version`, which callers set to the current
     ///   build's generator; a mismatch is refused rather than opened wrongly.
     pub fn open(root: impl AsRef<Path>, new_world: WorldMeta) -> Result<Self, StoreError> {
+        Self::open_with_blocks(root, new_world, &BlockRegistry::default_set())
+    }
+
+    /// [`WorldStore::open`] against a given block registry: the world's
+    /// block table is reconciled with it (ADR-0024).
+    ///
+    /// - A new world records the registry's keys, in its order.
+    /// - A world with a table keeps its own numbering; chunks are
+    ///   translated on the way in and out. Blocks the registry has gained
+    ///   since are appended to the table, and the file rewritten, before
+    ///   any chunk can be saved with them.
+    /// - A world with no table predates them: its ids are M14's
+    ///   ([`M14_BLOCK_KEYS`]), and it is given the file now.
+    /// - A world using a block the registry lacks is refused, by key.
+    pub fn open_with_blocks(
+        root: impl AsRef<Path>,
+        new_world: WorldMeta,
+        registry: &BlockRegistry,
+    ) -> Result<Self, StoreError> {
         let root = root.as_ref().to_path_buf();
         let chunks_dir = root.join("chunks");
         let meta_path = root.join("world.meta");
+        let existed = meta_path.exists();
 
-        let meta = if meta_path.exists() {
+        let meta = if existed {
             let saved = read_meta(&meta_path)?;
             if saved.generator_version != new_world.generator_version {
                 return Err(StoreError::GeneratorMismatch {
@@ -177,10 +299,30 @@ impl WorldStore {
             new_world
         };
 
+        let table_path = root.join("blocks.table");
+        let saved: Option<Vec<String>> = match fs::read(&table_path) {
+            Ok(bytes) => Some(decode_block_table(&bytes)?),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(StoreError::Io(e)),
+        };
+        let keys = match &saved {
+            Some(keys) => keys.clone(),
+            // No table: a world from before ADR-0024 holds M14's ids; a
+            // brand-new one takes this build's.
+            None if existed => M14_BLOCK_KEYS.iter().map(|k| k.to_string()).collect(),
+            None => registry.keys().map(str::to_string).collect(),
+        };
+        let (blocks, keys) = BlockTable::reconcile(keys, registry)?;
+        if saved.as_ref() != Some(&keys) {
+            let tmp = table_path.with_extension("table.tmp");
+            fs::write(&tmp, encode_block_table(&keys))?;
+            fs::rename(&tmp, &table_path)?;
+        }
         Ok(Self {
             root,
             chunks_dir,
             meta,
+            blocks: Arc::new(blocks),
         })
     }
 
@@ -214,7 +356,20 @@ impl WorldStore {
     /// Persist a chunk to disk. Caller decides *whether* to save (e.g. only
     /// when `chunk.is_modified()`); this always writes when called.
     pub fn save_chunk(&self, pos: ChunkPos, chunk: &Chunk) -> Result<(), StoreError> {
-        let bytes = chunk.serialize();
+        // In the world's numbering (ADR-0024); the usual case is identity.
+        let bytes = if self.blocks.identity {
+            chunk.serialize()
+        } else {
+            // Every id a chunk can hold is the registry's, and the table
+            // covers the whole registry; an id beyond it reads as air does.
+            chunk.serialize_mapped(|b| {
+                self.blocks
+                    .to_world
+                    .get(b.0 as usize)
+                    .copied()
+                    .unwrap_or(BlockId::AIR)
+            })
+        };
         // Write to a temp file then rename, so a crash mid-write can't leave
         // a half-written chunk that fails to decode.
         let final_path = self.chunk_path(pos);
@@ -232,6 +387,16 @@ impl WorldStore {
         match fs::read(&path) {
             Ok(bytes) => {
                 let mut chunk = Chunk::deserialize(&bytes).map_err(StoreError::Chunk)?;
+                // From the world's numbering to this build's (ADR-0024).
+                // When they are the same the palette is left alone, but an
+                // id the table has no entry for is still refused.
+                let table = &self.blocks;
+                chunk
+                    .remap_blocks(|b| match table.to_build.get(b.0 as usize) {
+                        Some(_) if table.identity => Some(b),
+                        other => other.copied(),
+                    })
+                    .map_err(|b| StoreError::UnknownBlockId(b.0))?;
                 chunk.mark_modified();
                 Ok(Some(chunk))
             }
@@ -282,6 +447,43 @@ impl WorldStore {
             Err(e) => Err(StoreError::Io(e)),
         }
     }
+}
+
+/// `blocks.table`: magic, version, entry count (u16), then each key in
+/// world-id order as a length byte and that many ASCII bytes.
+fn encode_block_table(keys: &[String]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&BLOCKS_MAGIC);
+    out.push(BLOCK_TABLE_VERSION);
+    out.extend_from_slice(&(keys.len() as u16).to_le_bytes());
+    for key in keys {
+        out.push(key.len() as u8);
+        out.extend_from_slice(key.as_bytes());
+    }
+    out
+}
+
+fn decode_block_table(bytes: &[u8]) -> Result<Vec<String>, StoreError> {
+    let bad = || StoreError::BadBlockTable;
+    if bytes.len() < 7 || bytes[0..4] != BLOCKS_MAGIC || bytes[4] != BLOCK_TABLE_VERSION {
+        return Err(bad());
+    }
+    let count = u16::from_le_bytes([bytes[5], bytes[6]]) as usize;
+    let mut at = 7;
+    let mut keys = Vec::with_capacity(count);
+    for _ in 0..count {
+        let len = *bytes.get(at).ok_or_else(bad)? as usize;
+        let key = bytes.get(at + 1..at + 1 + len).ok_or_else(bad)?;
+        if len == 0 || !key.is_ascii() {
+            return Err(bad());
+        }
+        keys.push(String::from_utf8(key.to_vec()).map_err(|_| bad())?);
+        at += 1 + len;
+    }
+    if at != bytes.len() || keys.is_empty() {
+        return Err(bad());
+    }
+    Ok(keys)
 }
 
 fn write_meta(path: &Path, meta: &WorldMeta) -> Result<(), StoreError> {
@@ -575,5 +777,227 @@ mod tests {
             WorldStore::open(&dir.0, new_world(1)),
             Err(StoreError::BadMetaMagic)
         ));
+    }
+
+    // ---- A world remembers its blocks by name (ADR-0024) ----
+
+    /// A chunk holding one of each of `registry`'s first `n` blocks, along
+    /// a row, and what each cell's key is.
+    fn sampler(registry: &BlockRegistry, n: usize) -> (Chunk, Vec<&'static str>) {
+        let mut chunk = Chunk::new_air();
+        let mut keys = Vec::new();
+        for i in 0..n {
+            chunk.set(LocalPos::new(i as u8, 3, 7), BlockId(i as u16));
+            keys.push(registry.key(BlockId(i as u16)));
+        }
+        (chunk, keys)
+    }
+
+    /// The keys read back along the sampler's row, under `registry`.
+    fn keys_in(chunk: &Chunk, registry: &BlockRegistry, n: usize) -> Vec<&'static str> {
+        (0..n)
+            .map(|i| registry.key(chunk.get(LocalPos::new(i as u8, 3, 7))))
+            .collect()
+    }
+
+    /// The starter set in another order: air first (it must be), then the
+    /// rest reversed — every other block has a different id.
+    fn reordered() -> BlockRegistry {
+        let mut types = BlockRegistry::default_set().types();
+        types[1..].reverse();
+        BlockRegistry::from_types(types)
+    }
+
+    /// The whole point: the registry is reordered between a save and a
+    /// load, and every block is still the block it was.
+    #[test]
+    fn a_reordered_registry_loads_every_block_as_itself() {
+        let dir = TempDir::new("blocks_reorder");
+        let was = BlockRegistry::default_set();
+        let n = was.len();
+        let (chunk, keys) = sampler(&was, n);
+        let pos = ChunkPos::new(2, -1, 5);
+        WorldStore::open(&dir.0, new_world(1))
+            .unwrap()
+            .save_chunk(pos, &chunk)
+            .unwrap();
+
+        let now = reordered();
+        assert_ne!(
+            now.key(BlockId(1)),
+            was.key(BlockId(1)),
+            "the order really changed"
+        );
+        let store = WorldStore::open_with_blocks(&dir.0, new_world(1), &now).unwrap();
+        assert!(!store.blocks.identity);
+        let loaded = store.load_chunk(pos).unwrap().unwrap();
+        assert_eq!(keys_in(&loaded, &now, n), keys);
+
+        // Saved again by the reordered build, and read by the original: the
+        // file is still in the WORLD's numbering, whoever wrote it.
+        let mut edited = loaded;
+        edited.set(LocalPos::new(0, 9, 0), now.id_of_key("peat").unwrap());
+        store.save_chunk(pos, &edited).unwrap();
+        let back = WorldStore::open(&dir.0, new_world(1))
+            .unwrap()
+            .load_chunk(pos)
+            .unwrap()
+            .unwrap();
+        assert_eq!(keys_in(&back, &was, n), keys);
+        assert_eq!(was.key(back.get(LocalPos::new(0, 9, 0))), "peat");
+    }
+
+    /// A world from before worlds kept a table: its ids are M14's. It
+    /// opens, is given the table, and reads exactly as it did — also under
+    /// a build whose order has since changed.
+    #[test]
+    fn a_world_without_a_table_holds_m14_ids() {
+        let dir = TempDir::new("blocks_legacy");
+        let was = BlockRegistry::default_set();
+        let (chunk, keys) = sampler(&was, M14_BLOCK_KEYS.len());
+        let pos = ChunkPos::new(0, 0, 0);
+        WorldStore::open(&dir.0, new_world(1))
+            .unwrap()
+            .save_chunk(pos, &chunk)
+            .unwrap();
+        fs::remove_file(dir.0.join("blocks.table")).unwrap(); // as such a world is
+
+        let now = reordered();
+        let store = WorldStore::open_with_blocks(&dir.0, new_world(1), &now).unwrap();
+        let table = decode_block_table(&fs::read(dir.0.join("blocks.table")).unwrap()).unwrap();
+        assert_eq!(
+            table, M14_BLOCK_KEYS,
+            "given M14's table, not this build's order"
+        );
+        let loaded = store.load_chunk(pos).unwrap().unwrap();
+        assert_eq!(keys_in(&loaded, &now, keys.len()), keys);
+        // And under the unchanged build it is the identity: nothing to do.
+        fs::remove_file(dir.0.join("blocks.table")).unwrap();
+        assert!(
+            WorldStore::open(&dir.0, new_world(1))
+                .unwrap()
+                .blocks
+                .identity
+        );
+    }
+
+    /// A build that has gained blocks appends them to the world's table;
+    /// no id the world already used moves.
+    #[test]
+    fn new_blocks_are_appended_and_old_ids_never_move() {
+        let dir = TempDir::new("blocks_grow");
+        let full = BlockRegistry::default_set();
+        let early = BlockRegistry::from_types(full.types()[..20].to_vec());
+        let (chunk, keys) = sampler(&early, 20);
+        let pos = ChunkPos::new(1, 1, 1);
+        WorldStore::open_with_blocks(&dir.0, new_world(1), &early)
+            .unwrap()
+            .save_chunk(pos, &chunk)
+            .unwrap();
+        let before = decode_block_table(&fs::read(dir.0.join("blocks.table")).unwrap()).unwrap();
+        assert_eq!(before.len(), 20);
+
+        // The later build lists its new blocks FIRST (after air): the worst
+        // case for a format that trusted the order.
+        let mut types = full.types();
+        types[1..].rotate_right(6);
+        let later = BlockRegistry::from_types(types);
+        let store = WorldStore::open_with_blocks(&dir.0, new_world(1), &later).unwrap();
+        let after = decode_block_table(&fs::read(dir.0.join("blocks.table")).unwrap()).unwrap();
+        assert_eq!(after.len(), full.len());
+        assert_eq!(
+            &after[..20],
+            &before[..],
+            "ids already given are never moved"
+        );
+        let loaded = store.load_chunk(pos).unwrap().unwrap();
+        assert_eq!(keys_in(&loaded, &later, 20), keys);
+
+        // A chunk using a new block round-trips.
+        let mut with_new = Chunk::new_air();
+        with_new.set(LocalPos::new(4, 4, 4), later.id_of_key("peat").unwrap());
+        store.save_chunk(ChunkPos::new(9, 9, 9), &with_new).unwrap();
+        let back = store.load_chunk(ChunkPos::new(9, 9, 9)).unwrap().unwrap();
+        assert_eq!(later.key(back.get(LocalPos::new(4, 4, 4))), "peat");
+    }
+
+    /// A world using a block this build lacks is refused, by key — an old
+    /// build must not open, and then save over, a newer world. A block
+    /// that was renamed is not lacking: its alias finds it.
+    #[test]
+    fn unknown_blocks_refuse_by_name_and_aliases_resolve() {
+        let dir = TempDir::new("blocks_unknown");
+        let full = BlockRegistry::default_set();
+        let pos = ChunkPos::new(0, 0, 0);
+        let mut chunk = Chunk::new_air();
+        chunk.set(LocalPos::new(1, 1, 1), full.id_of_key("peat").unwrap());
+        WorldStore::open(&dir.0, new_world(1))
+            .unwrap()
+            .save_chunk(pos, &chunk)
+            .unwrap();
+
+        // A build without peat or mud.
+        let fewer: Vec<_> = full
+            .types()
+            .into_iter()
+            .filter(|t| t.key != "peat" && t.key != "mud")
+            .collect();
+        match WorldStore::open_with_blocks(&dir.0, new_world(1), &BlockRegistry::from_types(fewer))
+        {
+            Err(StoreError::UnknownBlocks(keys)) => assert_eq!(keys, ["mud", "peat"]),
+            other => panic!("expected the missing keys, got {other:?}"),
+        }
+
+        // A build where peat has been renamed "turf", with the alias.
+        let mut types = full.types();
+        types.iter_mut().find(|t| t.key == "peat").unwrap().key = "turf";
+        let renamed = BlockRegistry::from_types_with_aliases(types, vec![("peat", "turf")]);
+        let store = WorldStore::open_with_blocks(&dir.0, new_world(1), &renamed).unwrap();
+        let loaded = store.load_chunk(pos).unwrap().unwrap();
+        assert_eq!(renamed.key(loaded.get(LocalPos::new(1, 1, 1))), "turf");
+    }
+
+    /// Under the build that made it a world's numbering is the build's:
+    /// chunk files are byte-for-byte what they always were, and a damaged
+    /// table or an id beyond it is reported, never guessed at.
+    #[test]
+    fn the_unchanged_case_is_the_identity_and_damage_is_refused() {
+        let dir = TempDir::new("blocks_identity");
+        let registry = BlockRegistry::default_set();
+        let store = WorldStore::open(&dir.0, new_world(1)).unwrap();
+        assert!(store.blocks.identity);
+        let (chunk, _) = sampler(&registry, registry.len());
+        let pos = ChunkPos::new(3, 3, 3);
+        store.save_chunk(pos, &chunk).unwrap();
+        let on_disk = fs::read(store.chunk_path(pos)).unwrap();
+        assert_eq!(on_disk, chunk.serialize(), "no translation: the same bytes");
+        let table = fs::read(dir.0.join("blocks.table")).unwrap();
+        assert_eq!(decode_block_table(&table).unwrap(), M14_BLOCK_KEYS);
+        assert_eq!(
+            encode_block_table(&decode_block_table(&table).unwrap()),
+            table
+        );
+
+        // A chunk naming an id past the table's end.
+        let mut alien = Chunk::new_air();
+        alien.set(LocalPos::new(0, 0, 0), BlockId(4_000));
+        fs::write(store.chunk_path(ChunkPos::new(8, 8, 8)), alien.serialize()).unwrap();
+        assert!(matches!(
+            store.load_chunk(ChunkPos::new(8, 8, 8)),
+            Err(StoreError::UnknownBlockId(4_000))
+        ));
+
+        // A truncated table, a table of nothing, a table not starting with air.
+        for bad in [
+            &table[..table.len() - 3],
+            &table[..5],
+            b"VXTB\x01\x01\x00\x05stone".as_slice(),
+        ] {
+            fs::write(dir.0.join("blocks.table"), bad).unwrap();
+            assert!(matches!(
+                WorldStore::open(&dir.0, new_world(1)),
+                Err(StoreError::BadBlockTable)
+            ));
+        }
     }
 }

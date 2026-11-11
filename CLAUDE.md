@@ -272,6 +272,11 @@ authoritative.
   `crates/vox-core/src/lib.rs` (`pub use light::{…}`). Any new `pub fn` that
   `vox-app` calls must be added there; the sandbox can't catch the omission
   because it never compiles `vox-app`.
+- **A new block needs a permanent `key`** (ADR-0024), and
+  `M14_BLOCK_KEYS` is frozen: it is the block table of every world saved
+  before worlds kept one. Never reorder or edit it; append new blocks to
+  the registry after it. A renamed block keeps its key or gets an entry
+  in `KEY_ALIASES`; a block is never removed without one.
 - **Verify file writes by reading back.** A generation script that reports
   success but skips the actual write has shipped a mismatched signature.
 - `NEIGHBOR_OFFSETS.iter()` yields `&(i64,i64,i64)`; arithmetic auto-derefs
@@ -308,13 +313,12 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   (`docs/milestones/15-landforms-by-climate.md`): **spec approved
   2026-11-03** — all five families; glacial landforms wherever last-ice-age
   ice lay; real cliffs, not all walkable (traversal is later gameplay);
-  dunes 6–30 high, 100–250 apart; dry lands first. No code yet. **Handoff (2026-11-04):** the landform catalogue (`docs/landforms.md`) is drafted and its five questions are answered (its *Decisions* section). **The catalogue was approved by the owner on 2026-11-10.** **Task 1 is done (2026-11-10):** the process-weight map (`vox_worldgen::process`, ADR-0023 proposed), not yet read by generation, so still `GENERATOR_VERSION` 8. Next: the owner's M14 re-bench at version 8 on the audited build (the baseline), and task 2 (dry lands: dunes, benches, mesas, canyons) — see the spec's *Task 0 progress* note and ADR-0023's *Consequences* for task 2's first decision. Dune
+  dunes 6–30 high, 100–250 apart; dry lands first. No code yet. **Handoff (2026-11-04):** the landform catalogue (`docs/landforms.md`) is drafted and its five questions are answered (its *Decisions* section). **The catalogue was approved by the owner on 2026-11-10.** **Task 1 is done (2026-11-10):** the process-weight map (`vox_worldgen::process`, ADR-0023 proposed), not yet read by generation, so still `GENERATOR_VERSION` 8. Next, **in the owner's order (2026-11-10): milestone 16's task 2 comes before this milestone's task 2** (see *Geology* below); then task 2 (dry lands: dunes, benches, mesas, canyons). **The baseline is taken (2026-11-11):** `docs/bench/bench-1794373242.md`, version 8 on the audited build, and the owner's play-test of the audit changes was fine — see the spec's *Task 0 progress* note and ADR-0023's *Consequences* for task 2's first decision. Dune
   seas, mesas and canyons, glacial valleys and fjords, inselbergs, dissected
   humid hills, as height layers weighted by a stage-1 process map, applied
   before the drainage network so water still fits the ground (M14's lesson).
   Takes over M14's carried items: closed basins ~29% (Earth ~18%), shallow
-  valleys for large rivers. Task 0 starts with the owner re-benching M14 at
-  `GENERATOR_VERSION` 8 as the baseline. No low-end machine exists yet —
+  valleys for large rivers. No low-end machine exists yet —
   M12's spec says how to judge low-end performance by proxy.
 - **Last completed milestone:** 14 — Rivers, Lakes & Valleys (2026-11-03);
   retrospective at the end of `docs/milestones/14-rivers-lakes-and-valleys.md`,
@@ -330,8 +334,9 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   rivers as ribbons, reservoirs with the water simulation.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 301, vox-mesh 71, vox-worldgen 81, vox-render 21, vox-app 18
-  passing (288, 72 and 11 before the 2026-11 audit), plus the ignored
+  vox-core 306, vox-mesh 71, vox-worldgen 96, vox-render 21, vox-app 18
+  passing (288, 72 and 11 before the 2026-11 audit; worldgen was 81
+  before the tectonic framework), plus the ignored
   `every_biome_in_every_world` and `biome_survey`, run in release), then
   start the first unchecked item.
 - **Code audit, 2026-11-09:** `docs/notes/code-audit-2026-11.md` — what was
@@ -341,21 +346,41 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   packages with an order; they are proposals until the owner picks them.
   **Done since:** A1 (the world pipeline is `session.rs`, with six system
   tests) and D1 (ADR-0021 accepted; one edit path). Still the owner's to
-  decide: D2 (world versions). D3 (block names in saves) is approved in
-  principle and needs its ADR.
-- **Geology is designed, not built (2026-11-10, draft for the owner's
-  review):** `docs/geology.md` — the checklist a geologist would test the
+  decide: D2 (world versions). D3 (block names in saves) is done
+  (ADR-0024).
+- **Geology is designed and agreed, not built (2026-11-10):** `docs/geology.md` — the checklist a geologist would test the
   world against, the plate-framework decision, provinces, six ages, strata
   in structural coordinates, the rock catalogue, caves, mineral systems,
   and the five milestones it becomes — and the draft spec for the first,
-  `docs/milestones/16-tectonics-and-bedrock.md`. Six questions for the
-  owner at the end of `geology.md`; the first (how the terrain gets a
-  tectonic cause) decides the shape of milestone 16. It follows M15.
-- **Open decision records (2026-11-10):** ADR-0022 (relight and mesh off
-  the frame — proposed, and gated on the owner's bench); ADR-0023
+  `docs/milestones/16-tectonics-and-bedrock.md`. The owner answered all
+  of its questions (§16): the terrain gets a plate framework (ADR-0025,
+  proposed: terranes at walking scale, plates at world scale, replacing
+  the noise *gates* and keeping ADR-0010's shapes); caves only where
+  Earth has them; a floor of heat and plastic rock instead of bedrock;
+  every tunable a per-world option. **The order of work is his
+  (2026-11-10): milestone 16's tasks 1–2 (the framework, then terrain
+  placed by it) FIRST, then M15's tasks 2–6, then the rest of milestone
+  16** — so landforms are tuned once, on the terrain they ship on.
+  **Milestone 16 task 1 is done (2026-11-11):** the tectonic framework,
+  `vox_worldgen::tectonics` (`Generator::tectonics()`) — terranes,
+  plates, continents grown from cratons, every boundary's kind, the
+  `continentalness` and `belt` fields — with fifteen tests and four
+  tools (`tectonics_map`, `tectonics_survey`, `belt_jump_scan`,
+  `tectonics_cost`); map in `docs/gallery/m16/`. **Nothing in generation
+  reads it, so still `GENERATOR_VERSION` 8.** Next is task 2 (terrain
+  placed by it); the spec's *Task 1 as built* says where it starts, and
+  its first item is cost: one framework search per column is ~165 ns
+  against ~112 ns for today's whole height, so it must be done per
+  patch, not per column, before anything else.
+- **Open decision records (2026-11-11):** ADR-0022 (relight and mesh off
+  the frame — proposed; **its gate is met** by the owner's bench: the two
+  passes hold the frame thread ~320 ms of every sprinting second and the
+  1% low is 72–77 fps against a median near 800 — worth building, not
+  urgent, and *when* is the owner's to choose); ADR-0023
   (landform processes — proposed, built as M15 task 1); ADR-0024 (block
-  names in saves — approved in principle, not built, wanted before
-  geology's first block).
+  names in saves) is accepted and built; ADR-0025 (the tectonic
+  framework) is proposed, its sections 1–3 built and corrected by the
+  building (its *As built*), to be accepted with milestone 16 task 2.
 - **Instruments (from M11):** the P key logs a `VIEW` line (exact position,
   angles, window, settings) and a `hole_census` — the frame re-rendered six
   ways on the player's GPU with pinholes counted per variant. In the cloud

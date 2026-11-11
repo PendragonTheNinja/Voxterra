@@ -1,9 +1,11 @@
 # ADR-0024: A world remembers its blocks by name
 
-- **Status:** Accepted in principle by the owner (2026-11-10: "If this is
-  important and good for the game in the long run, I'm all for it"); the
-  design below is proposed and not yet built. Backlog package D3; audit
-  finding D3. **To be built before geology adds its blocks.**
+- **Status:** Accepted and built (2026-11-10). The owner: "If this is
+  important and good for the game in the long run, I'm all for it", and on
+  the design, "Sure, important step." Backlog package D3; audit finding
+  D3. Built in `vox-core` (`registry.rs`: `BlockType::key`,
+  `M14_BLOCK_KEYS`, `KEY_ALIASES`; `storage.rs`: `blocks.table`,
+  `WorldStore::open_with_blocks`), with the five tests listed below.
 - **Context:** A saved chunk stores numeric `BlockId`s, and a `BlockId` is
   an index into the registry's list (`vox_core::registry`). The list's
   order is therefore part of the save format, protected only by a comment

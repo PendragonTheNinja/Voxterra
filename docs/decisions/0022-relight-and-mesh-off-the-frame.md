@@ -1,8 +1,9 @@
 # ADR-0022: Relight and mesh results arrive over channels
 
-- **Status:** Proposed (2026-11-10). **Not to be built until the owner's
-  `--bench` on the audited build says it is needed** — see *The gate*.
-  Backlog package P1; audit finding P1.
+- **Status:** Proposed (2026-11-10). **The gate is met** (owner's
+  `--bench`, 2026-11-11 — see *The gate, measured*): the numbers say
+  build it. *When* is the owner's to choose; it is not accepted until he
+  does. Backlog package P1; audit finding P1.
 - **Context:** Each frame the session hands a batch of chunks to a thread
   pool to relight, waits for it, applies the results, then does the same
   for meshing (`Session::tick`; `relight_chunks_parallel`,
@@ -31,6 +32,32 @@ Build this if wall is more than a few percent of the second *and* the
 worst-frame or 1%-low columns show it (a blocked batch is a long frame).
 If wall is ~20 ms/s at 700 fps, this is a large change for a result nobody
 could see, and the performance milestone's GPU work (P2–P5) comes first.
+
+## The gate, measured (2026-11-11)
+
+`docs/bench/bench-1794373242.md`, the owner's RTX 4060, sprint phases:
+
+| | Relight | Mesh | Both |
+|---|---|---|---|
+| **Wall**, ms of the frame thread per second | 76–95 | 221–240 | **300–335** |
+| **Work**, CPU ms per second (count × µs per chunk) | 343–465 | 406–479 | 750–940 |
+
+- **Wall is a third of every second**, not "a few percent".
+- **The frame columns show it:** median 786–866 fps (1.2 ms a frame),
+  1% low 72–77 fps (13–14 ms), worst frame 31–46 ms. One frame in a
+  hundred is ten times the median, and the passes' budgets (3 ms + 4 ms,
+  checked only between sub-batches) are the size of that gap.
+- **Meshing gets about 2× from the pool and relight about 5×** (work ÷
+  wall). Not traced; decision 3 moves the snapshot build to the worker,
+  which is where the serial part is most likely to be.
+
+Both halves of the gate hold, so this is worth building. It is not
+urgent on this machine — the 1% low is still above 70 fps — and matters
+most on the low-end hardware the project has not got yet, where the same
+work is spread over fewer cores. The audit's own changes are confirmed
+by the same report: relight's wall time halved (157–196 → 76–95 ms/s),
+sprint fps up 10–20%, and the sprint backlog now drains to 0 where it
+ended at ~230.
 
 ## Decision (proposed)
 

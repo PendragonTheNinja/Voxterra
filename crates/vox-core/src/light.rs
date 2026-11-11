@@ -1825,6 +1825,7 @@ mod tests {
         let mut types: Vec<BlockType> = (0..9).map(|i| d.get(BlockId(i)).clone()).collect();
         let mut glass = d.get(BlockId(1)).clone();
         glass.name = "glass";
+        glass.key = "glass";
         glass.opaque = false;
         types.push(glass);
         (BlockRegistry::from_types(types), BlockId(9))

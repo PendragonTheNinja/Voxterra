@@ -42,7 +42,7 @@ pub use planet::{
 pub use raycast::{RayHit, cell_overlaps_aabb, raycast_blocks, raycast_voxels};
 pub use registry::{BlockRegistry, BlockType};
 pub use settings::Settings;
-pub use storage::{StoreError, WORLD_META_VERSION, WorldMeta, WorldStore};
+pub use storage::{BLOCK_TABLE_VERSION, StoreError, WORLD_META_VERSION, WorldMeta, WorldStore};
 pub use streaming::{
     ColumnWindow, MAX_RESIDENT_RADIUS, SpanCache, StreamConfig, StreamUpdate, Streamer,
     UNLOAD_MARGIN_CHUNKS, nearest_first,

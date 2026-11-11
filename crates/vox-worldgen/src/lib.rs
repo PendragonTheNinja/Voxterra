@@ -26,6 +26,7 @@ pub mod elevation;
 mod map;
 pub mod materials;
 pub mod process;
+pub mod tectonics;
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -76,6 +77,9 @@ pub struct Generator {
     drainage: Arc<OnceLock<DrainageMap>>,
     /// Stage-1 landform processes (M15, ADR-0023), built on first use.
     process: Arc<OnceLock<process::ProcessMap>>,
+    /// The tectonic framework (milestone 16, ADR-0025): a table over a few
+    /// hundred terranes, so it is built with the generator.
+    tectonics: Arc<tectonics::Tectonics>,
     /// Recently generated chunk columns' ground, shared by every clone
     /// ([`GroundCache`]): a speed-up only, never a source of truth.
     grounds: Arc<GroundCache>,
@@ -285,8 +289,17 @@ impl Generator {
             climate: Arc::new(OnceLock::new()),
             drainage: Arc::new(OnceLock::new()),
             process: Arc::new(OnceLock::new()),
+            tectonics: Arc::new(tectonics::Tectonics::new(seed, shape)),
             grounds: Arc::new(GroundCache::default()),
         }
+    }
+
+    /// The world's tectonic framework (milestone 16, ADR-0025): its
+    /// terranes and plates, and what every boundary between them is.
+    /// Nothing in generation reads it yet — milestone 16's task 2 places
+    /// the continents, mountain belts and trenches by it.
+    pub fn tectonics(&self) -> &tectonics::Tectonics {
+        &self.tectonics
     }
 
     /// The world's landform-process map (M15, ADR-0023): where wind, flash

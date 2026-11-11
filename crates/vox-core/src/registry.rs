@@ -52,7 +52,12 @@ pub mod face {
 /// Definition of one block type.
 #[derive(Debug, Clone)]
 pub struct BlockType {
-    /// Human-readable name (debug/UI/logging).
+    /// The block's PERMANENT key (ADR-0024): what a saved world knows it by.
+    /// Short, lowercase, never changed once a world has been saved with it —
+    /// a block that is renamed keeps its key, or lists the old one in
+    /// [`KEY_ALIASES`]. Not for display.
+    pub key: &'static str,
+    /// Human-readable name (debug/UI/logging). May change freely.
     pub name: &'static str,
     /// PHYSICAL: stops the player, can be targeted and broken, and counts as
     /// the terrain top. See the module docs for which property to ask.
@@ -77,6 +82,7 @@ impl BlockType {
     /// A block with the same texture layer on all six faces.
     const fn uniform(name: &'static str, layer: u32, color: [f32; 3]) -> Self {
         Self {
+            key: "",
             name,
             solid: true,
             opaque: true,
@@ -91,6 +97,7 @@ impl BlockType {
     const fn tsb(name: &'static str, top: u32, side: u32, bottom: u32, color: [f32; 3]) -> Self {
         // Order: +X, -X, +Y(top), -Y(bottom), +Z, -Z.
         Self {
+            key: "",
             name,
             solid: true,
             opaque: true,
@@ -104,6 +111,7 @@ impl BlockType {
     /// A uniform-textured block that emits block light (e.g. a lamp).
     const fn emitter(name: &'static str, layer: u32, color: [f32; 3], emission: u8) -> Self {
         Self {
+            key: "",
             name,
             solid: true,
             opaque: true,
@@ -118,6 +126,7 @@ impl BlockType {
     /// undimmed (M10), and stops nobody — the player falls to the seabed.
     fn water() -> Self {
         Self {
+            key: "",
             name: "water",
             solid: false,
             opaque: false,
@@ -130,6 +139,7 @@ impl BlockType {
 
     fn air() -> Self {
         Self {
+            key: "",
             name: "air",
             solid: false,
             opaque: false,
@@ -220,9 +230,50 @@ pub const DEFAULT_LAYER_COUNT: u32 = 26;
 /// Block-light level emitted by the lamp block.
 pub const LAMP_EMISSION: u8 = 14;
 
+/// The keys of the blocks as they stood at M14, in id order: ids 0–25.
+///
+/// Two jobs (ADR-0024). It keys the starter registry — and it is, frozen,
+/// the block table of every world saved before worlds kept one, whose
+/// chunks hold these ids. **Never reorder or edit an entry**: append new
+/// blocks' keys to the registry instead ([`BlockRegistry::default_set`]).
+pub const M14_BLOCK_KEYS: [&str; 26] = [
+    "air",
+    "stone",
+    "dirt",
+    "grass",
+    "sand",
+    "cobblestone",
+    "planks",
+    "lamp",
+    "water",
+    "snow",
+    "ice",
+    "gravel",
+    "red_sand",
+    "sandstone",
+    "red_sandstone",
+    "badlands_orange",
+    "badlands_red",
+    "badlands_tan",
+    "coarse_dirt",
+    "podzol",
+    "clay",
+    "mud",
+    "silt",
+    "salt",
+    "river_gravel",
+    "peat",
+];
+
+/// Keys that blocks used to have: `(old, current)`. A world saved under the
+/// old key loads as the current block (ADR-0024). A block is never removed
+/// from the game without an entry here naming what replaces it.
+pub const KEY_ALIASES: &[(&str, &str)] = &[];
+
 /// The registry of all known block types, indexed by `BlockId`.
 pub struct BlockRegistry {
     types: Vec<BlockType>,
+    aliases: Vec<(&'static str, &'static str)>,
 }
 
 impl BlockRegistry {
@@ -264,7 +315,62 @@ impl BlockRegistry {
             BlockType::uniform("river gravel", L_RIVER_GRAVEL, [0.48, 0.47, 0.45]), // 24
             BlockType::uniform("peat", L_PEAT, [0.24, 0.18, 0.12]),   // 25
         ];
-        Self { types }
+        // Keyed in id order by the frozen M14 table. A block added after
+        // M14 is given its key where it is defined, after these.
+        let mut types = types;
+        assert!(types.len() >= M14_BLOCK_KEYS.len());
+        for (t, key) in types.iter_mut().zip(M14_BLOCK_KEYS) {
+            t.key = key;
+        }
+        let registry = Self {
+            types,
+            aliases: KEY_ALIASES.to_vec(),
+        };
+        registry.assert_keys_valid();
+        registry
+    }
+
+    /// Every block has a key, no two share one, and air is `air` at id 0:
+    /// the three things a saved world's table relies on.
+    fn assert_keys_valid(&self) {
+        assert_eq!(self.types[0].key, "air", "id 0 is air in every world");
+        for (i, t) in self.types.iter().enumerate() {
+            assert!(!t.key.is_empty(), "block {i} ({}) has no key", t.name);
+            assert!(
+                t.key.len() <= u8::MAX as usize && t.key.is_ascii(),
+                "block key {:?} must be short ASCII",
+                t.key
+            );
+            assert!(
+                self.types[..i].iter().all(|o| o.key != t.key),
+                "two blocks share the key {:?}",
+                t.key
+            );
+        }
+    }
+
+    /// A block's permanent key (ADR-0024). Unknown ids give air's.
+    pub fn key(&self, id: BlockId) -> &'static str {
+        self.get(id).key
+    }
+
+    /// The block a key names in this build, following [`KEY_ALIASES`] for a
+    /// key a block used to have. `None`: this build has no such block.
+    pub fn id_of_key(&self, key: &str) -> Option<BlockId> {
+        let current = self
+            .aliases
+            .iter()
+            .find(|(old, _)| *old == key)
+            .map_or(key, |(_, new)| new);
+        self.types
+            .iter()
+            .position(|t| t.key == current)
+            .map(|i| BlockId(i as u16))
+    }
+
+    /// Every block's key, in id order.
+    pub fn keys(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.types.iter().map(|t| t.key)
     }
 
     /// A registry of exactly `types`, id = index. For tests that need a block
@@ -273,7 +379,38 @@ impl BlockRegistry {
     /// property gets caught (ADR-0011).
     #[cfg(test)]
     pub(crate) fn from_types(types: Vec<BlockType>) -> Self {
-        Self { types }
+        Self::from_types_with_aliases(types, Vec::new())
+    }
+
+    /// As [`Self::from_types`], with key aliases: for tests of a world
+    /// meeting a build whose blocks were reordered, added to or renamed.
+    /// A type left without a key is keyed by its name.
+    #[cfg(test)]
+    pub(crate) fn from_types_with_aliases(
+        mut types: Vec<BlockType>,
+        aliases: Vec<(&'static str, &'static str)>,
+    ) -> Self {
+        for i in 0..types.len() {
+            if types[i].key.is_empty() {
+                // By name; a test registry that reuses a name gets the
+                // index too, since keys must be unique (leaked: test-only).
+                let name = types[i].name;
+                types[i].key = if types[..i].iter().any(|o| o.key == name) {
+                    Box::leak(format!("{name}_{i}").into_boxed_str())
+                } else {
+                    name
+                };
+            }
+        }
+        let registry = Self { types, aliases };
+        registry.assert_keys_valid();
+        registry
+    }
+
+    /// The starter set's block types, keyed: for tests that rearrange them.
+    #[cfg(test)]
+    pub(crate) fn types(&self) -> Vec<BlockType> {
+        self.types.clone()
     }
 
     /// Look up a block type. Unknown ids resolve to air (defensive: a saved
