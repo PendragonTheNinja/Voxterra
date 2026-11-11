@@ -218,6 +218,19 @@ pass.
    Small streams should bend round spurs and cut V-shaped gullies at
    block scale. It is hillside work, as this milestone's landforms are,
    so it is tuned once, with them.
+   **Proposed (2026-11-11), the owner to decide: coasts as a sixth
+   landform family.** The owner's first flight on generator version 9
+   found shores "obviously built from large sweeping shapes": one smooth
+   slope from land to sea, its sand and rock in bands parallel to the
+   water (`docs/gallery/m16/flight1-1-sand-curve.jpg`). Milestone 16's
+   polish could only alternate the shore's material
+   (`docs/milestones/16-tectonics-and-bedrock.md`, task 2b); the shape
+   needs Earth's coastal landforms — sea cliffs and wave-cut platforms on
+   rough coasts, coves and bayhead beaches between headlands, spits and
+   barrier islands on low sandy ones, stacks off retreating cliffs —
+   weighted, like the other five families, by what makes them (wave
+   energy, rock, sediment supply). It would go into `docs/landforms.md`
+   for approval first.
 6. **Materials, the LOD, the bench, the owner's walk, the retro** — bare
    rock on cliffs and domes, sand on dunes; renders of every landform.
 

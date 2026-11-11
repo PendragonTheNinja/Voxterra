@@ -334,7 +334,7 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   rivers as ribbons, reservoirs with the water simulation.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 306, vox-mesh 71, vox-worldgen 98, vox-render 21, vox-app 18
+  vox-core 306, vox-mesh 72, vox-worldgen 103, vox-render 21, vox-app 18
   passing (288, 72 and 11 before the 2026-11 audit; worldgen was 81
   before the tectonic framework), plus the ignored
   `every_biome_in_every_world` and `biome_survey`, run in release), then
@@ -372,9 +372,15 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   rifts), at version 8's chunk-generation cost; ADR-0010's guard and
   every M13–M15 test and survey pass. ADR-0025's *As built: task 2* has
   the numbers and three things for the owner to judge (narrow shelves,
-  smaller landmasses, rhombic basins). **Next: the owner's flight and
-  `--bench` on version 9** (a fresh world: version 8 worlds are
-  refused), then M15's task 2.
+  smaller landmasses, rhombic basins). **The owner flew version 9
+  (2026-11-11); the polish he asked for after it is done as
+  `GENERATOR_VERSION` 10** (milestone 16 spec, task 2b): dry strips across
+  ponds, seabeds fining outward, rough coasts alternating rock and beach,
+  the LOD's slopes as bright as full resolution's, water darkening with
+  depth. Small streams that follow the ground went to M15 (task 5);
+  coastal landforms are proposed for M15's catalogue. **Next: the
+  owner's `--bench` and a look at version 10** (a fresh world again),
+  then M15's task 2.
 - **Open decision records (2026-11-11):** ADR-0022 (relight and mesh off
   the frame — proposed; **its gate is met** by the owner's bench: the two
   passes hold the frame thread ~320 ms of every sprinting second and the

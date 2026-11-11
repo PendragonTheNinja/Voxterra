@@ -134,7 +134,34 @@ caves, ore, or rock's effect on erosion (milestones 17–20).
    to full resolution, and water darkening with depth alike in both.
    One generator version (10) for the lot. Small streams that follow the
    ground went to M15 (its task 5). The flight's views are
-   `docs/gallery/m16/flight1-*.jpg`.
+   `docs/gallery/m16/flight1-*.jpg`. **Done 2026-11-11** (each with a test
+   that failed first, and a before/after in the gallery):
+   - (1) **Ponds**: ground at a pond's own level is its floor, a block
+     down (81 strip columns at the owner's view, 6 after — where two
+     rivers' ponds meet, a natural levee). The "lines" were a pond's, not
+     a lake's: a river held over a flat plain flooded its 54s and left its
+     55s dry. The circles near lakes are the banks that hold a lake where
+     the ground outside its reach is lower; M14's design, left as it is.
+   - (2) **Seabeds** fine outward: sand or gravel, silt from ~85 down,
+     mud from ~175, the bands moved by patch noise (150 sand-against-mud
+     places → 0).
+   - (3) **Coasts, partly.** A rough coast now alternates rocky headlands
+     and beaches in its bays (`Surface::headland`), and a guard holds
+     coastal speckle under 3% (0.9%). The owner's view itself is
+     unchanged: its bands are the coast's *shape*, one smooth slope, and
+     three tries at shaping it here failed — folded cliffs along the shore
+     (one even wall), cliffs on headlands only (still a wall), a domain
+     warp of the shoreline (too faint at 45 blocks; more would fold
+     contours). Real coasts need a landform family — sea cliffs, coves,
+     bayhead beaches, spits, stacks — **proposed for M15's catalogue**.
+   - (4a) **The LOD's slopes** darken as full resolution's do: tops 0.4
+     per unit of slope, walls 0.6, measured from both meshers and held by
+     `lod_slopes_are_as_bright_as_full_resolution`. The near-LOD band is
+     gone.
+   - (4b) **Water darkens with depth**, near and far alike: the opaque
+     depth is copied after it is drawn and both water shaders absorb by
+     the water between surface and bed. A depth copy a frame — the
+     owner's `--bench` should show whether it costs anything.
 3. **Provinces and ages**; the bedrock map; the cross-section tool.
 4. **Strata in the chunks**: datum, structure, units; the engine's
    hidden-opaque-chunk shortcut; the bench.
