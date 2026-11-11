@@ -414,11 +414,12 @@ impl Elevation {
         for j in 0..CALIBRATION_GRID {
             for i in 0..CALIBRATION_GRID {
                 let (x, z) = (i * sx / CALIBRATION_GRID, j * sz / CALIBRATION_GRID);
-                let column = self.tectonics.column_canonical(x, z);
-                let c = self.continent_from(&column, x, z).0 - self.continent_offset;
-                let profile = coastal_profile(c);
+                let (c, belt) = self.tectonics.column_canonical(x, z, |column| {
+                    (self.continent_from(column, x, z).0, column.belt() as f32)
+                });
+                let profile = coastal_profile(c - self.continent_offset);
                 if profile.base > 0.0 {
-                    land.push((self.ridged_c(x, z), profile.land, column.belt() as f32));
+                    land.push((self.ridged_c(x, z), profile.land, belt));
                 }
             }
         }
@@ -545,8 +546,14 @@ impl Elevation {
     /// The single composition point. Every stage feeds in here and nowhere
     /// else, so a future erosion pass has one place to attach.
     fn surface_canonical(&self, x: i64, z: i64) -> Surface {
-        let column = self.tectonics.column_canonical(x, z);
-        let (c, wander) = self.continent_from(&column, x, z);
+        self.tectonics
+            .column_canonical(x, z, |column| self.surface_of(column, x, z))
+    }
+
+    /// [`Elevation::surface_canonical`], given the column's place in the
+    /// tectonic framework.
+    fn surface_of(&self, column: &crate::tectonics::Column, x: i64, z: i64) -> Surface {
+        let (c, wander) = self.continent_from(column, x, z);
         let c = c - self.continent_offset;
         let CoastalProfile {
             mut base,
@@ -663,8 +670,8 @@ impl Elevation {
     }
 
     fn continent_c(&self, x: i64, z: i64) -> f32 {
-        self.continent_from(&self.tectonics.column_canonical(x, z), x, z)
-            .0
+        self.tectonics
+            .column_canonical(x, z, |column| self.continent_from(column, x, z).0)
     }
 
     /// The continent field from a column's search of the framework: how
@@ -1304,6 +1311,148 @@ mod tests {
         );
     }
 
+    /// Everything near a column that the framework says shapes it.
+    fn near(e: &Elevation, x: i64, z: i64) -> Vec<(Boundary, f64, f64)> {
+        let mut found = Vec::new();
+        e.tectonics().column(x, z, |column| {
+            column.boundaries(|boundary, over, fade| found.push((boundary, over, fade)));
+        });
+        found
+    }
+
+    /// Milestone 16, criterion 3: the terrain is where the framework puts
+    /// it. No mountain stands off a belt, and no high one stands anywhere
+    /// but on a collision, an arc or a weld being squeezed today; every
+    /// trench is on the plate going under, off the edge of the one above.
+    #[test]
+    fn mountains_and_trenches_are_where_the_plates_put_them() {
+        for seed in [SEED, 1, 2, 3] {
+            let e = Elevation::new(seed, WorldShape::DEFAULT);
+            let size = WorldShape::DEFAULT.size_x();
+            let (mut uplifted, mut high, mut trenches) = (0u32, 0u32, 0u32);
+            for k in 0..120_000i64 {
+                let (x, z) = (k * 7_919 % size, k * 104_729 % size);
+                let s = e.surface(x, z);
+                if s.uplift > 0.0 {
+                    uplifted += 1;
+                    assert!(
+                        e.tectonics().belt(x, z) > 0.0,
+                        "seed {seed}: {} of uplift at ({x}, {z}), off every belt",
+                        s.uplift
+                    );
+                }
+                // 700 blocks of uplift needs a belt of 0.68 or more: only
+                // the strong kinds reach it (unless this world's belts
+                // were strengthened, which the gain accounts for).
+                if s.uplift >= 700.0 {
+                    high += 1;
+                    let strongest = near(&e, x, z)
+                        .iter()
+                        .map(|&(b, over, fade)| b.belt(over) * fade)
+                        .fold(0.0, f64::max);
+                    assert!(
+                        strongest * f64::from(e.belt_gain) >= 0.68,
+                        "seed {seed}: a {}-block massif at ({x}, {z}) on a belt of {strongest}",
+                        s.uplift
+                    );
+                    assert!(
+                        near(&e, x, z)
+                            .iter()
+                            .any(|&(b, _, _)| b.belt_strength() * f64::from(e.belt_gain) >= 0.68),
+                        "seed {seed}: a high range at ({x}, {z}) on no strong boundary"
+                    );
+                }
+                if (s.height as f32) < -(ABYSSAL_DEPTH + TRENCH_EXTRA * 0.5) {
+                    trenches += 1;
+                    assert!(
+                        near(&e, x, z).iter().any(|&(b, over, _)| matches!(
+                            b,
+                            Boundary::Convergent {
+                                kind: Convergence::ContinentalArc | Convergence::IslandArc,
+                                ..
+                            }
+                        ) && over < 0.0),
+                        "seed {seed}: a trench at ({x}, {z}) that is not on a plate going under"
+                    );
+                }
+            }
+            assert!(
+                uplifted > 5_000 && high > 100 && trenches > 100,
+                "seed {seed}: {uplifted} uplifted, {high} high, {trenches} in trenches"
+            );
+        }
+    }
+
+    /// The sea floor rises to a ridge where plates part, and a continent
+    /// being pulled apart drops a valley between raised shoulders.
+    #[test]
+    fn ridges_rise_and_rifts_drop() {
+        let (mut crest, mut plain) = (Vec::new(), Vec::new());
+        let (mut floor, mut shoulder) = (Vec::new(), Vec::new());
+        for seed in [SEED, 1, 2, 3] {
+            let e = Elevation::new(seed, WorldShape::DEFAULT);
+            let size = WorldShape::DEFAULT.size_x();
+            for k in 0..200_000i64 {
+                let (x, z) = (k * 7_919 % size, k * 104_729 % size);
+                let s = e.surface(x, z);
+                let around = near(&e, x, z);
+                // Deep water only: on a shelf nothing is raised.
+                if s.height < -150 {
+                    let ridge = around
+                        .iter()
+                        .find(|&&(b, _, fade)| b == Boundary::Ridge && fade > 0.9);
+                    match ridge {
+                        Some(&(_, over, _)) if (400.0..1_000.0).contains(&over.abs()) => {
+                            crest.push(s.height);
+                        }
+                        None if around.is_empty() => plain.push(s.height),
+                        _ => {}
+                    }
+                }
+                if s.height > -200 && s.uplift == 0.0 {
+                    let rift = around
+                        .iter()
+                        .find(|&&(b, _, fade)| b == Boundary::Rift && fade > 0.9);
+                    if let Some(&(_, over, _)) = rift {
+                        // The valley wanders up to RIFT_WANDER from its
+                        // line, so "the floor" is taken as the lowest and
+                        // "the shoulder" well clear of it.
+                        if over.abs() < 200.0 {
+                            floor.push(s.height);
+                        } else if (1_900.0..2_600.0).contains(&over.abs()) {
+                            shoulder.push(s.height);
+                        }
+                    }
+                }
+            }
+        }
+        let mean = |v: &[i64]| v.iter().sum::<i64>() as f64 / v.len() as f64;
+        assert!(
+            crest.len() > 300 && plain.len() > 3_000,
+            "{} {}",
+            crest.len(),
+            plain.len()
+        );
+        assert!(
+            mean(&crest) > mean(&plain) + 35.0,
+            "ridge flanks at {:.0}, the plain at {:.0}",
+            mean(&crest),
+            mean(&plain)
+        );
+        assert!(
+            floor.len() > 60 && shoulder.len() > 100,
+            "{} {}",
+            floor.len(),
+            shoulder.len()
+        );
+        assert!(
+            mean(&floor) < mean(&shoulder) - 25.0,
+            "rift floors at {:.0}, their shoulders at {:.0}",
+            mean(&floor),
+            mean(&shoulder)
+        );
+    }
+
     /// Tool: the numbers ADR-0010 tuned the terrain to, world by world —
     /// what milestone 16 must hold while it moves where things are
     /// (`cargo test -p vox-worldgen --release terrain_stats -- --ignored
@@ -1448,5 +1597,48 @@ mod tests {
                 pct(trench, total),
             );
         }
+    }
+
+    /// Tool: what a column's height costs, three ways a caller asks for it
+    /// (`cargo test -p vox-worldgen --release height_cost -- --ignored
+    /// --nocapture`): columns scattered over the world; whole 32 × 32
+    /// chunk columns, as generation asks; and a grid 64 blocks apart, as a
+    /// far LOD level does. Best of seven.
+    #[test]
+    #[ignore]
+    fn height_cost() {
+        let e = Elevation::new(SEED, WorldShape::DEFAULT);
+        const N: i64 = 409_600;
+        let time = |name: &str, at: &dyn Fn(i64) -> (i64, i64)| {
+            let (mut best, mut sum) = (f64::MAX, 0i64);
+            for _ in 0..7 {
+                let start = std::time::Instant::now();
+                sum = (0..N)
+                    .map(|k| {
+                        let (x, z) = at(k);
+                        e.height(x, z)
+                    })
+                    .sum();
+                best = best.min(start.elapsed().as_nanos() as f64 / N as f64);
+            }
+            println!("height, {name:14} {best:6.0} ns/column   (checksum {sum})");
+        };
+        time("scattered", &|k| {
+            (k * 7_919 % 204_800, k * 104_729 % 204_800)
+        });
+        time("chunk columns", &|k| {
+            let (patch, i) = (k / 1_024, k % 1_024);
+            (
+                patch * 7_919 % 204_800 + i % 32,
+                patch * 104_729 % 204_800 + i / 32,
+            )
+        });
+        time("grid of 64", &|k| {
+            let (patch, i) = (k / 1_024, k % 1_024);
+            (
+                patch * 7_919 % 204_800 + 64 * (i % 32),
+                patch * 104_729 % 204_800 + 64 * (i / 32),
+            )
+        });
     }
 }

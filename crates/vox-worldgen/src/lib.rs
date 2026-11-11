@@ -469,6 +469,13 @@ impl Generator {
         // flat desert, with a step at its edge, was the owner's "raised
         // blocks around them"). Returns the ground, and whether it is flat
         // at the target — within LOWLAND_BELOW under it.
+        //
+        // And never below a lake standing beside it: where a river leaves
+        // a lake a block below the lake's surface, a flat cut to the
+        // river's level took the lake's shore away, and the lake stood a
+        // block over the wetland with nothing to hold it (found when
+        // milestone 16 moved the terrain under
+        // `lake_shores_hold_their_water`).
         let flatten = |target: i64, span: f32| {
             let above = h - target;
             if above <= 0 {
@@ -477,6 +484,13 @@ impl Generator {
             let w = (1.0 - smooth(n.out / span))
                 * (1.0 - smooth((above - 1) as f32 / (LOWLAND_ABOVE - 1) as f32));
             let g = (h as f32 - above as f32 * w).round() as i64;
+            let g = match self
+                .drainage()
+                .lake_beside(wx, wz, |x, z, l| self.elevation.meander_warp(x, z, l))
+            {
+                Some(lake) if g < lake => lake.min(h),
+                _ => g,
+            };
             (g, g <= target)
         };
         // A large river's mouth on a gentle coast — low ground beside it,
@@ -837,7 +851,13 @@ impl Generator {
                 let col = self.column_with(x, z, s.expect("at least one sample"));
                 let at = (cz * n + cx) as usize;
                 let wet = wet_top(&col.water);
-                if col.biome == biome::Biome::PolarSea {
+                // Sea ice is on the sea: a polar-sea column whose ground
+                // stands exactly at sea level has no water to freeze, and
+                // its top is its ground (the chunk generator's, which the
+                // LOD said was ice until milestone 16 moved the terrain
+                // onto such a column in
+                // `lod_surface_matches_full_resolution_in_every_biome`).
+                if col.biome == biome::Biome::PolarSea && h < SEA_LEVEL_BLOCKS {
                     heights[at] = SEA_LEVEL_BLOCKS as i32;
                     tops[at] = vox_core::registry::ICE;
                 } else if wet > h && self.block_in(&col, wet) == vox_core::registry::ICE {
@@ -2013,7 +2033,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (9, 0x4737_e9b9_0af8_1d01);
+        const PINNED: (u32, u64) = (9, 0x70e2_8e98_4d73_d901);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),
@@ -2144,5 +2164,75 @@ mod modflag_tests {
         assert!(!g.generate_chunk(ChunkPos::new(0, 0, 0)).is_modified());
         assert!(!g.generate_chunk(ChunkPos::new(0, 100, 0)).is_modified()); // air
         assert!(!g.generate_chunk(ChunkPos::new(0, -100, 0)).is_modified()); // stone
+    }
+
+    /// Tool: what the real callers pay (`cargo test -p vox-worldgen
+    /// --release generation_cost -- --ignored --nocapture`): generating
+    /// the surface chunks of a chunk column, cold, and building one LOD
+    /// node's surface at a near, a middle and a far level. Best of five.
+    #[test]
+    #[ignore]
+    fn generation_cost() {
+        let g = Generator::new(0x0007_E22A_C0DE, WorldShape::DEFAULT);
+        g.drainage();
+        g.climate();
+        let places: Vec<(i64, i64)> = (0..48i64)
+            .map(|k| (k * 7_919 % 6_400, k * 104_729 % 6_400))
+            .collect();
+        let best = |run: &dyn Fn() -> u64| {
+            let mut best = f64::MAX;
+            let mut sum = 0;
+            for _ in 0..5 {
+                let start = std::time::Instant::now();
+                sum = run();
+                best = best.min(start.elapsed().as_secs_f64() * 1e3);
+            }
+            (best, sum)
+        };
+        let (ms, sum) = best(&|| {
+            let g = Generator {
+                grounds: Arc::new(GroundCache::default()),
+                ..g.clone()
+            };
+            let mut sum = 0u64;
+            for &(cx, cz) in &places {
+                let (lo, hi) = g.surface_span_chunks(cx, cz);
+                for cy in lo..=hi {
+                    sum += u64::from(
+                        g.generate_chunk(ChunkPos::new(cx, cy, cz))
+                            .get(LocalPos::new(1, 2, 3))
+                            .0,
+                    );
+                }
+            }
+            sum
+        });
+        println!(
+            "surface chunks of a column  {:7.3} ms   (checksum {sum})",
+            ms / places.len() as f64
+        );
+        for stride in [2i64, 16, 128] {
+            let (ms, sum) = best(&|| {
+                let g = Generator {
+                    grounds: Arc::new(GroundCache::default()),
+                    ..g.clone()
+                };
+                places
+                    .iter()
+                    .take(24)
+                    .map(|&(cx, cz)| {
+                        let (h, _, _) =
+                            g.lod_surface(cx * 32, cz * 32, stride, LodSampling::Sparse);
+                        h.iter()
+                            .map(|&v| v as i64 as u64)
+                            .fold(0u64, u64::wrapping_add)
+                    })
+                    .fold(0u64, u64::wrapping_add)
+            });
+            println!(
+                "LOD node, stride {stride:3}        {:7.3} ms   (checksum {sum})",
+                ms / 24.0
+            );
+        }
     }
 }
