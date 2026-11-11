@@ -2235,4 +2235,23 @@ mod modflag_tests {
             );
         }
     }
+
+    /// Tool: what creating a world costs, stage by stage (`cargo test -p
+    /// vox-worldgen --release creation_cost -- --ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn creation_cost() {
+        for seed in [0x0007_E22A_C0DE_u64, 1, 2] {
+            let start = std::time::Instant::now();
+            let g = Generator::new(seed, WorldShape::DEFAULT);
+            let elevation = start.elapsed().as_secs_f64();
+            g.climate();
+            let climate = start.elapsed().as_secs_f64() - elevation;
+            g.drainage();
+            let drainage = start.elapsed().as_secs_f64() - elevation - climate;
+            println!(
+                "seed {seed:#x}: elevation {elevation:.2} s, climate {climate:.2} s, drainage {drainage:.2} s"
+            );
+        }
+    }
 }

@@ -2077,8 +2077,11 @@ mod tests {
         let steps = ((to.0 - from.0).abs().max((to.1 - from.1).abs()) as i64).max(1);
         for k in 0..=steps {
             let t = k as f64 / steps as f64;
-            let i = (from.0 + (to.0 - from.0) * t).rem_euclid(f64::from(px)) as u32;
-            let j = (from.1 + (to.1 - from.1) * t).rem_euclid(f64::from(px)) as u32;
+            let (i, j) = (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t);
+            if !(0.0..f64::from(px)).contains(&i) || !(0.0..f64::from(px)).contains(&j) {
+                continue;
+            }
+            let (i, j) = (i as u32, j as u32);
             let at = ((j * px + i) * 3) as usize;
             rgb[at..at + 3].copy_from_slice(&colour);
         }
@@ -2088,8 +2091,11 @@ mod tests {
         for dj in -radius..=radius {
             for di in -radius..=radius {
                 if di * di + dj * dj <= radius * radius {
-                    let i = (at.0 as i64 + di).rem_euclid(i64::from(px)) as u32;
-                    let j = (at.1 as i64 + dj).rem_euclid(i64::from(px)) as u32;
+                    let (i, j) = (at.0 as i64 + di, at.1 as i64 + dj);
+                    if !(0..i64::from(px)).contains(&i) || !(0..i64::from(px)).contains(&j) {
+                        continue;
+                    }
+                    let (i, j) = (i as u32, j as u32);
                     let o = ((j * px + i) * 3) as usize;
                     rgb[o..o + 3].copy_from_slice(&colour);
                 }
@@ -2126,7 +2132,17 @@ mod tests {
             _ => (0.0, 0.0, shape.size_x() as f64),
         };
         let step = span / f64::from(px);
-        let to_px = |x: f64, z: f64| ((x - x0) / step, (z - z0) / step);
+        // A marker is drawn at its image nearest the panel's centre, so
+        // the whole-world map still shows every one and a close-up only
+        // those inside it.
+        let (sx, sz) = (shape.size_x() as f64, shape.size_z() as f64);
+        let to_px = |x: f64, z: f64| {
+            let near = |v: f64, origin: f64, size: f64| {
+                let centre = origin + span * 0.5;
+                v - ((v - centre) / size).round() * size
+            };
+            ((near(x, x0, sx) - x0) / step, (near(z, z0, sz) - z0) / step)
+        };
         let mut panels = [(); 3].map(|()| vec![0u8; (px * px * 3) as usize]);
         for j in 0..px {
             let z = (z0 + f64::from(j) * step) as i64;

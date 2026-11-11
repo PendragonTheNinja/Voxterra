@@ -334,7 +334,7 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   rivers as ribbons, reservoirs with the water simulation.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 306, vox-mesh 71, vox-worldgen 96, vox-render 21, vox-app 18
+  vox-core 306, vox-mesh 71, vox-worldgen 98, vox-render 21, vox-app 18
   passing (288, 72 and 11 before the 2026-11 audit; worldgen was 81
   before the tectonic framework), plus the ignored
   `every_biome_in_every_world` and `biome_survey`, run in release), then
@@ -366,12 +366,15 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   plates, continents grown from cratons, every boundary's kind, the
   `continentalness` and `belt` fields — with fifteen tests and four
   tools (`tectonics_map`, `tectonics_survey`, `belt_jump_scan`,
-  `tectonics_cost`); map in `docs/gallery/m16/`. **Nothing in generation
-  reads it, so still `GENERATOR_VERSION` 8.** Next is task 2 (terrain
-  placed by it); the spec's *Task 1 as built* says where it starts, and
-  its first item is cost: one framework search per column is ~165 ns
-  against ~112 ns for today's whole height, so it must be done per
-  patch, not per column, before anything else.
+  `tectonics_cost`); map in `docs/gallery/m16/`. **Task 2 is built
+  (2026-11-11): `GENERATOR_VERSION` 9, terrain placed by the framework**
+  (continents from crust, ranges on belts, trenches, ocean ridges,
+  rifts), at version 8's chunk-generation cost; ADR-0010's guard and
+  every M13–M15 test and survey pass. ADR-0025's *As built: task 2* has
+  the numbers and three things for the owner to judge (narrow shelves,
+  smaller landmasses, rhombic basins). **Next: the owner's flight and
+  `--bench` on version 9** (a fresh world: version 8 worlds are
+  refused), then M15's task 2.
 - **Open decision records (2026-11-11):** ADR-0022 (relight and mesh off
   the frame — proposed; **its gate is met** by the owner's bench: the two
   passes hold the frame thread ~320 ms of every sprinting second and the
@@ -379,8 +382,8 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   urgent, and *when* is the owner's to choose); ADR-0023
   (landform processes — proposed, built as M15 task 1); ADR-0024 (block
   names in saves) is accepted and built; ADR-0025 (the tectonic
-  framework) is proposed, its sections 1–3 built and corrected by the
-  building (its *As built*), to be accepted with milestone 16 task 2.
+  framework) is proposed and built (tasks 1–2), to be accepted after the
+  owner's flight and bench on version 9.
 - **Instruments (from M11):** the P key logs a `VIEW` line (exact position,
   angles, window, settings) and a `hole_census` — the frame re-rendered six
   ways on the player's GPU with pinholes counted per variant. In the cloud
