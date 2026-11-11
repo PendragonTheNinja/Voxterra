@@ -2,7 +2,11 @@
 
 - **Status:** Proposed (2026-11-10). The *decision to have one* is the
   owner's (2026-11-10, `docs/geology.md` §4, option C: "yes we do this");
-  this is how. Not built. Milestone 16, tasks 1 and 2. On acceptance it
+  this is how. **Sections 1–3 and 7 are built** (milestone 16 task 1,
+  2026-11-11: `vox_worldgen::tectonics`, read by nothing yet) and were
+  corrected by the building — see *As built* at the end; sections 4–5
+  are task 2. To be accepted with task 2, when terrain is placed by the
+  framework and ADR-0010's guard has passed. On acceptance it
   supersedes the *placement* of ADR-0010's continents, mountain belts and
   trenches; ADR-0010's scale — its wavelengths, amplitudes and the
   walking-time table — stands unchanged and is this ADR's hardest
@@ -53,12 +57,14 @@ One seed point per cell of a lattice around the torus (a whole number of
 cells per lap, at least three — ADR-0012's rule for every periodic
 field), each displaced within its cell by a hash of the world seed. A
 column belongs to its nearest seed, measured after a smooth warp of the
-coordinates so that boundaries curve. Nearest and second-nearest seed
-are found among the nine cells round the column: a pure function of
-`(x, z)`, a few dozen operations, no grid to interpolate and so nothing
-to show through as squares. Half the difference of the two distances is
-the distance to the terrane's boundary, which is all a belt's profile
-needs.
+coordinates so that boundaries curve. The seeds that matter are found
+among the twenty-five cells round the column (nine are not enough: with
+seeds free to sit anywhere in their cells, a seed two cells away can be
+the nearest): a pure function of `(x, z)`, no grid to interpolate and so
+nothing to show through as squares. The distance from a column to the
+line between two seeds is exact — the difference of the squared
+distances over twice the seeds' separation — which is all a belt's
+profile needs.
 
 ### 3. World creation writes each terrane's story
 
@@ -77,20 +83,33 @@ is the stage-1 "simulation", and it is a table, not a grid):
    it is today.
 3. **Each continent's past.** Its first one to three terranes are
    **cratons** (ages Eoan–Ferrian). The rest were *accreted* onto them in
-   order, outward: each is given the age of its welding, older near the
-   craton, younger toward the active margin. A suture's age is the
-   younger of the two terranes it joins. This is how continents grow, and
-   it gives every suture a date for free.
+   order, outward, and each records the **step** at which it was welded
+   on: 1 for the first belt of terranes round the cratons, 2 for the
+   next. The first belt round an Eoan core is Ferrian; everything since
+   is Thalassian; and ground on a plate boundary that is closing today
+   is Orean whatever its history (cratons excepted). The weld between
+   terranes of *different* steps is a **suture** — an old mountain belt,
+   dated by the younger of the two, running round the continent's core as
+   the Appalachians wrap North America's. The joint between two terranes
+   of the *same* step is a **seam**: it runs across the belts, was never
+   a range, and raises low hills at most. (Without the distinction every
+   terrane is ringed by mountains — a honeycomb of closed basins.)
 4. **Each plate boundary's kind**, from the two plates' relative drift
    across it and the crust on each side (`docs/geology.md` §4's table):
    convergent, divergent or transform; ocean–ocean, ocean–continent or
    continent–continent; and which side goes under (ocean under continent;
-   between two oceans, the older plate). Kind is constant along the
-   boundary between two plates but the crust is not, so one subduction
-   zone runs from island arc to continental arc along its length, as the
+   between two oceans, the older plate). The drift is fixed for a pair of
+   plates; *across what* it is measured is each stretch of boundary's own
+   direction bent two parts in three toward the trend of the whole
+   boundary. So a boundary keeps its character along its length and
+   changes it only where it truly turns — a subduction zone that becomes
+   a transform round a bend, as the Pacific's edge does between Alaska
+   and California — and the crust changes along it too, so one
+   subduction zone runs from island arc to continental arc, as the
    Aleutians run into Alaska.
-5. **Hotspots**: a few fixed points, each with a track along its plate's
-   drift.
+5. **Hotspots**: a few fixed points (about two for every five plates),
+   placed without regard to the plates, each with a track along the
+   drift of the plate above it.
 
 ### 4. The framework replaces the gates, not the mountains
 
@@ -139,9 +158,9 @@ from the ridge. No second map.
 Hashes, integer lattice arithmetic, `+ − × ÷` and square roots only (all
 bit-exact everywhere; no trigonometry — drift vectors are normalised
 hash pairs). The per-world table is built sequentially in a fixed order.
-Per column, the framework costs one nine-cell search plus a few table
-reads, in place of three noise fields it removes; measured by
-`bench_`-style tests before and after, and by `--bench`.
+Per column, the framework costs one search of the cells round it plus a
+few table reads, in place of three noise fields it removes — and that
+trade is **not** even: see *As built*.
 
 ## Consequences
 
@@ -176,3 +195,68 @@ reads, in place of three noise fields it removes; measured by
   well.
 - **Keep the noise, label it** (option A). Rejected by the owner with
   option C's acceptance.
+
+## As built (milestone 16 task 1, 2026-11-11)
+
+`crates/vox-worldgen/src/tectonics.rs`: `Tectonics::new(seed, shape)`,
+held by `Generator` (`Generator::tectonics()`), read by nothing in
+generation; `GENERATOR_VERSION` is still 8. Fifteen tests and four tools
+(`tectonics_map`, `tectonics_survey`, `belt_jump_scan`,
+`tectonics_cost`). Map: `docs/gallery/m16/`.
+
+**What a default world holds** (24 seeds, 204 800 blocks): 256 terranes
+on 13 plates; 7–11 continents; 46% continental crust. Boundary length by
+kind: sutures 24%, seams 17%, ridges 16%, passive margins 14%,
+continental arcs 9%, transforms 8%, island arcs 7%, collisions 3%,
+rifts 2%. Every world has both kinds of coast, an arc, a ridge and
+sutures; collisions and rifts are in most worlds, not all. The smallest
+world (32 768) is nine terranes on three plates with four continental.
+
+**What the building corrected in this ADR:**
+
+- *Nine cells are not enough* (§2), and neither is "the four nearest
+  seeds". The belt envelope must be continuous, and two shorter versions
+  of it were not: the continuity test found a 0.16 step where a fifth
+  terrane came into range, and then another. The rule that works is
+  geometric, not a count: consider every seed within two belt half-widths
+  of being nearest. A seed farther than that can neither be half of a
+  boundary that reaches the column nor come between two that are.
+- *A boundary's line runs on for ever; the boundary does not.* Each
+  pair's envelope is also faded by how far past the boundary's end the
+  column is — the most that any third seed is nearer than either of the
+  pair — so belts end in a rounded cap at each junction instead of
+  crossing the next terrane.
+- *Kind per plate pair was too coarse and kind per segment too fine*
+  (§3.4): per segment, every kink flipped a subduction zone to a rift
+  and back within a terrane's width.
+- *Sutures and seams* (§3.3), above.
+- *Continentalness is clamped* at 3 500 blocks either side of the coast
+  (`COAST_REACH`) — more than the coastal profile's width — which is
+  also what lets most columns stop the search at nine cells.
+- *Tunables are a `Params` struct* (terrane size, plate size, continental
+  share), so that the owner's "every tunable a per-world option" needs a
+  field in `world.meta` and nothing here.
+
+**Cost, measured — and task 2's first problem.** In the cloud container,
+best of seven over 400 000 scattered columns: one search with both
+fields (`Tectonics::column`) is **~165 ns**; today's whole terrain
+height is **~112 ns**. The framework replaces about four of the
+height's noise octaves, perhaps 45 ns. So a column's height would cost
+roughly **twice** what it does now if `Elevation` simply called the
+framework per column. That would undo part of the 2026-11 audit's
+generation work and must not ship. The way out is that nobody asks for
+one column: chunk generation asks for 32 × 32 (the `GroundCache`), the
+LOD sampler for a grid, the stage-1 maps for a grid. Across a patch a
+few dozen blocks wide the seeds that matter are the same handful, so the
+search is done once per patch and each column costs the warp and a few
+distances. Task 2 builds that and measures it with `tectonics_cost`,
+the generation benches and `--bench`, before and after; the per-column
+entry point stays for tools and tests.
+
+**For task 2's calibration** (§5): the envelope as built covers 22% of
+continental ground above 0.25, 10% above 0.5 and 1.4% above 0.75.
+Version 8's belt gate lets mountains through over most of the land and
+leaves rarity to the ridged field, so the envelope is the narrower of
+the two by a wide margin; holding ADR-0010's range share will mean
+scaling strengths up or widening belts by kind (a collision's orogen is
+wider than an old suture's), not only matching a number.

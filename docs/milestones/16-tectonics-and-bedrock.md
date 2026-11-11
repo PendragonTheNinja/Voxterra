@@ -11,14 +11,15 @@ This is the first of five geology milestones. The design all five are
 written against is `docs/geology.md`; read it first. This spec is the
 part of it built now.
 
-**Status: draft; its deciding questions are answered (2026-11-10).**
-Nothing is built. The owner chose option C, the plate framework, and
-answered every question in `docs/geology.md` §16; ADR-0024 (block names
-in saves) is built. How the framework is made is ADR-0025 (proposed),
-which also proposes an order: this milestone's tasks 1 and 2 *before*
-M15's tasks 2–6, so that landforms are tuned once, on the terrain they
-ship on. That reordering awaits the owner's word; the spec as a whole
-awaits his approval.
+**Status: draft; its deciding questions are answered (2026-11-10);
+task 1 is built (2026-11-11).** The owner chose option C, the plate
+framework, and answered every question in `docs/geology.md` §16;
+ADR-0024 (block names in saves) is built. How the framework is made is
+ADR-0025 (proposed, sections 1–3 built), and the order is the owner's
+(2026-11-10): **this milestone's tasks 1 and 2 first, then M15's tasks
+2–6, then this milestone's tasks 3–6** — so that landforms are tuned
+once, on the terrain they ship on. **Next: task 2** — see *Task 1 as
+built* below for where it starts.
 
 ## Why this milestone exists
 
@@ -118,6 +119,7 @@ caves, ore, or rock's effect on erosion (milestones 17–20).
    §16. The rock catalogue's first thirty, with textures. ADR-0024 built.
 1. **The framework** in stage 1, with its maps and its tests. No terrain
    change yet: the framework is drawn beside the existing terrain.
+   **Done 2026-11-11.**
 2. **Terrain placed by the framework.** Continents, belts and trenches
    move; ridges and rifts appear. The ADR-0010 statistics are held. This
    is the task that bumps the generator and re-runs M13–M15.
@@ -128,6 +130,55 @@ caves, ore, or rock's effect on erosion (milestones 17–20).
    becomes the unit there); bare rock on cliffs, peaks and deserts; the
    LOD.
 6. **Every world, the walk, the retrospective.**
+
+## Task 1 as built (2026-11-11)
+
+`vox_worldgen::tectonics` — `Tectonics`, held by the `Generator`
+(`Generator::tectonics()`), read by nothing in generation, so
+`GENERATOR_VERSION` is still 8 and no world changes. What it holds, what
+the building corrected in the design, and the survey numbers are in
+ADR-0025's *As built*; the map is `docs/gallery/m16/`.
+
+What a caller can ask:
+
+| Call | Gives |
+|---|---|
+| `terranes()`, `plates()`, `hotspots()` | The tables: each terrane's plate, crust, continent, craton flag, accretion step and age; each plate's drift |
+| `boundary(a, b)` | What the boundary between two terranes is: quiet, passive margin, suture or seam (with age), convergent (collision, continental arc, island arc, and which side is over), ridge, rift, transform |
+| `site(x, z)` | A column's terrane, the terrane across its nearest boundary, the distance to it and its kind — what task 3's provinces are read from |
+| `column(x, z)` → `continentalness()`, `belt()` | The two fields terrain is placed by: signed distance to the coast (clamped at ±3 500) and the mountain-belt envelope in `[0, 1]` |
+
+Fifteen tests hold it: the same seed and size give the same framework;
+it is periodic to the bit on every lap; the lattice fits every legal
+size (and the search window is proven wide enough for every one);
+plates and continents are each one piece; continents are grown outward
+from one to three cratons; every boundary follows from crust and drift
+(`docs/geology.md` §4's table, pair by pair, both ways round); active
+margins are Orean; a default world has both kinds of coast, an arc, a
+ridge and sutures; the smallest world has land, sea and a plate
+boundary; and — walking lines across whole worlds — a terrane changes
+only at its edge, the belt is full on a boundary and nothing beyond its
+half-width, and neither field ever jumps.
+
+**Where task 2 starts** (ADR-0025 *As built* has the reasoning):
+
+1. **Cost first.** One search per column is ~165 ns against ~112 ns for
+   today's whole height; called naively, height would cost about twice
+   what it does. Do the search once per patch (chunk columns, LOD grids
+   and stage-1 maps are all patches) and measure with `tectonics_cost`,
+   the generation benches and `--bench` before any terrain is judged.
+2. **Then placement**, one input at a time, each behind the ADR-0010
+   guard: the continent field (`continentalness` scaled into the coastal
+   profile, plus the fine coastal octaves, then the 42% calibration);
+   the belt gate (`belt`, with strengths calibrated — the envelope is
+   much narrower than version 8's gate, so expect to widen belts by
+   kind, not only scale them); trenches along the subducting side of
+   convergent boundaries.
+3. **Then the new shapes**: mid-ocean ridges, rift valleys, foreland
+   sags.
+4. **The smallest world** has no guaranteed passive margin or collision;
+   criterion 7's "stated minimum" should be: land and sea, one plate
+   boundary with a belt, one craton.
 
 ## Non-goals
 

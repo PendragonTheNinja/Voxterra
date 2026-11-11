@@ -319,10 +319,11 @@ legal size.
 
 Every rock unit carries an **age**, and the checklist's first six
 principles are all statements about ages. The world has one relative
-timescale, six ages long. The names are proposals (the owner asked for a
-set, 2026-11-10, and sent two back; these are the second round) — his to
-change, and worth getting right, since players will read them on maps and
-in the lore. Each has a scholar's name, built
+timescale, six ages long. The owner asked for a set of names (2026-11-10),
+sent two back, and accepted the first and last of the second round
+("Eoan and Dawn Age are in. Nivean age is also nice."); the middle four
+stand unchallenged. They can still change — players will read them on
+maps and in the lore. Each has a scholar's name, built
 the way Earth's are (the Carboniferous is "the coal-bearing", the
 Cretaceous "the chalky"), and a plain one:
 
@@ -685,8 +686,14 @@ because real prospecting is already a good game, and only needs to be
 1. **Abundance** — how closely deposits are spaced within the settings
    that can hold them. A world-creation setting (`docs/vision.md` §8):
    *Earth-like* for those who want an expedition, *generous* by default.
-2. **The reach guarantee** — a test, per seed, at the default abundance:
-   from any spawn, the Stone-Age materials (flint or obsidian, clay,
+2. **The reach guarantee** — a *ceiling*, not a distance anyone must
+   walk. A world is random and so is a spawn: one player starts beside an
+   iron outcrop, another in the middle of a barren plain. The guarantee
+   only bounds the unlucky case — no spawn, in any seed, is *further*
+   than this from each thing a player needs, so no world is ruined by
+   where it happened to put its ore. It is a test over many seeds and
+   spawns, in the way "every biome in every world" is. At the default
+   abundance: from any spawn, the Stone-Age materials (flint or obsidian, clay,
    native copper or bog iron) within about **ten minutes'** walk; a
    workable source of each early metal (copper, tin) within about
    **forty-five minutes**, rarely both in one place; iron and coal in
@@ -771,6 +778,9 @@ All of this document's questions are answered.
 6. **Fossils: the fossil-bearing rocks now, their contents later** (§7).
 7. **Ore**: real in kind, place, size and shape; spacing compressed;
    every "tell" in §13 to be built; reach numbers set low for now (§13).
-8. **The ages' names** (§7): Eoan, Ferrian, Thalassian, Rhexian, Orean,
-   Nivean — the second round, after "no ember" and "a different word for
-   Cryan". Still his to change.
+8. **The ages' names** (§7): Eoan (the Dawn Age), Ferrian, Thalassian,
+   Rhexian, Orean, Nivean (the Age of Ice) — Eoan and Nivean accepted by
+   name after a first round's were sent back.
+9. **The order of work**: "plate framework should be first. Then finish
+   M15, then geology" — milestone 16's tasks 1–2, then M15's tasks 2–6,
+   then the rest of milestone 16 (ADR-0025, *Consequences*).
