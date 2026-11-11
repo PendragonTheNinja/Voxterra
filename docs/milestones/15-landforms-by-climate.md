@@ -208,6 +208,16 @@ pass.
 4. **Tropics and humid lands:** inselbergs; dissected, rounded humid hills.
 5. **M14's carried items:** the enclosed interiors (closed basins); deeper
    valleys for large rivers.
+   **Small streams that follow the ground** (owner, 2026-11-11, after
+   his first flight on generator version 9: "so many weird funky things
+   with rivers ... worse in mountains"; agreed to fold in here). Streams
+   are straight segments between drainage cells 128 blocks apart, so a
+   small torrent on a steep hillside is a straight one-block slot down
+   the slope with falls stacked on it
+   (`docs/gallery/m16/flight1-3-river-mountain-a.jpg`, `-4-...-b.jpg`).
+   Small streams should bend round spurs and cut V-shaped gullies at
+   block scale. It is hillside work, as this milestone's landforms are,
+   so it is tuned once, with them.
 6. **Materials, the LOD, the bench, the owner's walk, the retro** — bare
    rock on cliffs and domes, sand on dunes; renders of every landform.
 

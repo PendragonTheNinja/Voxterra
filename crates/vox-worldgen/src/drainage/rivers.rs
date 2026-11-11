@@ -494,11 +494,15 @@ impl DrainageMap {
         // The blend eases cuts back into the land; it never lowers a bank
         // that holds water (a bank falls at 45° to the ground already).
         let h = (banked + (h - banked) * natural).max(floor).round() as i64;
+        // Ground at the pond's own level is its floor too, a block down:
+        // left dry, a flat plain's one-block contours stood across the
+        // water as lines and arcs (the owner's first version 9 flight;
+        // `no_dry_lines_cross_a_pond`). Cut, never raised.
         if let Some((_, level)) = pond
-            && h < level as i64
+            && h <= level as i64
         {
             return (
-                h,
+                h.min(level as i64 - 1),
                 Water {
                     level: level as i64,
                     body: Body::Lake,
@@ -556,6 +560,25 @@ impl DrainageMap {
         let ci = (x as f64 / self.cell_x).floor() as i64;
         let cj = (z as f64 / self.cell_z).floor() as i64;
         self.coastal((ci, cj), (x, z))
+    }
+
+    /// The highest lake whose reach holds column `(x, z)` (any lap), if
+    /// any: where it stands over ground lower than its level.
+    pub fn lake_at(
+        &self,
+        x: i64,
+        z: i64,
+        warp: impl Fn(i64, i64, f32) -> (f32, f32),
+    ) -> Option<i64> {
+        let cell = (
+            (x as f64 / self.cell_x).floor() as i64,
+            (z as f64 / self.cell_z).floor() as i64,
+        );
+        if !self.regions_near(cell.0, cell.1) {
+            return None;
+        }
+        let wobble = f64::from(warp(x, z, REGION_WAVELENGTH).0);
+        self.lake_level_at(cell, (x, z), wobble)
     }
 
     /// The highest lake standing at column `(x, z)` (any lap) or at any of

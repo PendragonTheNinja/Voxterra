@@ -276,7 +276,10 @@ pub enum DrainageSource {
 /// Continents are continental crust, mountain belts stand along
 /// collisions, arcs and old welds, trenches lie off subduction zones; new
 /// are mid-ocean ridges and rift valleys. Every world's ground moved.
-pub const GENERATOR_VERSION: u32 = 9;
+/// 10 — the polish after the owner's first version 9 flight: a pond's
+/// floor takes in ground at its own level (no dry strips across it); and
+/// what follows in the same pass (see milestone 16's spec, task 2b).
+pub const GENERATOR_VERSION: u32 = 10;
 
 impl Generator {
     /// A generator for one world: its seed and its size. The size is part of
@@ -1765,6 +1768,148 @@ mod tests {
         );
     }
 
+    /// No dry line crosses a pond (the owner's first version 9 flight,
+    /// `docs/gallery/m16/flight1-5-lake-lines.jpg`). A river held at its
+    /// receiver's level over a flat plain pools beside it; where the
+    /// plain's ground lay a block below the water it flooded, and where it
+    /// lay at the water's level it stayed dry — the plain's own one-block
+    /// contours stood across the pond as green lines and arcs. A strip of
+    /// dry ground at a pond's level, up to four blocks wide, with the pond
+    /// on both sides, is such a line.
+    #[test]
+    fn no_dry_lines_cross_a_pond() {
+        let g = Generator::new(0x0007_E22A_C0DE, WorldShape::DEFAULT);
+        let d = g.drainage();
+        let (nx, nz) = d.cells();
+        let (cw, ch) = d.cell_blocks();
+        let pond = |x: i64, z: i64| {
+            let (_, w) = g.ground(x, z);
+            (w.body == Body::Lake).then_some(w.level)
+        };
+        let (mut ponds, mut lines) = (0u32, Vec::new());
+        let mut look = |x0: i64, z0: i64, span: i64| {
+            for z in z0..z0 + span {
+                for x in x0..x0 + span {
+                    let (s, w) = g.ground(x, z);
+                    if w.body == Body::Lake {
+                        ponds += 1;
+                        continue;
+                    }
+                    if wet_top(&w) >= s.height || w.near.is_none() {
+                        continue;
+                    }
+                    // Along each axis, the first column either way that
+                    // is not dry ground at this height, within four blocks.
+                    let level_here = s.height;
+                    let end = |dx: i64, dz: i64| {
+                        (1..=4).find_map(|k| {
+                            let (x, z) = (x + k * dx, z + k * dz);
+                            let (s, w) = g.ground(x, z);
+                            (w.body == Body::Lake || s.height != level_here)
+                                .then_some((w.body == Body::Lake).then_some(w.level))
+                        })
+                    };
+                    for (dx, dz) in [(1, 0), (0, 1)] {
+                        if let (Some(Some(a)), Some(Some(b))) = (end(-dx, -dz), end(dx, dz))
+                            && a == b
+                            && level_here == a
+                        {
+                            lines.push((x, z, a));
+                        }
+                    }
+                }
+            }
+        };
+        // The owner's view, then the lowland rivers of one region.
+        look(29_120, 7_820, 80);
+        for j in (100..nz).step_by(97).take(4) {
+            for i in (100..nx).step_by(97).take(4) {
+                let (_, _, q, _) = d.cell(i, j);
+                if q >= 0.05 && !d.is_lake(i, j) && !d.is_sea(i, j) {
+                    look((i as f64 * cw) as i64, (j as f64 * ch) as i64, cw as i64);
+                }
+            }
+        }
+        eprintln!("{ponds} pond columns, {} dry lines", lines.len());
+        assert!(ponds > 200, "only {ponds} pond columns");
+        // Where two rivers' ponds meet, each 24 blocks from its own
+        // channel, each pond's holding bank stands at the edge and the two
+        // make a ridge a block or two wide between them — a natural levee,
+        // rare (81 strips before the fix, 6 after, at the owner's view).
+        assert!(
+            lines.len() * 100 < ponds as usize,
+            "{} dry columns at a pond's level between its water, e.g. {:?}",
+            lines.len(),
+            &lines[..lines.len().min(8)]
+        );
+    }
+
+    /// No dry ground stands at or above a lake inside its reach where the
+    /// ground began well under it. `rivers_end_at_still_water...` looks
+    /// only at a lake's own cells; this looks wherever a lake reaches,
+    /// its neighbours' cells included. (Written for the owner's first
+    /// version 9 flight's "lines in the lake"; those proved to be a pond's,
+    /// `no_dry_lines_cross_a_pond`, and this passes — kept as the guard
+    /// for lakes.)
+    #[test]
+    fn no_dry_lines_cross_a_lake() {
+        let g = Generator::new(0x0007_E22A_C0DE, WorldShape::DEFAULT);
+        let d = g.drainage();
+        let (nx, nz) = d.cells();
+        let (cw, ch) = d.cell_blocks();
+        let warp = |x: i64, z: i64, l: f32| g.elevation.meander_warp(x, z, l);
+        let (mut under, mut lines) = (0u32, Vec::new());
+        let mut check = |x: i64, z: i64| {
+            let Some(level) = d.lake_at(x, z, warp) else {
+                return;
+            };
+            let nat = g.eroded_surface(x, z).height;
+            if nat >= level - 1 {
+                return; // a shore: ground near the water's level
+            }
+            under += 1;
+            let (s, w) = g.ground(x, z);
+            if wet_top(&w) < level && s.height >= level {
+                lines.push((x, z, nat, s.height, level));
+            }
+        };
+        // The owner's view, then lakes across the world that rivers enter.
+        for z in (7_770..7_890).step_by(2) {
+            for x in (29_070..29_270).step_by(2) {
+                check(x, z);
+            }
+        }
+        let mut lakes = 0;
+        for j in (0..nz).step_by(7) {
+            for i in (0..nx).step_by(7) {
+                if !d.is_lake(i, j) || lakes >= 60 {
+                    continue;
+                }
+                lakes += 1;
+                let (x0, z0) = (
+                    ((i as f64 - 1.0) * cw) as i64,
+                    ((j as f64 - 1.0) * ch) as i64,
+                );
+                for z in (z0..z0 + (3.0 * ch) as i64).step_by(3) {
+                    for x in (x0..x0 + (3.0 * cw) as i64).step_by(3) {
+                        check(x, z);
+                    }
+                }
+            }
+        }
+        eprintln!("{lakes} lakes, {under} columns under them");
+        assert!(
+            lakes >= 20 && under > 10_000,
+            "{lakes} lakes, {under} under"
+        );
+        assert!(
+            lines.is_empty(),
+            "{} of {under} columns under a lake stand dry at or above it, e.g. {:?}",
+            lines.len(),
+            &lines[..lines.len().min(8)]
+        );
+    }
+
     /// The sea is only by the sea (the owner's third flight, M14): a lake at
     /// sea level in a hot desert, far from the coast, had a ring of "rocky
     /// coast" stone round it, coast and sea being classed by height alone;
@@ -2033,7 +2178,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (9, 0x70e2_8e98_4d73_d901);
+        const PINNED: (u32, u64) = (10, 0x56ac_fdb0_5454_0ef4);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),

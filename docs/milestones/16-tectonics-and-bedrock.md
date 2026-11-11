@@ -126,6 +126,15 @@ caves, ore, or rock's effect on erosion (milestones 17–20).
    is the task that bumps the generator and re-runs M13–M15.
    **Built 2026-11-11 (`GENERATOR_VERSION` 9); the owner's flight and
    bench to come.**
+2b. **Polish after the owner's first flight** (2026-11-11, agreed): what
+   he found on version 9 that is not M15's, in this order — (1) dry lines
+   across ponds; (2) seabeds grading sand → silt → mud with depth, not
+   one hard line; (3) coasts with real variety, not materials in bands
+   parallel to the shore; (4) the near LOD's colour and shading matched
+   to full resolution, and water darkening with depth alike in both.
+   One generator version (10) for the lot. Small streams that follow the
+   ground went to M15 (its task 5). The flight's views are
+   `docs/gallery/m16/flight1-*.jpg`.
 3. **Provinces and ages**; the bedrock map; the cross-section tool.
 4. **Strata in the chunks**: datum, structure, units; the engine's
    hidden-opaque-chunk shortcut; the bench.
