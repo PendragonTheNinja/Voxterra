@@ -58,6 +58,16 @@ const BASE_WANDER_WAVELENGTH: f32 = 128.0;
 const BANK_REACH: f32 = 48.0;
 /// The steepest bank: rise per block.
 const BANK_SLOPE: f32 = 1.0;
+/// A bank built to hold a river's water falls away from it no less
+/// steeply than this many times the river's own slope. At 45° alone, the
+/// bank beside a torrent steeper than 45° — common on the tectonic
+/// framework's mountain spines (milestone 16) — fell no faster than the
+/// river below it, and the levee holding a waterfall's lip ran on beside
+/// the lower river as a wall fifteen blocks high, raising ground that had
+/// stood lower (`rivers_run_in_valleys_not_slots`). Twice the river's
+/// slope ends that levee within a few blocks of the lip; below ~26°
+/// (slope 0.5) the bank still falls at 45°, as before.
+const LEVEE_FALL_PER_SLOPE: f32 = 2.0;
 /// Manning's roughness of a natural channel.
 const MANNING_N: f32 = 0.035;
 /// The slowest and fastest water drawn flowing, m/s.
@@ -318,6 +328,10 @@ impl DrainageMap {
         // levees had been built out across the open water — a dike (the
         // owner's walk): there only its channel is cut.
         let mut drowned = None;
+        // Whether the column is a braided river's dry bar, and the highest
+        // water any reach has within a block of it.
+        let mut on_bar = false;
+        let mut beside = f32::NEG_INFINITY;
         NEAR.with_borrow_mut(|near| {
             if (near.0, near.1, near.2) != (self.id, ci, cj) {
                 self.reaches_near(ci, cj, &mut near.3);
@@ -371,6 +385,9 @@ impl DrainageMap {
                 // The bank holds the water beside it — the highest within a
                 // few blocks upstream, where the profile steps down past it.
                 let held = reach.level_at(t - HELD_BACK / reach.len.max(1.0)).floor();
+                if out < 1.5 && !under && reach.kind != RiverKind::Wadi {
+                    beside = beside.max(held.max(level));
+                }
                 // Water is held by ground level with its surface; a bank a
                 // block above it raised flat ground beside every river into
                 // a little levee (the owner's walk).
@@ -392,10 +409,12 @@ impl DrainageMap {
                 if under {
                     // Nothing built under still water.
                 } else if !pooled {
-                    floor = floor.max(held - (give - BANK_SLOPE).max(0.0));
+                    let fall = BANK_SLOPE.max(LEVEE_FALL_PER_SLOPE * reach.slope);
+                    floor = floor.max(held - (out - 1.0).max(0.0) * fall);
                 } else if out >= POND_REACH {
                     let past = out - POND_REACH;
-                    floor = floor.max(held - (past - 1.0).max(0.0) * BANK_SLOPE);
+                    let fall = BANK_SLOPE.max(LEVEE_FALL_PER_SLOPE * reach.slope);
+                    floor = floor.max(held - (past - 1.0).max(0.0) * fall);
                 } else if out >= 0.0 && pond.is_none_or(|p| level > p.1) {
                     pond = Some((out, level));
                 }
@@ -420,6 +439,7 @@ impl DrainageMap {
                         RiverKind::Meandering => (Bed::Silt, false),
                     };
                     h = if bar { level } else { level - deep };
+                    on_bar = bar;
                     if under {
                         h = h.min(ground as f32);
                     }
@@ -433,6 +453,16 @@ impl DrainageMap {
                 }
             }
         });
+        // A bar is ground, and holds water as a bank does: it stands no
+        // lower than the water of ANY reach within a block of it — its
+        // own where the profile steps down past it, or the reach above's
+        // where that ends. A bar at its own river's level there left the
+        // higher water standing a block above it with nothing to hold it
+        // (found when milestone 16 moved the terrain under
+        // `water_is_never_held_by_air`).
+        if on_bar && drowned != Some(true) {
+            h = h.max(beside);
+        }
         if let Some((_, level, bed)) = best
             && drowned != Some(true)
         {
@@ -464,11 +494,15 @@ impl DrainageMap {
         // The blend eases cuts back into the land; it never lowers a bank
         // that holds water (a bank falls at 45° to the ground already).
         let h = (banked + (h - banked) * natural).max(floor).round() as i64;
+        // Ground at the pond's own level is its floor too, a block down:
+        // left dry, a flat plain's one-block contours stood across the
+        // water as lines and arcs (the owner's first version 9 flight;
+        // `no_dry_lines_cross_a_pond`). Cut, never raised.
         if let Some((_, level)) = pond
-            && h < level as i64
+            && h <= level as i64
         {
             return (
-                h,
+                h.min(level as i64 - 1),
                 Water {
                     level: level as i64,
                     body: Body::Lake,
@@ -526,6 +560,54 @@ impl DrainageMap {
         let ci = (x as f64 / self.cell_x).floor() as i64;
         let cj = (z as f64 / self.cell_z).floor() as i64;
         self.coastal((ci, cj), (x, z))
+    }
+
+    /// The highest lake whose reach holds column `(x, z)` (any lap), if
+    /// any: where it stands over ground lower than its level.
+    pub fn lake_at(
+        &self,
+        x: i64,
+        z: i64,
+        warp: impl Fn(i64, i64, f32) -> (f32, f32),
+    ) -> Option<i64> {
+        let cell = (
+            (x as f64 / self.cell_x).floor() as i64,
+            (z as f64 / self.cell_z).floor() as i64,
+        );
+        if !self.regions_near(cell.0, cell.1) {
+            return None;
+        }
+        let wobble = f64::from(warp(x, z, REGION_WAVELENGTH).0);
+        self.lake_level_at(cell, (x, z), wobble)
+    }
+
+    /// The highest lake standing at column `(x, z)` (any lap) or at any of
+    /// the four beside it, wherever the ground there lets it: the level
+    /// no ground here may be cut below, or the lake would stand over it
+    /// with nothing to hold it.
+    pub fn lake_beside(
+        &self,
+        x: i64,
+        z: i64,
+        warp: impl Fn(i64, i64, f32) -> (f32, f32),
+    ) -> Option<i64> {
+        let ci = (x as f64 / self.cell_x).floor() as i64;
+        let cj = (z as f64 / self.cell_z).floor() as i64;
+        if !self.regions_near(ci, cj) {
+            return None;
+        }
+        [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)]
+            .iter()
+            .filter_map(|&(dx, dz)| {
+                let (x, z) = (x + dx, z + dz);
+                let cell = (
+                    (x as f64 / self.cell_x).floor() as i64,
+                    (z as f64 / self.cell_z).floor() as i64,
+                );
+                let wobble = f64::from(warp(x, z, REGION_WAVELENGTH).0);
+                self.lake_level_at(cell, (x, z), wobble)
+            })
+            .max()
     }
 
     /// The highest lake whose region holds column `(x, z)`, of cell

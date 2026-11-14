@@ -77,9 +77,6 @@ pub struct Generator {
     drainage: Arc<OnceLock<DrainageMap>>,
     /// Stage-1 landform processes (M15, ADR-0023), built on first use.
     process: Arc<OnceLock<process::ProcessMap>>,
-    /// The tectonic framework (milestone 16, ADR-0025): a table over a few
-    /// hundred terranes, so it is built with the generator.
-    tectonics: Arc<tectonics::Tectonics>,
     /// Recently generated chunk columns' ground, shared by every clone
     /// ([`GroundCache`]): a speed-up only, never a source of truth.
     grounds: Arc<GroundCache>,
@@ -275,7 +272,14 @@ pub enum DrainageSource {
 /// blocks of the sea, land below sea level farther inland a lake at sea
 /// level; rivers end at any ground below sea level; a braided river's bars
 /// only in its middle, never across it.
-pub const GENERATOR_VERSION: u32 = 8;
+/// 9 — milestone 16: the tectonic framework places the terrain (ADR-0025).
+/// Continents are continental crust, mountain belts stand along
+/// collisions, arcs and old welds, trenches lie off subduction zones; new
+/// are mid-ocean ridges and rift valleys. Every world's ground moved.
+/// 10 — the polish after the owner's first version 9 flight: a pond's
+/// floor takes in ground at its own level (no dry strips across it); and
+/// what follows in the same pass (see milestone 16's spec, task 2b).
+pub const GENERATOR_VERSION: u32 = 10;
 
 impl Generator {
     /// A generator for one world: its seed and its size. The size is part of
@@ -289,17 +293,16 @@ impl Generator {
             climate: Arc::new(OnceLock::new()),
             drainage: Arc::new(OnceLock::new()),
             process: Arc::new(OnceLock::new()),
-            tectonics: Arc::new(tectonics::Tectonics::new(seed, shape)),
             grounds: Arc::new(GroundCache::default()),
         }
     }
 
     /// The world's tectonic framework (milestone 16, ADR-0025): its
     /// terranes and plates, and what every boundary between them is.
-    /// Nothing in generation reads it yet — milestone 16's task 2 places
-    /// the continents, mountain belts and trenches by it.
+    /// The terrain's continents, mountain belts, trenches, ocean ridges
+    /// and rifts are placed by it (`Elevation`).
     pub fn tectonics(&self) -> &tectonics::Tectonics {
-        &self.tectonics
+        self.elevation.tectonics()
     }
 
     /// The world's landform-process map (M15, ADR-0023): where wind, flash
@@ -469,6 +472,13 @@ impl Generator {
         // flat desert, with a step at its edge, was the owner's "raised
         // blocks around them"). Returns the ground, and whether it is flat
         // at the target — within LOWLAND_BELOW under it.
+        //
+        // And never below a lake standing beside it: where a river leaves
+        // a lake a block below the lake's surface, a flat cut to the
+        // river's level took the lake's shore away, and the lake stood a
+        // block over the wetland with nothing to hold it (found when
+        // milestone 16 moved the terrain under
+        // `lake_shores_hold_their_water`).
         let flatten = |target: i64, span: f32| {
             let above = h - target;
             if above <= 0 {
@@ -477,6 +487,13 @@ impl Generator {
             let w = (1.0 - smooth(n.out / span))
                 * (1.0 - smooth((above - 1) as f32 / (LOWLAND_ABOVE - 1) as f32));
             let g = (h as f32 - above as f32 * w).round() as i64;
+            let g = match self
+                .drainage()
+                .lake_beside(wx, wz, |x, z, l| self.elevation.meander_warp(x, z, l))
+            {
+                Some(lake) if g < lake => lake.min(h),
+                _ => g,
+            };
             (g, g <= target)
         };
         // A large river's mouth on a gentle coast — low ground beside it,
@@ -837,7 +854,13 @@ impl Generator {
                 let col = self.column_with(x, z, s.expect("at least one sample"));
                 let at = (cz * n + cx) as usize;
                 let wet = wet_top(&col.water);
-                if col.biome == biome::Biome::PolarSea {
+                // Sea ice is on the sea: a polar-sea column whose ground
+                // stands exactly at sea level has no water to freeze, and
+                // its top is its ground (the chunk generator's, which the
+                // LOD said was ice until milestone 16 moved the terrain
+                // onto such a column in
+                // `lod_surface_matches_full_resolution_in_every_biome`).
+                if col.biome == biome::Biome::PolarSea && h < SEA_LEVEL_BLOCKS {
                     heights[at] = SEA_LEVEL_BLOCKS as i32;
                     tops[at] = vox_core::registry::ICE;
                 } else if wet > h && self.block_in(&col, wet) == vox_core::registry::ICE {
@@ -1666,20 +1689,52 @@ mod tests {
                 banks += 1;
                 // A 45° bank from a block above the water rises ~3 here;
                 // uneven ground and stepping water allow a few more.
-                if s.height > n.level + 8 {
+                if s.height <= n.level + 8 {
+                    continue;
+                }
+                // Beside a waterfall the bank of the water above stands
+                // that far over the water below, and should: it is what
+                // holds the upper river. A slot is ground high above ALL
+                // the water near it. (Milestone 16 gave rivers mountain
+                // chains to come down, and torrents with falls every few
+                // blocks went from rare to common.)
+                let highest = (-3..=3)
+                    .flat_map(|dz| (-3..=3).map(move |dx| (dx, dz)))
+                    .map(|(dx, dz)| wet_top(&g.ground(x + dx, z + dz).1))
+                    .max()
+                    .unwrap_or(i64::MIN);
+                if s.height > highest + 8 {
                     slots.push((x, z, s.height - n.level));
                 }
             }
             (banks, slots)
         };
-        // The owner's view.
+        // The default world's largest rivers. (Until generator version 9
+        // this was the owner's own view of the slot, at a place the
+        // tectonic framework has since moved.)
         let g = Generator::new(0x0007_E22A_C0DE, WorldShape::DEFAULT);
-        let mut here = (-82_300..-82_180).flat_map(|z| (-51_730..-51_610).map(move |x| (x, z)));
+        let d = g.drainage();
+        let (nx, nz) = d.cells();
+        let (cw, ch) = d.cell_blocks();
+        let mut largest: Vec<(f32, usize, usize)> = (0..nz)
+            .flat_map(|j| (0..nx).map(move |i| (i, j)))
+            .filter(|&(i, j)| !d.is_sea(i, j) && !d.is_lake(i, j))
+            .map(|(i, j)| (d.cell(i, j).2, i, j))
+            .collect();
+        largest.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let mut here = largest.iter().take(6).flat_map(|&(_, i, j)| {
+            let (x0, z0) = ((i as f64 * cw) as i64, (j as f64 * ch) as i64);
+            (z0..z0 + ch as i64).flat_map(move |z| (x0..x0 + cw as i64).map(move |x| (x, z)))
+        });
         let (banks, found) = slots(&g, &mut here);
-        assert!(banks > 100, "only {banks} bank columns at the owner's view");
         assert!(
-            found.is_empty(),
-            "slots at the owner's view: {:?}",
+            banks > 100,
+            "only {banks} bank columns on the largest rivers"
+        );
+        assert!(
+            found.len() * 200 < banks as usize,
+            "{} of {banks} banks on the largest rivers stand 9+ above them, e.g. {:?}",
+            found.len(),
             &found[..found.len().min(8)]
         );
         // Rivers of every size.
@@ -1713,34 +1768,270 @@ mod tests {
         );
     }
 
+    /// No dry line crosses a pond (the owner's first version 9 flight,
+    /// `docs/gallery/m16/flight1-5-lake-lines.jpg`). A river held at its
+    /// receiver's level over a flat plain pools beside it; where the
+    /// plain's ground lay a block below the water it flooded, and where it
+    /// lay at the water's level it stayed dry — the plain's own one-block
+    /// contours stood across the pond as green lines and arcs. A strip of
+    /// dry ground at a pond's level, up to four blocks wide, with the pond
+    /// on both sides, is such a line.
+    #[test]
+    fn no_dry_lines_cross_a_pond() {
+        let g = Generator::new(0x0007_E22A_C0DE, WorldShape::DEFAULT);
+        let d = g.drainage();
+        let (nx, nz) = d.cells();
+        let (cw, ch) = d.cell_blocks();
+        let (mut ponds, mut lines) = (0u32, Vec::new());
+        let mut look = |x0: i64, z0: i64, span: i64| {
+            for z in z0..z0 + span {
+                for x in x0..x0 + span {
+                    let (s, w) = g.ground(x, z);
+                    if w.body == Body::Lake {
+                        ponds += 1;
+                        continue;
+                    }
+                    if wet_top(&w) >= s.height || w.near.is_none() {
+                        continue;
+                    }
+                    // Along each axis, the first column either way that
+                    // is not dry ground at this height, within four blocks.
+                    let level_here = s.height;
+                    let end = |dx: i64, dz: i64| {
+                        (1..=4).find_map(|k| {
+                            let (x, z) = (x + k * dx, z + k * dz);
+                            let (s, w) = g.ground(x, z);
+                            (w.body == Body::Lake || s.height != level_here)
+                                .then_some((w.body == Body::Lake).then_some(w.level))
+                        })
+                    };
+                    for (dx, dz) in [(1, 0), (0, 1)] {
+                        if let (Some(Some(a)), Some(Some(b))) = (end(-dx, -dz), end(dx, dz))
+                            && a == b
+                            && level_here == a
+                        {
+                            lines.push((x, z, a));
+                        }
+                    }
+                }
+            }
+        };
+        // The owner's view, then the lowland rivers of one region.
+        look(29_120, 7_820, 80);
+        for j in (100..nz).step_by(97).take(4) {
+            for i in (100..nx).step_by(97).take(4) {
+                let (_, _, q, _) = d.cell(i, j);
+                if q >= 0.05 && !d.is_lake(i, j) && !d.is_sea(i, j) {
+                    look((i as f64 * cw) as i64, (j as f64 * ch) as i64, cw as i64);
+                }
+            }
+        }
+        eprintln!("{ponds} pond columns, {} dry lines", lines.len());
+        assert!(ponds > 200, "only {ponds} pond columns");
+        // Where two rivers' ponds meet, each 24 blocks from its own
+        // channel, each pond's holding bank stands at the edge and the two
+        // make a ridge a block or two wide between them — a natural levee,
+        // rare (81 strips before the fix, 6 after, at the owner's view).
+        assert!(
+            lines.len() * 100 < ponds as usize,
+            "{} dry columns at a pond's level between its water, e.g. {:?}",
+            lines.len(),
+            &lines[..lines.len().min(8)]
+        );
+    }
+
+    /// No dry ground stands at or above a lake inside its reach where the
+    /// ground began well under it. `rivers_end_at_still_water...` looks
+    /// only at a lake's own cells; this looks wherever a lake reaches,
+    /// its neighbours' cells included. (Written for the owner's first
+    /// version 9 flight's "lines in the lake"; those proved to be a pond's,
+    /// `no_dry_lines_cross_a_pond`, and this passes — kept as the guard
+    /// for lakes.)
+    #[test]
+    fn no_dry_lines_cross_a_lake() {
+        let g = Generator::new(0x0007_E22A_C0DE, WorldShape::DEFAULT);
+        let d = g.drainage();
+        let (nx, nz) = d.cells();
+        let (cw, ch) = d.cell_blocks();
+        let warp = |x: i64, z: i64, l: f32| g.elevation.meander_warp(x, z, l);
+        let (mut under, mut lines) = (0u32, Vec::new());
+        let mut check = |x: i64, z: i64| {
+            let Some(level) = d.lake_at(x, z, warp) else {
+                return;
+            };
+            let nat = g.eroded_surface(x, z).height;
+            if nat >= level - 1 {
+                return; // a shore: ground near the water's level
+            }
+            under += 1;
+            let (s, w) = g.ground(x, z);
+            if wet_top(&w) < level && s.height >= level {
+                lines.push((x, z, nat, s.height, level));
+            }
+        };
+        // The owner's view, then lakes across the world that rivers enter.
+        for z in (7_770..7_890).step_by(2) {
+            for x in (29_070..29_270).step_by(2) {
+                check(x, z);
+            }
+        }
+        let mut lakes = 0;
+        for j in (0..nz).step_by(7) {
+            for i in (0..nx).step_by(7) {
+                if !d.is_lake(i, j) || lakes >= 60 {
+                    continue;
+                }
+                lakes += 1;
+                let (x0, z0) = (
+                    ((i as f64 - 1.0) * cw) as i64,
+                    ((j as f64 - 1.0) * ch) as i64,
+                );
+                for z in (z0..z0 + (3.0 * ch) as i64).step_by(3) {
+                    for x in (x0..x0 + (3.0 * cw) as i64).step_by(3) {
+                        check(x, z);
+                    }
+                }
+            }
+        }
+        eprintln!("{lakes} lakes, {under} columns under them");
+        assert!(
+            lakes >= 20 && under > 10_000,
+            "{lakes} lakes, {under} under"
+        );
+        assert!(
+            lines.is_empty(),
+            "{} of {under} columns under a lake stand dry at or above it, e.g. {:?}",
+            lines.len(),
+            &lines[..lines.len().min(8)]
+        );
+    }
+
+    /// The seabed fines outward (the owner's first version 9 flight,
+    /// `docs/gallery/m16/flight1-2-shore-drop.jpg`): sand and gravel near
+    /// shore, silt beyond, mud in the deep — as Earth's shelves are
+    /// sorted by the waves — never sand or gravel straight against mud.
+    /// They had met in one hard line where shallow sea became deep ocean.
+    #[test]
+    fn the_seabed_grades_from_sand_to_mud() {
+        use vox_core::registry as r;
+        let g = Generator::new(0x0007_E22A_C0DE, WorldShape::DEFAULT);
+        let size = WorldShape::DEFAULT.size_x();
+        let top = |x: i64, z: i64| {
+            let h = g.surface_height(x, z);
+            (h < -2).then(|| g.block_at(x, h, z))
+        };
+        let coarse = [r::SAND, r::GRAVEL];
+        let (mut beds, mut silt, mut seams) = (0u32, 0u32, Vec::new());
+        // Lines out from the coast: wherever a line crosses into the sea.
+        for k in 0..600i64 {
+            let z = k * 104_729 % size;
+            let x0 = k * 7_919 % size;
+            let mut last = top(x0, z);
+            for x in x0 + 1..x0 + 4_000 {
+                let here = top(x, z);
+                if let (Some(a), Some(b)) = (last, here) {
+                    beds += 1;
+                    silt += u32::from(b == r::SILT);
+                    if (coarse.contains(&a) && b == r::MUD) || (a == r::MUD && coarse.contains(&b))
+                    {
+                        seams.push((x, z, a, b));
+                    }
+                }
+                last = here;
+            }
+        }
+        eprintln!("{beds} seabed steps, {silt} silt, {} seams", seams.len());
+        assert!(beds > 100_000 && silt > 1_000, "{beds} beds, {silt} silt");
+        assert!(
+            seams.is_empty(),
+            "{} places where sand or gravel meets mud, e.g. {:?}",
+            seams.len(),
+            &seams[..seams.len().min(6)]
+        );
+    }
+
+    /// A rough coast alternates (the owner's first version 9 flight,
+    /// `docs/gallery/m16/flight1-1-sand-curve.jpg`): rocky on its headlands,
+    /// beaches in its bays — not one material along the whole shore in
+    /// bands parallel to the water. Of the shore where the region is rough,
+    /// neither rock nor beach is under a fifth.
+    #[test]
+    fn rough_coasts_alternate_rock_and_beach() {
+        use crate::biome::Biome;
+        let g = Generator::new(0x0007_E22A_C0DE, WorldShape::DEFAULT);
+        let size = WorldShape::DEFAULT.size_x();
+        let (mut rock, mut beach) = (0u32, 0u32);
+        for k in 0..3_000_000i64 {
+            let (x, z) = (k * 7_919 % size, k * 104_729 % size);
+            let s = g.surface(x, z);
+            if !(1..=3).contains(&s.height) || s.relief < 0.3 {
+                continue;
+            }
+            match g.column(x, z).biome {
+                Biome::RockyCoast => rock += 1,
+                Biome::SandBeach | Biome::ShingleBeach => beach += 1,
+                _ => {}
+            }
+        }
+        let shore = f64::from(rock + beach);
+        eprintln!("rough shore: {rock} rock, {beach} beach");
+        assert!(shore > 300.0, "only {shore} rough shore columns");
+        assert!(
+            f64::from(rock) > 0.2 * shore && f64::from(beach) > 0.2 * shore,
+            "rough shore is {rock} rock and {beach} beach"
+        );
+    }
+
     /// The sea is only by the sea (the owner's third flight, M14): a lake at
     /// sea level in a hot desert, far from the coast, had a ring of "rocky
     /// coast" stone round it, coast and sea being classed by height alone;
     /// and an inland basin below sea level, which the sea's rule fills with
-    /// water, had a dry river carried across it on a causeway. At the
-    /// owner's two VIEWs: no coast or sea biome inland, and no ground below
-    /// sea level raised.
+    /// water, had a dry river carried across it on a causeway.
+    ///
+    /// Until generator version 9 this looked at the owner's two VIEWs.
+    /// The tectonic framework moved those places, and gave the world many
+    /// more like the first — a rift's floor drops below sea level far
+    /// inland — so now it looks everywhere deep inside a continent, at all
+    /// ground that began below sea level: no coast or sea biome there.
+    ///
+    /// The second view's check, that ground below sea level is never
+    /// raised, was true of that basin and is not true in general: M14
+    /// fills hollows with sediment to their river's grade, and a rift is
+    /// a hollow. What it guarded — a river built out across standing
+    /// water as a causeway — is `rivers_end_at_still_water_and_flats_are_cut`
+    /// and `rivers_build_no_walls`, which look at every river.
     #[test]
     fn the_sea_is_only_by_the_sea() {
         let g = Generator::new(0x0007_E22A_C0DE, WorldShape::DEFAULT);
-        // The desert lake's shore, (−28 830, 22 030..22 090).
-        let shore: Vec<_> = (22_030..22_090)
-            .step_by(2)
-            .map(|z| (z, g.column(-28_830, z).biome))
-            .filter(|(_, b)| b.is_coast() || b.is_sea())
-            .collect();
-        assert!(shore.is_empty(), "coast or sea inland: {shore:?}");
-        // The inland basin the river crossed, (−43 950..−43 860, 26 260).
-        let raised: Vec<_> = (-43_950..-43_860)
-            .filter_map(|x| {
-                let nat = g.eroded_surface(x, 26_260).height;
-                let h = g.surface_height(x, 26_260);
-                (nat < 0 && h > nat).then_some((x, nat, h))
-            })
-            .collect();
+        let size = WorldShape::DEFAULT.size_x();
+        let (mut inland, mut below) = (0u32, 0u32);
+        let mut by_the_sea = Vec::new();
+        for k in 0..400_000i64 {
+            let (x, z) = (k * 7_919 % size, k * 104_729 % size);
+            // Three kilometres inside continental crust: farther than any
+            // coast wanders from its edge.
+            if g.tectonics().continentalness(x, z) < 3_000.0 {
+                continue;
+            }
+            inland += 1;
+            if g.eroded_surface(x, z).height >= 0 {
+                continue;
+            }
+            below += 1;
+            let biome = g.column(x, z).biome;
+            if biome.is_coast() || biome.is_sea() {
+                by_the_sea.push((x, z, biome));
+            }
+        }
         assert!(
-            raised.is_empty(),
-            "ground below sea level raised: {raised:?}"
+            inland > 20_000 && below > 100,
+            "{below} of {inland} inland columns began below the sea"
+        );
+        assert!(
+            by_the_sea.is_empty(),
+            "{} of {below}: coast or sea inland: {:?}",
+            by_the_sea.len(),
+            &by_the_sea[..by_the_sea.len().min(8)]
         );
     }
 
@@ -1845,7 +2136,7 @@ mod tests {
     /// Noise stays in range so heights are bounded and sane.
     #[test]
     fn stages_stay_in_their_ranges() {
-        let e = *Generator::new(123, WorldShape::DEFAULT).elevation();
+        let e = Generator::new(123, WorldShape::DEFAULT).elevation().clone();
         for x in (-4_000..4_000).step_by(37) {
             for z in (-4_000..4_000).step_by(211) {
                 for v in [e.continent(x, z), e.detail(x, z)] {
@@ -1959,7 +2250,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (8, 0x409a_bb6d_efe2_4f67);
+        const PINNED: (u32, u64) = (10, 0x16f0_ef61_040a_9ca0);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),
@@ -2090,5 +2381,94 @@ mod modflag_tests {
         assert!(!g.generate_chunk(ChunkPos::new(0, 0, 0)).is_modified());
         assert!(!g.generate_chunk(ChunkPos::new(0, 100, 0)).is_modified()); // air
         assert!(!g.generate_chunk(ChunkPos::new(0, -100, 0)).is_modified()); // stone
+    }
+
+    /// Tool: what the real callers pay (`cargo test -p vox-worldgen
+    /// --release generation_cost -- --ignored --nocapture`): generating
+    /// the surface chunks of a chunk column, cold, and building one LOD
+    /// node's surface at a near, a middle and a far level. Best of five.
+    #[test]
+    #[ignore]
+    fn generation_cost() {
+        let g = Generator::new(0x0007_E22A_C0DE, WorldShape::DEFAULT);
+        g.drainage();
+        g.climate();
+        let places: Vec<(i64, i64)> = (0..48i64)
+            .map(|k| (k * 7_919 % 6_400, k * 104_729 % 6_400))
+            .collect();
+        let best = |run: &dyn Fn() -> u64| {
+            let mut best = f64::MAX;
+            let mut sum = 0;
+            for _ in 0..5 {
+                let start = std::time::Instant::now();
+                sum = run();
+                best = best.min(start.elapsed().as_secs_f64() * 1e3);
+            }
+            (best, sum)
+        };
+        let (ms, sum) = best(&|| {
+            let g = Generator {
+                grounds: Arc::new(GroundCache::default()),
+                ..g.clone()
+            };
+            let mut sum = 0u64;
+            for &(cx, cz) in &places {
+                let (lo, hi) = g.surface_span_chunks(cx, cz);
+                for cy in lo..=hi {
+                    sum += u64::from(
+                        g.generate_chunk(ChunkPos::new(cx, cy, cz))
+                            .get(LocalPos::new(1, 2, 3))
+                            .0,
+                    );
+                }
+            }
+            sum
+        });
+        println!(
+            "surface chunks of a column  {:7.3} ms   (checksum {sum})",
+            ms / places.len() as f64
+        );
+        for stride in [2i64, 16, 128] {
+            let (ms, sum) = best(&|| {
+                let g = Generator {
+                    grounds: Arc::new(GroundCache::default()),
+                    ..g.clone()
+                };
+                places
+                    .iter()
+                    .take(24)
+                    .map(|&(cx, cz)| {
+                        let (h, _, _) =
+                            g.lod_surface(cx * 32, cz * 32, stride, LodSampling::Sparse);
+                        h.iter()
+                            .map(|&v| v as i64 as u64)
+                            .fold(0u64, u64::wrapping_add)
+                    })
+                    .fold(0u64, u64::wrapping_add)
+            });
+            println!(
+                "LOD node, stride {stride:3}        {:7.3} ms   (checksum {sum})",
+                ms / 24.0
+            );
+        }
+    }
+
+    /// Tool: what creating a world costs, stage by stage (`cargo test -p
+    /// vox-worldgen --release creation_cost -- --ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn creation_cost() {
+        for seed in [0x0007_E22A_C0DE_u64, 1, 2] {
+            let start = std::time::Instant::now();
+            let g = Generator::new(seed, WorldShape::DEFAULT);
+            let elevation = start.elapsed().as_secs_f64();
+            g.climate();
+            let climate = start.elapsed().as_secs_f64() - elevation;
+            g.drainage();
+            let drainage = start.elapsed().as_secs_f64() - elevation - climate;
+            println!(
+                "seed {seed:#x}: elevation {elevation:.2} s, climate {climate:.2} s, drainage {drainage:.2} s"
+            );
+        }
     }
 }

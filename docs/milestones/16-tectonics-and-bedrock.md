@@ -12,14 +12,15 @@ written against is `docs/geology.md`; read it first. This spec is the
 part of it built now.
 
 **Status: draft; its deciding questions are answered (2026-11-10);
-task 1 is built (2026-11-11).** The owner chose option C, the plate
+tasks 1 and 2 are built (2026-11-11) — task 2 awaits the owner's
+flight and `--bench` on generator version 9.** The owner chose option C, the plate
 framework, and answered every question in `docs/geology.md` §16;
 ADR-0024 (block names in saves) is built. How the framework is made is
 ADR-0025 (proposed, sections 1–3 built), and the order is the owner's
 (2026-11-10): **this milestone's tasks 1 and 2 first, then M15's tasks
 2–6, then this milestone's tasks 3–6** — so that landforms are tuned
-once, on the terrain they ship on. **Next: task 2** — see *Task 1 as
-built* below for where it starts.
+once, on the terrain they ship on. **Next: the owner's flight and bench
+on version 9** (see *Task 2 as built* below), then M15's task 2.
 
 ## Why this milestone exists
 
@@ -123,6 +124,44 @@ caves, ore, or rock's effect on erosion (milestones 17–20).
 2. **Terrain placed by the framework.** Continents, belts and trenches
    move; ridges and rifts appear. The ADR-0010 statistics are held. This
    is the task that bumps the generator and re-runs M13–M15.
+   **Built 2026-11-11 (`GENERATOR_VERSION` 9); the owner's flight and
+   bench to come.**
+2b. **Polish after the owner's first flight** (2026-11-11, agreed): what
+   he found on version 9 that is not M15's, in this order — (1) dry lines
+   across ponds; (2) seabeds grading sand → silt → mud with depth, not
+   one hard line; (3) coasts with real variety, not materials in bands
+   parallel to the shore; (4) the near LOD's colour and shading matched
+   to full resolution, and water darkening with depth alike in both.
+   One generator version (10) for the lot. Small streams that follow the
+   ground went to M15 (its task 5). The flight's views are
+   `docs/gallery/m16/flight1-*.jpg`. **Done 2026-11-11** (each with a test
+   that failed first, and a before/after in the gallery):
+   - (1) **Ponds**: ground at a pond's own level is its floor, a block
+     down (81 strip columns at the owner's view, 6 after — where two
+     rivers' ponds meet, a natural levee). The "lines" were a pond's, not
+     a lake's: a river held over a flat plain flooded its 54s and left its
+     55s dry. The circles near lakes are the banks that hold a lake where
+     the ground outside its reach is lower; M14's design, left as it is.
+   - (2) **Seabeds** fine outward: sand or gravel, silt from ~85 down,
+     mud from ~175, the bands moved by patch noise (150 sand-against-mud
+     places → 0).
+   - (3) **Coasts, partly.** A rough coast now alternates rocky headlands
+     and beaches in its bays (`Surface::headland`), and a guard holds
+     coastal speckle under 3% (0.9%). The owner's view itself is
+     unchanged: its bands are the coast's *shape*, one smooth slope, and
+     three tries at shaping it here failed — folded cliffs along the shore
+     (one even wall), cliffs on headlands only (still a wall), a domain
+     warp of the shoreline (too faint at 45 blocks; more would fold
+     contours). Real coasts need a landform family — sea cliffs, coves,
+     bayhead beaches, spits, stacks — **proposed for M15's catalogue**.
+   - (4a) **The LOD's slopes** darken as full resolution's do: tops 0.4
+     per unit of slope, walls 0.6, measured from both meshers and held by
+     `lod_slopes_are_as_bright_as_full_resolution`. The near-LOD band is
+     gone.
+   - (4b) **Water darkens with depth**, near and far alike: the opaque
+     depth is copied after it is drawn and both water shaders absorb by
+     the water between surface and bed. A depth copy a frame — the
+     owner's `--bench` should show whether it costs anything.
 3. **Provinces and ages**; the bedrock map; the cross-section tool.
 4. **Strata in the chunks**: datum, structure, units; the engine's
    hidden-opaque-chunk shortcut; the bench.
@@ -179,6 +218,44 @@ half-width, and neither field ever jumps.
 4. **The smallest world** has no guaranteed passive margin or collision;
    criterion 7's "stated minimum" should be: land and sea, one plate
    boundary with a belt, one craton.
+
+## Task 2 as built (2026-11-11)
+
+Generator version 9: continents are continental crust, ranges stand on
+collisions, arcs and old welds, trenches lie off subduction zones, ocean
+ridges rise and rifts drop. ADR-0025's *As built: task 2* has the
+numbers; the gallery (`docs/gallery/m16/`) has version 8 and 9 side by
+side.
+
+**Criterion 4's tolerances**, stated now that both versions are
+measured (`terrain_stats`, six seeds, default size): land within a
+point of 42%; land under ranges within ±25% of version 8's 5.0–7.6%;
+median, 99th-percentile and highest land heights within ±15%; near-flat
+land within 5 points; the walk spreads no lower than version 8's (more
+variety is not a failure). Version 9 meets all of these. Two numbers
+moved that criterion 4 did not name, and they are the owner's to judge:
+**shelves are 4–6× narrower** and **landmasses ~30% smaller** (ADR-0025
+lists both, and what would change them).
+
+**Criterion 3**, as tests: `mountains_and_trenches_are_where_the_plates_put_them`
+(no uplift off a belt; every massif of 700+ on a strong boundary; every
+trench on the plate going under), `ridges_rise_and_rifts_drop`, and
+task 1's framework tests.
+
+**Criterion 8**, re-run: every biome in every world; every M14 test
+(four found real flaws in M14's water code on the new ground, fixed;
+two were re-anchored from places version 9 moved — ADR-0025 says which
+and why); M15's process survey, nothing misplaced. Closed basins fell
+from 29% to 22%.
+
+**Criterion 10** so far: deterministic, pinned, chunk generation at
+version 8's cost, world creation ~10–15% dearer (6.6–7.4 s). The
+`--bench` is the owner's.
+
+**What the owner should look at** in flight: coasts (narrow shelves);
+continent sizes; ranges — cordilleras on arcs and collisions, worn
+massifs on old welds; trenches and ridges from the air; a rift valley;
+an enclosed basin (rhombic, filled flat, `docs/gallery/m16/task2-basin-close-up.jpg`).
 
 ## Non-goals
 

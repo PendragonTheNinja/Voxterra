@@ -1554,6 +1554,119 @@ fn emit_sealed_rect(mesh: &mut MeshData, rect: &MergedRect, corners: &HashSet<[i
 
 #[cfg(test)]
 mod tests {
+    /// A slope is as bright in the LOD as at full resolution (the owner's
+    /// first version 9 flight: near hillsides were a darker band against
+    /// the LOD beyond them). Lit staircases of slope `g`, open sky above,
+    /// meshed both ways; the area-weighted brightness of their walls agree
+    /// within 0.02 and of their tops within 0.035 at every slope and
+    /// stride. (The finest LOD on the gentlest slopes is the 0.03: its flat
+    /// stretches between risers merge into one shape with one shade, which
+    /// loses the slight darkening at each riser's foot; splitting them
+    /// would cost triangles over every gentle slope for a difference under
+    /// 4%.) Before
+    /// `LOD_SLOPE_DARKEN` and `LOD_WALL_SHADE`, the LOD's walls were 0.650
+    /// against 0.391 and its tops 1.0 against down to 0.70. Prints the
+    /// table with `--nocapture`: it is what calibrates them.
+    #[test]
+    fn lod_slopes_are_as_bright_as_full_resolution() {
+        use vox_core::{
+            Chunk, LocalPos,
+            registry::{AIR, STONE},
+        };
+        fn mean(
+            tris: impl Iterator<Item = ([f32; 3], [f32; 3], [f32; 3], [f32; 3])>,
+        ) -> (f64, f64, f64, f64) {
+            // (top area, top brightness·area, wall area, wall brightness·area)
+            let (mut ta, mut tb, mut wa, mut wb) = (0.0, 0.0, 0.0, 0.0);
+            for (a, b, c, br) in tris {
+                let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+                let n = [
+                    u[1] * v[2] - u[2] * v[1],
+                    u[2] * v[0] - u[0] * v[2],
+                    u[0] * v[1] - u[1] * v[0],
+                ];
+                let area = 0.5 * ((n[0] * n[0] + n[1] * n[1] + n[2] * n[2]) as f64).sqrt();
+                let bright = f64::from((br[0] + br[1] + br[2]) / 3.0);
+                if (n[1] as f64).abs() > 0.9 * 2.0 * area && n[1] > 0.0 {
+                    ta += area;
+                    tb += area * bright;
+                } else if (n[1] as f64).abs() < 0.1 * 2.0 * area {
+                    wa += area;
+                    wb += area * bright;
+                }
+            }
+            (ta, tb, wa, wb)
+        }
+        println!("slope | full: top wall mean | lod s=2: top wall mean | s=8 | s=32");
+        for g in [0.05f32, 0.1, 0.2, 0.3, 0.45, 0.6, 0.75] {
+            let h = |x: f32| 4 + (g * x).floor() as i32;
+            let mut chunk = Chunk::new_air();
+            let mut light = vec![0u8; vox_core::CHUNK_VOLUME];
+            for x in 0..32 {
+                for z in 0..32 {
+                    for y in 0..32 {
+                        let p = LocalPos::new(x, y, z);
+                        if (y as i32) <= h(x as f32) {
+                            chunk.set(p, STONE);
+                        } else {
+                            light[p.index()] = 15 << 4;
+                        }
+                    }
+                }
+            }
+            chunk.set_light_packed(&light);
+            let mesh = mesh_chunk(&chunk, &ChunkNeighbors::NONE, |_, _| 0, |b| b != AIR);
+            let vb = |v: &Vertex| v.shade * light_curve_f(v.sky.max(v.block) * 15.0);
+            let full = mean(
+                mesh.indices[..mesh.opaque_index_count as usize]
+                    .chunks(3)
+                    .filter_map(|t| {
+                        let [a, b, c] = [t[0], t[1], t[2]].map(|i| &mesh.vertices[i as usize]);
+                        let cx = (a.position[0] + b.position[0] + c.position[0]) / 3.0;
+                        let cz = (a.position[2] + b.position[2] + c.position[2]) / 3.0;
+                        ((6.0..26.0).contains(&cx) && (6.0..26.0).contains(&cz))
+                            .then(|| (a.position, b.position, c.position, [vb(a), vb(b), vb(c)]))
+                    }),
+            );
+            let mut row = format!(
+                "{g:5.2} | {:.3} {:.3} {:.3}",
+                full.1 / full.0.max(1e-9),
+                full.3 / full.2.max(1e-9),
+                (full.1 + full.3) / (full.0 + full.2)
+            );
+            for s in [2i32, 8, 32] {
+                let heights: Vec<i32> = (0..LOD_CELLS * LOD_CELLS)
+                    .map(|k| (4.0 + (g * ((k % LOD_CELLS) as i32 * s) as f32).floor()) as i32)
+                    .collect();
+                let lod = mesh_lod_heightfield(&heights, s, 0, |_, _| 0, 0);
+                let lb = |v: &LodVertex| v.shade * light_curve_f(v.sky * 15.0);
+                let span = (LOD_CELLS as f32) * s as f32;
+                let m = mean(lod.indices.chunks(3).filter_map(|t| {
+                    let [a, b, c] = [t[0], t[1], t[2]].map(|i| &lod.vertices[i as usize]);
+                    let cx = (a.position[0] + b.position[0] + c.position[0]) / 3.0;
+                    let cz = (a.position[2] + b.position[2] + c.position[2]) / 3.0;
+                    ((0.2 * span..0.8 * span).contains(&cx)
+                        && (0.2 * span..0.8 * span).contains(&cz))
+                    .then(|| (a.position, b.position, c.position, [lb(a), lb(b), lb(c)]))
+                }));
+                row += &format!(
+                    " | {:.3} {:.3} {:.3}",
+                    m.1 / m.0.max(1e-9),
+                    m.3 / m.2.max(1e-9),
+                    (m.1 + m.3) / (m.0 + m.2)
+                );
+                let (full_top, full_wall) = (full.1 / full.0, full.3 / full.2);
+                let (lod_top, lod_wall) = (m.1 / m.0, m.3 / m.2);
+                assert!(
+                    (full_top - lod_top).abs() < 0.035 && (full_wall - lod_wall).abs() < 0.02,
+                    "slope {g}, stride {s}: tops {full_top:.3} / {lod_top:.3}, walls {full_wall:.3} / {lod_wall:.3}"
+                );
+            }
+            println!("{row}");
+        }
+    }
+
     use super::*;
     use std::collections::HashMap;
 
@@ -3282,6 +3395,19 @@ pub fn mesh_lod_heightfield_with(
 /// A cell with no standing water, in [`LodCells::water`].
 pub const LOD_DRY: i32 = i32::MIN;
 
+/// What full resolution's smooth light and ambient occlusion do to a slope,
+/// on average, given to the LOD, which has neither (the owner's first
+/// version 9 flight: near hillsides were a darker band against the LOD
+/// beyond them, `docs/gallery/m16/flight1-6-lod-seam.jpg`). Measured from
+/// the real meshers by `slope_brightness`, which also holds them together:
+/// full resolution's tops darken by this much per block of rise per block
+/// of run — every riser shades the tread at its foot — down to the floor;
+/// its walls are this share of an unoccluded wall's brightness at every
+/// slope (each riser's foot meets the ground).
+const LOD_SLOPE_DARKEN: f32 = 0.4;
+const LOD_SLOPE_FLOOR: f32 = 0.55;
+const LOD_WALL_SHADE: f32 = 0.6;
+
 /// The 32×32 cells of an LOD node: each one's ground height, top block, and
 /// the top block of the water standing on it ([`LOD_DRY`] for none).
 #[derive(Clone, Copy)]
@@ -3359,6 +3485,25 @@ pub fn mesh_lod_cells(
     // `sky_scale` uniform as the near field.
     let sky = 1.0f32;
     let top_shade = face_brightness(1, true);
+    // A cell's rise per block of run, both ways summed: the risers full
+    // resolution would have across it ([`LOD_SLOPE_DARKEN`]).
+    let slope_shade = |cx: i32, cz: i32| -> f32 {
+        let h = |x: i32, z: i32| heights[(z.clamp(0, n - 1) * n + x.clamp(0, n - 1)) as usize];
+        let rise = |dx: i32, dz: i32| {
+            let (a, b) = (h(cx - dx, cz - dz), h(cx + dx, cz + dz));
+            let span = if (cx - dx).clamp(0, n - 1) == cx - dx
+                && (cx + dx).clamp(0, n - 1) == cx + dx
+                && (cz - dz).clamp(0, n - 1) == cz - dz
+                && (cz + dz).clamp(0, n - 1) == cz + dz
+            {
+                2
+            } else {
+                1
+            };
+            (a - b).unsigned_abs() as f32 / (span * h_stride) as f32
+        };
+        (1.0 - LOD_SLOPE_DARKEN * (rise(1, 0) + rise(0, 1))).max(LOD_SLOPE_FLOOR)
+    };
 
     // The ground, everywhere — seabed included. The sea is a separate,
     // translucent surface added after (ADR-0011 decision 1c), so a view
@@ -3455,7 +3600,7 @@ pub fn mesh_lod_cells(
                             s,
                             layer,
                             sky,
-                            top_shade,
+                            top_shade * slope_shade(x, z),
                             [coarse_top; 4],
                         );
                     }
@@ -3551,7 +3696,7 @@ pub fn mesh_lod_cells(
                 // up smoothly as the morph carries it to the other end.
                 let (bottom, top) = (neighbour.min(h) + 1, h + 1);
                 let wall_bottom = bottom as f32;
-                let shade = face_brightness(axis, positive);
+                let shade = face_brightness(axis, positive) * LOD_WALL_SHADE;
                 let layer = layer_of(top_of(cx, cz), face_index);
                 let plane = if positive { w } else { 0.0 };
                 // Winding follows FACE_DIRS so back-face culling keeps these.

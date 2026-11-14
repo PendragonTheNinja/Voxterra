@@ -275,6 +275,12 @@ pub struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     depth_view: wgpu::TextureView,
+    /// The depth buffer itself, and a copy of it taken after the opaque
+    /// world is drawn: what the water shaders read to know how much water
+    /// lies in front of the bed (flow.wgsl, `water_depth`).
+    depth_texture: wgpu::Texture,
+    depth_copy: wgpu::Texture,
+    depth_copy_view: wgpu::TextureView,
     pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
@@ -649,7 +655,8 @@ impl Renderer {
             .is_none()
             .then(|| create_offscreen(&device, &config));
 
-        let depth_view = create_depth_view(&device, &config);
+        let (depth_texture, depth_view, depth_copy, depth_copy_view) =
+            create_depth_targets(&device, &config);
 
         // --- Camera uniform: one mat4, rewritten every frame. ---
         let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -697,7 +704,8 @@ impl Renderer {
             // and lod.wgsl. Three writers, disjoint ranges: `set_sky` owns
             // vec4s 0-3, `set_fullres_columns` vec4 4, `write_climate_placement`
             // vec4s 5-6.
-            size: std::mem::size_of::<[f32; 28]>() as u64,
+            // An eighth, the depth range (near, far), is `set_sky`'s too.
+            size: std::mem::size_of::<[f32; 32]>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -775,6 +783,18 @@ impl Renderer {
                     },
                     count: None,
                 },
+                // The opaque world's depth, copied after it is drawn: how far
+                // behind a water surface its bed lies (flow.wgsl).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let climate_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -798,6 +818,7 @@ impl Renderer {
             &fullres_mask_view,
             (&climate_texture_view, &flow_view),
             &climate_sampler,
+            &depth_copy_view,
         );
 
         // --- Per-chunk offset uniform layout (group 1), for floating
@@ -1245,6 +1266,9 @@ impl Renderer {
             queue,
             config,
             depth_view,
+            depth_texture,
+            depth_copy,
+            depth_copy_view,
             pipeline,
             camera_buffer,
             camera_bind_group,
@@ -1604,6 +1628,7 @@ impl Renderer {
             &self.fullres_mask_view,
             (&self.climate_view, &self.flow_view),
             &self.climate_sampler,
+            &self.depth_copy_view,
         );
     }
 
@@ -1773,6 +1798,22 @@ impl Renderer {
         ];
         self.queue
             .write_buffer(&self.sky_buffer, 0, bytemuck::cast_slice(&chunk_uniform));
+        // vec4 7: the depth range, near and far, for the water shaders to
+        // turn depth back into distance (flow.wgsl, `water_depth`). Read
+        // off the projection itself — reversed-Z (ADR-0013) puts the near
+        // plane at depth 1 and the far at 0 — so it is always the one in
+        // use.
+        let inv = Mat4::from_cols_array_2d(&inv_view_proj);
+        let at = |depth: f32| {
+            let p = inv * Vec4::new(0.0, 0.0, depth, 1.0);
+            (p.truncate() / p.w - Vec3::from(camera_rel)).length()
+        };
+        let depth_range: [f32; 4] = [at(1.0), at(0.0), 0.0, 0.0];
+        self.queue.write_buffer(
+            &self.sky_buffer,
+            (28 * std::mem::size_of::<f32>()) as u64,
+            bytemuck::cast_slice(&depth_range),
+        );
 
         // Sky-pass uniform.
         let sun = time.sun_direction();
@@ -1820,8 +1861,15 @@ impl Renderer {
             Some(surface) => surface.configure(&self.device, &self.config),
             None => self.offscreen = Some(create_offscreen(&self.device, &self.config)),
         }
-        // Depth buffer dimensions must always match the surface.
-        self.depth_view = create_depth_view(&self.device, &self.config);
+        // Depth buffer dimensions must always match the surface, and the
+        // water shaders' copy of it with them.
+        (
+            self.depth_texture,
+            self.depth_view,
+            self.depth_copy,
+            self.depth_copy_view,
+        ) = create_depth_targets(&self.device, &self.config);
+        self.rebuild_sky_bind_group();
     }
 
     /// Width/height ratio, for the projection matrix.
@@ -1916,7 +1964,7 @@ impl Renderer {
                     view: &self.depth_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(DEPTH_CLEAR),
-                        store: wgpu::StoreOp::Discard,
+                        store: wgpu::StoreOp::Store,
                     }),
                     stencil_ops: None,
                 }),
@@ -1990,10 +2038,49 @@ impl Renderer {
                         area_tris += mesh.opaque_area_tris as usize;
                     }
                 }
-
+            }
+        }
+        // The opaque world is drawn; its depth is what the water shaders
+        // read to know how much water lies in front of the bed (flow.wgsl).
+        // A copy, because a texture cannot be read while it is the pass's
+        // depth attachment.
+        encoder.copy_texture_to_texture(
+            self.depth_texture.as_image_copy(),
+            self.depth_copy.as_image_copy(),
+            wgpu::Extent3d {
+                width: self.config.width,
+                height: self.config.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("water pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            if !self.meshes.is_empty() || !self.lod_meshes.is_empty() {
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_bind_group(2, &self.texture_bind_group, &[]);
+                pass.set_bind_group(3, &self.sky_bind_group, &[]);
                 // Transparent chunk faces (ADR-0011), last of the world so they
-                // blend over everything opaque — full-res and LOD alike. Same
-                // bind-group layout, so groups 0, 2 and 3 stay bound.
+                // blend over everything opaque — full-res and LOD alike.
                 pass.set_pipeline(&self.transparent_pipeline);
                 for (pos, mesh) in self.meshes.iter().filter(|_| self.variant.chunks) {
                     if mesh.index_count == mesh.opaque_index_count {
@@ -2417,6 +2504,7 @@ fn sky_bind_group(
     fullres_mask: &wgpu::TextureView,
     (climate, flow): (&wgpu::TextureView, &wgpu::TextureView),
     climate_sampler: &wgpu::Sampler,
+    opaque_depth: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("sky bind group"),
@@ -2441,6 +2529,10 @@ fn sky_bind_group(
             wgpu::BindGroupEntry {
                 binding: 4,
                 resource: wgpu::BindingResource::TextureView(flow),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(opaque_depth),
             },
         ],
     })
@@ -2610,25 +2702,44 @@ fn create_offscreen(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) 
     })
 }
 
-fn create_depth_view(
+/// The depth buffer, and the copy of it the water shaders read: each a
+/// texture and its view.
+fn create_depth_targets(
     device: &wgpu::Device,
     config: &wgpu::SurfaceConfiguration,
-) -> wgpu::TextureView {
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("depth texture"),
-        size: wgpu::Extent3d {
-            width: config.width,
-            height: config.height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: DEPTH_FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        view_formats: &[],
-    });
-    texture.create_view(&wgpu::TextureViewDescriptor::default())
+) -> (
+    wgpu::Texture,
+    wgpu::TextureView,
+    wgpu::Texture,
+    wgpu::TextureView,
+) {
+    let make = |label, usage| {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: config.width,
+                height: config.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        (texture, view)
+    };
+    let (depth, depth_view) = make(
+        "depth texture",
+        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+    );
+    let (copy, copy_view) = make(
+        "opaque depth copy",
+        wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+    );
+    (depth, depth_view, copy, copy_view)
 }
 
 #[cfg(test)]

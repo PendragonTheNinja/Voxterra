@@ -2,11 +2,13 @@
 
 - **Status:** Proposed (2026-11-10). The *decision to have one* is the
   owner's (2026-11-10, `docs/geology.md` §4, option C: "yes we do this");
-  this is how. **Sections 1–3 and 7 are built** (milestone 16 task 1,
-  2026-11-11: `vox_worldgen::tectonics`, read by nothing yet) and were
-  corrected by the building — see *As built* at the end; sections 4–5
-  are task 2. To be accepted with task 2, when terrain is placed by the
-  framework and ADR-0010's guard has passed. On acceptance it
+  this is how. **Built** (milestone 16 tasks 1 and 2, 2026-11-11):
+  the framework, `vox_worldgen::tectonics`, and since generator version
+  9 the terrain placed by it — corrected by the building in both tasks;
+  see *As built* and *As built: task 2* at the end. ADR-0010's guard
+  tests pass. **To be accepted after the owner's flight and `--bench` on
+  version 9**, and his answer to the two questions task 2 leaves open
+  (narrower shelves; smaller landmasses). On acceptance it
   supersedes the *placement* of ADR-0010's continents, mountain belts and
   trenches; ADR-0010's scale — its wavelengths, amplitudes and the
   walking-time table — stands unchanged and is this ADR's hardest
@@ -260,3 +262,128 @@ leaves rarity to the ridged field, so the envelope is the narrower of
 the two by a wide margin; holding ADR-0010's range share will mean
 scaling strengths up or widening belts by kind (a collision's orogen is
 wider than an old suture's), not only matching a number.
+
+## As built: task 2 — the terrain placed by it (2026-11-11)
+
+`GENERATOR_VERSION` **9**. `Elevation` holds the framework and reads it
+for every column; every shape §4 keeps is kept.
+
+**What reads what** (`elevation.rs`):
+
+| Input | Version 8 | Version 9 |
+|---|---|---|
+| Continent field | Three noise octaves (56 / 21 / 7.5 km) | `continentalness` ÷ 23 000 blocks per unit on land, ÷ 46 000 at sea (a longer shelf and slope than the land side's rise: a distance field cannot run nearly level along a coast as the noise did), plus coastal noise (6.1 / 2.3 / 0.85 km, ±0.1, a third of that far from any coast so it cannot open lakes of sea inland); then the same 42% calibration |
+| Where ranges may rise | A 13 km noise gate | The belt envelope (`Boundary::belt`): full across the inner half of a belt's 3.5 km half-width, falling to nothing at its edge; an arc's belt set back 0.35 of that onto the overriding plate |
+| How high | Ridged field above its floor, × gate | The same ridged field, given a **spine** (`BELT_SPINE`: raised toward full by half the belt's strength squared), × belt × `belt_gain`. Strong belts become one continuous cordillera with passes; weak ones stay as separate worn massifs |
+| Trenches | A ridge noise × a gate | On the plate going under, 2 200 blocks off the boundary, ±800 wide, 340 deep at most, varying along strike (12 km wavelength, never under 40%) |
+| New: ocean ridges | — | +100 at the line falling as √distance (the cooling curve) over 3.5 km, with a 60-deep, ±300 axial valley |
+| New: rifts | — | A floor ±380 dropping 30–110 (by the along-strike noise), walls out to ±800, shoulders +60 fading over the rest of the reach; the valley wanders ±900 from its line |
+
+**Strengths, recalibrated** (task 1's numbers gave summits that were too
+low once squared through `uplift`): collision 1.0, continental arc 0.9,
+island arc 0.6; sutures Orean 0.8, Rhexian 0.6, Thalassian 0.55, Ferrian
+0.35, Eoan 0.3; seams 0.3 / 0.15 / 0.1. **Calibration** (§5) became a
+floor rather than a match: `MIN_RANGE_SHARE` 5% of land under ranges of
+400+ uplift (version 8 measured 5.0–7.6% at the default size), reached by
+a per-world `belt_gain` up to 3; most worlds need none. Continental share
+is now 0.41 (near the 42% land target, so the coast calibration moves
+shores hundreds of blocks, not a continent).
+
+**Not built:** foreland sags (they are a province, task 3); hotspot
+volcanoes and crustal thickness (milestone 17).
+
+**Cost.** One framework lookup per column would have doubled terrain
+height (task 1's finding). Built instead:
+
+- **Seeds kept between columns** (`tectonics::Kept`): a search keeps the
+  seeds that can matter within 512 blocks of it, with the boundaries
+  between them; a column nearby is answered from those alone. Proven
+  bit-exact against a fresh search over every world shape
+  (`remembering_changes_nothing`, and the pinned fingerprint).
+- **The warp baked into one table** at 8 nodes per terrane cell (four
+  reads per column, not three octaves of interpolation).
+
+Measured in the cloud container, both versions back to back:
+
+| | v8 | v9 |
+|---|---|---|
+| Generating a column's surface chunks (cold) | 1.01 ms | 0.89–1.06 ms |
+| LOD node, stride 2 / 16 / 128 | 2.1–2.3 / 6.9–8.2 / 8.5–9.2 ms | 2.1 / 8.0 / 9.5–11.1 ms |
+| Height, chunk columns / LOD grid | 127–145 / 130–145 ns | 169–199 / 189–208 ns |
+| Height, columns scattered across the world (tools only) | 113–157 ns | 410–500 ns |
+| World creation (climate + drainage) | 5.9–6.6 s | 6.6–7.4 s |
+
+Chunk generation is unchanged within noise; the far LOD level is up to
+~20%; world creation ~10–15%. Scattered single columns cost ~3× — only
+tools and tests ask for those.
+
+**Statistics against version 8** (`terrain_stats`, 6 seeds, default
+size):
+
+| | v8 | v9 | |
+|---|---|---|---|
+| Land | 41.5–41.7% | 41.5–41.7% | held |
+| Land under ranges (400+) | 5.0–7.6% | 5.1–8.5% | held |
+| Heights: median / 99th / highest | 73–75 / 994–1 096 / 1 335–1 362 | 76–81 / 875–1 022 / 1 240–1 391 | held |
+| Near-flat land | 83–86% | 81–85% | held |
+| Elevation spread of a 3 km / 10 km walk | 77–85 / 143–166 | 89–104 / 223–338 | more varied (the guard is one-sided) |
+| Width of a range's core (200+) on a straight line | 3.6–4.6 km | 2.9–3.7 km | ~20% narrower |
+| Land between ranges on a straight line | 39–46 km | 23–38 km | ranges met more often |
+| Landmass crossed by a straight line, mean | 15–21.5 km | 10.9–13.5 km | **~30% smaller** |
+| Shore to water 130 deep | 3.2–8.0 km | 0.9–1.4 km | **4–6× narrower shelves** |
+| World in trenches | 0.08–0.24% | 0.45–0.82% | a trench off every subduction zone |
+
+And M13–M15, re-run: every biome in every legal world size (passes);
+closed basins **29% → 22%** mean (Earth ~18%; §4 predicted the fall);
+lakes 13–20% (14–20%); hot desert 3.1–7.7% of land (4.7–9.5%), dry land
+26–32% (28–39%) — a wetter world, from smaller landmasses; dune seas
+13–24% of hot desert (20–24%); no process misplaced. Larger continents
+per plate (`CONTINENT_OF_PLATE` up to 0.75–1.0) were tried and barely
+moved landmass size while costing passive margins: crooked coasts, not
+continent area, shorten the chords.
+
+**Found by the moved terrain in older code, and fixed** (each by a test
+that failed on version 9):
+
+- A braided river's dry bar stood at its own river's level beside a
+  higher reach's water, which hung a block over it
+  (`water_is_never_held_by_air`): a bar now stands as high as any
+  reach's water beside it.
+- A floodplain flat was cut a block below a lake beside it, letting the
+  lake out (`lake_shores_hold_their_water`): flats are never cut below
+  a lake within a block.
+- The LOD put sea ice on a polar-sea column whose ground stood at sea
+  level, which the chunks leave bare
+  (`lod_surface_matches_full_resolution_in_every_biome`).
+- **Levees beside steep torrents.** A bank built to hold a waterfall's
+  lip fell away at 45°; on the spines' torrents, steeper than 45°, it
+  fell no faster than the river below and ran beside it as a wall 15
+  blocks high, raised over ground that had stood lower
+  (`rivers_run_in_valleys_not_slots`: 552 slots → 339 of 90 394 banks).
+  A levee now falls at least twice its river's slope.
+
+**Tests that changed, and why:** two M14 tests looked at the owner's own
+VIEWs, places version 9 moved; they now look at the default world's
+largest rivers and at every column 3 km inside a continent. The second
+also dropped "ground below sea level is never raised" — true of that
+one basin, false in general (M14 fills hollows to grade, and a rift is a
+hollow); the causeway it guarded is `rivers_end_at_still_water...` and
+`rivers_build_no_walls`. The slot test no longer counts a bank holding
+water above a waterfall within 3 blocks (it should). The erosion
+gradient bound rose 1.0 → 1.25: it measures the cut, not the ground, and
+the wall rule that keeps valleys walkable did not change.
+
+**For the owner's flight:**
+
+- **Shelves are narrow** — deep water within ~1 km of most coasts. That
+  is Earth's scale (an 80 km shelf ÷ 100), but version 8's broad
+  shallows are gone. The geologist's answer is wide shelves on passive
+  margins and narrow ones on active margins (`docs/geology.md` §4); it
+  needs `COAST_REACH` raised and is proposed for task 3.
+- **Landmasses are smaller** and the world wetter. Plate size
+  (`Params::plate_blocks`) is the knob; a per-world option by design.
+- **Enclosed basins are rhombic.** A terrane ringed by belts is a closed
+  basin, and filled to its spill level it is a flat plain against four
+  nearly straight range fronts — the Tarim and Qaidam basins are exactly
+  this. Say if it reads as artificial at ground level.
+
