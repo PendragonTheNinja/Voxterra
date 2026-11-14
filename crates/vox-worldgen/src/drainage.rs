@@ -164,6 +164,28 @@ impl std::fmt::Debug for DrainageMap {
 impl DrainageMap {
     /// Build the network for one world from its elevation and climate.
     pub fn build(elevation: &Elevation, climate: &ClimateMap, shape: WorldShape) -> Self {
+        Self::build_on(
+            elevation,
+            |x, z| (elevation.height(x, z), 0.0, 0.0),
+            climate,
+            shape,
+        )
+    }
+
+    /// Build the network on any ground: `ground(x, z)` gives its height in
+    /// blocks, how strongly a caprock there makes rivers cut canyons (the
+    /// flash-flood weight, M15) and whether ice lay there in the ice age
+    /// (the ice weight, M15: glacial troughs); `elevation` gives only the
+    /// meander noise. The
+    /// generator passes the elevation field with the landform layers that
+    /// come before the network (M15, ADR-0026 §4); [`Self::build`] the
+    /// elevation field alone.
+    pub fn build_on(
+        elevation: &Elevation,
+        ground: impl Fn(i64, i64) -> (i64, f32, f32) + Sync,
+        climate: &ClimateMap,
+        shape: WorldShape,
+    ) -> Self {
         let (nx, nz) = grid(shape);
         let cell_x = shape.size_x() as f64 / nx as f64;
         let cell_z = shape.size_z() as f64 / nz as f64;
@@ -174,13 +196,17 @@ impl DrainageMap {
                 ((j as f64 + 0.5) * cell_z).floor() as i64,
             )
         };
-        let base: Vec<i32> = (0..nx * nz)
+        let sampled: Vec<(i32, f32, f32)> = (0..nx * nz)
             .into_par_iter()
             .map(|c| {
                 let (x, z) = centre(c);
-                elevation.height(x, z) as i32
+                let (h, canyon, ice) = ground(x, z);
+                (h as i32, canyon, ice)
             })
             .collect();
+        let base: Vec<i32> = sampled.iter().map(|s| s.0).collect();
+        let canyon: Vec<f32> = sampled.iter().map(|s| s.1).collect();
+        let ice: Vec<f32> = sampled.iter().map(|s| s.2).collect();
         let sea = seas(nx, nz, &base);
         // Runoff per cell (the Budyko water balance), and what a lake over
         // it would cost: its evaporation less the rain on it, plus the
@@ -236,11 +262,20 @@ impl DrainageMap {
                 }
             })
             .collect();
-        let erosion = Erosion::build(nx, nz, (cell_x, cell_z), &base, &sea, &carving);
+        let erosion = Erosion::build(
+            nx,
+            nz,
+            (cell_x, cell_z),
+            &base,
+            &sea,
+            &carving,
+            &canyon,
+            &ice,
+        );
         let height: Vec<i32> = (0..nx * nz)
             .map(|c| {
                 let (x, z) = centre(c);
-                base[c] + erosion.at(x as f64, z as f64).round() as i32
+                erosion.apply(x as f64, z as f64, i64::from(base[c])) as i32
             })
             .collect();
         let held = hollows::settle(
@@ -313,7 +348,7 @@ impl DrainageMap {
         // The full-resolution ground, which stage 2 shapes.
         let ground = |x: f64, z: f64| {
             let (x, z) = (x.floor() as i64, z.floor() as i64);
-            elevation.height(x, z) as i32 + erosion.at(x as f64, z as f64).round() as i32
+            erosion.apply(x as f64, z as f64, ground(x, z).0) as i32
         };
         // The ground a river is seated under: none where a lake or the sea
         // lies — that is water, not ground to cut through (a river running
@@ -604,10 +639,25 @@ impl DrainageMap {
         self.erosion_at(x, z)
     }
 
-    /// The elevation's erosion stage at any column: what erosion took from
-    /// the base, blocks (never positive), on any lap of the world.
+    /// The rivers' erosion at any column: what they took from the base,
+    /// blocks (never positive), on any lap of the world. Glacial troughs
+    /// (M15) are not a change but a surface: see [`Self::erode`].
     pub fn erosion_at(&self, x: f64, z: f64) -> f32 {
         self.erosion.at(x, z)
+    }
+
+    /// Glacier heads (M15, for surveys): each head trough's node and how
+    /// far its cirque's floor lies below the head, blocks.
+    #[cfg(test)]
+    pub(crate) fn glacier_heads(&self) -> Vec<(f64, f64, f32)> {
+        self.erosion.glacier_heads()
+    }
+
+    /// The ground at a column after the erosion stage, from its ground `h`
+    /// before (the landformed elevation): cut by the rivers, then by any
+    /// glacial trough (M15). On any lap of the world.
+    pub fn erode(&self, x: i64, z: i64, h: i64) -> i64 {
+        self.erosion.apply(x as f64, z as f64, h)
     }
 
     /// Whether the cell is sea.
@@ -1159,12 +1209,14 @@ mod tests {
         // a wall may stand as steep as the hillside it was cut into
         // already stood (`retreat_walls`), and a river cut into a slope
         // above lower ground it did not cut leaves a large difference in
-        // the cut where the ground itself got flatter. So the bound grew
-        // with the hillsides when milestone 16 gave ranges their spines
-        // (it read under 1.0 on version 8's terrain and 1.06 on version
-        // 9's); the wall rule is what keeps valleys walkable, and has not
-        // changed.
-        assert!(steepest < 1.25, "erosion adds a slope of {steepest:.2}");
+        // the cut where the ground itself got flatter. It grew twice: when
+        // milestone 16 gave ranges their spines (under 1.0 on version 8's
+        // terrain, 1.06 on version 9's), and when M15 interpolated the cut
+        // by Catmull–Rom, which curves a valley's flank where bilinear ran
+        // it straight (~10% steeper at its steepest). The wall rule is
+        // what keeps valleys walkable, and has not changed. Measured 1.39
+        // on the merged version 18.
+        assert!(steepest < 1.45, "erosion adds a slope of {steepest:.2}");
     }
 
     /// Criterion 10: rivers differ as Earth's do — every kind appears;

@@ -362,7 +362,7 @@ impl ClimateMap {
     }
 
     /// The four cells around a column and its weights between them.
-    fn corners(&self, x: i64, z: i64) -> ([usize; 4], (f32, f32)) {
+    pub(crate) fn corners(&self, x: i64, z: i64) -> ([usize; 4], (f32, f32)) {
         let u = x as f64 / self.cell_x - 0.5;
         let v = z as f64 / self.cell_z - 0.5;
         let (fu, fv) = (u.floor(), v.floor());
@@ -491,7 +491,7 @@ pub(crate) fn blur(field: &mut [f32], nx: usize, nz: usize) {
 }
 
 /// Bilinear blend of `field` at four corners `[00, 10, 01, 11]`.
-fn lerp4(field: &[f32], c: [usize; 4], (tu, tv): (f32, f32)) -> f32 {
+pub(crate) fn lerp4(field: &[f32], c: [usize; 4], (tu, tv): (f32, f32)) -> f32 {
     let top = field[c[0]] + (field[c[1]] - field[c[0]]) * tu;
     let bottom = field[c[2]] + (field[c[3]] - field[c[2]]) * tu;
     top + (bottom - top) * tv
@@ -523,7 +523,7 @@ pub(crate) fn smoothstep(lo: f32, hi: f32, v: f32) -> f32 {
 }
 
 /// Linear between `(x, y)` stops sorted by x, clamped at the ends.
-fn piecewise(stops: &[(f32, f32)], x: f32) -> f32 {
+pub(crate) fn piecewise(stops: &[(f32, f32)], x: f32) -> f32 {
     if x <= stops[0].0 {
         return stops[0].1;
     }

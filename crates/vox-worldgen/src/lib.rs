@@ -22,10 +22,10 @@ pub mod biome;
 pub mod climate;
 pub mod drainage;
 pub mod elevation;
+pub mod landform;
 #[cfg(test)]
 mod map;
 pub mod materials;
-pub mod process;
 pub mod tectonics;
 
 use std::collections::{HashMap, VecDeque};
@@ -34,8 +34,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use biome::Column;
 use climate::ClimateMap;
-use drainage::{Body, DrainageMap, Water};
+use drainage::{Body, DrainageMap, Near, Water};
 use elevation::Elevation;
+use landform::{Dunes, MesaPart, Mesas, ProcessMap, Processes};
 use vox_core::{BlockId, CHUNK_SIZE, Chunk, ChunkPos, LocalPos, SEA_LEVEL_BLOCKS, WorldShape};
 
 /// Block ids used by the placeholder generator. These now come from the
@@ -74,9 +75,15 @@ pub struct Generator {
     shape: WorldShape,
     elevation: Elevation,
     climate: Arc<OnceLock<ClimateMap>>,
+    process_map: Arc<OnceLock<ProcessMap>>,
     drainage: Arc<OnceLock<DrainageMap>>,
-    /// Stage-1 landform processes (M15, ADR-0023), built on first use.
-    process: Arc<OnceLock<process::ProcessMap>>,
+    dunes: Dunes,
+    mesas: Mesas,
+    deposits: landform::Deposits,
+    inselbergs: landform::Inselbergs,
+    /// The noise that roughens inselbergs' outlines (~150 blocks).
+    outline: elevation::LandformNoise,
+    dissection: landform::Dissection,
     /// Recently generated chunk columns' ground, shared by every clone
     /// ([`GroundCache`]): a speed-up only, never a source of truth.
     grounds: Arc<GroundCache>,
@@ -175,6 +182,23 @@ fn wet_top(w: &Water) -> i64 {
     }
 }
 
+/// Tors on temperate uplands (M15, owner's decision 4): from these heights
+/// (blocks) with this share of the rain weight.
+const TOR_UPLAND: (f32, f32) = (150.0, 250.0);
+const TOR_UPLAND_WEIGHT: f32 = 0.3;
+/// Margins of the inselberg layer's cheap test: °C of warmth and blocks
+/// of height a site's centre may differ by from a column it reaches.
+const ROCK_WARMTH_MARGIN_C: f32 = 3.0;
+const TOR_UPLAND_MARGIN: f32 = 40.0;
+
+/// Blocks over which the mesa layer measures the base's slope (M15).
+const SLOPE_STEP: i64 = 8;
+
+/// Dunes clear of rivers (M15): none within the first of these distances
+/// beyond a river's bank, full beyond the second, blocks. Rivers run in the
+/// interdunes, never over a crest (criterion 5).
+const DUNE_RIVER_CLEAR: (f32, f32) = (4.0, 40.0);
+
 /// Lowland rivers (task 4): below this slope a river has a floodplain.
 const LOWLAND_SLOPE: f32 = 0.003;
 /// How far beyond its banks a lowland river's flats reach: this many of
@@ -272,14 +296,57 @@ pub enum DrainageSource {
 /// blocks of the sea, land below sea level farther inland a lake at sea
 /// level; rivers end at any ground below sea level; a braided river's bars
 /// only in its middle, never across it.
-/// 9 — milestone 16: the tectonic framework places the terrain (ADR-0025).
-/// Continents are continental crust, mountain belts stand along
-/// collisions, arcs and old welds, trenches lie off subduction zones; new
-/// are mid-ocean ridges and rift valleys. Every world's ground moved.
-/// 10 — the polish after the owner's first version 9 flight: a pond's
-/// floor takes in ground at its own level (no dry strips across it); and
-/// what follows in the same pass (see milestone 16's spec, task 2b).
-pub const GENERATOR_VERSION: u32 = 10;
+/// Two lines of work counted versions from 9 in parallel, and worlds were
+/// made at both, so their merge is 18, past either:
+/// - **The tectonic line** (milestone 16): 9 — the tectonic framework places
+///   the terrain (ADR-0025): continents are continental crust, mountain
+///   belts stand along collisions, arcs and old welds, trenches lie off
+///   subduction zones; new are mid-ocean ridges and rift valleys. 10 — the
+///   polish after the owner's first version 9 flight (milestone 16's spec,
+///   task 2b): ponds without dry strips, seabeds fining outward, rough
+///   coasts alternating rock and beach.
+/// - **The landform line** (M15 tasks 1–4, branch
+///   `claude/vigilant-babbage-kbhxwa`):
+///   9 — dune seas (M15 task 2, ADR-0026): wind-blown sand ridges on dry,
+///   low, flat ground where the wind process acts — transverse, linear, star
+///   and barchan by the wind — laid on dry ground after the water, faded
+///   toward rivers.
+///   10 — benches, mesas and buttes (M15 task 2b, ADR-0026): on flash-flood
+///   uplands the caprock stands in islands 30–120 above the stripped ground
+///   with talus at its foot (about half with a walkable ramp), and the ground
+///   steps in benches 18–60 high — before the drainage network, which is
+///   built on this ground. Two lake-shore fixes the reshaped networks found:
+///   a river's channel on ground level with a lake runs on into it, and a
+///   column hard against a lake's region always gets its bank.
+///   11 — canyons (M15 task 2): on flash-flood ground the erosion stage cuts
+///   up to 4× harder and leaves walls up to 3:1, so rivers crossing a plateau
+///   cut canyons.
+///   12 — glacial troughs (M15 task 3): where ice lay in the ice age and a
+///   valley had relief to channel it, the ground is the lower of its own and
+///   a U about the network's line, deeper and wider with the glaciated
+///   catchment; overdeepened floors fill as lakes, small valleys hang above
+///   large ones; drainage cache format 5.
+///   13 — two M14 artefacts in steep mountains (the owner's request): the
+///   rivers' erosion interpolated by Catmull–Rom, not bilinear (its 256-block
+///   grid showed as squares), and only a reach's highest step held as a
+///   waterfall, the others cascading (every steep stretch had held its banks
+///   level: a sawtooth of wedges along mountain rivers).
+///   14 — cirques (M15 task 3): a glacier's head is a bowl ~240 across, its
+///   floor overdeepened below the lip, its headwall steep.
+///   15 — end moraines and drumlins (M15 task 3): ridges 5–20 high along
+///   the ice age's ice margin and swarms of streamlined hills behind it, on
+///   low ground, before the drainage network.
+///   16 — inselbergs and tors (M15 task 4): bare-rock domes 40–150 high on
+///   savanna and dry-forest plains, rock piles there and on temperate
+///   uplands, whole and before the network.
+///   17 — rain-dissected hills (M15 task 4): on humid hills, rounded ridges
+///   10–40 high between small valleys 40–120 apart left at the ground's
+///   level, closer with more rain; raised after the water, faded toward
+///   rivers.
+///   18 — the two lines merged (2026-11-14): M15's landforms on milestone
+///   16's tectonic terrain; ponds past a reach's end no longer stand beside
+///   a lower river's waterfall.
+pub const GENERATOR_VERSION: u32 = 18;
 
 impl Generator {
     /// A generator for one world: its seed and its size. The size is part of
@@ -291,8 +358,14 @@ impl Generator {
             shape,
             elevation: Elevation::new(seed, shape),
             climate: Arc::new(OnceLock::new()),
+            process_map: Arc::new(OnceLock::new()),
             drainage: Arc::new(OnceLock::new()),
-            process: Arc::new(OnceLock::new()),
+            dunes: Dunes::new(shape),
+            mesas: Mesas::new(shape),
+            deposits: landform::Deposits::new(shape),
+            inselbergs: landform::Inselbergs::new(seed, shape),
+            outline: elevation::LandformNoise::new(shape, 150, 0xB0_0010),
+            dissection: landform::Dissection::new(shape),
             grounds: Arc::new(GroundCache::default()),
         }
     }
@@ -303,16 +376,6 @@ impl Generator {
     /// and rifts are placed by it (`Elevation`).
     pub fn tectonics(&self) -> &tectonics::Tectonics {
         self.elevation.tectonics()
-    }
-
-    /// The world's landform-process map (M15, ADR-0023): where wind, flash
-    /// floods, ice, deep weathering and rain each shape the land. Built on
-    /// first use after the climate it reads (a fraction of a second at the
-    /// default size) and shared by every clone. Nothing in generation reads
-    /// it yet — the landform layers (M15 tasks 2–4) will.
-    pub fn process(&self) -> &process::ProcessMap {
-        self.process
-            .get_or_init(|| process::ProcessMap::build(&self.elevation, self.climate(), self.shape))
     }
 
     /// The ground of chunk column `(cx, cz)`, from the cache or computed
@@ -353,13 +416,34 @@ impl Generator {
             .get_or_init(|| ClimateMap::build(&self.elevation, self.shape))
     }
 
+    /// The landform processes' stage-1 fields (M15, ADR-0026): basins and
+    /// sand, on the climate's grid, built on first use after it (a few
+    /// milliseconds) and shared by every clone.
+    pub fn process_map(&self) -> &ProcessMap {
+        self.process_map
+            .get_or_init(|| ProcessMap::build(self.climate(), &self.elevation, self.shape))
+    }
+
+    /// The five landform processes' weights at a column (M15,
+    /// `docs/landforms.md`): from the base ground and the stage-1 maps, so
+    /// the landforms they will shape never feed back into them.
+    pub fn processes(&self, wx: i64, wz: i64) -> Processes {
+        landform::weights(&landform::inputs_at(
+            self.climate(),
+            self.process_map(),
+            &self.elevation,
+            self.shape,
+            wx,
+            wz,
+        ))
+    }
+
     /// The world's drainage network and erosion stage (M14), built on first
     /// use after the climate it needs (a few seconds at the default size)
     /// and shared by every clone. Call it once at world load, with
     /// [`Self::climate`], so the cost is paid there.
     pub fn drainage(&self) -> &DrainageMap {
-        self.drainage
-            .get_or_init(|| DrainageMap::build(&self.elevation, self.climate(), self.shape))
+        self.drainage.get_or_init(|| self.build_drainage())
     }
 
     /// [`Self::drainage`], read from the world folder's cache when it holds
@@ -382,7 +466,7 @@ impl Generator {
                 source = DrainageSource::Cache;
                 return map;
             }
-            let map = DrainageMap::build(&self.elevation, self.climate(), self.shape);
+            let map = self.build_drainage();
             let tmp = path.with_extension("tmp");
             source = match std::fs::write(&tmp, map.to_cache_bytes(key))
                 .and_then(|()| std::fs::rename(&tmp, &path))
@@ -405,8 +489,13 @@ impl Generator {
     /// The surface and the water on it (M14): the eroded ground, its river
     /// channels cut and their banks shaped, and the river, lake or salt
     /// flat the column holds.
+    ///
+    /// Dunes (M15, ADR-0026) go on last, on dry ground only and faded out
+    /// toward rivers: they only ever raise ground the water was fitted to,
+    /// so no water is left held by air, and rivers keep to the interdunes.
     pub fn ground(&self, wx: i64, wz: i64) -> (elevation::Surface, Water) {
-        let mut s = self.eroded_surface(wx, wz);
+        let (base, mut s, _) = self.landformed(wx, wz);
+        s.height = self.drainage().erode(wx, wz, s.height);
         let (h, water) = self.drainage().shape_column(
             wx,
             wz,
@@ -416,7 +505,291 @@ impl Generator {
         );
         let (h, water) = self.lowlands(wx, wz, h, water, true);
         s.height = h;
+        if water.body == Body::Dry && h > 0 {
+            let sand = self.dune_sand(wx, wz, base, water.near);
+            s.height += sand;
+            s.sand = sand;
+            if sand == 0 && !s.rock {
+                s.ridge = self.ridges(wx, wz, base, water.near);
+                s.height += s.ridge;
+            }
+        }
         (s, water)
+    }
+
+    /// Blocks rain-dissected hills (M15 task 4) raise a dry column: ridges
+    /// between small valleys left at the ground's level, faded toward the
+    /// nearest river (`near`) as the dunes are. The rain weight here is
+    /// the climate's without boundary noise: cheap, and the layer is fine
+    /// grained enough that frayed edges would not show.
+    fn ridges(&self, wx: i64, wz: i64, base: elevation::Surface, near: Option<Near>) -> i64 {
+        // Plains stay plains: most of the world, and the cheapest test.
+        if base.relief <= landform::DISSECTED_FROM_RELIEF {
+            return 0;
+        }
+        let (sea_c, precip) = self.climate().sample(wx, wz);
+        let rain = landform::weights(&landform::Inputs {
+            surface: base,
+            sea_level_c: sea_c,
+            precipitation: precip,
+            abs_s: (self.shape.latitude_sine(wz) as f32).abs(),
+            basin: 0.0,
+            sand: 0.0,
+        })
+        .rain;
+        if rain <= 0.0 {
+            return 0;
+        }
+        let clear = near.map_or(1.0, |n| {
+            climate::smoothstep(DUNE_RIVER_CLEAR.0, DUNE_RIVER_CLEAR.1, n.out)
+        });
+        (self
+            .dissection
+            .at(&self.elevation, wx, wz, rain, base.relief)
+            * clear)
+            .round() as i64
+    }
+
+    /// Blocks of dune sand at a dry column (M15 task 2), from its base
+    /// surface, faded toward the nearest river (`near`): full from
+    /// [`DUNE_RIVER_CLEAR`] blocks beyond its bank.
+    fn dune_sand(&self, wx: i64, wz: i64, base: elevation::Surface, near: Option<Near>) -> i64 {
+        self.dune(wx, wz, base, near)
+            .map_or(0, |(d, clear)| (d.height * clear).round() as i64)
+    }
+
+    /// The network's own build, on the landformed ground.
+    fn build_drainage(&self) -> DrainageMap {
+        // The stage-1 maps the landforms read, first, outside the parallel
+        // build.
+        let _ = (self.climate(), self.process_map());
+        DrainageMap::build_on(
+            &self.elevation,
+            |x, z| {
+                let (base, s, _, flood) = self.landformed_flood(x, z);
+                (s.height, flood, self.ice_weight(x, z, base))
+            },
+            self.climate(),
+            self.shape,
+        )
+    }
+
+    /// The elevation field's surface, and the same with the landform layers
+    /// that come before the drainage network (M15, ADR-0026 §4: benches,
+    /// mesas and buttes on flash-flood uplands), and where on the mesa
+    /// layer the column stands. The first is what the process weights and
+    /// the dunes read; the second is what everything else builds on.
+    pub fn landformed(
+        &self,
+        wx: i64,
+        wz: i64,
+    ) -> (elevation::Surface, elevation::Surface, Option<MesaPart>) {
+        let (base, formed, part, _) = self.landformed_flood(wx, wz);
+        (base, formed, part)
+    }
+
+    /// [`Self::landformed`] with the column's flash-flood weight, which
+    /// the network's erosion reads for canyons (0 where none can act).
+    fn landformed_flood(
+        &self,
+        wx: i64,
+        wz: i64,
+    ) -> (
+        elevation::Surface,
+        elevation::Surface,
+        Option<MesaPart>,
+        f32,
+    ) {
+        let base = self.elevation.surface(wx, wz);
+        let (base, mut formed, part, flood) = self.mesa_layer(wx, wz, base);
+        if let Some((h, _)) = self.deposit(wx, wz, base) {
+            formed.height += h.round() as i64;
+        }
+        if let Some((h, _)) = self.rock(wx, wz, base) {
+            formed.height += h.round() as i64;
+            formed.rock = true;
+        }
+        (base, formed, part, flood)
+    }
+
+    /// The inselberg or tor raising a column (M15 task 4), if any: from
+    /// the weathering weight at each site's centre (and, for tors, a
+    /// temperate upland's), asked only where a site's rock could reach.
+    fn rock(&self, wx: i64, wz: i64, base: elevation::Surface) -> Option<(f32, landform::Rock)> {
+        if base.height <= 0 {
+            return None;
+        }
+        // Cheap first: domes need the tropics' warmth (with a margin for
+        // the climate at a dome's centre and the boundary noise), tors on
+        // temperate ground an upland.
+        let (sea_c, _) = self.climate().sample(wx, wz);
+        let warm = climate::temperature_at(sea_c + ROCK_WARMTH_MARGIN_C, base.height)
+            >= landform::WEATHERING_FROM_C;
+        if !warm && (base.height as f32) < TOR_UPLAND.0 - TOR_UPLAND_MARGIN {
+            return None;
+        }
+        let wobble = self.elevation.noise(wx, wz, &self.outline);
+        self.inselbergs.at(wx, wz, wobble, |sx, sz| {
+            let p = self.processes(sx, sz);
+            let h = self.elevation.height(sx, sz) as f32;
+            let upland = climate::smoothstep(TOR_UPLAND.0, TOR_UPLAND.1, h);
+            (
+                p.weathering,
+                p.weathering.max(TOR_UPLAND_WEIGHT * p.rain * upland),
+            )
+        })
+    }
+
+    /// What the last ice age's ice left at a column (M15): an end moraine
+    /// or drumlins, and how many blocks they raise it; from the ice-age
+    /// weight without boundary noise (the margin's contour, smooth).
+    fn deposit(
+        &self,
+        wx: i64,
+        wz: i64,
+        base: elevation::Surface,
+    ) -> Option<(f32, landform::Deposit)> {
+        if base.height <= 0 {
+            return None;
+        }
+        let (sea_c, precip) = self.climate().sample(wx, wz);
+        let abs_s = (self.shape.latitude_sine(wz) as f32).abs();
+        if !landform::ice_possible(sea_c, abs_s, base.height) {
+            return None;
+        }
+        let ice = landform::glaciation(
+            landform::ice_age_temperature(sea_c, abs_s, base.height),
+            precip,
+        );
+        self.deposits
+            .at(&self.elevation, wx, wz, ice, base.relief, base.uplift)
+    }
+
+    /// The mesa layer (M15 task 2b) on a base surface: the base, the
+    /// formed surface, where on the layer, and the flash-flood weight.
+    fn mesa_layer(
+        &self,
+        wx: i64,
+        wz: i64,
+        base: elevation::Surface,
+    ) -> (
+        elevation::Surface,
+        elevation::Surface,
+        Option<MesaPart>,
+        f32,
+    ) {
+        if base.height <= landform::FLOOD_FROM_HEIGHT || !self.process_map().floodable(wx, wz) {
+            return (base, base, None, 0.0);
+        }
+        let (sea_c, precip) = self.climate().sample(wx, wz);
+        if !landform::flood_possible(sea_c, precip, base.height) {
+            return (base, base, None, 0.0);
+        }
+        let inputs = landform::inputs_with(
+            self.climate(),
+            self.process_map(),
+            &self.elevation,
+            self.shape,
+            wx,
+            wz,
+            base,
+        );
+        let flood = landform::weights(&inputs).flood;
+        if flood <= 0.0 {
+            return (base, base, None, 0.0);
+        }
+        // The base's slope, from two forward differences: only where
+        // benches are cut, since each costs a full elevation sample.
+        let h = base.height as f32;
+        let slope = || {
+            let dx = (self.elevation.height(wx + SLOPE_STEP, wz) as f32 - h) / SLOPE_STEP as f32;
+            let dz = (self.elevation.height(wx, wz + SLOPE_STEP) as f32 - h) / SLOPE_STEP as f32;
+            (dx * dx + dz * dz).sqrt()
+        };
+        match self.mesas.at(&self.elevation, wx, wz, flood, h, slope) {
+            Some((height, part)) => {
+                let mut s = base;
+                s.height = height.round() as i64;
+                (base, s, Some(part), flood)
+            }
+            None => (base, base, None, flood),
+        }
+    }
+
+    /// The ice process's weight at a column (M15): where ice lay in the
+    /// ice age, read by the network's glacial erosion; 0 without the full
+    /// weights where ice cannot have lain.
+    fn ice_weight(&self, wx: i64, wz: i64, base: elevation::Surface) -> f32 {
+        let (sea_c, _) = self.climate().sample(wx, wz);
+        let abs_s = (self.shape.latitude_sine(wz) as f32).abs();
+        if !landform::ice_possible(sea_c, abs_s, base.height) {
+            return 0.0;
+        }
+        let inputs = landform::inputs_with(
+            self.climate(),
+            self.process_map(),
+            &self.elevation,
+            self.shape,
+            wx,
+            wz,
+            base,
+        );
+        landform::weights(&inputs).ice
+    }
+
+    /// The landform a column stands on (M15), by name, for the readout:
+    /// `None` where no landform layer has shaped it.
+    pub fn landform(&self, wx: i64, wz: i64) -> Option<&'static str> {
+        let (s, w) = self.ground(wx, wz);
+        if s.sand == 0 {
+            let base = self.elevation.surface(wx, wz);
+            if w.body == Body::Dry && !s.rock && self.ridges(wx, wz, base, w.near) >= 3 {
+                return Some("dissected hills");
+            }
+            if let Some((_, r)) = self.rock(wx, wz, base) {
+                return Some(r.name());
+            }
+            if let Some((_, d)) = self.deposit(wx, wz, base) {
+                return Some(d.name());
+            }
+            return self.landformed(wx, wz).2.map(MesaPart::name);
+        }
+        self.dune(wx, wz, self.elevation.surface(wx, wz), w.near)
+            .map(|(d, _)| d.kind.name())
+    }
+
+    /// The dune layer at a column, with the share of it left clear of the
+    /// nearest river; `None` where wind cannot act at all.
+    fn dune(
+        &self,
+        wx: i64,
+        wz: i64,
+        base: elevation::Surface,
+        near: Option<Near>,
+    ) -> Option<(landform::Dune, f32)> {
+        let (sea_c, precip) = self.climate().sample(wx, wz);
+        if !landform::wind_possible(sea_c, precip, base.height) {
+            return None;
+        }
+        let inputs = landform::inputs_with(
+            self.climate(),
+            self.process_map(),
+            &self.elevation,
+            self.shape,
+            wx,
+            wz,
+            base,
+        );
+        let wind = landform::weights(&inputs).wind;
+        let clear = near.map_or(1.0, |n| {
+            climate::smoothstep(DUNE_RIVER_CLEAR.0, DUNE_RIVER_CLEAR.1, n.out)
+        });
+        let westerly = climate::eastward_share(inputs.abs_s);
+        let temp = climate::temperature_at(inputs.sea_level_c, base.height);
+        let dune = self
+            .dunes
+            .at(&self.elevation, wx, wz, wind, inputs.abs_s, westerly, temp);
+        Some((dune, clear))
     }
 
     /// The least discharge that builds a delta in this world: large for its
@@ -576,9 +949,8 @@ impl Generator {
     /// The elevation field cut by the erosion stage, before rivers shape
     /// it: the ground the drainage network was built on.
     pub fn eroded_surface(&self, wx: i64, wz: i64) -> elevation::Surface {
-        let mut s = self.elevation.surface(wx, wz);
-        let cut = self.drainage().erosion_at(wx as f64, wz as f64);
-        s.height += cut.round() as i64;
+        let mut s = self.landformed(wx, wz).1;
+        s.height = self.drainage().erode(wx, wz, s.height);
         s
     }
 
@@ -1504,6 +1876,249 @@ mod tests {
         );
     }
 
+    /// Dune seas where Earth puts them (M15 criterion 3): sand only where
+    /// the wind process acts, only on dry ground, clear of river banks;
+    /// most in hot deserts; and every dune sea's ground tiles with the
+    /// world.
+    #[test]
+    fn dunes_lie_where_the_wind_works_and_never_on_water() {
+        use crate::biome::Biome;
+        let shape = WorldShape::DEFAULT;
+        let g = Generator::new(0x7e22ac0de, shape);
+        let (mut dunes, mut hot, mut hot_dunes) = (0u32, 0u32, 0u32);
+        for j in 0..300i64 {
+            for i in 0..300i64 {
+                let (x, z) = (i * 683 + 5, j * 683 + 9);
+                let (s, w) = g.ground(x, z);
+                let col = g.column(x, z);
+                if col.biome == Biome::HotDesert {
+                    hot += 1;
+                    hot_dunes += u32::from(s.sand >= 3);
+                }
+                if s.sand == 0 {
+                    continue;
+                }
+                dunes += 1;
+                assert_eq!(w.body, Body::Dry, "sand on water at ({x}, {z})");
+                assert!(
+                    g.processes(x, z).wind > 0.0,
+                    "sand without wind at ({x}, {z})"
+                );
+                assert!(
+                    w.near.is_none_or(|n| n.out >= DUNE_RIVER_CLEAR.0),
+                    "sand on a river bank at ({x}, {z})"
+                );
+                assert!(s.sand <= 60, "{} blocks of sand at ({x}, {z})", s.sand);
+                let p = shape.size_x();
+                assert_eq!(
+                    g.ground(x + p, z - p),
+                    (s, w),
+                    "dunes do not tile at ({x}, {z})"
+                );
+                assert_eq!(g.block_at(x, s.height, z), vox_core::registry::SAND);
+            }
+        }
+        let share = f64::from(hot_dunes) / f64::from(hot.max(1));
+        eprintln!("{dunes} dune columns, {hot} hot desert, {hot_dunes} of it dunes");
+        // A floor against dunes vanishing, not a target: version 18 has
+        // 819 here, fewer than the landform line's 1 000-odd because the
+        // tectonic terrain has less hot desert (smaller landmasses, a
+        // wetter world — ADR-0025's *As built: task 2*), while the share of
+        // desert under dunes, below, is where it was tuned.
+        assert!(dunes > 500, "only {dunes} dune columns");
+        assert!(
+            (0.12..=0.40).contains(&share),
+            "dunes on {:.0}% of hot desert",
+            100.0 * share
+        );
+    }
+
+    /// Mesas where Earth puts them (M15 criterion 3): the layer acts only
+    /// on flash-flood ground; caprock is raised and floors cut at most one
+    /// bench step (so the network finds no new pits); mesa tops end in
+    /// cliffs; and the
+    /// layer tiles with the world.
+    #[test]
+    fn mesas_stand_only_on_flash_flood_uplands() {
+        let shape = WorldShape::DEFAULT;
+        let g = Generator::new(0x7e22ac0de, shape);
+        let (mut tops, mut cliffs) = (0u32, 0u32);
+        for j in 0..300i64 {
+            for i in 0..300i64 {
+                let (x, z) = (i * 683 + 5, j * 683 + 9);
+                let (base, formed, part) = g.landformed(x, z);
+                let Some(part) = part else {
+                    // Only moraines and drumlins, which raise.
+                    assert!(formed.height >= base.height);
+                    continue;
+                };
+                assert!(
+                    g.processes(x, z).flood > 0.0,
+                    "mesa without flash floods at ({x}, {z})"
+                );
+                // Benches cut at most one step (60) to flatten; terracing
+                // keeps heights in order, so it digs no pits.
+                assert!(
+                    formed.height >= base.height - 61,
+                    "ground dug at ({x}, {z})"
+                );
+                let p = shape.size_x();
+                assert_eq!(g.landformed(x - p, z + p), (base, formed, Some(part)));
+                if part == landform::MesaPart::Top {
+                    tops += 1;
+                    // Walk out until the ground falls: a cliff drops 8+ over
+                    // 4 blocks somewhere within 600,
+                    // in one of the four directions.
+                    let cliff = [(1, 0), (-1, 0), (0, 1), (0, -1)].iter().any(|&(dx, dz)| {
+                        let h = |k: i64| g.landformed(x + dx * k, z + dz * k).1.height;
+                        (0..600).step_by(2).any(|k| h(k) - h(k + 4) >= 8)
+                    });
+                    cliffs += u32::from(cliff);
+                }
+            }
+        }
+        assert!(tops >= 50, "only {tops} mesa tops");
+        assert!(
+            cliffs * 2 >= tops,
+            "{cliffs} of {tops} mesa tops reach a cliff"
+        );
+    }
+
+    /// Moraines and drumlins where Earth puts them (M15 criterion 3): only
+    /// where ice lay in the ice age, and drumlins streamlined along the
+    /// ice's flow (Z) — the ground changes more across them than along.
+    #[test]
+    fn drumlins_lie_along_the_ice_flow() {
+        let shape = WorldShape::DEFAULT;
+        let g = Generator::new(0x7e22ac0de, shape);
+        let (mut along, mut across, mut sites, mut moraines) = (0i64, 0i64, 0u32, 0u32);
+        for j in 0..800i64 {
+            for i in 0..800i64 {
+                let (x, z) = (i * 254 + 13, j * 254 + 7);
+                let name = g.landform(x, z);
+                if name == Some("end moraine") {
+                    moraines += 1;
+                    assert!(
+                        g.processes(x, z).ice > 0.0,
+                        "a moraine where no ice lay at ({x}, {z})"
+                    );
+                }
+                if name != Some("drumlins") {
+                    continue;
+                }
+                assert!(
+                    g.processes(x, z).ice > 0.0,
+                    "drumlins where no ice lay at ({x}, {z})"
+                );
+                let raised = |x: i64, z: i64| {
+                    let (b, f, _) = g.landformed(x, z);
+                    f.height - b.height
+                };
+                // Inside a swarm only: at its edge the hills fade and the
+                // ground beyond (a moraine, a slope) changes either way.
+                if [(-40, 0), (40, 0), (0, -40), (0, 40)]
+                    .iter()
+                    .any(|&(dx, dz)| g.landform(x + dx, z + dz) != Some("drumlins"))
+                {
+                    continue;
+                }
+                for t in [-40, -20, 20, 40] {
+                    along += (raised(x, z + t) - raised(x, z)).abs();
+                    across += (raised(x + t, z) - raised(x, z)).abs();
+                }
+                sites += 1;
+            }
+        }
+        assert!(
+            sites >= 20 && moraines >= 20,
+            "{sites} drumlin sites, {moraines} moraine"
+        );
+        eprintln!("{sites} drumlin sites inside swarms: across {across}, along {along}");
+        assert!(
+            across > 2 * along,
+            "change across the flow {across}, along {along}"
+        );
+    }
+
+    /// Inselbergs as Earth's are (M15 criterion 3): bare rock, standing
+    /// up to 40–150 above the plain they rise from. (Where they stand is
+    /// the weathering weight at each dome's centre: `rock_survey` and the
+    /// process map show it.)
+    #[test]
+    fn inselbergs_stand_on_weathered_plains() {
+        let shape = WorldShape::DEFAULT;
+        let g = Generator::new(0x7e22ac0de, shape);
+        let (mut domes, mut tallest) = (0u32, 0i64);
+        for j in 0..500i64 {
+            for i in 0..500i64 {
+                let (x, z) = (i * 409 + 3, j * 409 + 1);
+                let name = g.landform(x, z);
+                if name != Some("inselberg") && name != Some("tor") {
+                    continue;
+                }
+                let (b, f, _) = g.landformed(x, z);
+                assert!(f.rock && f.height > b.height, "({x}, {z})");
+                let top = g.surface(x, z).height;
+                if g.ground(x, z).1.body == Body::Dry {
+                    assert_eq!(g.block_at(x, top, z), vox_core::registry::STONE);
+                }
+                if name == Some("inselberg") {
+                    domes += 1;
+                    tallest = tallest.max(f.height - b.height);
+                }
+            }
+        }
+        assert!(domes >= 10, "only {domes} dome samples");
+        assert!((40..=160).contains(&tallest), "tallest {tallest}");
+    }
+
+    /// Transverse ridges run across the dune wind (M15 criterion 3): in the
+    /// trades' core, ground changes far more along the wind (over crests
+    /// and lee faces) than across it (along a crest).
+    #[test]
+    fn transverse_crests_run_across_the_wind() {
+        let shape = WorldShape::DEFAULT;
+        let g = Generator::new(0x7e22ac0de, shape);
+        // The trades blow toward −X, tilted toward the equator by 22.5°.
+        let (mut along, mut across, mut sites) = (0.0f64, 0.0f64, 0u32);
+        for j in 0..400i64 {
+            for i in 0..400i64 {
+                let (x, z) = (i * 509 + 13, j * 509 + 7);
+                let lat = shape.latitude_degrees(z).abs();
+                if !(12.0..20.0).contains(&lat) || g.ground(x, z).0.sand < 6 {
+                    continue;
+                }
+                let u = shape.canonical_z(z) as f64 / shape.size_z() as f64;
+                let eq = if ((u * 4.0).floor() as i64) % 2 == 0 {
+                    -1.0
+                } else {
+                    1.0
+                };
+                let (dx, dz) = (-0.924, eq * 0.383);
+                let h = |t: f64, perpendicular: bool| {
+                    let (ox, oz) = if perpendicular {
+                        (-dz * t, dx * t)
+                    } else {
+                        (dx * t, dz * t)
+                    };
+                    g.ground(x + ox.round() as i64, z + oz.round() as i64)
+                        .0
+                        .sand as f64
+                };
+                for t in [-30.0, -15.0, 15.0, 30.0] {
+                    along += (h(t, false) - h(0.0, false)).abs();
+                    across += (h(t, true) - h(0.0, true)).abs();
+                }
+                sites += 1;
+            }
+        }
+        assert!(sites >= 20, "only {sites} transverse sites");
+        assert!(
+            along > 2.0 * across,
+            "change along the wind {along:.0}, across {across:.0} over {sites} sites"
+        );
+    }
+
     /// Rivers sit in their ground, never on walls (the owner's walk, M14):
     /// river shaping had built ground up to hold rivers whose levels, from
     /// the 128-block network, stood above the full-resolution ground — an
@@ -1543,15 +2158,19 @@ mod tests {
                         columns += 1;
                         let nat = g.eroded_surface(x, z).height;
                         let wet = |w: &Water| !matches!(w.body, drainage::Body::Dry);
-                        if !wet(&w) && !near_fill && s.height - nat > 16 {
-                            raised.push((x, z, s.height - nat));
+                        // Dune sand and rain's ridges (M15) are the wind's
+                        // and the rain's, not the river's shaping.
+                        let shaped = s.height - s.sand - s.ridge;
+                        if !wet(&w) && !near_fill && shaped - nat > 16 {
+                            raised.push((x, z, shaped - nat));
                         }
                         let (sn, wn) = g.ground(x + 1, z);
                         if wet(&w) || wet(&wn) {
                             continue;
                         }
                         let nn = g.eroded_surface(x + 1, z).height;
-                        let excess = (s.height - sn.height).abs() - (nat - nn).abs();
+                        let excess =
+                            (shaped - (sn.height - sn.sand - sn.ridge)).abs() - (nat - nn).abs();
                         if excess > 10 {
                             cliffs.push((x, z, excess));
                         }
@@ -2250,7 +2869,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (10, 0x16f0_ef61_040a_9ca0);
+        const PINNED: (u32, u64) = (18, 0x610e_a977_244c_a011);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),

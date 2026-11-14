@@ -1,6 +1,10 @@
 # ADR-0023: Landform processes — a fourth stage-1 map, and where landforms sit in the pipeline
 
-- **Status:** Proposed (2026-11-10, M15 task 1). The map and its tests are
+- **Status:** Superseded by ADR-0026 (2026-11-14), never accepted. Two
+  sessions built M15's task 1 in parallel; at the merge the other's
+  `vox_worldgen::landform` was kept (it had tasks 2–4 built on it) and
+  `vox_worldgen::process` was removed. The two agree on the pipeline
+  order this ADR fixes. Was: Proposed (2026-11-10, M15 task 1). The map and its tests are
   built (`vox_worldgen::process`); nothing in generation reads it yet, so
   `GENERATOR_VERSION` is unchanged. To be accepted with M15's
   retrospective, as ADRs 0019 and 0020 were with M14's.

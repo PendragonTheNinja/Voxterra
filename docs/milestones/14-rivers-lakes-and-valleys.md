@@ -630,7 +630,7 @@ stage 2 met ground the 128-block network could not see.
 - **Closed basins ~29%** of land (Earth ~18%) — M15's landforms reshape the
   enclosed interiors.
 - **Valleys shallow for large rivers** in the chunks (11–13 blocks) — M15.
-- **Re-bench at version 8**; world creation time with profiles unmeasured.
+- ~~**Re-bench at version 8**~~ — done 2026-11-04 (M15 spec, *Baseline*): within noise, sprint back at M13's level. World creation time with profiles still unmeasured.
 - **Large rivers as ribbons in the far LOD.**
 - **Reservoirs or finite water per body** — with the water simulation.
 - Still from M13: far-horizon pinholes, water absorbing with depth, seasons.

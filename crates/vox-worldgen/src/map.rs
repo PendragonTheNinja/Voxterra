@@ -392,7 +392,16 @@ pub(crate) mod tests {
         // Drainage (M14): rivers by discharge and lakes, at the network's
         // own resolution, over the elevation.
         let t = std::time::Instant::now();
-        let drainage = crate::drainage::DrainageMap::build(g.elevation(), &climate, shape);
+        let _ = g.process_map();
+        let drainage = crate::drainage::DrainageMap::build_on(
+            g.elevation(),
+            |x, z| {
+                let p = g.processes(x, z);
+                (g.landformed(x, z).1.height, p.flood, p.ice)
+            },
+            &climate,
+            shape,
+        );
         println!(
             "drainage: {:?}, built in {:.0} ms",
             drainage,
@@ -497,6 +506,115 @@ pub(crate) mod tests {
             ("precipitation", &rain),
             ("biomes", &biomes),
         ] {
+            let path = dir.join(format!("{name}-{:x}-{}.png", g.seed(), shape.size_x()));
+            write_png(&path, px, px, img).unwrap();
+            println!("wrote {}", path.display());
+        }
+        process_layers(&g, px, &dir);
+    }
+
+    /// Only the landform-process layers (M15 task 1):
+    /// `cargo test -p vox-worldgen --release process_map -- --ignored
+    /// --nocapture`, with the same environment as [`world_map`].
+    #[test]
+    #[ignore]
+    fn process_map() {
+        let (g, px, dir) = map_world();
+        process_layers(&g, px, &dir);
+    }
+
+    /// The landform processes (M15, `docs/landforms.md`), as two images over
+    /// the hill-shaded ground: `processes-*` the four climate processes
+    /// (wind sand-yellow, flash flood rust, weathering violet, rain green,
+    /// each by its weight), and `ice-age-*` where ice lay in the last ice
+    /// age (cyan) against where it lies today (white: M13's ice sheet and
+    /// permanent snow). Prints each process's share of land, and the
+    /// glaciated share per 10° band.
+    fn process_layers(g: &Generator, px: u32, dir: &Path) {
+        let shape = g.shape();
+        let step = shape.size_x() as f64 / f64::from(px);
+        let _ = g.climate();
+        let t = std::time::Instant::now();
+        let _ = g.process_map();
+        println!(
+            "process map: built in {:.0} ms",
+            t.elapsed().as_secs_f64() * 1000.0
+        );
+        const COLOURS: [[u8; 3]; 4] = [
+            [240, 200, 80], // wind
+            [205, 85, 40],  // flash flood
+            [160, 80, 210], // weathering
+            [40, 165, 60],  // rain
+        ];
+        let n = (px * px) as usize;
+        let (mut procs, mut ice) = (vec![0u8; n * 3], vec![0u8; n * 3]);
+        let (mut land, mut strong, mut mean) = (0u32, [0u32; 5], [0.0f64; 5]);
+        let mut bands = [(0u32, 0u32); 9];
+        let heights: Vec<i64> = (0..n)
+            .map(|k| {
+                let (i, j) = (k as u32 % px, k as u32 / px);
+                g.surface_height((f64::from(i) * step) as i64, (f64::from(j) * step) as i64)
+            })
+            .collect();
+        for j in 0..px {
+            let z = (f64::from(j) * step) as i64;
+            let band = ((shape.latitude_degrees(z).abs() / 10.0) as usize).min(8);
+            for i in 0..px {
+                let x = (f64::from(i) * step) as i64;
+                let k = (j * px + i) as usize;
+                let h = heights[k];
+                // Hill shade from the pixel up-left, in grey.
+                let up = heights[(j.saturating_sub(1) * px + i.saturating_sub(1)) as usize];
+                let shade = (1.0 + (up - h) as f32 / 80.0).clamp(0.5, 1.4);
+                let grey = if h > 0 { 150.0 } else { 60.0 };
+                let base = [(grey * shade).min(255.0) as u8; 3];
+                let p = g.processes(x, z);
+                let mut c = base;
+                for (w, col) in [p.wind, p.flood, p.weathering, p.rain].iter().zip(COLOURS) {
+                    c = ramp(&[(0.0, c), (1.0, col)], 0.9 * w);
+                }
+                procs[k * 3..k * 3 + 3].copy_from_slice(&c);
+                // Ice: today's (the column's own temperature below the snow
+                // line, or an ice-sheet biome) white, the ice age's cyan.
+                let (sea_c, _) = g.climate().sample(x, z);
+                let today = temperature_at(sea_c, h) < crate::climate::SNOW_LINE_C;
+                let c = if h <= 0 {
+                    base
+                } else if today {
+                    [250, 250, 250]
+                } else {
+                    ramp(&[(0.0, base), (1.0, [60, 200, 240])], 0.85 * p.ice)
+                };
+                ice[k * 3..k * 3 + 3].copy_from_slice(&c);
+                if h > 0 {
+                    land += 1;
+                    for (s, (_, w)) in p.named().iter().enumerate() {
+                        strong[s] += u32::from(*w >= 0.5);
+                        mean[s] += f64::from(*w);
+                    }
+                    bands[band].0 += 1;
+                    bands[band].1 += u32::from(p.ice >= 0.5);
+                }
+            }
+        }
+        let names = crate::landform::Processes::default().named();
+        for (s, (name, _)) in names.iter().enumerate() {
+            println!(
+                "  {:<12} weight ≥ 0.5 on {:>5.1}% of land, mean {:.3}",
+                name,
+                100.0 * f64::from(strong[s]) / f64::from(land),
+                mean[s] / f64::from(land)
+            );
+        }
+        let glaciated: Vec<u32> = bands
+            .iter()
+            .map(|&(l, g)| (100 * g).checked_div(l).unwrap_or(0))
+            .collect();
+        println!(
+            "ice-age glaciated % of land by 10° band from the equator: {glaciated:?} \
+             (Earth's last glacial maximum: ~25–30% of all land)"
+        );
+        for (name, img) in [("processes", &procs), ("ice-age", &ice)] {
             let path = dir.join(format!("{name}-{:x}-{}.png", g.seed(), shape.size_x()));
             write_png(&path, px, px, img).unwrap();
             println!("wrote {}", path.display());
@@ -764,6 +882,430 @@ mod survey {
                     100.0 * min[k],
                     missing[k]
                 );
+            }
+        }
+    }
+}
+
+/// Dune seas (M15 task 2) over many worlds, against the catalogue: how
+/// much of hot and cold desert they cover, ridge heights, walkable slopes,
+/// and hill-shaded close-ups at one block per pixel — the tallest sand in
+/// each of three latitude bands (trades, the belts' meeting, westerlies).
+///
+/// `cargo test -p vox-worldgen --release dune_survey -- --ignored
+/// --nocapture`; env `SURVEY_SEEDS` (default 4), `WORLD_MAP_DIR`.
+#[cfg(test)]
+mod dune_survey {
+    use super::{ramp, write_png};
+    use crate::Generator;
+    use crate::biome::Biome;
+    use vox_core::WorldShape;
+
+    #[test]
+    #[ignore]
+    fn dune_survey() {
+        let seeds: u64 = std::env::var("SURVEY_SEEDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4);
+        let dir: std::path::PathBuf = std::env::var("WORLD_MAP_DIR").map_or_else(
+            |_| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/world-map"),
+            Into::into,
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+        let shape = WorldShape::DEFAULT;
+        let step = 200;
+        let n = shape.size_x() / step;
+        for seed in [0x7e22ac0de].into_iter().chain(1..seeds) {
+            let g = Generator::new(seed, shape);
+            let (mut hot, mut hot_dune, mut cold, mut cold_dune) = (0u32, 0u32, 0u32, 0u32);
+            let mut best = [(0i64, 0i64, 0i64); 3];
+            let mut heights = Vec::new();
+            for j in 0..n {
+                for i in 0..n {
+                    let (x, z) = (i * step + 7, j * step + 3);
+                    let col = g.column(x, z);
+                    let dune = col.surface.sand >= 3;
+                    match col.biome {
+                        Biome::HotDesert => {
+                            hot += 1;
+                            hot_dune += u32::from(dune);
+                        }
+                        Biome::ColdDesert => {
+                            cold += 1;
+                            cold_dune += u32::from(dune);
+                        }
+                        _ => {}
+                    }
+                    if col.surface.sand > 0 {
+                        heights.push(col.surface.sand);
+                    }
+                    let lat = shape.latitude_degrees(z).abs();
+                    let band = usize::from(lat >= 24.0) + usize::from(lat >= 36.0);
+                    if col.surface.sand > best[band].2 {
+                        best[band] = (x, z, col.surface.sand);
+                    }
+                }
+            }
+            heights.sort_unstable();
+            let q = |f: f64| heights.get((heights.len() as f64 * f) as usize).copied();
+            println!(
+                "seed {seed:#x}: dunes (3+ blocks) on {:.0}% of hot desert ({hot} samples), {:.0}% of cold desert ({cold}); sand height p50 {:?} p90 {:?} max {:?}",
+                100.0 * f64::from(hot_dune) / f64::from(hot.max(1)),
+                100.0 * f64::from(cold_dune) / f64::from(cold.max(1)),
+                q(0.5),
+                q(0.9),
+                heights.last()
+            );
+            if seed != 0x7e22ac0de && seed != 1 {
+                continue; // close-ups of two worlds are enough
+            }
+            for (band, &(cx, cz, top)) in best.iter().enumerate() {
+                if top == 0 {
+                    continue;
+                }
+                closeup(&g, &dir, &format!("dunes-{seed:x}-{band}"), cx, cz);
+            }
+        }
+    }
+
+    /// 1 024 blocks square at one block per pixel, sand yellow, other
+    /// ground brown, water blue, lit from the north-west over 2 blocks so
+    /// single-block steps do not draw contour lines.
+    pub(super) fn closeup(g: &Generator, dir: &std::path::Path, name: &str, cx: i64, cz: i64) {
+        let px = 1024i64;
+        let cols: Vec<_> = (0..px * px)
+            .map(|k| g.ground(cx - px / 2 + k % px, cz - px / 2 + k / px))
+            .collect();
+        let h = |i: i64, j: i64| {
+            cols[(j.clamp(0, px - 1) * px + i.clamp(0, px - 1)) as usize]
+                .0
+                .height
+        };
+        let mut rgb = vec![0u8; (px * px * 3) as usize];
+        let (mut steps, mut steep) = (0u64, 0u64);
+        for j in 0..px {
+            for i in 0..px {
+                let k = (j * px + i) as usize;
+                let (s, w) = cols[k];
+                if s.sand > 0 && i > 0 {
+                    steps += 1;
+                    steep += u64::from((h(i, j) - h(i - 1, j)).abs() > 1);
+                }
+                let gx = (h(i + 2, j) - h(i - 2, j)) as f32 / 4.0;
+                let gz = (h(i, j + 2) - h(i, j - 2)) as f32 / 4.0;
+                let light = (0.75 - 1.4 * (gx + gz)).clamp(0.15, 1.3);
+                let part = g.landformed(cx - px / 2 + i, cz - px / 2 + j).2;
+                let base = if !matches!(w.body, crate::drainage::Body::Dry) {
+                    [60, 120, 200]
+                } else if s.sand > 0 {
+                    [230, 205, 145]
+                } else {
+                    match part {
+                        Some(crate::landform::MesaPart::Top) => [205, 120, 70],
+                        Some(crate::landform::MesaPart::Talus) => [150, 105, 85],
+                        Some(crate::landform::MesaPart::Floor) => [195, 165, 125],
+                        None => [165, 140, 110],
+                    }
+                };
+                let c = if light <= 1.0 {
+                    ramp(&[(0.0, [20, 15, 10]), (1.0, base)], light)
+                } else {
+                    ramp(&[(0.0, base), (1.0, [255, 255, 255])], light - 1.0)
+                };
+                rgb[k * 3..k * 3 + 3].copy_from_slice(&c);
+            }
+        }
+        let shape = g.shape();
+        println!(
+            "  close-up {name} at ({cx}, {cz}), {:.1}°: steps over one block between dune columns {:.2}%",
+            shape.latitude_degrees(cz),
+            100.0 * steep as f64 / steps.max(1) as f64
+        );
+        let path = dir.join(format!("{name}.png"));
+        write_png(&path, px as u32, px as u32, &rgb).unwrap();
+        println!("  wrote {}", path.display());
+    }
+}
+
+/// Benches, mesas and buttes (M15 task 2b) over many worlds: how much land
+/// the layer shapes, its walls, what share of land drains to closed
+/// basins (M15 criterion 6; the stripped ground must not add pits), and
+/// close-ups at the highest-weighted mesa top.
+///
+/// `cargo test -p vox-worldgen --release mesa_survey -- --ignored
+/// --nocapture`; env `SURVEY_SEEDS` (default 3), `WORLD_MAP_DIR`.
+#[cfg(test)]
+mod mesa_survey {
+    use crate::Generator;
+    use crate::landform::MesaPart;
+    use vox_core::WorldShape;
+
+    #[test]
+    #[ignore]
+    fn mesa_survey() {
+        let seeds: u64 = std::env::var("SURVEY_SEEDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3);
+        let dir: std::path::PathBuf = std::env::var("WORLD_MAP_DIR").map_or_else(
+            |_| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/world-map"),
+            Into::into,
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+        let shape = WorldShape::DEFAULT;
+        let step = 200;
+        let n = shape.size_x() / step;
+        for seed in [0x7e22ac0de].into_iter().chain(1..seeds) {
+            let g = Generator::new(seed, shape);
+            let (mut land, mut parts, mut best) = (0u32, [0u32; 3], (0i64, 0i64, 0.0f32));
+            let mut cut = Vec::new();
+            for j in 0..n {
+                for i in 0..n {
+                    let (x, z) = (i * step + 7, j * step + 3);
+                    let (base, formed, part) = g.landformed(x, z);
+                    if base.height <= 0 {
+                        continue;
+                    }
+                    land += 1;
+                    if let Some(p) = part {
+                        parts[p as usize] += 1;
+                        cut.push((formed.height - base.height).abs());
+                        let w = g.processes(x, z).flood;
+                        if p == MesaPart::Top && w > best.2 {
+                            best = (x, z, w);
+                        }
+                    }
+                }
+            }
+            cut.sort_unstable();
+            let q = |f: f64| cut.get((cut.len() as f64 * f) as usize).copied();
+            let d = g.drainage();
+            let (dx, dz) = d.cells();
+            let endo = d.endorheic();
+            let (mut lc, mut closed) = (0u32, 0u32);
+            for jj in 0..dz {
+                for ii in 0..dx {
+                    if !d.is_sea(ii, jj) {
+                        lc += 1;
+                        closed += u32::from(endo[jj * dx + ii]);
+                    }
+                }
+            }
+            // Canyons: how deep erosion cut under rivers of 0.1+ m³/s, on
+            // flash-flood ground and elsewhere.
+            let (cw, ch) = d.cell_blocks();
+            let (mut on, mut off) = (Vec::new(), Vec::new());
+            for jj in (0..dz).step_by(2) {
+                for ii in (0..dx).step_by(2) {
+                    let (_, _, q, _) = d.cell(ii, jj);
+                    if q < 0.1 || d.is_sea(ii, jj) || d.is_lake(ii, jj) {
+                        continue;
+                    }
+                    let (x, z) = (
+                        ((ii as f64 + 0.5) * cw) as i64,
+                        ((jj as f64 + 0.5) * ch) as i64,
+                    );
+                    let cut = -d.erosion(ii, jj);
+                    if g.processes(x, z).flood > 0.3 {
+                        on.push(cut);
+                    } else {
+                        off.push(cut);
+                    }
+                }
+            }
+            let med = |v: &mut Vec<f32>| {
+                v.sort_by(f32::total_cmp);
+                (
+                    v.get(v.len() / 2).copied(),
+                    v.get(v.len() * 9 / 10).copied(),
+                    v.len(),
+                )
+            };
+            println!(
+                "  rivers of 0.1+ m³/s cut (p50, p90, cells): on flash-flood ground {:?}, elsewhere {:?}",
+                med(&mut on),
+                med(&mut off)
+            );
+            let pct = |k: u32| 100.0 * f64::from(k) / f64::from(land.max(1));
+            println!(
+                "seed {seed:#x}: mesa layer on {:.1}% of land (tops {:.1}%, talus {:.1}%, floors {:.1}%); changed by p50 {:?} p90 {:?} max {:?}; {:.1}% of land drains to closed basins",
+                pct(parts.iter().sum()),
+                pct(parts[0]),
+                pct(parts[1]),
+                pct(parts[2]),
+                q(0.5),
+                q(0.9),
+                cut.last(),
+                100.0 * f64::from(closed) / f64::from(lc.max(1))
+            );
+            if best.2 > 0.0 && (seed == 0x7e22ac0de || seed == 1) {
+                super::dune_survey::closeup(&g, &dir, &format!("mesas-{seed:x}"), best.0, best.1);
+            }
+        }
+    }
+}
+
+/// Glacial troughs and fjords (M15 task 3): close-ups of the deepest
+/// glacial cut inland and of the deepest glaciated cut reaching the sea,
+/// and a cross-section through each (heights across the trough).
+///
+/// `cargo test -p vox-worldgen --release ice_survey -- --ignored
+/// --nocapture`; env `WORLD_MAP_SEED`, `WORLD_MAP_DIR`.
+#[cfg(test)]
+mod ice_survey {
+    #[test]
+    #[ignore]
+    fn ice_survey() {
+        let (g, _, dir) = super::tests::map_world();
+        let d = g.drainage();
+        let (nx, nz) = d.cells();
+        let (cw, ch) = d.cell_blocks();
+        let (mut inland, mut coast) = ((0i64, 0i64, 0.0f32), (0i64, 0i64, 0.0f32));
+        for j in 0..nz {
+            for i in 0..nx {
+                if d.is_sea(i, j) {
+                    continue;
+                }
+                let (x, z) = (
+                    ((i as f64 + 0.5) * cw) as i64,
+                    ((j as f64 + 0.5) * ch) as i64,
+                );
+                let cut = (g.landformed(x, z).1.height - g.eroded_surface(x, z).height) as f32;
+                let by_sea =
+                    (0..9).any(|k| d.is_sea((i + nx + k % 3 - 1) % nx, (j + nz + k / 3 - 1) % nz));
+                let best = if by_sea { &mut coast } else { &mut inland };
+                if cut > best.2 && g.processes(x, z).ice >= 0.9 {
+                    *best = (x, z, cut);
+                }
+            }
+        }
+        // The deepest cirque.
+        let heads = d.glacier_heads();
+        let cirques = heads.iter().filter(|h| h.2 >= 8.0).count();
+        let deepest = heads.iter().copied().max_by(|a, b| a.2.total_cmp(&b.2));
+        println!("glacier heads {}, cirques {cirques}", heads.len());
+        let cirque = deepest.map_or((0, 0, 0.0), |(x, z, c)| (x as i64, z as i64, c));
+        // Moraines and drumlins, by the readout's names, every 4th cell.
+        let (mut land, mut moraine, mut drumlins) = (0u32, None, None);
+        let (mut on_moraine, mut on_drumlins) = (0u32, 0u32);
+        for j in (0..nz).step_by(4) {
+            for i in (0..nx).step_by(4) {
+                if d.is_sea(i, j) {
+                    continue;
+                }
+                land += 1;
+                let (x, z) = (
+                    ((i as f64 + 0.5) * cw) as i64,
+                    ((j as f64 + 0.5) * ch) as i64,
+                );
+                match g.landform(x, z) {
+                    Some("end moraine") => {
+                        on_moraine += 1;
+                        moraine.get_or_insert((x, z, 1.0));
+                    }
+                    Some("drumlins") => {
+                        on_drumlins += 1;
+                        drumlins.get_or_insert((x, z, 1.0));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        println!(
+            "end moraines on {:.2}% of land, drumlins on {:.2}%",
+            100.0 * f64::from(on_moraine) / f64::from(land),
+            100.0 * f64::from(on_drumlins) / f64::from(land)
+        );
+        let moraine = moraine.unwrap_or((0, 0, 0.0));
+        let drumlins = drumlins.unwrap_or((0, 0, 0.0));
+        for (name, (x, z, cut)) in [
+            ("trough", inland),
+            ("fjord", coast),
+            ("cirque", cirque),
+            ("moraine", moraine),
+            ("drumlins", drumlins),
+        ] {
+            if cut == 0.0 {
+                continue;
+            }
+            println!(
+                "{name}: cut {cut:.0} at ({x}, {z}), {:.1}°",
+                g.shape().latitude_degrees(z)
+            );
+            let line: Vec<String> = (-300..=300)
+                .step_by(25)
+                .map(|k| {
+                    let (s, w) = g.ground(x + k, z);
+                    let wet = if matches!(w.body, crate::drainage::Body::Dry) {
+                        ""
+                    } else {
+                        "~"
+                    };
+                    format!("{}{wet}", s.height)
+                })
+                .collect();
+            println!("  across x every 25: {}", line.join(" "));
+            let line: Vec<String> = (-300..=300)
+                .step_by(25)
+                .map(|k| g.ground(x, z + k).0.height.to_string())
+                .collect();
+            println!("  across z every 25: {}", line.join(" "));
+            super::dune_survey::closeup(&g, &dir, &format!("ice-{name}-{:x}", g.seed()), x, z);
+        }
+    }
+}
+
+/// Inselbergs and tors (M15 task 4): their share of land and close-ups of
+/// one of each. `cargo test -p vox-worldgen --release rock_survey --
+/// --ignored --nocapture`; env as `world_map`.
+#[cfg(test)]
+mod rock_survey {
+    #[test]
+    #[ignore]
+    fn rock_survey() {
+        let (g, _, dir) = super::tests::map_world();
+        let shape = g.shape();
+        let (mut land, mut domes, mut tors, mut hills) = (0u32, 0u32, 0u32, 0u32);
+        let (mut dome_at, mut tor_at, mut hills_at) = (None, None, None);
+        let step = 40;
+        let n = shape.size_x() / step;
+        for j in 0..n {
+            for i in 0..n {
+                let (x, z) = (i * step + 3, j * step + 1);
+                if g.surface_height(x, z) <= 0 {
+                    continue;
+                }
+                land += 1;
+                match g.landform(x, z) {
+                    Some("inselberg") => {
+                        domes += 1;
+                        dome_at.get_or_insert((x, z));
+                    }
+                    Some("tor") => {
+                        tors += 1;
+                        tor_at.get_or_insert((x, z));
+                    }
+                    Some("dissected hills") => {
+                        hills += 1;
+                        if hills == 2_000 {
+                            hills_at = Some((x, z));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        println!(
+            "inselbergs on {:.3}% of land, tors on {:.3}%, dissected hills on {:.1}%",
+            100.0 * f64::from(domes) / f64::from(land),
+            100.0 * f64::from(tors) / f64::from(land),
+            100.0 * f64::from(hills) / f64::from(land)
+        );
+        for (name, at) in [("inselberg", dome_at), ("tor", tor_at), ("hills", hills_at)] {
+            if let Some((x, z)) = at {
+                println!("{name} at ({x}, {z}), {:.1}°", shape.latitude_degrees(z));
+                super::dune_survey::closeup(&g, &dir, &format!("{name}-{:x}", g.seed()), x, z);
             }
         }
     }

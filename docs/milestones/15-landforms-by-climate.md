@@ -20,29 +20,155 @@ Task 0 starts with the owner's re-bench of M14 at `GENERATOR_VERSION` 8.
 `docs/landforms.md`; the owner answered its five questions (its Decisions
 section: linear dunes from a seasonal dune-wind swing, slot canyons left
 for geology, the dune wind tilted, tors on temperate uplands too, about
-half the mesas with a way up). **The catalogue was approved by the owner
-on 2026-11-10** (criterion 1's first half is met; the ADR is task 1's).
-**The baseline is taken (2026-11-11):** `docs/bench/bench-1794373242.md`,
-generator version 8 on the audited build (sprint 786–866 fps, relight
-76–95 ms/s, backlog draining to 0) — criterion 9 compares against it, and
-task 0 is complete. What was asked, for the record: the owner's re-bench of M14 at `GENERATOR_VERSION` 8 (`cargo run -p vox-app --
---bench`; it runs in its own world now, so no need to move `world/`
-aside; copy the report from `bench/` to `docs/bench/` and commit it there —
-`bench/` is git-ignored). **Take it on a build that includes the 2026-11
-audit's engine changes** (generation, relight and threading all got
-cheaper there, `docs/notes/code-audit-2026-11.md`): criterion 9 compares
-M15's terrain against M14's on the same engine, and a baseline from before
-the audit would hide a real M15 cost behind the audit's gains. The
-process-weight map layer
-needs task 1's weights and lands with them. **Task 1 is done (2026-11-10):** the
-process weights and the ice-age climate are a stage-1 map
-(`vox_worldgen::process`, `Generator::process`), with its tests, the
-survey (`process_survey`) and the map layer (`process_map`,
-`docs/gallery/m15/`); ADR-0023 is proposed and fixes the pipeline order.
-Nothing in generation reads the map yet, so the generator is still
-version 8. **Next: task 2**, dry lands — and its first decision is what
-the drainage network samples once the ground has dunes and benches on it
-(ADR-0023, *Consequences*).
+half the mesas with a way up). **Baseline benched (owner, 2026-11-04,
+version 8):** `docs/bench/2026-11-04-m14-v8.md`; see *Baseline* below.
+**Re-benched on the audited build (2026-11-11):**
+`docs/bench/bench-1794373242.md`, version 8 (sprint 786–866 fps, relight
+76–95 ms/s, backlog draining to 0). Criterion 9 compares against this
+one: the 2026-11 audit made generation, relight and threading cheaper,
+and a baseline from before it would hide a real M15 cost behind the
+audit's gains. **Catalogue
+approved by the owner (2026-11-04)** — task 0 is done.
+**Task 1 progress (2026-11-04):** process weights and the ice-age climate
+built (`vox_worldgen::landform`, `Generator::processes`), the world map's
+`processes-*` and `ice-age-*` layers (`process_map`; gallery
+`docs/gallery/m15/`), ADR-0021 proposed (renumbered ADR-0026 at the merge: main had taken 0021). No terrain changed
+(`GENERATOR_VERSION` stays 8). Shares of land at weight ≥ 0.5, default
+seed: wind 8%, flash flood 2.5%, ice 41%, weathering 9%, rain 36%; over
+four seeds ice 23–41%. Two changes from the approved catalogue, for the
+owner to confirm: ice needs snow as well as cold (temperature alone
+glaciated 54% of land), and "mountains" means real ranges, not any uplift
+(see the catalogue's *Task 1's fit*). The owner approved
+the maps and both refinements (2026-11-04: "Seems good, move ahead!") —
+task 1 is done.
+**Task 2 progress (2026-11-05):** **dune seas built (2a,
+`GENERATOR_VERSION` 9)** — `landform::dunes`: transverse, linear, star and
+barchan dunes chosen by the dune wind (tilted 22.5°, swinging seasonally
+toward the deserts' poleward edges), as waves with whole cycles around the
+torus so they tile with no seam; laid on dry ground after the water (they
+only raise ground, so water still fits it) and faded out within 4–40 blocks
+of a river's bank; sand blocks; the readout names them ("hot desert, star
+dunes"). Measured (`dune_survey`, four seeds): dunes 3+ blocks high on
+20–25% of hot desert and 12–16% of cold; ridge columns' sand p50 6, p90
+16–17, max 30–35; under 0.5% of steps between dune columns over one block.
+Cost: `ground()` +2% across the world, +0.65 µs a column inside a dune sea.
+Tests: `dunes_lie_where_the_wind_works_and_never_on_water`,
+`transverse_crests_run_across_the_wind`, waves tile. **Benches, mesas
+and buttes built (2b, `GENERATOR_VERSION` 10)** — `landform::mesas`,
+applied before the network (`Generator::landformed`, `DrainageMap::build_on`):
+caprock raised 30–120 blocks in islands over the stripped ground, sheer
+walls with talus aprons (~34°), about half with a walkable ramp; benches
+18–60 high (whole 3-block beds) with risers 5 blocks wide on any slope.
+Raising the caprock, not digging the floors: the first draft dug floors
+and added 2–6 points of land draining to closed basins; raised, the share
+is unchanged (31.9 / 39.7 / 27.4% against 32.1 / 39.6 / 27.4% over three
+seeds). The layer touches ~9% of land (tops ~1%). The reshaped networks
+found two M14 lake-shore seams, fixed with failing tests first: a channel
+on ground level with a lake runs on into it; a column hard against a
+lake's region always gets its bank. Cost: `ground()` ~+10% across the
+world (noisy), ~2.7× inside mesa country. Test:
+`mesas_stand_only_on_flash_flood_uplands`; `mesa_survey`. **Canyons
+built (2c, `GENERATOR_VERSION` 11)** — in the erosion stage: on
+flash-flood ground (the weight passed in with the ground,
+`DrainageMap::build_on`) incision is up to 4× and valley sides may stand
+at 3:1 instead of 0.6. Measured (`mesa_survey`, rivers of 0.1+ m³/s):
+40–95 blocks deep on flash-flood ground against 8–9 (p50) elsewhere — but
+on only 1–4 sampled cells a world, because few rivers cross flash-flood
+uplands (they are dry and mostly drain inward; no world has an "exotic"
+river like the Colorado fed from wet mountains). Closed basins unchanged.
+Tests: `caprock_cuts_canyons`, `caprock_holds_walls_steep`. **Task 2 is
+built**; it waits on the owner's flight over the dry lands (the owner
+chose to test everything together after, 2026-11-05). Carried: walls
+banded only in their top 12 blocks (deep strata are geology's — the
+12-block profile keeps the stone-chunk fast path); canyons rare, for
+lack of rivers crossing the plateaus; `ground()` ~+10% (re-check with the
+owner's `--bench`). **Next: task 3** — ice.
+**Task 3 progress (2026-11-05):** **glacial troughs built (3a,
+`GENERATOR_VERSION` 12, drainage cache format 5)** — in the erosion
+stage, on the drainage grid: ice flux is the glaciated catchment routed
+down the valleys the rivers cut; a trough's depth grows with √flux (to
+400, at most 0.6 of the valley's relief), its half-width with flux^¼ (to
+200); stored as lines along the network's own jittered nodes (so rivers
+run on the floors) and evaluated at full resolution as a U — parabolic
+floor, 3:1 walls — the ground the lower of its own and the U's. Only
+where a valley has 100–250+ blocks of relief to channel the ice; troughs
+taper in from nothing at a glacier's head. Three rejected first tries,
+kept in the gallery's notes: a per-cell carved grid (128-block squares
+showed through), a cut-off at the rim (sheer 300-block steps), and
+troughs on low ground (a lattice of grooves and bowls on every gentle
+glaciated slope). Measured: troughs up to ~560 blocks below the original
+valley in the highest glaciated ranges, floors ~200 wide; lakes and
+closed basins unchanged; world creation +1–2 s (network build 5.1 →
+6.8 s, noisy); `ground()` unchanged across the world, ~+35% inside trough
+country. Test: `ice_carves_a_valley_into_a_u` (with the existing water
+tests all passing). **Fjords rare:** few glaciated coasts in these worlds
+have mountains to channel ice, so troughs seldom reach the sea (the
+deepest glaciated cut at a coast, default seed: 26 blocks). **Found in
+M14's code and fixed at the owner's request (version 13):** in steep
+mountains the river erosion stage's 256-block grid showed through as
+squares (bilinear creases; now Catmull–Rom, flanks ~10% steeper at most),
+and mountain rivers had sawtooth wedges along their banks (every steep
+stretch held its water level to its end; now only a reach's highest step
+is a waterfall and the others cascade). Gallery `ice-trough-…-v11-before`
+and `-v13`. **Fjords:** kept rare (recommended, not overruled by the
+owner, 2026-11-05). **Cirques (3b,
+version 14):** a glacier's head is a bowl ~240 across, flat-floored and
+overdeepened below its lip, its headwall 3:1 (1 773 on the default seed);
+tarns where the network's 128-block cells see the bowl. **End moraines
+and drumlins (3c, version 15):** `landform::deposits`, before the
+network, raise-only, on low ground: moraine ridges 4–12 high along the
+contour where the smooth (unjittered) ice-age weight is ½, broken by
+meltwater gaps about half their length (0.8% of land); drumlin swarms
+behind it (weights 0.55–0.95), ~260 long and ~110 apart along Z (2.1%).
+Tests: cirques in `ice_carves_a_valley_into_a_u`,
+`drumlins_lie_along_the_ice_flow`. **Arêtes and horns** are left to
+emerge where cirques and troughs cut both sides of a divide — not built
+or measured separately. **Closed basins are chaotic:** small changes
+reroute whole basins, so seeds move both ways — over three seeds 33.0%
+at version 11, 33.5% at version 15 (31.9 → 34.1, 39.7 → 38.4,
+27.4 → 27.9); task 5 must aim at them directly. **Task 3 is built**,
+waiting on the owner's flight with task 2. **Next: task 4** — inselbergs
+and rain-dissected hills.
+**Task 4 progress (2026-11-05):** **inselbergs and tors (4a, version
+16)** — `landform::inselbergs`: sites on a jittered lattice tiled with
+the world (domes every ~2.5 km, tors every ~500 blocks), kept by the
+weathering weight at the site's centre so a dome is always whole; domes
+40–150 high, 200–600 across, elongated with a wobbled outline, steep at
+the foot (half rounder, climbable); tors stepped in 3-block courses, also
+on rainy uplands at low weight; bare stone; before the network. 0.09% and
+0.02% of land on the default seed (domes every few km on savanna
+plains). **Rain-dissected hills (4b, version 17)** —
+`landform::dissection`: ridges 10–40 high between small valleys left at
+the ground's level, after the water and faded toward rivers (cutting
+valleys before the network would hand it pits; after, lakes over air);
+ridge crests on warped two-octave noise; closer with rain (test). 16.5%
+of land. Half-orange hills are not a separate shape: the rounded ridges
+are them at full rain. Cost: the ridge layer ~+10% on `ground()`
+(noisy); the inselberg layer, after its cheap tests, none measurable.
+Tests: `domes_are_whole_steep_and_tiled`,
+`inselbergs_stand_on_weathered_plains`, `ridges_rise_from_untouched_valleys`,
+`valleys_closer_with_more_rain`. **Task 4 is built**, waiting on the
+owner's flight. **Next: task 5** — M14's carried items: closed basins
+(~33%, target ≤ ~22%) and valleys of 1+ m³/s rivers ≥ ~20 deep.
+**Merged onto the tectonic terrain (2026-11-14, `GENERATOR_VERSION` 18).**
+Tasks 1–4 were built in a session whose branch was never merged; in the
+meantime, in the owner's order, milestone 16's tasks 1–2 replaced the
+terrain under them (versions 9–10 on that line) and a second task 1
+(`vox_worldgen::process`, ADR-0023) was built in parallel. The two lines
+were merged as version 18: this line's landform module replaces the
+`process` module (the same weights, built further), and every landform
+now stands on the plate framework's continents and ranges. What the
+merge changed, each with a failing test first or a measured reason:
+ponds past a river reach's end are filled, not held, where a lower
+reach's banks — or its water below a waterfall — come within three
+blocks (`lake_shores_hold_their_water`: the cascading reaches of
+version 13 met the tectonic ranges' steeper valleys); the dune survey's
+floor is 500 columns, the drumlin test samples a wider square (the
+tectonic continents put fewer of either in the old windows); and the
+erosion stage's steepest added slope is 1.39 (bound 1.45: the ranges'
+spines and the Catmull–Rom cut together). The images in the gallery
+up to `hills-…-v17` show this line's own terrain, not the merged one.
+Every landform waits on the owner's flight of version 18.
 
 ## Why this milestone exists
 
@@ -193,6 +319,33 @@ pass.
    within its budget; `--bench` within ~10% of M14's version-8 re-bench.
 10. **The owner's walk** (or flights, as M14), and a retrospective with
     before-and-after maps and renders.
+
+## Baseline (criterion 9)
+
+The owner's `--bench` at `GENERATOR_VERSION` 8, 2026-11-04, RTX 4060,
+800×600, dev build, flowing water on — `docs/bench/2026-11-04-m14-v8.md`.
+Against M14's version-4 bench (after the span-cache fix) and M13's close:
+
+| Phase | v8 (this) | M14 v4 | M13 close |
+|---|---|---|---|
+| 6 levels, land, standing | 834 | 850 | 894 |
+| 6 levels, ocean, standing | 737 | 727 | 811 |
+| 8 levels, land, sprint | 740 | 684 | 754 |
+| 8 levels, ocean, sprint | 731 | 664 | 745 |
+| 8 levels, rivers, standing / sprint | 695 / 741 | 716 / 709 | — |
+| 8 levels, waterfall, standing | 617 | 598 | — |
+
+Versions 5–8 (stage-1 long profiles, per-column region checks) cost
+nothing measurable: every phase is within this machine's ~14% run-to-run
+noise, and sprint is back at M13's level. Streaming unchanged: relight
+177–212 ms/s (M13 181–190), mesh 195–205 µs per chunk, encode ~0.7 ms at
+8 levels. Two things to watch, not act on yet: the sprint backlog at the
+end is 177–354 (M13 190–232; the 354 is 8-level ocean, ~200 of it
+waiting on relight), and the rivers standing phase had one 22 ms frame
+with nothing streaming (1% low 389, so a single hitch). Criterion 9
+compares against the v8 column. The bench header now names the
+generator version and build profile (M14 lesson 4); this run predates
+that, and its version is inferred from the build.
 
 ## Tasks (proposed order)
 

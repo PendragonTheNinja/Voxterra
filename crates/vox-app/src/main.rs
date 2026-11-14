@@ -934,6 +934,19 @@ impl App {
             .unwrap_or_default();
         let mut header = vec![
             format!("GPU: {gpu}, {w}×{h}"),
+            // A bench is evidence only if it names the build that made it
+            // (M14 lesson 4: two runs once measured a stale build). A world
+            // from another generator version is refused, so this is the
+            // world's version too.
+            format!(
+                "Build: generator version {}, {} profile",
+                vox_worldgen::GENERATOR_VERSION,
+                if cfg!(debug_assertions) {
+                    "dev"
+                } else {
+                    "release"
+                }
+            ),
             format!(
                 "World: seed {:#x}, {} × {} km; start ({sx}, {sz})",
                 self.session.store.seed(),
@@ -1014,8 +1027,13 @@ impl App {
             self.camera.position.z.floor() as i64,
         );
         let c = self.session.generator.column(x, z);
+        let landform = self
+            .session
+            .generator
+            .landform(x, z)
+            .map_or(String::new(), |l| format!(", {l}"));
         format!(
-            "{} {:.0}C {:.0}mm lat {:.1}",
+            "{}{landform} {:.0}C {:.0}mm lat {:.1}",
             c.biome.name(),
             c.temperature,
             c.precipitation,

@@ -224,7 +224,7 @@ pub(crate) const MOUNTAIN_UPLIFT: f32 = 0.06;
 /// Mean annual temperature, °C, at the treeline (mountains only).
 const TREELINE_C: f32 = 1.0;
 /// Mean annual temperature below which lowland is ice sheet, and tundra.
-const ICE_SHEET_BELOW_C: f32 = -14.0;
+pub(crate) const ICE_SHEET_BELOW_C: f32 = -14.0;
 const TUNDRA_BELOW_C: f32 = -5.0;
 /// Below this, humid lowland is boreal forest.
 const BOREAL_BELOW_C: f32 = 3.0;
@@ -252,8 +252,8 @@ const BADLANDS_RELIEF: f32 = 0.45;
 
 /// How far boundary noise moves the inputs: temperature by up to this many
 /// °C, precipitation by up to this share.
-const TEMPERATURE_JITTER_C: f32 = 1.5;
-const PRECIPITATION_JITTER: f32 = 0.22;
+pub(crate) const TEMPERATURE_JITTER_C: f32 = 1.5;
+pub(crate) const PRECIPITATION_JITTER: f32 = 0.22;
 
 use crate::drainage::Water;
 
@@ -396,6 +396,9 @@ mod tests {
             relief: 0.1,
             uplift: 0.0,
             headland: 0.0,
+            sand: 0,
+            rock: false,
+            ridge: 0,
         }
     }
 
@@ -454,6 +457,9 @@ mod tests {
             relief: 0.2,
             uplift: 0.5 * MAX_UPLIFT,
             headland: 0.0,
+            sand: 0,
+            rock: false,
+            ridge: 0,
         };
         // Mid-latitude: sea level 12 °C. Snow from ~470.
         assert_eq!(at(peak(600), 12.0, 1_000.0), Biome::AlpineRock);

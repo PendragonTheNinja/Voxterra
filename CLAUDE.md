@@ -313,7 +313,18 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   (`docs/milestones/15-landforms-by-climate.md`): **spec approved
   2026-11-03** — all five families; glacial landforms wherever last-ice-age
   ice lay; real cliffs, not all walkable (traversal is later gameplay);
-  dunes 6–30 high, 100–250 apart; dry lands first. No code yet. **Handoff (2026-11-04):** the landform catalogue (`docs/landforms.md`) is drafted and its five questions are answered (its *Decisions* section). **The catalogue was approved by the owner on 2026-11-10.** **Task 1 is done (2026-11-10):** the process-weight map (`vox_worldgen::process`, ADR-0023 proposed), not yet read by generation, so still `GENERATOR_VERSION` 8. Next, **in the owner's order (2026-11-10): milestone 16's task 2 comes before this milestone's task 2** (see *Geology* below); then task 2 (dry lands: dunes, benches, mesas, canyons). **The baseline is taken (2026-11-11):** `docs/bench/bench-1794373242.md`, version 8 on the audited build, and the owner's play-test of the audit changes was fine — see the spec's *Task 0 progress* note and ADR-0023's *Consequences* for task 2's first decision. Dune
+  dunes 6–30 high, 100–250 apart; dry lands first. Catalogue
+  `docs/landforms.md`, approved. **Tasks 1–4 are built** (dune seas;
+  benches, mesas and canyons; U-troughs, cirques, moraines and drumlins;
+  inselbergs, tors and dissected hills — `vox_worldgen::landform`,
+  ADR-0026), in a session whose branch sat unmerged until **2026-11-14,
+  when it was merged onto milestone 16's tectonic terrain as
+  `GENERATOR_VERSION` 18** (the spec's *Merged onto the tectonic terrain*
+  note; ADR-0023, the parallel task 1, is superseded). Every landform
+  waits on the owner's flight of version 18, and his `--bench`. Next:
+  re-check each landform on the tectonic terrain (surveys and renders),
+  then task 5 (M14's carried items, and small streams that follow the
+  ground), then task 6. Dune
   seas, mesas and canyons, glacial valleys and fjords, inselbergs, dissected
   humid hills, as height layers weighted by a stage-1 process map, applied
   before the drainage network so water still fits the ground (M14's lesson).
@@ -330,13 +341,13 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   ponds; nine water biomes (32 in all); flowing water in the shader; LOD
   water at its own levels. Closed after three owner flights in place of the
   walk (`GENERATOR_VERSION` 5–8 fixed what they found). Carried: closed
-  basins ~29%, shallow large-river valleys, re-bench at version 8, distant
+  basins ~29%, shallow large-river valleys, distant
   rivers as ribbons, reservoirs with the water simulation.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 306, vox-mesh 72, vox-worldgen 103, vox-render 21, vox-app 18
+  vox-core 306, vox-mesh 72, vox-worldgen 118, vox-render 21, vox-app 18
   passing (288, 72 and 11 before the 2026-11 audit; worldgen was 81
-  before the tectonic framework), plus the ignored
+  before the tectonic framework and 103 before M15's landforms), plus the ignored
   `every_biome_in_every_world` and `biome_survey`, run in release), then
   start the first unchecked item.
 - **Code audit, 2026-11-09:** `docs/notes/code-audit-2026-11.md` — what was
@@ -378,15 +389,16 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   ponds, seabeds fining outward, rough coasts alternating rock and beach,
   the LOD's slopes as bright as full resolution's, water darkening with
   depth. Small streams that follow the ground went to M15 (task 5);
-  coastal landforms are proposed for M15's catalogue. **Next: the
-  owner's `--bench` and a look at version 10** (a fresh world again),
-  then M15's task 2.
+  coastal landforms are proposed for M15's catalogue. Version 10's polish
+  is carried into version 18 by the M15 merge (2026-11-14). **Next: the
+  owner's `--bench` and a flight on version 18** (a fresh world again).
 - **Open decision records (2026-11-11):** ADR-0022 (relight and mesh off
   the frame — proposed; **its gate is met** by the owner's bench: the two
   passes hold the frame thread ~320 ms of every sprinting second and the
   1% low is 72–77 fps against a median near 800 — worth building, not
   urgent, and *when* is the owner's to choose); ADR-0023
-  (landform processes — proposed, built as M15 task 1); ADR-0024 (block
+  (landform processes) is superseded by ADR-0026 (landforms as height
+  layers — proposed, built as M15 tasks 1–4); ADR-0024 (block
   names in saves) is accepted and built; ADR-0025 (the tectonic
   framework) is proposed and built (tasks 1–2), to be accepted after the
   owner's flight and bench on version 9.

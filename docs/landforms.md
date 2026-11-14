@@ -1,9 +1,10 @@
 # Landform catalogue
 
-***Approved by the owner, 2026-11-10*** — "It's supposed to be following
-closely to Earth's landforms just on our scale. It's a good doc and I
-trust it will make a solid world gen." That is the standard every landform
-is held to: Earth's, at our scale. M15 task 1 may start. (Drafted
+***Approved by the owner*** — first on 2026-11-04 ("Yes that is
+approved!"), and again on 2026-11-10 in a parallel session: "It's
+supposed to be following closely to Earth's landforms just on our scale.
+It's a good doc and I trust it will make a solid world gen." That is the
+standard every landform is held to: Earth's, at our scale. (Drafted
 2026-11-03; its five questions answered 2026-11-04 — Decisions, at the
 end.) Written for the owner's approval before M15 builds anything
 (M15 criterion 1: "a landform catalogue … approved before code"). Once
@@ -91,6 +92,22 @@ are temperate today, as Norway's and Scotland's are. Where ice still lies
 
 These are tuning targets; task 1 fits the curve and the threshold to them.
 
+**Task 1's fit (2026-11-04, ADR-0026 §3; approved by the owner the same day).** The curve and threshold above
+reproduce the table exactly (ΔT a smoothstep in `sin(latitude)` from 20° to
+50°; a test pins it). Two things were added, because temperature alone put
+54% of land under ice, with every cold interior glaciated: **snow** — the
+threshold shifts with today's precipitation (−8 °C at 100 mm, 0 at the
+table's reference 1 000 mm, +2.5 at 4 000: wet ranges glaciate lower, as
+on Earth), and below 200–450 mm no ice sheet grows (Siberia stayed
+ice-free); and **today's ice sheet** counts as glaciated however dry
+(Antarctica). Result: 23–41% of land glaciated over four seeds (Earth's
+last glacial maximum ~25–32%).
+
+"Mountains" in the table's *Zero where* column means real ranges — uplift
+200–400 blocks and more — not any uplift: almost all high ground here is
+raised by mountain building, so the stricter reading left flash floods on
+1.4% of land.
+
 ## Wind — dune seas
 
 | Landform | Earth analogues | Earth size | Ours | Walking | Where |
@@ -128,6 +145,14 @@ These are tuning targets; task 1 fits the curve and the threshold to them.
   dunes). Fryberger's rule: one wind → transverse and barchans, two at an
   obtuse angle → linear, many → star.
 
+**Built (M15 task 2a, version 9).** As above, with: one dune type per
+place (transverse and linear ridges added together made a lattice); the
+erg needs warmth as well as wind (cold deserts keep ~45% of a hot one's),
+so dunes stand on ~20–25% of hot desert and ~12–16% of cold; star dunes
+on a wandering hexagonal lattice of crossing waves, many points empty,
+heights 25–55; barchans from crests cut one spacing long by the wave
+across the wind. Measured in `dune_survey`; gallery `docs/gallery/m15/`.
+
 ## Flash flood — benches, mesas, buttes, canyons
 
 | Landform | Earth analogues | Earth size | Ours | Walking | Where |
@@ -152,6 +177,21 @@ These are tuning targets; task 1 fits the curve and the threshold to them.
 - **Rivers cut them.** Benches are applied before the network, so M14's
   rivers find the plateau and cut canyons through it; the canyon's walls
   step as the benches do. Dry washes (arroyos) are M14's dry rivers.
+
+**Built (M15 task 2b, version 10).** Benches, mesas, buttes and talus as
+above, before the network. Mesas are the caprock *raised* above the
+stripped ground (which keeps the base height and its drainage), never the
+floor dug: dug floors made bowls the network filled with closed basins.
+Caprock covers at most about a third of an upland so it stands in islands.
+A per-mesa "way up" is approximated by a 450-block noise that widens walls
+into ramps — about half of all wall length, not a choice per mesa. Bench
+levels are whole 3-block beds, but walls show the beds only in their top
+12 blocks (the profile depth); below is stone until geology.
+
+**Canyons (task 2c, version 11)** are cut in the erosion stage: harder
+incision and walls up to 3:1 on flash-flood ground. 40–95 blocks deep
+where a river crosses a plateau, but rare — dry uplands seldom carry a
+through-flowing river.
 
 ## Ice — glacial valleys and coasts
 
@@ -180,6 +220,17 @@ decides what lies in them (ice sheet, tundra, forest, a lake).
 - **Fjord walls are rocky coast** (biome 19, already); their sill makes
   their mouths shallow.
 
+**Built so far (M15 task 3a, version 12).** U-troughs along glaciated
+valleys with relief (100–250+ blocks) to channel the ice, as lines along
+the network's nodes evaluated at full resolution; overdeepened floors
+fill as lakes through M14's routing; tributaries cut less deep hang above
+the main trough. Lowland ice sheets dig no troughs (M14's lake districts
+stand for their scour). Fjords: rare, because few glaciated coasts have
+mountains. Cirques at every glacier's head (version 14); end moraines
+along the ice age's margin and drumlins behind it on low ground (version
+15), aligned along Z. Arêtes and horns are left to emerge between cirques
+and troughs.
+
 ## Weathering — inselbergs
 
 | Landform | Earth analogues | Earth size | Ours | Walking | Where |
@@ -205,6 +256,12 @@ decides what lies in them (ice sheet, tundra, forest, a lake).
   (up to ~1 000 in the largest worlds), so these small valleys are a stage-2
   layer, applied before the network samples the ground. Their streams are
   too small for M14's rivers; they are dry valleys or, later, brooks.
+
+**Built (M15 task 4, versions 16–17).** Inselbergs and tors as above,
+whole (the weight is read at each site's centre), bare stone, before the
+network. Dissected hills as ridges raised between valleys left at the
+ground's level, after the water like the dunes, faded toward rivers;
+half-orange hills are the same ridges at full rain.
 
 ## M14's carried items
 
@@ -234,6 +291,12 @@ Over many seeds, conditioned on the process weights:
   (criterion 7), as `every_biome_in_every_world` does for biomes.
 
 ## As built — the process weights (M15 task 1, 2026-11-10)
+
+*Superseded at the merge (2026-11-14):* a second task 1 was built in a
+parallel session (`vox_worldgen::landform`, ADR-0026; *Task 1's fit*
+above), and that one is what generation reads. This section records the
+other, whose code was removed in the merge; its measurements agree with
+the landform module's to within the seeds' spread.
 
 `vox_worldgen::process` (ADR-0023). The table under *The process weights*
 is implemented as written, with three things the draft did not say:
