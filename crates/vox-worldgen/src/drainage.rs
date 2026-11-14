@@ -271,6 +271,7 @@ impl DrainageMap {
             &carving,
             &canyon,
             &ice,
+            &|x, z| ground(x.floor() as i64, z.floor() as i64).0 as f64,
         );
         let height: Vec<i32> = (0..nx * nz)
             .map(|c| {

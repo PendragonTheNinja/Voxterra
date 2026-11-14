@@ -1310,3 +1310,81 @@ mod rock_survey {
         }
     }
 }
+
+/// River valleys (M15 task 5): close-ups of the largest river's valley on
+/// land, and of a 1–10 m³/s river's among hills, with a cross-section
+/// through each (heights every 16 blocks across the valley, east–west).
+/// `cargo test -p vox-worldgen --release valley_closeups -- --ignored
+/// --nocapture`; env `WORLD_MAP_SEED`, `WORLD_MAP_DIR`.
+#[cfg(test)]
+mod valley_closeups {
+    use super::dune_survey::closeup;
+    use crate::Generator;
+    use vox_core::WorldShape;
+
+    #[test]
+    #[ignore]
+    fn valley_closeups() {
+        let seed = std::env::var("WORLD_MAP_SEED")
+            .ok()
+            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0x7e22ac0de);
+        let dir: std::path::PathBuf = std::env::var("WORLD_MAP_DIR").map_or_else(
+            |_| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/world-map"),
+            Into::into,
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+        let g = Generator::new(seed, WorldShape::DEFAULT);
+        let d = g.drainage();
+        let (nx, nz) = d.cells();
+        // The largest river on land, well up from its mouth (its ground 20+
+        // above the sea), and the 1–10 m³/s river with the most relief
+        // within 384 blocks.
+        let (mut largest, mut hilly) = ((0.0f32, 0usize, 0usize), (0i32, 0usize, 0usize));
+        for j in (0..nz).step_by(2) {
+            for i in (0..nx).step_by(2) {
+                let (h, _, q, _) = d.cell(i, j);
+                if d.is_sea(i, j) || d.is_lake(i, j) || h < 20 {
+                    continue;
+                }
+                if q > largest.0 {
+                    largest = (q, i, j);
+                }
+                if (1.0..10.0).contains(&q) {
+                    let mut rim = h;
+                    for (di, dj) in [(3isize, 0isize), (-3, 0), (0, 3), (0, -3)] {
+                        let ii = (i as isize + di).rem_euclid(nx as isize) as usize;
+                        let jj = (j as isize + dj).rem_euclid(nz as isize) as usize;
+                        rim = rim.max(d.cell(ii, jj).0);
+                    }
+                    if rim - h > hilly.0 {
+                        hilly = (rim - h, i, j);
+                    }
+                }
+            }
+        }
+        for (name, i, j) in [
+            ("valley-large", largest.1, largest.2),
+            ("valley-hills", hilly.1, hilly.2),
+        ] {
+            let (x, z) = d.node(i as i64, j as i64);
+            let (x, z) = (x.round() as i64, z.round() as i64);
+            let across: Vec<String> = (-12..=12)
+                .map(|k| {
+                    let (s, w) = g.ground(x + 16 * k, z);
+                    if w.level > s.height {
+                        format!("{}~", w.level)
+                    } else {
+                        s.height.to_string()
+                    }
+                })
+                .collect();
+            println!(
+                "{name} at ({x}, {z}), {:.2} m³/s: across x every 16: {}",
+                d.cell(i, j).2,
+                across.join(" ")
+            );
+            closeup(&g, &dir, &format!("{name}-{seed:x}"), x, z);
+        }
+    }
+}

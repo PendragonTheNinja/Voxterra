@@ -187,6 +187,34 @@ mountains); dune ground slightly rougher (0.4–1.6% of steps over a
 block, under 0.5% before). Moraines 0.21% of land, drumlins 1.4%,
 dissected hills 22.8%, inselbergs 0.08%. Every landform waits on the
 owner's flight of version 19.
+**Task 5 progress (2026-11-14, `GENERATOR_VERSION` 20).** M14's carried
+items, measured in the chunks over the survey's seeds:
+- **Closed basins: met.** 19.3% of land over six seeds (13.1–24.4%;
+  `drainage_survey`), against ≤ ~22% (33% on the old terrain, 29% at
+  M14's close). The tectonic terrain did most of it; the inner valleys
+  below took it from 19.9%.
+- **Valleys for 1+ m³/s rivers: met.** Rivers' **inner valleys**
+  (ADR-0026, *Rivers' inner valleys*): every river of 0.1+ m³/s lowers the
+  ground along its own line, 8 blocks per decade of discharge (at most
+  30), fading out over its sides, its floor falling all the way to its
+  mouth. Valley depth (the ground 384 blocks off less the river's water,
+  M14's measure; `valley_survey`): rivers of 1–10 m³/s **30–32** at the
+  median (p25 23–25), 10+ m³/s ~32; 18–19 at version 19, 11–13 at M14's
+  close. Streams of 0.01–0.1 m³/s unchanged (~18–20). Test:
+  `large_rivers_run_in_valleys` (held at 25; version 19 measured 21).
+  A first draft clipped the ground to a U about straight lines and sliced
+  ridged hillsides into flat facets (gallery, `…-clipped-draft`).
+  Found on the way and fixed with the failing test first: a pond a block
+  short of its reach's end, beside a lower river whose bank had cut solid
+  ground to the pond's level (`lake_shores_hold_their_water`) — every
+  pond now holds only where no bank within three blocks is cut below it.
+  Lakes on ice-scoured ground fell from 13–19% to 9–13% of cells (the
+  valleys cut some rims); still far above other ground's ~1.2%. World
+  creation +~1 s (network 6.9–7.0 s → 7.7–8.7 s, two seeds); chunk
+  generation unchanged within noise. Drainage cache format 6.
+- **Still open in task 5: small streams that follow the ground** (the
+  owner's version 9 flight) — next. Canyons: still none (no river of
+  0.1+ m³/s crosses flash-flood ground in three seeds).
 
 ## Why this milestone exists
 

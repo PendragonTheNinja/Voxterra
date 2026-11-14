@@ -70,6 +70,31 @@ const TROUGH_WIDTH_PER_QUARTER: f64 = 30.0;
 /// be channelled into a trough, and the flux from which a trough is full.
 const TROUGH_RELIEF: (f64, f64) = (100.0, 250.0);
 const TROUGH_FLUX_FULL: f64 = 16.0;
+/// Inner valleys (M15 task 5): every river of [`INNER_FROM_M3S`] or more
+/// runs in a valley of its own, cut at block scale along its line — the
+/// erosion grid's 256-block cells could only open valleys ~500 wide, and a
+/// large river sat 11–19 blocks below the ground 384 blocks off (M14's
+/// carried item). Depth: [`INNER_PER_DECADE`] blocks per decade of
+/// discharge above it, at most [`INNER_MAX_DEPTH`]; the floor at least
+/// [`INNER_FLOOR_PER_WIDTH`]× the river's width plus [`INNER_FLOOR`]
+/// across — its meander belt — and its sides no steeper than
+/// [`MAX_WALL_SLOPE`]. Floors never rise downstream, so it ponds nothing.
+const INNER_FROM_M3S: f64 = 0.1;
+const INNER_PER_DECADE: f64 = 8.0;
+const INNER_MAX_DEPTH: f64 = 30.0;
+const INNER_FLOOR: f64 = 20.0;
+const INNER_FLOOR_PER_WIDTH: f64 = 3.0;
+/// An inner valley's cut fades out over this many of its depths beyond its
+/// floor (a smoothstep: its steepest ~1.5 × share ÷ this ≈ 0.6, as
+/// [`MAX_WALL_SLOPE`]), and lowers ground at most this share of its depth.
+const INNER_FADE: f32 = 3.5;
+const INNER_CUT_SHARE: f32 = 1.5;
+/// Shallower than this, no inner valley is kept, blocks.
+const INNER_MIN_DEPTH: f64 = 2.0;
+/// The river's width per √(m³/s), as the chunks draw it
+/// (`rivers::WIDTH_PER_ROOT_Q`).
+const RIVER_WIDTH_PER_ROOT_Q: f64 = 8.0;
+
 /// Shallower than this, no trough is kept, blocks.
 const TROUGH_MIN_DEPTH: f64 = 3.0;
 /// The widest a trough's half-width gets, blocks.
@@ -90,13 +115,43 @@ pub(super) struct Erosion {
     /// surface along the line from its centre to its receiver's — the
     /// ground is the lower of its own and the nearest troughs'.
     pub(super) troughs: Troughs,
+    /// Rivers' inner valleys (M15 task 5), the same way: one per drainage
+    /// cell a river of [`INNER_FROM_M3S`] runs through.
+    pub(super) valleys: Troughs,
 }
+
+/// How a set of lines is drawn: its walls beyond the floor (rise over
+/// run), how many cells around a column it is looked for, and whether its
+/// heads are cirques and its lines past the last kept cell taper to their
+/// own ground (a glacier's snout) or run on down to the receiver's (a
+/// river's mouth, its target kept in `rim`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Style {
+    pub(super) wall: f32,
+    pub(super) search: i64,
+    pub(super) glacial: bool,
+}
+
+/// Glacial troughs: 3:1 walls, cirques, snouts.
+pub(super) const GLACIAL: Style = Style {
+    wall: TROUGH_WALL,
+    search: SEARCH,
+    glacial: true,
+};
+/// Rivers' inner valleys: walkable walls; a line reaches 100 blocks or so
+/// from itself, within two cells.
+pub(super) const FLUVIAL: Style = Style {
+    wall: MAX_WALL_SLOPE as f32,
+    search: 2,
+    glacial: false,
+};
 
 /// The glacial troughs, on the drainage grid (M15 task 3). Kept as lines,
 /// not a grid of heights: a 128-block grid interpolated showed through as
 /// squares (M14's lesson); a U about a line follows the valley.
 #[derive(Default)]
 pub(super) struct Troughs {
+    pub(super) style: Option<Style>,
     /// Drainage cells per axis, blocks per cell.
     pub(super) grid: (usize, usize, f64, f64),
     /// Per drainage cell: its trough's index in `cells`, or `u32::MAX`.
@@ -178,9 +233,9 @@ fn cirque_profile(r: f32, depth: f32, reach: f32) -> f32 {
 /// A trough's height above its floor at `d` blocks from its line: a
 /// parabola over the floor (`depth` at `half`), steep walls beyond, and a
 /// rise past any ground in the last [`TROUGH_EDGE`] blocks of `reach`.
-fn u_profile(d: f32, half: f32, depth: f32, reach: f32) -> f32 {
+fn u_profile(d: f32, half: f32, depth: f32, reach: f32, wall: f32) -> f32 {
     let e = (d / half).min(1.0);
-    let mut h = depth * e * e + TROUGH_WALL * (d - half).max(0.0);
+    let mut h = depth * e * e + wall * (d - half).max(0.0);
     let edge = d - (reach - TROUGH_EDGE);
     if edge > 0.0 {
         h += 100.0 * edge;
@@ -202,6 +257,7 @@ impl Erosion {
         runoff: &[f64],
         canyon: &[f32],
         ice: &[f32],
+        ground: &(dyn Fn(f64, f64) -> f64 + Sync),
     ) -> Self {
         // Two by two drainage cells to one: the mean height, the summed
         // runoff, sea where most of it is.
@@ -280,9 +336,15 @@ impl Erosion {
             cell_z,
             delta,
             troughs: Troughs::default(),
+            valleys: Troughs::default(),
         };
         let troughs = glaciate(fnx, fnz, cell, base, sea, ice, |x, z| erosion.at(x, z));
         erosion.troughs = troughs;
+        let eroded = |x: f64, z: f64, h: f64| {
+            let h = h + f64::from(erosion.at(x, z));
+            erosion.troughs.at(x, z).map_or(h, |t| h.min(f64::from(t)))
+        };
+        erosion.valleys = incise(fnx, fnz, cell, base, sea, runoff, ground, eroded);
         erosion
     }
 
@@ -306,10 +368,11 @@ impl Erosion {
     /// U (M15).
     pub(super) fn apply(&self, x: f64, z: f64, h: i64) -> i64 {
         let h = h + self.at(x, z).round() as i64;
-        match self.troughs.at(x, z) {
+        let h = match self.troughs.at(x, z) {
             Some(t) => h.min(t.floor() as i64),
             None => h,
-        }
+        };
+        h - self.valleys.cut(x, z, h as f32).round() as i64
     }
 }
 
@@ -356,7 +419,12 @@ impl Troughs {
 
     /// The troughs from their cells (ascending), with the index and the
     /// search flags rebuilt.
-    pub(super) fn from_cells(nx: usize, nz: usize, cx: f64, cz: f64, cells: Vec<Trough>) -> Self {
+    pub(super) fn from_cells(
+        style: Style,
+        (nx, nz): (usize, usize),
+        (cx, cz): (f64, f64),
+        cells: Vec<Trough>,
+    ) -> Self {
         let n = nx * nz;
         let mut index = vec![u32::MAX; n];
         let mut near = vec![false; n];
@@ -367,13 +435,14 @@ impl Troughs {
             let c = t.cell as usize;
             index[c] = k as u32;
             let (i, j) = ((c % nx) as i64, (c / nx) as i64);
-            for dj in -SEARCH..=SEARCH {
-                for di in -SEARCH..=SEARCH {
+            for dj in -style.search..=style.search {
+                for di in -style.search..=style.search {
                     near[at(i + di, j + dj)] = true;
                 }
             }
         }
         Self {
+            style: Some(style),
             grid: (nx, nz, cx, cz),
             index,
             near,
@@ -381,16 +450,89 @@ impl Troughs {
         }
     }
 
+    /// How far a river's inner valleys lower ground `h` at a point, blocks
+    /// (never negative): along each line near, the ground within the
+    /// floor's half-width goes down to the floor, and beyond it the cut
+    /// fades out smoothly over [`INNER_FADE`] depths — the most it lowers
+    /// anywhere [`INNER_CUT_SHARE`] of the depth. Lowered, not clipped to
+    /// a surface: a U about straight lines between the network's nodes,
+    /// taken as the lower of it and the ground, sliced ridged hillsides
+    /// into flat facets with straight edges; lowered, the hillside keeps
+    /// its ridges down to the floor.
+    pub(super) fn cut(&self, x: f64, z: f64, h: f32) -> f32 {
+        let Some(style) = self.style.filter(|_| !self.cells.is_empty()) else {
+            return 0.0;
+        };
+        let (nx, nz, cx, cz) = self.grid;
+        let (fi, fj) = ((x / cx).floor() as i64, (z / cz).floor() as i64);
+        let wrap = |i: i64, j: i64| {
+            (j.rem_euclid(nz as i64) as usize) * nx + i.rem_euclid(nx as i64) as usize
+        };
+        if !self.near[wrap(fi, fj)] {
+            return 0.0;
+        }
+        let mut most = 0.0f32;
+        for dj in -style.search..=style.search {
+            for di in -style.search..=style.search {
+                let (ci, cj) = (fi + di, fj + dj);
+                let k = self.index[wrap(ci, cj)];
+                if k == u32::MAX {
+                    continue;
+                }
+                let t = self.cells[k as usize];
+                let r = t.receiver as usize;
+                let (ri, rj) = ((r % nx) as i64, (r / nx) as i64);
+                let a = super::rivers::node(t.cell as usize, ci, cj, (cx, cz));
+                let b =
+                    super::rivers::node(r, ci + step(ci, ri, nx), cj + step(cj, rj, nz), (cx, cz));
+                let (vx, vz) = (b.0 - a.0, b.1 - a.1);
+                let len2 = vx * vx + vz * vz;
+                let raw_u = if len2 > 0.0 {
+                    ((x - a.0) * vx + (z - a.1) * vz) / len2
+                } else {
+                    0.0
+                };
+                let u = raw_u.clamp(0.0, 1.0);
+                let (px, pz) = (a.0 + u * vx - x, a.1 + u * vz - z);
+                let d = (px * px + pz * pz).sqrt() as f32;
+                let next = self.index[r];
+                let (to_ground, to_depth, to_half) = if next == u32::MAX {
+                    (t.rim, 0.0, t.half)
+                } else {
+                    let n = self.cells[next as usize];
+                    (n.floor + n.depth, n.depth, n.half)
+                };
+                let u = u as f32;
+                let ground = t.floor + t.depth + (to_ground - t.floor - t.depth) * u;
+                let mut depth = t.depth + (to_depth - t.depth) * u;
+                if t.head {
+                    depth *= if raw_u <= 0.0 { 0.0 } else { u };
+                }
+                if depth <= 0.0 {
+                    continue;
+                }
+                let half = t.half + (to_half - t.half) * u;
+                let e = ((d - half) / (INNER_FADE * depth)).clamp(0.0, 1.0);
+                let w = 1.0 - e * e * (3.0 - 2.0 * e);
+                if w <= 0.0 {
+                    continue;
+                }
+                let floor = ground - depth;
+                let cut = (h - floor).clamp(0.0, INNER_CUT_SHARE * depth) * w;
+                most = most.max(cut);
+            }
+        }
+        most
+    }
+
     /// The lowest trough surface at a point, blocks, if a trough reaches
     /// it: the U `floor + depth·(d / half)²` about each trough line near,
     /// out to its rim. Along a line its values run from the cell's to its
     /// receiver's — or, past the snout, taper to nothing.
     pub(super) fn at(&self, x: f64, z: f64) -> Option<f32> {
-        if self.cells.is_empty() {
-            return None;
-        }
+        let style = self.style.filter(|_| !self.cells.is_empty())?;
         let (nx, nz, cx, cz) = self.grid;
-        let reach = SEARCH as f32 * cx.min(cz) as f32;
+        let reach = style.search as f32 * cx.min(cz) as f32;
         let (fi, fj) = ((x / cx).floor() as i64, (z / cz).floor() as i64);
         let wrap = |i: i64, j: i64| {
             (j.rem_euclid(nz as i64) as usize) * nx + i.rem_euclid(nx as i64) as usize
@@ -399,8 +541,8 @@ impl Troughs {
             return None;
         }
         let mut best: Option<f32> = None;
-        for dj in -SEARCH..=SEARCH {
-            for di in -SEARCH..=SEARCH {
+        for dj in -style.search..=style.search {
+            for di in -style.search..=style.search {
                 let (ci, cj) = (fi + di, fj + dj);
                 let k = self.index[wrap(ci, cj)];
                 if k == u32::MAX {
@@ -432,7 +574,10 @@ impl Troughs {
                 let next = self.index[r];
                 let ground = t.floor + t.depth;
                 let (to_ground, to_depth, to_half) = if next == u32::MAX {
-                    (ground, 0.0, t.half)
+                    // A glacier's snout rises to its own ground; a river's
+                    // valley runs on down to its receiver's (the sea's, a
+                    // lake's), so it never ends in a dam.
+                    (if style.glacial { ground } else { t.rim }, 0.0, t.half)
                 } else {
                     let n = self.cells[next as usize];
                     (n.floor + n.depth, n.depth, n.half)
@@ -440,7 +585,7 @@ impl Troughs {
                 let u = u as f32;
                 let ground = ground + (to_ground - ground) * u;
                 let mut depth = t.depth + (to_depth - t.depth) * u;
-                if t.head {
+                if t.head && style.glacial {
                     // Nothing behind a glacier's head; it deepens from there.
                     depth *= if raw_u <= 0.0 { 0.0 } else { u };
                     // And its head is a cirque: a bowl about the node, its
@@ -459,12 +604,16 @@ impl Troughs {
                         }
                     }
                 }
+                if t.head && !style.glacial {
+                    // A stream's valley starts from nothing at its head.
+                    depth *= if raw_u <= 0.0 { 0.0 } else { u };
+                }
                 if depth <= 0.0 {
                     continue;
                 }
                 let half = (t.half + (to_half - t.half) * u).max(1.0);
                 let floor = ground - depth;
-                let surface = floor + u_profile(d, half, depth, reach);
+                let surface = floor + u_profile(d, half, depth, reach, style.wall);
                 if best.is_none_or(|b| surface < b) {
                     best = Some(surface);
                 }
@@ -618,7 +767,126 @@ fn glaciate(
     for t in &mut cells {
         t.head = !fed[t.cell as usize];
     }
-    Troughs::from_cells(fnx, fnz, cx, cz, cells)
+    Troughs::from_cells(GLACIAL, (fnx, fnz), (cx, cz), cells)
+}
+
+/// The rivers' inner valleys (M15 task 5), on the drainage grid: routed
+/// over the ground the erosion stage and the ice left (`cut(x, z)`: the
+/// rivers' change and any trough's floor there), each cell a river of
+/// [`INNER_FROM_M3S`] or more runs through gets a valley along its line,
+/// its floor never rising downstream.
+#[allow(clippy::too_many_arguments)] // the drainage grid's fields, each its own
+fn incise(
+    fnx: usize,
+    fnz: usize,
+    (cx, cz): (f64, f64),
+    base: &[i32],
+    sea: &[bool],
+    runoff: &[f64],
+    ground: &(dyn Fn(f64, f64) -> f64 + Sync),
+    eroded: impl Fn(f64, f64, f64) -> f64,
+) -> Troughs {
+    let n = fnx * fnz;
+    let centre = |c: usize| ((c % fnx) as f64 + 0.5, (c / fnx) as f64 + 0.5);
+    // Routed over the cells' centres, as the network is (their heights
+    // after erosion: the base less the rivers' change and the troughs').
+    let surface: Vec<i32> = (0..n)
+        .map(|c| {
+            let (u, v) = centre(c);
+            let (x, z) = (u * cx, v * cz);
+            eroded(x, z, f64::from(base[c])).round() as i32
+        })
+        .collect();
+    let none = vec![false; n];
+    let (receiver, order) = flood(fnx, fnz, &surface, sea, &none, &none);
+    let mut q = runoff.to_vec();
+    for &c in order.iter().rev() {
+        let (c, r) = (c as usize, receiver[c as usize] as usize);
+        if r != c {
+            q[r] += q[c];
+        }
+    }
+    // The ground at a cell's node, where its river runs, after erosion:
+    // asked only of rivers' cells and their receivers. (From the centre,
+    // up to ~40 blocks off the river on its valley's side, a floor came
+    // out only a few blocks under the river.)
+    let mut start = vec![f64::NAN; n];
+    let mut at_node = |c: usize| {
+        if start[c].is_nan() {
+            let (i, j) = ((c % fnx) as i64, (c / fnx) as i64);
+            let (x, z) = super::rivers::node(c, i, j, (cx, cz));
+            start[c] = eroded(x, z, ground(x, z));
+        }
+        start[c]
+    };
+    let river = |c: usize| !sea[c] && receiver[c] as usize != c && q[c] >= INNER_FROM_M3S;
+    // The floor each river asks for: its node's ground less its depth.
+    let mut floor = vec![f64::NAN; n];
+    for c in (0..n).filter(|&c| river(c)) {
+        let depth = (INNER_PER_DECADE * (q[c] / INNER_FROM_M3S).log10()).min(INNER_MAX_DEPTH);
+        floor[c] = at_node(c) - depth;
+    }
+    // Carved on down, sources first: no floor above one upstream of it. A
+    // node on its valley's side reads a few blocks high, and floors held
+    // to it had stood the whole river on it — three quarters of large
+    // rivers' cells cut only a few blocks.
+    for &c in order.iter().rev() {
+        let (c, r) = (c as usize, receiver[c as usize] as usize);
+        if river(c) && river(r) {
+            floor[r] = floor[r].min(floor[c]);
+        }
+    }
+    // Then, outlets first, never below the floor it flows on into (or the
+    // sea's level, or a receiver's ground with no valley) and never more
+    // than the deepest a valley is cut: every valley falls all the way to
+    // its mouth, and ponds nothing.
+    let mut cells = Vec::new();
+    let mut kept = vec![false; n];
+    for &c in &order {
+        let (c, r) = (c as usize, receiver[c as usize] as usize);
+        if !river(c) {
+            continue;
+        }
+        let below = if sea[r] {
+            0.0
+        } else if kept[r] {
+            floor[r]
+        } else {
+            at_node(r)
+        };
+        let here = at_node(c);
+        let f = floor[c].max(here - INNER_MAX_DEPTH).max(below);
+        if here - f < INNER_MIN_DEPTH {
+            continue;
+        }
+        let width = RIVER_WIDTH_PER_ROOT_Q * q[c].sqrt();
+        let depth = here - f;
+        let half = 0.5 * (INNER_FLOOR + INNER_FLOOR_PER_WIDTH * width);
+        floor[c] = f;
+        kept[c] = true;
+        cells.push(Trough {
+            cell: c as u32,
+            receiver: r as u32,
+            floor: f as f32,
+            depth: depth as f32,
+            half: half as f32,
+            // Where its line runs on to past the last kept cell: the
+            // receiver's floor, or its ground, or the sea's level.
+            rim: below as f32,
+            head: true,
+        });
+    }
+    cells.sort_by_key(|t| t.cell);
+    let mut fed = vec![false; n];
+    for t in &cells {
+        if kept[t.receiver as usize] {
+            fed[t.receiver as usize] = true;
+        }
+    }
+    for t in &mut cells {
+        t.head = !fed[t.cell as usize];
+    }
+    Troughs::from_cells(FLUVIAL, (fnx, fnz), (cx, cz), cells)
 }
 
 /// Lower valley sides left steeper than [`MAX_WALL_SLOPE`] by the cutting,
@@ -670,6 +938,16 @@ fn retreat_walls(
 mod tests {
     use super::*;
 
+    /// The ground anywhere from a grid of 128-block cells' heights: its
+    /// cell's (the tests' worlds are sampled only at cells).
+    fn cell_ground(base: &[i32], nx: usize, nz: usize) -> impl Fn(f64, f64) -> f64 + Sync + '_ {
+        move |x, z| {
+            let i = ((x / 128.0).floor() as i64).rem_euclid(nx as i64) as usize;
+            let j = ((z / 128.0).floor() as i64).rem_euclid(nz as i64) as usize;
+            f64::from(base[j * nx + i])
+        }
+    }
+
     /// Canyons (M15): the same plateau, the same rain — with a caprock
     /// (flash-flood weight 1) its river cuts deeper and its walls stand
     /// steeper than without.
@@ -694,6 +972,7 @@ mod tests {
             }
         }
         let runoff = vec![0.000_05f64; fnx * fnz];
+        let nearest = cell_ground(&base, fnx, fnz);
         let erode = |w: f32| {
             Erosion::build(
                 fnx,
@@ -704,6 +983,7 @@ mod tests {
                 &runoff,
                 &vec![w; fnx * fnz],
                 &vec![0.0; fnx * fnz],
+                &nearest,
             )
         };
         let (plain, capped) = (erode(0.0), erode(1.0));
@@ -739,6 +1019,7 @@ mod tests {
             }
         }
         let runoff = vec![0.000_01f64; fnx * fnz];
+        let nearest = cell_ground(&base, fnx, fnz);
         let erode = |ice: f32| {
             Erosion::build(
                 fnx,
@@ -749,6 +1030,7 @@ mod tests {
                 &runoff,
                 &vec![0.0; fnx * fnz],
                 &vec![ice; fnx * fnz],
+                &nearest,
             )
         };
         let (river, glacier) = (erode(0.0), erode(1.0));

@@ -139,6 +139,27 @@ the ground the water was fitted to, and the ground between rises into
 rounded ridges, faded toward rivers. The rule for every layer stands:
 raise, or reorder nothing.
 
+**Rivers' inner valleys come after the troughs, inside the same build
+(task 5, version 20).** M14 carried shallow valleys: the erosion stage's
+256-block cells can only open valleys ~500 wide, so a large river sat
+11–19 blocks below the ground 384 blocks off. Each drainage cell a river
+of 0.1+ m³/s runs through now gets a line too, as the troughs do, routed
+over the eroded and glaciated ground: 8 blocks of depth per decade of
+discharge, at most 30, measured from the ground at the cell's node
+(where its river runs: from the cell's centre, often on the valley's
+side, the cut came out a few blocks); floors carved down to the lowest
+upstream and then held never to rise downstream, nor below the sea, so a
+valley falls all the way to its mouth and ponds nothing. Unlike a
+trough, it *lowers* the ground rather than clipping it to a surface:
+within the floor's half-width (the meander belt, 20 + 3 widths across)
+the ground goes down to the floor, and beyond it the cut fades out over
+3.5 depths. Clipped to a U about straight node-to-node lines, it sliced
+ridged hillsides into flat facets with straight edges; lowered, the
+hillside keeps its ridges. Digging is safe here, unlike before the
+network (the mesas' rule above): the network is routed after it, on the
+ground it leaves. Its cost: world creation +~1 s; chunk generation
+unchanged within noise.
+
 The climate map and the process weights read the base elevation (step 0),
 never steps 1–3: landforms are smaller than climate cells and would only
 add noise to rain, and reading them back would make weights depend on

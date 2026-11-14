@@ -74,8 +74,7 @@ const MANNING_N: f32 = 0.035;
 const MIN_FLOW: f32 = 0.05;
 pub const MAX_FLOW: f32 = 4.0;
 /// How near a lower river's banks — or its water a waterfall below — may
-/// come to a pond past its own reach's end: the pond's neighbours must not
-/// be cut below it. Blocks.
+/// come to a pond: the pond's neighbours must not be cut below it. Blocks.
 const POND_GUARD: f32 = 3.0;
 
 /// How far beside a river ground below its water holds a pond rather than
@@ -332,9 +331,9 @@ impl DrainageMap {
         let mut best: Option<(f32, f32, Bed)> = None; // (inside, level, bed)
         // Within POND_REACH of a river, ground below its water holds it as a
         // pond instead of being raised into a causeway: the nearest's level.
-        // Candidates, decided after every reach is in (`pond_ok`): a pond
-        // past a reach's end depends on the other reaches' banks.
-        let mut ponds: [(f32, f32, bool); 4] = [(0.0, f32::NEG_INFINITY, false); 4];
+        // Candidates, decided after every reach is in: a pond depends on
+        // the other reaches' banks.
+        let mut ponds: [(f32, f32); 4] = [(0.0, f32::NEG_INFINITY); 4];
         let mut pond_count = 0;
         // The banks: no higher than `ceiling`, no lower than `floor`.
         let (mut ceiling, mut floor) = (f32::INFINITY, f32::NEG_INFINITY);
@@ -463,7 +462,7 @@ impl DrainageMap {
                     let fall = BANK_SLOPE.max(LEVEE_FALL_PER_SLOPE * reach.slope);
                     floor = floor.max(held - (past - 1.0).max(0.0) * fall);
                 } else if out >= 0.0 && pond_count < ponds.len() {
-                    ponds[pond_count] = (out, level, t0 >= 1.0);
+                    ponds[pond_count] = (out, level);
                     pond_count += 1;
                 }
                 if out < 0.0 && best.is_none_or(|b| out < b.0) {
@@ -536,15 +535,18 @@ impl DrainageMap {
         {
             floor = floor.max(rim as f32);
         }
-        // The pond: the highest candidate that holds. One past its reach's
-        // end holds only where no reach cuts a bank below it within
-        // POND_GUARD blocks — a hollow beside a lower river drains into it,
-        // and a pond there stood over that river's banks, held by air.
-        // Where it does not hold, the hollow is filled to the pond's level
-        // instead: left a hollow, it was the hole in the next pond's shore.
+        // The pond: the highest candidate that holds. It holds only where
+        // no reach cuts a bank below it within POND_GUARD blocks — a hollow
+        // beside a lower river drains into it, and a pond there stood over
+        // that river's banks, held by air. First found past a reach's end;
+        // then (M15's inner valleys) a block short of one, where the lower
+        // river's bank had cut solid ground down to the pond's level and
+        // the pond took the cut for a hollow. Where it does not hold, the
+        // hollow is filled to the pond's level instead: left a hollow, it
+        // was the hole in the next pond's shore.
         let mut pond: Option<(f32, f32)> = None;
-        for &(out, level, past_end) in &ponds[..pond_count] {
-            if past_end && guard < level + 1.0 {
+        for &(out, level) in &ponds[..pond_count] {
+            if guard < level + 1.0 {
                 floor = floor.max(level);
             } else if pond.is_none_or(|p| level > p.1) {
                 pond = Some((out, level));
@@ -941,7 +943,7 @@ impl DrainageMap {
     }
 
     /// Where a cell's reach sits, in the unwrapped frame of cell `(i, j)`.
-    fn node(&self, i: i64, j: i64) -> (f64, f64) {
+    pub(crate) fn node(&self, i: i64, j: i64) -> (f64, f64) {
         node(self.wrap(i, j), i, j, (self.cell_x, self.cell_z))
     }
 

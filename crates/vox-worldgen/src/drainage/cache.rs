@@ -15,14 +15,15 @@ use vox_core::WorldShape;
 
 use super::{
     DrainageMap,
-    erosion::{Erosion, Trough, Troughs},
+    erosion::{Erosion, FLUVIAL, GLACIAL, Style, Trough, Troughs},
 };
 
 const MAGIC: &[u8; 4] = b"VXDR";
 /// Bump when the layout changes. A file of another version is rebuilt.
 /// 2 — the cover byte carries arid and ice-scoured bits (M14 criterion 10).
-/// 3 — waterfalls' lips. 4 — reaches' long profiles instead.
-pub const FORMAT_VERSION: u32 = 5;
+/// 3 — waterfalls' lips. 4 — reaches' long profiles instead. 5 — glacial
+/// troughs (M15). 6 — rivers' inner valleys (M15 task 5).
+pub const FORMAT_VERSION: u32 = 6;
 
 /// What a cache must have been built for to be used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,7 +41,7 @@ impl DrainageMap {
             68 + n * 11
                 + self.profile.len() * 12
                 + self.erosion.delta.len() * 4
-                + self.erosion.troughs.cells.len() * 25,
+                + (self.erosion.troughs.cells.len() + self.erosion.valleys.cells.len()) * 25,
         );
         out.extend_from_slice(MAGIC);
         put_u32(&mut out, FORMAT_VERSION);
@@ -76,16 +77,10 @@ impl DrainageMap {
         for &v in &e.delta {
             out.extend_from_slice(&v.to_le_bytes());
         }
-        // Format 5 (M15): the glacial troughs, by cell.
-        put_u32(&mut out, e.troughs.cells.len() as u32);
-        for t in &e.troughs.cells {
-            put_u32(&mut out, t.cell);
-            put_u32(&mut out, t.receiver);
-            for v in [t.floor, t.depth, t.half, t.rim] {
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            out.push(u8::from(t.head));
-        }
+        // Format 5 (M15): the glacial troughs, by cell; format 6, the
+        // rivers' inner valleys after them.
+        put_lines(&mut out, &e.troughs);
+        put_lines(&mut out, &e.valleys);
         let sum = fnv1a(&out);
         out.extend_from_slice(&sum.to_le_bytes());
         out
@@ -137,36 +132,8 @@ impl DrainageMap {
         }
         let discharge = r.array(n, |b| f32::from_le_bytes(b.try_into().unwrap()), 4)?;
         let delta = r.array(en, |b| f32::from_le_bytes(b.try_into().unwrap()), 4)?;
-        let count = r.u32()? as usize;
-        let mut cells: Vec<Trough> = Vec::with_capacity(count.min(n));
-        for _ in 0..count {
-            let (cell, receiver) = (r.u32()?, r.u32()?);
-            let mut v = [0.0f32; 4];
-            for x in &mut v {
-                *x = f32::from_le_bytes(r.take(4)?.try_into().ok()?);
-            }
-            // Ascending and in the grid, or it is not this world's.
-            if cell as usize >= n
-                || receiver as usize >= n
-                || cells.last().is_some_and(|t| t.cell >= cell)
-            {
-                return None;
-            }
-            cells.push(Trough {
-                cell,
-                receiver,
-                floor: v[0],
-                depth: v[1],
-                half: v[2],
-                rim: v[3],
-                head: match r.take(1)?[0] {
-                    0 => false,
-                    1 => true,
-                    _ => return None,
-                },
-            });
-        }
-        let troughs = Troughs::from_cells(nx, nz, cell_x, cell_z, cells);
+        let troughs = r.lines(GLACIAL, (nx, nz), (cell_x, cell_z))?;
+        let valleys = r.lines(FLUVIAL, (nx, nz), (cell_x, cell_z))?;
         if !r.0.is_empty() || flow.iter().any(|&d| d > super::HERE) {
             return None;
         }
@@ -189,10 +156,24 @@ impl DrainageMap {
                 cell_z: ecell_z,
                 delta,
                 troughs,
+                valleys,
             },
             #[cfg(test)]
             budget: (Vec::new(), Vec::new()),
         })
+    }
+}
+
+/// A set of trough-like lines, by cell.
+fn put_lines(out: &mut Vec<u8>, lines: &Troughs) {
+    put_u32(out, lines.cells.len() as u32);
+    for t in &lines.cells {
+        put_u32(out, t.cell);
+        put_u32(out, t.receiver);
+        for v in [t.floor, t.depth, t.half, t.rim] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.push(u8::from(t.head));
     }
 }
 
@@ -213,6 +194,46 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 struct Reader<'a>(&'a [u8]);
 
 impl<'a> Reader<'a> {
+    /// A set of lines [`put_lines`] wrote, if whole and this world's.
+    fn lines(
+        &mut self,
+        style: Style,
+        (nx, nz): (usize, usize),
+        cell: (f64, f64),
+    ) -> Option<Troughs> {
+        let n = nx * nz;
+        let count = self.u32()? as usize;
+        let mut cells: Vec<Trough> = Vec::with_capacity(count.min(n));
+        for _ in 0..count {
+            let (c, receiver) = (self.u32()?, self.u32()?);
+            let mut v = [0.0f32; 4];
+            for x in &mut v {
+                *x = f32::from_le_bytes(self.take(4)?.try_into().ok()?);
+            }
+            // Ascending and in the grid, or it is not this world's.
+            if c as usize >= n
+                || receiver as usize >= n
+                || cells.last().is_some_and(|t| t.cell >= c)
+            {
+                return None;
+            }
+            cells.push(Trough {
+                cell: c,
+                receiver,
+                floor: v[0],
+                depth: v[1],
+                half: v[2],
+                rim: v[3],
+                head: match self.take(1)?[0] {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                },
+            });
+        }
+        Some(Troughs::from_cells(style, (nx, nz), cell, cells))
+    }
+
     fn take(&mut self, k: usize) -> Option<&'a [u8]> {
         let (head, rest) = self.0.split_at_checked(k)?;
         self.0 = rest;

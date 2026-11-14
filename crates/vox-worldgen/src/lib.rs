@@ -351,7 +351,13 @@ pub enum DrainageSource {
 ///   flat lowland), drumlins staggered and varied (a grid of identical
 ///   hills), cirques no deeper than the slope below them falls across the
 ///   bowl and a tarn's lip (craters walled all round on gentler slopes).
-pub const GENERATOR_VERSION: u32 = 19;
+///   20 — rivers' inner valleys (M15 task 5): every river of 0.1+ m³/s
+///   lowers the ground along its line, 8 blocks a decade of discharge (at
+///   most 30), fading out over its sides, its floor falling all the way to
+///   its mouth; rivers of 1+ m³/s sit ~30 deep (~20 before). Drainage
+///   cache format 6. Every pond held only where no bank within three
+///   blocks is cut below it.
+pub const GENERATOR_VERSION: u32 = 20;
 
 impl Generator {
     /// A generator for one world: its seed and its size. The size is part of
@@ -2874,7 +2880,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (19, 0x925d_3ee3_f41f_e337);
+        const PINNED: (u32, u64) = (20, 0x0134_5209_6a74_3165);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),
@@ -3138,5 +3144,125 @@ mod cirque_tests {
             craters.len(),
             &craters[..craters.len().min(6)]
         );
+    }
+}
+
+#[cfg(test)]
+mod valley_tests {
+    use super::*;
+
+    /// Valley depths in the chunks by discharge decade (0.01–0.1, 0.1–1,
+    /// 1–10, 10+ m³/s), sorted: at every `step`th drainage node a river
+    /// runs through, the mean of the final ground 384 blocks away in eight
+    /// directions, less the river's water. The network's own numbers are
+    /// the erosion stage's; this is what the player walks (M14's measure,
+    /// "three cells around").
+    fn valley_depths(g: &Generator, step: usize) -> [Vec<f64>; 4] {
+        let d = g.drainage();
+        let (nx, nz) = d.cells();
+        let mut bins: [Vec<f64>; 4] = Default::default();
+        for j in (0..nz).step_by(step) {
+            for i in (0..nx).step_by(step) {
+                let (_, _, q, _) = d.cell(i, j);
+                if q < 0.01 || d.is_sea(i, j) || d.is_lake(i, j) {
+                    continue;
+                }
+                let (x, z) = d.node(i as i64, j as i64);
+                let (x, z) = (x.round() as i64, z.round() as i64);
+                let (s, w) = g.ground(x, z);
+                let Body::River(_) = w.body else { continue };
+                let level = w.level.max(s.height);
+                let around = (0..8)
+                    .map(|a| {
+                        let a = f64::from(a) * std::f64::consts::TAU / 8.0;
+                        let (px, pz) = (x as f64 + 384.0 * a.cos(), z as f64 + 384.0 * a.sin());
+                        g.ground(px.round() as i64, pz.round() as i64).0.height as f64
+                    })
+                    .sum::<f64>()
+                    / 8.0;
+                let b = match q {
+                    q if q < 0.1 => 0,
+                    q if q < 1.0 => 1,
+                    q if q < 10.0 => 2,
+                    _ => 3,
+                };
+                bins[b].push(around - level as f64);
+            }
+        }
+        for v in &mut bins {
+            v.sort_by(f64::total_cmp);
+        }
+        bins
+    }
+
+    /// M15 criterion 6 (M14's carried item): rivers of 1+ m³/s sit in
+    /// valleys at least ~20 blocks deep in the chunks — they sat 11–13 at
+    /// M14's close and 18–19 on the tectonic terrain, the erosion grid's
+    /// 256-block cells opening valleys too wide to sink a river in. And
+    /// valleys deepen with the water: a large river's is deeper than a
+    /// stream's.
+    #[test]
+    fn large_rivers_run_in_valleys() {
+        let g = Generator::new(0x7e22ac0de, WorldShape::DEFAULT);
+        let bins = valley_depths(&g, 3);
+        let p50 = |v: &Vec<f64>| v[v.len() / 2];
+        let large: Vec<f64> = bins[2].iter().chain(&bins[3]).copied().collect();
+        let mut large = large;
+        large.sort_by(f64::total_cmp);
+        assert!(large.len() > 100, "only {} large-river nodes", large.len());
+        eprintln!(
+            "valley depth medians: streams {:.0}, 1+ m³/s {:.0}",
+            p50(&bins[0]),
+            p50(&large)
+        );
+        // Held at 25, not the criterion's ~20: the tectonic terrain's
+        // valleys measured ~20 before the inner valleys (version 20), and a
+        // fall back to that is what this guards against.
+        assert!(
+            p50(&large) >= 25.0,
+            "rivers of 1+ m³/s in valleys {:.0} deep (median)",
+            p50(&large)
+        );
+        assert!(
+            p50(&large) > p50(&bins[0]) + 5.0,
+            "valleys do not deepen with the water: {:.0} against a stream's {:.0}",
+            p50(&large),
+            p50(&bins[0])
+        );
+    }
+
+    /// The same over several worlds, with quartiles.
+    /// `cargo test -p vox-worldgen --release valley_survey -- --ignored
+    /// --nocapture`; env `SURVEY_SEEDS` (default 3).
+    #[test]
+    #[ignore]
+    fn valley_survey() {
+        let seeds = std::env::var("SURVEY_SEEDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3u64);
+        for k in 0..seeds {
+            let seed = if k == 0 { 0x7e22ac0de } else { k };
+            let g = Generator::new(seed, WorldShape::DEFAULT);
+            let line: Vec<String> = valley_depths(&g, 2)
+                .iter()
+                .zip(["0.01–0.1", "0.1–1", "1–10", "10+"])
+                .map(|(v, name)| {
+                    let p = |f: f64| {
+                        v.get((f * v.len() as f64) as usize)
+                            .copied()
+                            .unwrap_or(f64::NAN)
+                    };
+                    format!(
+                        "{name} m³/s: n {} p25 {:.0} p50 {:.0} p75 {:.0}",
+                        v.len(),
+                        p(0.25),
+                        p(0.5),
+                        p(0.75)
+                    )
+                })
+                .collect();
+            println!("seed {seed:#x}: {}", line.join(" | "));
+        }
     }
 }
