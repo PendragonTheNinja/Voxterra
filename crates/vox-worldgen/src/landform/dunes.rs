@@ -125,6 +125,19 @@ impl Wave {
         let p = (a - a.floor()) + (b - b.floor());
         (p - p.floor()) as f32
     }
+
+    /// The phase with the whole cycles kept: its floor numbers the cycle
+    /// (an axis-aligned wave's cells, wrapped by [`Self::cycles`]).
+    pub(super) fn cycle(&self, shape: WorldShape, x: f64, z: f64) -> f64 {
+        let (px, pz) = (shape.size_x() as f64, shape.size_z() as f64);
+        self.mx * x / px + self.mz * z / pz
+    }
+
+    /// Whole cycles around the world (the larger axis's, for an
+    /// axis-aligned wave).
+    pub(super) fn cycles(&self) -> i64 {
+        self.mx.abs().max(self.mz.abs()) as i64
+    }
 }
 
 /// Transverse, linear and star waves for one wind direction.

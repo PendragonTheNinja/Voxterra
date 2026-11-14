@@ -139,6 +139,28 @@ const CIRQUE_RADIUS: f32 = 120.0;
 const CIRQUE_RELIEF_SHARE: f32 = 0.35;
 const CIRQUE_MAX_DEPTH: f32 = 80.0;
 const CIRQUE_MIN_DEPTH: f32 = 8.0;
+/// The most a cirque's floor lies below the ground where its glacier
+/// leaves it, blocks: a tarn's lip. A cirque is an armchair open downhill;
+/// cut deeper than the slope below it falls across the bowl, its downhill
+/// wall stood up as a ring — a crater (found on the tectonic terrain,
+/// `cirques_open_downhill`).
+const CIRQUE_LIP: f32 = 6.0;
+
+/// The shortest step from one cell index to another, across the seam.
+fn step(a: i64, b: i64, n: usize) -> i64 {
+    let d = (b - a).rem_euclid(n as i64);
+    if d > n as i64 / 2 { d - n as i64 } else { d }
+}
+
+/// How deep a glacier's head is cut into a cirque: a share of the rim's
+/// height above it, no deeper than the ground falls across the bowl toward
+/// its valley (`fall`, blocks per block, from the head to its receiver's
+/// ground) and a tarn's lip.
+fn cirque_cut(t: &Trough, fall: f32) -> f32 {
+    let head = t.floor + t.depth;
+    let share = (CIRQUE_RELIEF_SHARE * (t.rim - head)).min(CIRQUE_MAX_DEPTH);
+    share.min(fall.max(0.0) * CIRQUE_RADIUS + CIRQUE_LIP)
+}
 
 /// A cirque's height above its floor at `r` blocks from its centre: flat
 /// (quartic) across the floor, the trough's steep walls beyond, and the
@@ -304,15 +326,34 @@ impl Erosion {
                 let c = t.cell as usize;
                 let (i, j) = ((c % nx) as i64, (c / nx) as i64);
                 let a = super::rivers::node(c, i, j, (cx, cz));
-                let head = t.floor + t.depth;
-                let cut = (CIRQUE_RELIEF_SHARE * (t.rim - head)).min(CIRQUE_MAX_DEPTH);
-                (a.0, a.1, cut)
+                (a.0, a.1, cirque_cut(t, self.troughs.fall(t, (cx, cz))))
             })
             .collect()
     }
 }
 
 impl Troughs {
+    /// How steeply the ground falls from a trough cell's node to its
+    /// receiver's (blocks per block; the receiver's ground is its own where
+    /// no trough runs on), as [`Self::at`] reads it for a cirque.
+    #[cfg(test)]
+    fn fall(&self, t: &Trough, (cx, cz): (f64, f64)) -> f32 {
+        let nx = self.grid.0;
+        let nz = self.grid.1;
+        let (c, r) = (t.cell as usize, t.receiver as usize);
+        let (ci, cj) = ((c % nx) as i64, (c / nx) as i64);
+        let (ri, rj) = ((r % nx) as i64, (r / nx) as i64);
+        let a = super::rivers::node(c, ci, cj, (cx, cz));
+        let b = super::rivers::node(r, ci + step(ci, ri, nx), cj + step(cj, rj, nz), (cx, cz));
+        let len = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt() as f32;
+        let head = t.floor + t.depth;
+        let to_ground = match self.index[r] {
+            u32::MAX => head,
+            n => self.cells[n as usize].floor + self.cells[n as usize].depth,
+        };
+        (head - to_ground) / len.max(1.0)
+    }
+
     /// The troughs from their cells (ascending), with the index and the
     /// search flags rebuilt.
     pub(super) fn from_cells(nx: usize, nz: usize, cx: f64, cz: f64, cells: Vec<Trough>) -> Self {
@@ -357,11 +398,6 @@ impl Troughs {
         if !self.near[wrap(fi, fj)] {
             return None;
         }
-        // The shortest step from one cell index to another, across the seam.
-        let step = |a: i64, b: i64, n: usize| {
-            let d = (b - a).rem_euclid(n as i64);
-            if d > n as i64 / 2 { d - n as i64 } else { d }
-        };
         let mut best: Option<f32> = None;
         for dj in -SEARCH..=SEARCH {
             for di in -SEARCH..=SEARCH {
@@ -412,7 +448,8 @@ impl Troughs {
                     // (a tarn's basin), its headwall cut steep into the
                     // mountain behind.
                     let head = t.floor + t.depth;
-                    let cut = (CIRQUE_RELIEF_SHARE * (t.rim - head)).min(CIRQUE_MAX_DEPTH);
+                    let fall = (head - to_ground) / (len2.sqrt() as f32).max(1.0);
+                    let cut = cirque_cut(&t, fall);
                     if cut >= CIRQUE_MIN_DEPTH {
                         let (rx, rz) = (x - a.0, z - a.1);
                         let r = (rx * rx + rz * rz).sqrt() as f32;

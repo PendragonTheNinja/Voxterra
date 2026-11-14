@@ -168,7 +168,25 @@ tectonic continents put fewer of either in the old windows); and the
 erosion stage's steepest added slope is 1.39 (bound 1.45: the ranges'
 spines and the Catmull–Rom cut together). The images in the gallery
 up to `hills-…-v17` show this line's own terrain, not the merged one.
-Every landform waits on the owner's flight of version 18.
+**Re-checked on the tectonic terrain (2026-11-14, `GENERATOR_VERSION`
+19).** Every survey rerun on version 18 (gallery rows `…-v18`). Better
+than on the old terrain: closed basins **19.0 / 23.7 / 18.1%** over three
+seeds (33% before — task 5's target of ≤ ~22% is all but met already;
+re-measure there), fjords cut 184–258 deep (26 before). Fixed, each with
+a failing test first: end moraines ran dead straight over flat lowland
+(the ice weight follows latitude there) — now bent into lobes
+(`moraines_bend_in_lobes`); drumlins stood on a grid of identical hills —
+now staggered, sized and thinned (`drumlins_are_not_a_grid`); 13% of
+cirques were craters walled all round on gentler slopes — now cut no
+deeper than the slope below falls across the bowl, plus a 6-block tarn
+lip (`cirques_open_downhill`; 1 402 cirques of 8+ blocks, 1 952 before).
+Worse, carried: **no canyons** — no river of 0.1+ m³/s crosses
+flash-flood ground in three seeds (the dry uplands drain inward, as
+before, and the tectonic continents put them farther from wet
+mountains); dune ground slightly rougher (0.4–1.6% of steps over a
+block, under 0.5% before). Moraines 0.21% of land, drumlins 1.4%,
+dissected hills 22.8%, inselbergs 0.08%. Every landform waits on the
+owner's flight of version 19.
 
 ## Why this milestone exists
 

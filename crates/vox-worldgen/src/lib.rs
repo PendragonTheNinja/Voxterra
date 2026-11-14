@@ -346,7 +346,12 @@ pub enum DrainageSource {
 ///   18 — the two lines merged (2026-11-14): M15's landforms on milestone
 ///   16's tectonic terrain; ponds past a reach's end no longer stand beside
 ///   a lower river's waterfall.
-pub const GENERATOR_VERSION: u32 = 18;
+///   19 — M15's landforms re-checked on the tectonic terrain: end moraines
+///   bent into lobes (the margin had followed latitude dead straight over
+///   flat lowland), drumlins staggered and varied (a grid of identical
+///   hills), cirques no deeper than the slope below them falls across the
+///   bowl and a tarn's lip (craters walled all round on gentler slopes).
+pub const GENERATOR_VERSION: u32 = 19;
 
 impl Generator {
     /// A generator for one world: its seed and its size. The size is part of
@@ -362,7 +367,7 @@ impl Generator {
             drainage: Arc::new(OnceLock::new()),
             dunes: Dunes::new(shape),
             mesas: Mesas::new(shape),
-            deposits: landform::Deposits::new(shape),
+            deposits: landform::Deposits::new(seed, shape),
             inselbergs: landform::Inselbergs::new(seed, shape),
             outline: elevation::LandformNoise::new(shape, 150, 0xB0_0010),
             dissection: landform::Dissection::new(shape),
@@ -2869,7 +2874,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (18, 0x610e_a977_244c_a011);
+        const PINNED: (u32, u64) = (19, 0x925d_3ee3_f41f_e337);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),
@@ -3089,5 +3094,49 @@ mod modflag_tests {
                 "seed {seed:#x}: elevation {elevation:.2} s, climate {climate:.2} s, drainage {drainage:.2} s"
             );
         }
+    }
+}
+#[cfg(test)]
+mod cirque_tests {
+    use super::*;
+
+    /// A cirque is an armchair, open downhill — at most a low lip holds a
+    /// tarn in it — never a crater walled all round. Found on the tectonic
+    /// terrain (version 18): on a hillside gentler than the bowl was deep,
+    /// the bowl's downhill wall stood up out of the slope as a ring.
+    #[test]
+    fn cirques_open_downhill() {
+        let g = Generator::new(0x7e22ac0de, WorldShape::DEFAULT);
+        let heads = g.drainage().glacier_heads();
+        let (mut cirques, mut craters) = (0, Vec::new());
+        for &(hx, hz, cut) in &heads {
+            if cut < 8.0 {
+                continue;
+            }
+            cirques += 1;
+            let (x, z) = (hx.round() as i64, hz.round() as i64);
+            let floor = g.ground(x, z).0.height;
+            // The lowest way out: the ground just past the bowl's rim, in
+            // sixteen directions, above its floor.
+            let lip = (0..16)
+                .map(|k| {
+                    let a = f64::from(k) * std::f64::consts::TAU / 16.0;
+                    let r = 140.0;
+                    let (px, pz) = (hx + r * a.cos(), hz + r * a.sin());
+                    g.ground(px.round() as i64, pz.round() as i64).0.height - floor
+                })
+                .min()
+                .unwrap();
+            if lip > 12 {
+                craters.push((x, z, cut as i64, lip));
+            }
+        }
+        assert!(cirques > 500, "only {cirques} cirques");
+        assert!(
+            craters.len() * 100 <= cirques,
+            "{} of {cirques} cirques walled all round (x, z, cut, lowest way out), e.g. {:?}",
+            craters.len(),
+            &craters[..craters.len().min(6)]
+        );
     }
 }
