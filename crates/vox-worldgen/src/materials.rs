@@ -53,6 +53,16 @@ pub const MAX_PROFILE_DEPTH: i64 = 12;
 /// sea's own threshold, `SEA_ICE_BELOW_C`).
 const LAKE_ICE_BELOW_C: f32 = -2.0;
 
+/// Whether a column's cliffs are banded rock (M15 task 6): the dry lands,
+/// where mesas, buttes and canyons stand — steppe or desert by Köppen's
+/// aridity (rain under twice the threshold), whatever the biome: a mesa's
+/// top, cooler for its height, is often classed as grassland, and its
+/// walls had stayed plain stone.
+fn dry_land(col: &Column) -> bool {
+    col.biome == Biome::Badlands
+        || col.precipitation < 2.0 * crate::biome::aridity_threshold(col.temperature)
+}
+
 /// Thickness of one badlands stratum, blocks.
 const STRATUM_BLOCKS: i64 = 3;
 /// How deep a badlands profile's banded rock goes.
@@ -106,15 +116,20 @@ pub fn block_in(col: &Column, wy: i64, strata: impl Fn(i64) -> BlockId) -> Block
             return block;
         }
     }
-    // Bare rock (M15): an inselberg's dome, a tor, a cliff — no soil. A
-    // desert's is sandstone; badlands keep their bands (already rock); a
-    // dune's steep slip face is sand however steep.
-    if wy <= h && col.surface.rock && col.surface.sand == 0 && col.biome != Biome::Badlands {
-        return if col.biome == Biome::HotDesert {
-            r::SANDSTONE
-        } else {
-            r::STONE
-        };
+    // Bare rock (M15): an inselberg's dome, a tor, a cliff — no soil; a
+    // dune's steep slip face is sand however steep. In the dry lands a
+    // cliff is banded rock all the way down its face (`col.face`): mesa and
+    // butte walls had shown their bands for 12 blocks and plain stone
+    // below, a grey fluted wall (the owner's first look at version 22).
+    if wy <= h && col.surface.rock && col.surface.sand == 0 {
+        let d = h - wy;
+        // A cliff's face only: a dome or tor (rock, no face) is granite.
+        if dry_land(col) && col.face > 0 && d < col.face.max(MAX_PROFILE_DEPTH) {
+            return strata(wy);
+        }
+        if col.biome != Biome::Badlands && d < MAX_PROFILE_DEPTH {
+            return r::STONE;
+        }
     }
     // Dune sand (M15): the dune's own body, and one block under it.
     if wy <= h && h - wy <= col.surface.sand && col.surface.sand > 0 {
@@ -282,6 +297,7 @@ mod tests {
             precipitation: 800.0,
             biome,
             patch,
+            face: 0,
             water: crate::drainage::Water::DRY,
         }
     }

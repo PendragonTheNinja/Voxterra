@@ -175,10 +175,16 @@ const fn vox_mesh_dry() -> i32 {
 }
 
 /// The top of a column's standing water, or `i64::MIN` where it has none.
-/// How far a column stands over a neighbour, blocks per block of stride,
-/// for its face to be a cliff of bare rock (M15 task 6): a 3-block step
-/// is a wall, not a slope a soil holds on.
-const CLIFF_STEP: i64 = 3;
+/// How steep the ground is across a column, blocks per block of stride,
+/// for it to be a cliff of bare rock (M15 task 6): ~56°, steeper than a
+/// soil holds on. Measured over [`CLIFF_SPAN`] blocks either side, so a
+/// single terrace step on flat ground is no cliff — judged against one
+/// neighbour, a 3-block step put rock on one column in two along every
+/// terrace edge and shore step, rows of stone posts (the owner's first
+/// look at version 22).
+const CLIFF_SLOPE: i64 = 3;
+const CLIFF_SLOPE_PER: i64 = 2;
+const CLIFF_SPAN: i64 = 2;
 
 /// Which of a 32×32 grid's cells (`height(k)` at `k = z·32 + x`, `stride`
 /// blocks apart) stand a cliff over a neighbour in the grid: one-sided at
@@ -193,19 +199,35 @@ fn cliff_mask(stride: i64, height: impl Fn(usize) -> i64) -> Vec<bool> {
         .collect()
 }
 
-/// [`cliff_mask`] for one cell.
-fn is_cliff(k: usize, stride: i64, height: &impl Fn(usize) -> i64) -> bool {
+/// How far a cell's face reaches below its top: to its lowest neighbour in
+/// the grid, blocks (0 where none is lower).
+fn face_depth(k: usize, height: &impl Fn(usize) -> i64) -> i64 {
     let n = CHUNK_SIZE as i64;
     let (x, z) = (k as i64 % n, k as i64 / n);
     let here = height(k);
     [(1i64, 0i64), (-1, 0), (0, 1), (0, -1)]
         .iter()
-        .any(|&(dx, dz)| {
-            let (nx, nz) = (x + dx, z + dz);
-            (0..n).contains(&nx)
-                && (0..n).contains(&nz)
-                && here - height((nz * n + nx) as usize) >= CLIFF_STEP * stride
-        })
+        .filter(|&&(dx, dz)| (0..n).contains(&(x + dx)) && (0..n).contains(&(z + dz)))
+        .map(|&(dx, dz)| here - height(((z + dz) * n + x + dx) as usize))
+        .max()
+        .unwrap_or(0)
+        .max(0)
+}
+
+/// [`cliff_mask`] for one cell.
+fn is_cliff(k: usize, stride: i64, height: &impl Fn(usize) -> i64) -> bool {
+    let n = CHUNK_SIZE as i64;
+    let (x, z) = (k as i64 % n, k as i64 / n);
+    let at = |x: i64, z: i64| height((z * n + x) as usize);
+    // Across each axis: the fall over up to CLIFF_SPAN either side, within
+    // the grid. Steep if it falls 1.5 blocks a block (in integers: 2·fall
+    // ≥ 3·run).
+    let steep = |(a, b): (i64, i64), fall: &dyn Fn(i64, i64) -> i64| {
+        let run = (b - a) * stride;
+        run > 0 && CLIFF_SLOPE_PER * fall(a, b).abs() >= CLIFF_SLOPE * run
+    };
+    let span = |v: i64| ((v - CLIFF_SPAN).max(0), (v + CLIFF_SPAN).min(n - 1));
+    steep(span(x), &|a, b| at(b, z) - at(a, z)) || steep(span(z), &|a, b| at(x, b) - at(x, a))
 }
 
 fn wet_top(w: &Water) -> i64 {
@@ -402,7 +424,13 @@ pub enum DrainageSource {
 ///   it leaves the plateau; inner valleys' lines wander smoothly; cliffs
 ///   (a 3-block step within the chunk) are bare rock, sandstone in hot
 ///   desert, near and far. Drainage cache format 8.
-pub const GENERATOR_VERSION: u32 = 22;
+///   23 — the owner's first look at version 22: a cliff is a steady slope of
+///   1.5 a block across ±2 columns, not a 3-block step (terrace edges and
+///   shore steps had come out as rows of stone posts); dry-land cliffs
+///   are banded rock all the way down their faces (mesa walls had been
+///   banded for 12 blocks and plain stone below), dry by Köppen's aridity
+///   rather than by biome (a mesa's cooler top is often grassland).
+pub const GENERATOR_VERSION: u32 = 23;
 
 impl Generator {
     /// A generator for one world: its seed and its size. The size is part of
@@ -1048,9 +1076,13 @@ impl Generator {
         // cliff is judged within the chunk (`cliff_mask`).
         let ground = self.column_ground(wx >> 5, wz >> 5);
         let k = ((wz & 31) * CHUNK_SIZE as i64 + (wx & 31)) as usize;
+        let height = |k: usize| ground.cells[k].0.height;
         let mut g = ground.cells[k];
-        g.0.rock |= g.1.body == Body::Dry && is_cliff(k, 1, &|k| ground.cells[k].0.height);
-        self.block_in(&self.column_with(wx, wz, g), wy)
+        let cliff = g.1.body == Body::Dry && !g.0.rock && is_cliff(k, 1, &height);
+        g.0.rock |= cliff;
+        let mut col = self.column_with(wx, wz, g);
+        col.face = if cliff { face_depth(k, &height) } else { 0 };
+        self.block_in(&col, wy)
     }
 
     /// The block at height `wy` of a classified column.
@@ -1152,22 +1184,30 @@ impl Generator {
         // chunk meets its profile or its sea surface. Elsewhere it is stone
         // below the profile and air or water above, whatever the biome.
         let mut chunk = Chunk::new_air();
-        let cliffs = cliff_mask(1, |k| surfaces[k].0.height);
+        let height = |k: usize| surfaces[k].0.height;
+        let cliffs = cliff_mask(1, height);
         for lz in 0..CHUNK_SIZE as u8 {
             for lx in 0..CHUNK_SIZE as u8 {
                 let k = lz as usize * CHUNK_SIZE + lx as usize;
                 let mut g = surfaces[k];
-                g.0.rock |= cliffs[k] && g.1.body == Body::Dry;
+                // A cliff's face is classified all the way down it; a dome's
+                // or a tor's rock (the landform's own) is granite, no face.
+                let cliff = cliffs[k] && g.1.body == Body::Dry && !g.0.rock;
+                g.0.rock |= cliff;
+                let face = if cliff { face_depth(k, &height) } else { 0 };
                 let (wx, wz) = (origin.x + lx as i64, origin.z + lz as i64);
                 let h = g.0.height;
-                let profile_lo = h - materials::MAX_PROFILE_DEPTH + 1;
+                let profile_lo = h - materials::MAX_PROFILE_DEPTH.max(face) + 1;
                 let touches_profile = chunk_max_y >= profile_lo && chunk_min_y <= h;
                 let touches_sea_surface =
                     h < SEA_LEVEL_BLOCKS && (chunk_min_y..=chunk_max_y).contains(&SEA_LEVEL_BLOCKS);
                 let touches_water =
                     wet_top(&g.1) > h && chunk_max_y > h && chunk_min_y <= g.1.level;
-                let col = (touches_profile || touches_sea_surface || touches_water)
-                    .then(|| self.column_with(wx, wz, g));
+                let col = (touches_profile || touches_sea_surface || touches_water).then(|| {
+                    let mut c = self.column_with(wx, wz, g);
+                    c.face = face;
+                    c
+                });
                 for ly in 0..CHUNK_SIZE as u8 {
                     let wy = chunk_min_y + ly as i64;
                     let block = match &col {
@@ -1298,8 +1338,15 @@ impl Generator {
                 let at = (cz * n + cx) as usize;
                 let (h, x, z, s) = samples[at];
                 let mut s = s.expect("at least one sample");
-                s.0.rock |= cliffs[at] && s.1.body == Body::Dry;
-                let col = self.column_with(x, z, s);
+                let cliff = cliffs[at] && s.1.body == Body::Dry && !s.0.rock;
+                s.0.rock |= cliff;
+                let mut col = self.column_with(x, z, s);
+                // As the chunk generator does, at this stride.
+                col.face = if cliff {
+                    face_depth(at, &|k: usize| samples[k].0)
+                } else {
+                    0
+                };
                 let wet = wet_top(&col.water);
                 // Sea ice is on the sea: a polar-sea column whose ground
                 // stands exactly at sea level has no water to freeze, and
@@ -2947,7 +2994,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (22, 0x52f7_2360_cd43_eb72);
+        const PINNED: (u32, u64) = (23, 0x8dc1_69bd_1693_1d9f);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),
@@ -3539,8 +3586,80 @@ mod cliff_tests {
     use super::*;
     use vox_core::registry as r;
 
-    /// M15 task 6: cliffs are bare rock — a dry column standing 3+ blocks
-    /// over a neighbour in its chunk wears no soil. (Until version 22 a
+    /// Mesa and butte walls are banded rock all the way down (the owner's
+    /// first look at version 22: bands for 12 blocks, then a grey fluted
+    /// wall of plain stone to the floor). Around the butte they flew past.
+    #[test]
+    fn mesa_walls_are_banded_to_the_floor() {
+        let g = Generator::new(0x7e22ac0de, WorldShape::DEFAULT);
+        let (mut walls, mut plain) = (0u32, Vec::new());
+        let n = CHUNK_SIZE as i64;
+        for dcz in -4..=4i64 {
+            for dcx in -4..=4i64 {
+                let (cx, cz) = ((42_911i64 >> 5) + dcx, (18_503i64 >> 5) + dcz);
+                let ground = g.column_ground(cx, cz);
+                let h = |lx: i64, lz: i64| ground.cells[(lz * n + lx) as usize].0.height;
+                for lz in 1..n - 1 {
+                    for lx in 1..n - 1 {
+                        let here = h(lx, lz);
+                        let low = h(lx + 1, lz)
+                            .min(h(lx - 1, lz))
+                            .min(h(lx, lz + 1))
+                            .min(h(lx, lz - 1));
+                        let (x, z) = (cx * n + lx, cz * n + lz);
+                        if here - low < 20
+                            || ground.cells[(lz * n + lx) as usize].1.body != Body::Dry
+                        {
+                            continue;
+                        }
+                        if !matches!(
+                            g.column(x, z).biome,
+                            biome::Biome::HotDesert
+                                | biome::Biome::HotSteppe
+                                | biome::Biome::ColdDesert
+                                | biome::Biome::Badlands
+                        ) {
+                            continue;
+                        }
+                        walls += 1;
+                        if g.block_at(x, here - 15, z) == blocks::STONE {
+                            plain.push((x, z, here, low));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(walls > 50, "only {walls} wall columns");
+        assert!(
+            plain.len() * 20 < walls as usize,
+            "{} of {walls} dry-land walls plain stone 15 down, e.g. {:?}",
+            plain.len(),
+            &plain[..plain.len().min(4)]
+        );
+    }
+
+    /// A single terrace step on flat ground is no cliff: version 22 put
+    /// bare rock on every column standing 3 over a neighbour, and terrace
+    /// edges and shore steps came out as rows of stone posts between soil
+    /// (the owner's first look at version 22). A steady steep slope is.
+    #[test]
+    fn a_terrace_step_is_not_a_cliff() {
+        let n = CHUNK_SIZE as i64;
+        // Flat at 100, a 3-block step up from x = 16.
+        let step = |k: usize| if k as i64 % n >= 16 { 103 } else { 100 };
+        assert!(
+            cliff_mask(1, step).iter().all(|&c| !c),
+            "a 3-block step made rock"
+        );
+        // A wall rising 2 blocks a block from x = 10 to 20.
+        let wall = |k: usize| 100 + 2 * (k as i64 % n).clamp(10, 20);
+        let mask = cliff_mask(1, wall);
+        assert!(mask[16 * 32 + 15], "a 63° wall stayed soil");
+    }
+
+    /// M15 task 6: cliffs are bare rock — a dry column where the ground
+    /// falls 6+ blocks across its two neighbours on an axis (in its chunk)
+    /// wears no soil. (Until version 22 a
     /// trough's 3:1 walls, a cirque's headwall and a canyon's sides were
     /// grass from rim to floor.) Around a glacial trough, a cirque and a
     /// canyon on the default world.
@@ -3566,15 +3685,13 @@ mod cliff_tests {
                                 continue;
                             }
                             let here = h(lx, lz);
-                            let drop = [(1i64, 0i64), (-1, 0), (0, 1), (0, -1)]
-                                .iter()
-                                .filter(|(dx, dz)| {
-                                    (0..n).contains(&(lx + dx)) && (0..n).contains(&(lz + dz))
-                                })
-                                .map(|(dx, dz)| here - h(lx + dx, lz + dz))
-                                .max()
-                                .unwrap();
-                            if drop < 3 {
+                            if !(1..n - 1).contains(&lx) || !(1..n - 1).contains(&lz) {
+                                continue;
+                            }
+                            let fall = (h(lx + 1, lz) - h(lx - 1, lz))
+                                .abs()
+                                .max((h(lx, lz + 1) - h(lx, lz - 1)).abs());
+                            if fall < 6 {
                                 continue;
                             }
                             cliffs += 1;

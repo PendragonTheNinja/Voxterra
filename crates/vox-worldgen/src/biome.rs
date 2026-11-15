@@ -276,6 +276,10 @@ pub struct Column {
     /// The river, lake or salt flat here (M14), if any. Dry from
     /// [`classify`] alone; the generator sets it.
     pub water: Water,
+    /// How far a cliff's face reaches below the surface here, blocks (M15
+    /// task 6): to its lowest neighbour. 0 from [`classify`] alone; the
+    /// generator sets it from its grid.
+    pub face: i64,
 }
 
 /// Köppen's aridity threshold, mm/yr: the annual precipitation below which a
@@ -305,6 +309,7 @@ pub fn classify(
         biome,
         patch: 0.0,
         water: Water::DRY,
+        face: 0,
     }
 }
 

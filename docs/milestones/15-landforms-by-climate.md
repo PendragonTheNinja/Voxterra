@@ -264,6 +264,21 @@ items, measured in the chunks over the survey's seeds:
   chunk grid, as every LOD node is.
 - Cost: chunk generation and world creation unchanged within noise
   (measured interleaved against version 21 on the same machine).
+- **The owner's first look at version 22 (2026-11-15)**, eight VIEW
+  lines re-rendered headlessly (gallery `owner-v22-…`). Fixed as version
+  23, each with a failing test first: cliff rock judged against one
+  neighbour put rows of stone posts on terrace edges and shore steps —
+  now a steady slope of 1.5 a block across ±2 columns
+  (`a_terrace_step_is_not_a_cliff`); mesa and butte walls were banded
+  for 12 blocks and plain stone below, a grey fluted wall — dry-land
+  cliffs are now banded down their whole face, dry by Köppen's aridity,
+  since a mesa's cooler top is often grassland
+  (`mesa_walls_are_banded_to_the_floor`: 107 of 107 plain at version 22).
+  Seen and not yet fixed: buttes are extruded cylinders with no benches
+  or scree ("straight up, no real shape"); inselbergs are smooth grey
+  blobs on the plain; thin gaps in the LOD's mesa walls; the LOD under
+  sea ice; ice blocks all light. The world emptying while flying was
+  speed: 400–700 blocks a second, 3–6× sprint-flight, outruns generation.
 - Still to do in task 6: renders of every landform (the gallery has one
   per landform at versions 18–22), the owner's `--bench` and walk, the
   retrospective.
