@@ -430,7 +430,13 @@ pub enum DrainageSource {
 ///   are banded rock all the way down their faces (mesa walls had been
 ///   banded for 12 blocks and plain stone below), dry by Köppen's aridity
 ///   rather than by biome (a mesa's cooler top is often grassland).
-pub const GENERATOR_VERSION: u32 = 23;
+///   24 — mesas and buttes with shape: a sheer caprock cliff over a steep
+///   slope over a talus apron, ragged outlines; the benches terrace only
+///   the plateau under them, with continuous steps (no longer rounded to
+///   beds, slower to vary) and risers half as wide as high, a slope under
+///   a cliff band (a whole step had been one sheer drop, and terraces left
+///   standing cylinders).
+pub const GENERATOR_VERSION: u32 = 24;
 
 impl Generator {
     /// A generator for one world: its seed and its size. The size is part of
@@ -2994,7 +3000,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (23, 0x8dc1_69bd_1693_1d9f);
+        const PINNED: (u32, u64) = (24, 0xda1a_8a52_f6c0_1099);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),

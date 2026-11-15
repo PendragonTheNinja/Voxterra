@@ -274,8 +274,18 @@ items, measured in the chunks over the survey's seeds:
   cliffs are now banded down their whole face, dry by Köppen's aridity,
   since a mesa's cooler top is often grassland
   (`mesa_walls_are_banded_to_the_floor`: 107 of 107 plain at version 22).
-  Seen and not yet fixed: buttes are extruded cylinders with no benches
-  or scree ("straight up, no real shape"); inselbergs are smooth grey
+  **Mesas and buttes with shape (version 24):** the "walls" the owner
+  flew past were mostly bench risers — the benches terraced the whole
+  layer, mesas included, in 18–60-block steps with 5-block risers, and
+  rounding steps to whole beds made the levels jump: a whole step one
+  sheer drop, terraces left standing as cylinders. Now the benches
+  terrace only the plateau, continuously (steps vary over 20 km), risers
+  half as wide as high — a slope under a cliff band — with edges that
+  wander; mesas stand on it with Monument Valley's profile (caprock
+  cliff 40%, steep slope 35%, talus 25%) and ragged outlines. Tests
+  `mesa_walls_stand_on_slopes` (53 of 163 edges one sheer drop at
+  version 23) and `bench_risers_stand_on_slopes` (41 sheer risers);
+  closed basins unchanged (17.6 / 22.8 / 19.6%). Seen and not yet fixed: inselbergs are smooth grey
   blobs on the plain; thin gaps in the LOD's mesa walls; the LOD under
   sea ice; ice blocks all light. The world emptying while flying was
   speed: 400–700 blocks a second, 3–6× sprint-flight, outruns generation.

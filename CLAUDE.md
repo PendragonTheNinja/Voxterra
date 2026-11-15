@@ -330,7 +330,9 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   whole at its end (2026-11-15). **Task 6 (2026-11-15, `GENERATOR_VERSION`
   22–23): canyons cut by washes on caprock (modest; a plateau's deep
   canyons carried), cliffs of bare rock near and far, dry-land cliffs
-  banded to the floor (23, after the owner's first look).** Left: the owner's
+  banded to the floor (23, after the owner's first look), mesas and
+  buttes with Monument Valley's profile and benches with sloped risers
+  (24).** Left: the owner's
   `--bench` and walk of version 22, then the retrospective. Dune
   seas, mesas and canyons, glacial valleys and fjords, inselbergs, dissected
   humid hills, as height layers weighted by a stage-1 process map, applied
@@ -352,7 +354,7 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   rivers as ribbons, reservoirs with the water simulation.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 306, vox-mesh 72, vox-worldgen 127, vox-render 21, vox-app 18
+  vox-core 306, vox-mesh 72, vox-worldgen 129, vox-render 21, vox-app 18
   passing (288, 72 and 11 before the 2026-11 audit; worldgen was 81
   before the tectonic framework and 103 before M15's landforms), plus the ignored
   `every_biome_in_every_world` and `biome_survey`, run in release), then
@@ -397,8 +399,8 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   the LOD's slopes as bright as full resolution's, water darkening with
   depth. Small streams that follow the ground went to M15 (task 5);
   coastal landforms are proposed for M15's catalogue. Version 10's polish
-  is carried into versions 18–23 by the M15 merge (2026-11-14). **Next: the
-  owner's `--bench` and a flight on version 23** (a fresh world again).
+  is carried into versions 18–24 by the M15 merge (2026-11-14). **Next: the
+  owner's `--bench` and a flight on version 24** (a fresh world again).
 - **Open decision records (2026-11-11):** ADR-0022 (relight and mesh off
   the frame — proposed; **its gate is met** by the owner's bench: the two
   passes hold the frame thread ~320 ms of every sprinting second and the
