@@ -237,8 +237,36 @@ items, measured in the chunks over the survey's seeds:
   banks into wetland; they act on slopes only. Cost: chunk generation
   +~5% (1.10 → 1.15 ms a chunk column), LOD nodes +5–7%, world creation
   +~1 s. Drainage cache format 7.
-- **Task 5 is built.** Canyons: still none (no river of 0.1+ m³/s crosses
-  flash-flood ground in three seeds) — carried to task 6 or the retro.
+- **Task 5 is built.**
+
+**Task 6 progress (2026-11-15, `GENERATOR_VERSION` 22).**
+- **Canyons.** Version 21 had almost none: 0.3% of flash-flood drainage
+  nodes stood in a canyon 30+ deep (the ground 48 blocks round 30+ above
+  them). Washes, not rivers, now cut them: on caprock every wash of
+  0.001+ m³/s gets an inner valley 90% of the way down to the floor it
+  drains to, near-sheer walls (ADR-0026, *Canyons are washes' inner
+  valleys*): 2 192 canyon lines on the default world, median 15 deep, p90
+  53; **1.1% of flash-flood nodes in canyons** (test
+  `canyons_cut_the_dry_plateaus`, held at 0.8%). Inner valleys wander
+  ±20 blocks by a tiled value noise (straight, they were ruled cuts; the
+  first canyons, gallery `…-straight-draft`). **Carried:** these are
+  arroyos and canyons into the floors between mesas; a plateau's deep
+  canyons want rivers from wetter ground crossing it, which these worlds'
+  dry uplands — mesa islands on stripped floors, draining inward —
+  seldom have.
+- **Bare rock on cliffs.** A dry column 3+ blocks over a neighbour in its
+  chunk wears stone (sandstone in hot desert; badlands keep their bands,
+  dune sand stays sand); the LOD applies the same rule on its own grid at
+  3×stride, and agrees with full resolution at stride 1. Around a trough,
+  a cirque and a canyon, 29% of cliff columns wore soil at version 21;
+  under 10% now (test `cliffs_are_bare_rock`). Domes and tors were rock
+  already, dunes sand. The LOD/full-resolution test now samples on the
+  chunk grid, as every LOD node is.
+- Cost: chunk generation and world creation unchanged within noise
+  (measured interleaved against version 21 on the same machine).
+- Still to do in task 6: renders of every landform (the gallery has one
+  per landform at versions 18–22), the owner's `--bench` and walk, the
+  retrospective.
 
 ## Why this milestone exists
 

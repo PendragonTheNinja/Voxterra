@@ -175,6 +175,39 @@ const fn vox_mesh_dry() -> i32 {
 }
 
 /// The top of a column's standing water, or `i64::MIN` where it has none.
+/// How far a column stands over a neighbour, blocks per block of stride,
+/// for its face to be a cliff of bare rock (M15 task 6): a 3-block step
+/// is a wall, not a slope a soil holds on.
+const CLIFF_STEP: i64 = 3;
+
+/// Which of a 32×32 grid's cells (`height(k)` at `k = z·32 + x`, `stride`
+/// blocks apart) stand a cliff over a neighbour in the grid: one-sided at
+/// its edges. The chunk generator and the LOD read the same rule on their
+/// own grids, which are one and the same at stride 1 (LOD nodes are
+/// aligned to them), so near and far agree; a column's neighbours across a
+/// chunk's edge are not asked, which would cost every chunk column a ring
+/// of surfaces more.
+fn cliff_mask(stride: i64, height: impl Fn(usize) -> i64) -> Vec<bool> {
+    (0..CHUNK_SIZE * CHUNK_SIZE)
+        .map(|k| is_cliff(k, stride, &height))
+        .collect()
+}
+
+/// [`cliff_mask`] for one cell.
+fn is_cliff(k: usize, stride: i64, height: &impl Fn(usize) -> i64) -> bool {
+    let n = CHUNK_SIZE as i64;
+    let (x, z) = (k as i64 % n, k as i64 / n);
+    let here = height(k);
+    [(1i64, 0i64), (-1, 0), (0, 1), (0, -1)]
+        .iter()
+        .any(|&(dx, dz)| {
+            let (nx, nz) = (x + dx, z + dz);
+            (0..n).contains(&nx)
+                && (0..n).contains(&nz)
+                && here - height((nz * n + nx) as usize) >= CLIFF_STEP * stride
+        })
+}
+
 fn wet_top(w: &Water) -> i64 {
     match w.body {
         Body::River(_) | Body::Lake | Body::SaltLake | Body::Pool => w.level,
@@ -364,7 +397,12 @@ pub enum DrainageSource {
 ///   reaches; rivers meet still water at its level within two blocks of
 ///   its region, and still water is judged on the ground after the fill.
 ///   Drainage cache format 7.
-pub const GENERATOR_VERSION: u32 = 21;
+///   22 — M15 task 6: canyons — on caprock every wash of 0.001+ m³/s cuts
+///   most of the way to the floor it drains to, near sheer, deepest where
+///   it leaves the plateau; inner valleys' lines wander smoothly; cliffs
+///   (a 3-block step within the chunk) are bare rock, sandstone in hot
+///   desert, near and far. Drainage cache format 8.
+pub const GENERATOR_VERSION: u32 = 22;
 
 impl Generator {
     /// A generator for one world: its seed and its size. The size is part of
@@ -1006,7 +1044,13 @@ impl Generator {
     /// The block at a world position, as generated: THE per-block profile,
     /// which every chunk path must reproduce (tests compare against it).
     pub fn block_at(&self, wx: i64, wy: i64, wz: i64) -> BlockId {
-        self.block_in(&self.column(wx, wz), wy)
+        // Its chunk column's ground, as the chunk generator reads it: a
+        // cliff is judged within the chunk (`cliff_mask`).
+        let ground = self.column_ground(wx >> 5, wz >> 5);
+        let k = ((wz & 31) * CHUNK_SIZE as i64 + (wx & 31)) as usize;
+        let mut g = ground.cells[k];
+        g.0.rock |= g.1.body == Body::Dry && is_cliff(k, 1, &|k| ground.cells[k].0.height);
+        self.block_in(&self.column_with(wx, wz, g), wy)
     }
 
     /// The block at height `wy` of a classified column.
@@ -1108,9 +1152,12 @@ impl Generator {
         // chunk meets its profile or its sea surface. Elsewhere it is stone
         // below the profile and air or water above, whatever the biome.
         let mut chunk = Chunk::new_air();
+        let cliffs = cliff_mask(1, |k| surfaces[k].0.height);
         for lz in 0..CHUNK_SIZE as u8 {
             for lx in 0..CHUNK_SIZE as u8 {
-                let g = surfaces[lz as usize * CHUNK_SIZE + lx as usize];
+                let k = lz as usize * CHUNK_SIZE + lx as usize;
+                let mut g = surfaces[k];
+                g.0.rock |= cliffs[k] && g.1.body == Body::Dry;
                 let (wx, wz) = (origin.x + lx as i64, origin.z + lz as i64);
                 let h = g.0.height;
                 let profile_lo = h - materials::MAX_PROFILE_DEPTH + 1;
@@ -1224,6 +1271,7 @@ impl Generator {
         let mut heights = vec![0i32; (n * n) as usize];
         let mut tops = vec![blocks::AIR; (n * n) as usize];
         let mut water = vec![vox_mesh_dry(); (n * n) as usize];
+        let mut samples = Vec::with_capacity((n * n) as usize);
         for cz in 0..n {
             for cx in 0..n {
                 let bx = origin_x + cx * h_stride;
@@ -1240,9 +1288,18 @@ impl Generator {
                         }
                     }
                 }
-                let (h, x, z, s) = lowest;
-                let col = self.column_with(x, z, s.expect("at least one sample"));
+                samples.push(lowest);
+            }
+        }
+        // Cliffs as full resolution finds them, at this stride.
+        let cliffs = cliff_mask(h_stride, |k| samples[k].0);
+        for cz in 0..n {
+            for cx in 0..n {
                 let at = (cz * n + cx) as usize;
+                let (h, x, z, s) = samples[at];
+                let mut s = s.expect("at least one sample");
+                s.0.rock |= cliffs[at] && s.1.body == Body::Dry;
+                let col = self.column_with(x, z, s);
                 let wet = wet_top(&col.water);
                 // Sea ice is on the sea: a polar-sea column whose ground
                 // stands exactly at sea level has no water to freeze, and
@@ -1574,7 +1631,10 @@ mod tests {
         }
         assert!(found.contains_key(&Biome::PolarSea) && found.contains_key(&Biome::HotDesert));
         for (biome, (x, z)) in found {
-            let (ox, oz) = (x - 16, z - 16);
+            // On the chunk grid, as every LOD node is: cliffs are judged
+            // within the grid (`cliff_mask`), the chunk's and the node's
+            // being one and the same at stride 1.
+            let (ox, oz) = ((x >> 5) << 5, (z >> 5) << 5);
             let (heights, tops, _) = g.lod_surface(ox, oz, 1, LodSampling::Exact);
             for cz in 0..32i64 {
                 for cx in 0..32i64 {
@@ -2887,7 +2947,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (21, 0x09c4_1007_cd4e_75da);
+        const PINNED: (u32, u64) = (22, 0x52f7_2360_cd43_eb72);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),
@@ -3405,5 +3465,136 @@ mod stream_tests {
                 100.0 * walls
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod canyon_tests {
+    use super::*;
+
+    /// Drainage nodes on flash-flood ground (weight ≥ 0.5) every `step`
+    /// cells, and of them how many stand in a canyon: the final ground 48
+    /// blocks around 30+ above the node's on average.
+    fn canyon_nodes(g: &Generator, step: usize) -> (usize, Vec<(i64, i64, i64)>) {
+        let d = g.drainage();
+        let (nx, nz) = d.cells();
+        let (mut nodes, mut canyons) = (0, Vec::new());
+        for j in (0..nz).step_by(step) {
+            for i in (0..nx).step_by(step) {
+                if d.is_sea(i, j) || d.is_lake(i, j) {
+                    continue;
+                }
+                let (x, z) = d.node(i as i64, j as i64);
+                let (x, z) = (x.round() as i64, z.round() as i64);
+                if !g.process_map().floodable(x, z) || g.landformed_flood(x, z).3 < 0.5 {
+                    continue;
+                }
+                nodes += 1;
+                let here = g.ground(x, z).0.height;
+                let around = (0..8)
+                    .map(|a| {
+                        let a = f64::from(a) * std::f64::consts::TAU / 8.0;
+                        g.ground(x + (48.0 * a.cos()) as i64, z + (48.0 * a.sin()) as i64)
+                            .0
+                            .height
+                    })
+                    .sum::<i64>()
+                    / 8;
+                if around - here >= 30 {
+                    canyons.push((x, z, around - here));
+                }
+            }
+        }
+        (nodes, canyons)
+    }
+
+    /// M15 criterion 3 ("mesas and canyons in dry uplands"): the dry
+    /// uplands are cut by canyons. Version 21 had almost none: rivers of
+    /// 0.1+ m³/s, the only ones the network cut canyons for, never cross
+    /// them.
+    #[test]
+    fn canyons_cut_the_dry_plateaus() {
+        let g = Generator::new(0x7e22ac0de, WorldShape::DEFAULT);
+        let (nodes, canyons) = canyon_nodes(&g, 2);
+        eprintln!(
+            "{} of {nodes} flash-flood nodes in canyons, e.g. {:?}",
+            canyons.len(),
+            &canyons[..canyons.len().min(5)]
+        );
+        assert!(nodes > 1_000, "only {nodes} flash-flood nodes");
+        // Version 21: 0.3%. Washes cut arroyos and canyons 15–50 deep
+        // into the floors between mesas; the deep canyons of a whole
+        // plateau want rivers from wetter ground crossing it, which these
+        // worlds' dry uplands seldom have (carried, the spec's task 6).
+        assert!(
+            canyons.len() * 1000 >= nodes * 8,
+            "{} of {nodes} flash-flood nodes stand in canyons",
+            canyons.len()
+        );
+    }
+}
+
+#[cfg(test)]
+mod cliff_tests {
+    use super::*;
+    use vox_core::registry as r;
+
+    /// M15 task 6: cliffs are bare rock — a dry column standing 3+ blocks
+    /// over a neighbour in its chunk wears no soil. (Until version 22 a
+    /// trough's 3:1 walls, a cirque's headwall and a canyon's sides were
+    /// grass from rim to floor.) Around a glacial trough, a cirque and a
+    /// canyon on the default world.
+    #[test]
+    fn cliffs_are_bare_rock() {
+        let g = Generator::new(0x7e22ac0de, WorldShape::DEFAULT);
+        let (mut cliffs, mut soil) = (0u32, Vec::new());
+        for (x, z) in [
+            (169_536i64, 190_272i64),
+            (169_758, 194_785),
+            (41_529, 19_759),
+        ] {
+            for dcz in -3..=3i64 {
+                for dcx in -3..=3i64 {
+                    let (cx, cz) = ((x >> 5) + dcx, (z >> 5) + dcz);
+                    let ground = g.column_ground(cx, cz);
+                    let n = CHUNK_SIZE as i64;
+                    let h = |lx: i64, lz: i64| ground.cells[(lz * n + lx) as usize].0.height;
+                    for lz in 0..n {
+                        for lx in 0..n {
+                            let cell = ground.cells[(lz * n + lx) as usize];
+                            if cell.1.body != Body::Dry || cell.0.height <= 0 {
+                                continue;
+                            }
+                            let here = h(lx, lz);
+                            let drop = [(1i64, 0i64), (-1, 0), (0, 1), (0, -1)]
+                                .iter()
+                                .filter(|(dx, dz)| {
+                                    (0..n).contains(&(lx + dx)) && (0..n).contains(&(lz + dz))
+                                })
+                                .map(|(dx, dz)| here - h(lx + dx, lz + dz))
+                                .max()
+                                .unwrap();
+                            if drop < 3 {
+                                continue;
+                            }
+                            cliffs += 1;
+                            let chunk = g.generate_chunk(ChunkPos::new(cx, here >> 5, cz));
+                            let top =
+                                chunk.get(LocalPos::new(lx as u8, (here & 31) as u8, lz as u8));
+                            if [r::GRASS, r::DIRT, r::COARSE_DIRT].contains(&top) {
+                                soil.push((cx * n + lx, cz * n + lz, here));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(cliffs > 500, "only {cliffs} cliff columns");
+        assert!(
+            soil.len() * 10 < cliffs as usize,
+            "{} of {cliffs} cliff columns wear soil, e.g. {:?}",
+            soil.len(),
+            &soil[..soil.len().min(5)]
+        );
     }
 }

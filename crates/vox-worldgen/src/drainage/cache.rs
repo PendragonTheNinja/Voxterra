@@ -23,8 +23,8 @@ const MAGIC: &[u8; 4] = b"VXDR";
 /// 2 — the cover byte carries arid and ice-scoured bits (M14 criterion 10).
 /// 3 — waterfalls' lips. 4 — reaches' long profiles instead. 5 — glacial
 /// troughs (M15). 6 — rivers' inner valleys (M15 task 5). 7 — streams'
-/// paths (M15 task 5).
-pub const FORMAT_VERSION: u32 = 7;
+/// paths (M15 task 5). 8 — each line's fade (canyons, M15 task 6).
+pub const FORMAT_VERSION: u32 = 8;
 
 /// What a cache must have been built for to be used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,7 +42,7 @@ impl DrainageMap {
             68 + n * 11
                 + self.profile.len() * 12
                 + self.erosion.delta.len() * 4
-                + (self.erosion.troughs.cells.len() + self.erosion.valleys.cells.len()) * 25,
+                + (self.erosion.troughs.cells.len() + self.erosion.valleys.cells.len()) * 29,
         );
         out.extend_from_slice(MAGIC);
         put_u32(&mut out, FORMAT_VERSION);
@@ -193,7 +193,7 @@ fn put_lines(out: &mut Vec<u8>, lines: &Troughs) {
     for t in &lines.cells {
         put_u32(out, t.cell);
         put_u32(out, t.receiver);
-        for v in [t.floor, t.depth, t.half, t.rim] {
+        for v in [t.floor, t.depth, t.half, t.rim, t.fade] {
             out.extend_from_slice(&v.to_le_bytes());
         }
         out.push(u8::from(t.head));
@@ -229,7 +229,7 @@ impl<'a> Reader<'a> {
         let mut cells: Vec<Trough> = Vec::with_capacity(count.min(n));
         for _ in 0..count {
             let (c, receiver) = (self.u32()?, self.u32()?);
-            let mut v = [0.0f32; 4];
+            let mut v = [0.0f32; 5];
             for x in &mut v {
                 *x = f32::from_le_bytes(self.take(4)?.try_into().ok()?);
             }
@@ -247,6 +247,7 @@ impl<'a> Reader<'a> {
                 depth: v[1],
                 half: v[2],
                 rim: v[3],
+                fade: v[4],
                 head: match self.take(1)?[0] {
                     0 => false,
                     1 => true,

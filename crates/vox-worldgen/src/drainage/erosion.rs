@@ -89,6 +89,21 @@ const INNER_FLOOR_PER_WIDTH: f64 = 3.0;
 /// [`MAX_WALL_SLOPE`]), and lowers ground at most this share of its depth.
 const INNER_FADE: f32 = 3.5;
 const INNER_CUT_SHARE: f32 = 1.5;
+/// Canyons (M15): on caprock (the flash-flood weight, from
+/// [`CANYON_WEIGHT`] in full by its top) every wash of [`CANYON_FROM_M3S`]
+/// or more cuts down [`CANYON_SHARE`] of the way to the floor it drains to,
+/// at most [`CANYON_MAX_DEPTH`], its walls fading over [`CANYON_FADE`] of
+/// its depth — near sheer. So a canyon is deepest where it leaves the
+/// plateau and shallows headward into it, as the plateau's edge is eaten
+/// back. Washes, not rivers: a dry upland's rivers of 0.1+ m³/s, the only
+/// ones the network had cut canyons for, almost never cross it.
+const CANYON_WEIGHT: (f32, f32) = (0.3, 0.7);
+const CANYON_FROM_M3S: f64 = 0.001;
+const CANYON_SHARE: f64 = 0.9;
+const CANYON_MAX_DEPTH: f64 = 200.0;
+const CANYON_FADE: f32 = 0.3;
+/// How far inner valleys' lines wander either way, blocks ([`Troughs::wander`]).
+const VALLEY_WANDER: f64 = 20.0;
 /// Shallower than this, no inner valley is kept, blocks.
 const INNER_MIN_DEPTH: f64 = 2.0;
 /// The river's width per √(m³/s), as the chunks draw it
@@ -172,6 +187,10 @@ pub(super) struct Trough {
     pub(super) depth: f32,
     pub(super) half: f32,
     pub(super) rim: f32,
+    /// Over how many of its depths an inner valley's cut fades beyond its
+    /// floor (river valleys [`INNER_FADE`], canyons [`CANYON_FADE`]);
+    /// unused by troughs.
+    pub(super) fade: f32,
     /// Whether no trough flows into it: a glacier's head, where the trough
     /// tapers in from nothing (round caps there drew bowls on every
     /// hillside a short glacier began on).
@@ -344,7 +363,7 @@ impl Erosion {
             let h = h + f64::from(erosion.at(x, z));
             erosion.troughs.at(x, z).map_or(h, |t| h.min(f64::from(t)))
         };
-        erosion.valleys = incise(fnx, fnz, cell, base, sea, runoff, ground, eroded);
+        erosion.valleys = incise(fnx, fnz, cell, base, sea, runoff, canyon, ground, eroded);
         erosion
     }
 
@@ -459,6 +478,33 @@ impl Troughs {
         }
     }
 
+    /// A smooth wander for inner valleys' lines (M15 task 6): value noise
+    /// on the drainage grid's corners, hashed by their wrapped index (so it
+    /// tiles with the world), smoothstepped between — each axis in
+    /// `[-1, 1]`. Straight node-to-node valleys and canyons read as cuts
+    /// ruled across the land, and the streams in them, bent to the low
+    /// ground, ran off their floors.
+    fn wander(&self, x: f64, z: f64) -> (f64, f64) {
+        let (nx, nz, cx, cz) = self.grid;
+        let (u, v) = (x / cx, z / cz);
+        let (i, j) = (u.floor() as i64, v.floor() as i64);
+        let (fu, fv) = (u - i as f64, v - j as f64);
+        let s = |f: f64| f * f * (3.0 - 2.0 * f);
+        let (su, sv) = (s(fu), s(fv));
+        let corner = |di: i64, dj: i64, salt: u64| {
+            let ii = (i + di).rem_euclid(nx as i64) as u64;
+            let jj = (j + dj).rem_euclid(nz as i64) as u64;
+            let h = super::mix(salt ^ (jj << 32 | ii));
+            (h >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0
+        };
+        let at = |salt: u64| {
+            let a = corner(0, 0, salt) + (corner(1, 0, salt) - corner(0, 0, salt)) * su;
+            let b = corner(0, 1, salt) + (corner(1, 1, salt) - corner(0, 1, salt)) * su;
+            a + (b - a) * sv
+        };
+        (at(0x5A11_E701), at(0x5A11_E702))
+    }
+
     /// How far a river's inner valleys lower ground `h` at a point, blocks
     /// (never negative): along each line near, the ground within the
     /// floor's half-width goes down to the floor, and beyond it the cut
@@ -474,6 +520,15 @@ impl Troughs {
         };
         let (nx, nz, cx, cz) = self.grid;
         let (fi, fj) = ((x / cx).floor() as i64, (z / cz).floor() as i64);
+        let wrap0 = |i: i64, j: i64| {
+            (j.rem_euclid(nz as i64) as usize) * nx + i.rem_euclid(nx as i64) as usize
+        };
+        if !self.near[wrap0(fi, fj)] {
+            return 0.0;
+        }
+        // The column, wandered: every line near bends the same way here.
+        let (wx, wz) = self.wander(x, z);
+        let (x, z) = (x + VALLEY_WANDER * wx, z + VALLEY_WANDER * wz);
         let wrap = |i: i64, j: i64| {
             (j.rem_euclid(nz as i64) as usize) * nx + i.rem_euclid(nx as i64) as usize
         };
@@ -505,13 +560,14 @@ impl Troughs {
                 let (px, pz) = (a.0 + u * vx - x, a.1 + u * vz - z);
                 let d = (px * px + pz * pz).sqrt() as f32;
                 let next = self.index[r];
-                let (to_ground, to_depth, to_half) = if next == u32::MAX {
-                    (t.rim, 0.0, t.half)
+                let (to_ground, to_depth, to_half, to_fade) = if next == u32::MAX {
+                    (t.rim, 0.0, t.half, t.fade)
                 } else {
                     let n = self.cells[next as usize];
-                    (n.floor + n.depth, n.depth, n.half)
+                    (n.floor + n.depth, n.depth, n.half, n.fade)
                 };
                 let u = u as f32;
+                let fade = t.fade + (to_fade - t.fade) * u;
                 let ground = t.floor + t.depth + (to_ground - t.floor - t.depth) * u;
                 let mut depth = t.depth + (to_depth - t.depth) * u;
                 if t.head {
@@ -521,7 +577,7 @@ impl Troughs {
                     continue;
                 }
                 let half = t.half + (to_half - t.half) * u;
-                let e = ((d - half) / (INNER_FADE * depth)).clamp(0.0, 1.0);
+                let e = ((d - half) / (fade * depth)).clamp(0.0, 1.0);
                 let w = 1.0 - e * e * (3.0 - 2.0 * e);
                 if w <= 0.0 {
                     continue;
@@ -763,6 +819,7 @@ fn glaciate(
             depth: depth as f32,
             half: half as f32,
             rim: rim as f32,
+            fade: 0.0,
             head: true,
         });
     }
@@ -792,6 +849,7 @@ fn incise(
     base: &[i32],
     sea: &[bool],
     runoff: &[f64],
+    canyon: &[f32],
     ground: &(dyn Fn(f64, f64) -> f64 + Sync),
     eroded: impl Fn(f64, f64, f64) -> f64,
 ) -> Troughs {
@@ -828,11 +886,22 @@ fn incise(
         }
         start[c]
     };
-    let river = |c: usize| !sea[c] && receiver[c] as usize != c && q[c] >= INNER_FROM_M3S;
+    // How much of a canyon a cell's wash cuts (0 off caprock).
+    let cap = |c: usize| {
+        let w =
+            ((canyon[c] - CANYON_WEIGHT.0) / (CANYON_WEIGHT.1 - CANYON_WEIGHT.0)).clamp(0.0, 1.0);
+        f64::from(w * w * (3.0 - 2.0 * w))
+    };
+    let river = |c: usize| {
+        !sea[c]
+            && receiver[c] as usize != c
+            && (q[c] >= INNER_FROM_M3S || (q[c] >= CANYON_FROM_M3S && cap(c) > 0.0))
+    };
     // The floor each river asks for: its node's ground less its depth.
     let mut floor = vec![f64::NAN; n];
     for c in (0..n).filter(|&c| river(c)) {
-        let depth = (INNER_PER_DECADE * (q[c] / INNER_FROM_M3S).log10()).min(INNER_MAX_DEPTH);
+        let depth =
+            (INNER_PER_DECADE * (q[c] / INNER_FROM_M3S).log10()).clamp(0.0, INNER_MAX_DEPTH);
         floor[c] = at_node(c) - depth;
     }
     // Carved on down, sources first: no floor above one upstream of it. A
@@ -864,7 +933,15 @@ fn incise(
             at_node(r)
         };
         let here = at_node(c);
-        let f = floor[c].max(here - INNER_MAX_DEPTH).max(below);
+        // A canyon: most of the way down to the floor below.
+        let w = cap(c);
+        let deepest = INNER_MAX_DEPTH + (CANYON_MAX_DEPTH - INNER_MAX_DEPTH) * w;
+        let gorge = if w > 0.0 {
+            below + (here - below) * (1.0 - CANYON_SHARE * w)
+        } else {
+            f64::INFINITY
+        };
+        let f = floor[c].min(gorge).max(here - deepest).max(below);
         if here - f < INNER_MIN_DEPTH {
             continue;
         }
@@ -882,6 +959,7 @@ fn incise(
             // Where its line runs on to past the last kept cell: the
             // receiver's floor, or its ground, or the sea's level.
             rim: below as f32,
+            fade: INNER_FADE + (CANYON_FADE - INNER_FADE) * w as f32,
             head: true,
         });
     }

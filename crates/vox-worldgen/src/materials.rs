@@ -106,9 +106,15 @@ pub fn block_in(col: &Column, wy: i64, strata: impl Fn(i64) -> BlockId) -> Block
             return block;
         }
     }
-    // Bare rock (M15): an inselberg's dome, a tor — no soil.
-    if wy <= h && col.surface.rock {
-        return r::STONE;
+    // Bare rock (M15): an inselberg's dome, a tor, a cliff — no soil. A
+    // desert's is sandstone; badlands keep their bands (already rock); a
+    // dune's steep slip face is sand however steep.
+    if wy <= h && col.surface.rock && col.surface.sand == 0 && col.biome != Biome::Badlands {
+        return if col.biome == Biome::HotDesert {
+            r::SANDSTONE
+        } else {
+            r::STONE
+        };
     }
     // Dune sand (M15): the dune's own body, and one block under it.
     if wy <= h && h - wy <= col.surface.sand && col.surface.sand > 0 {

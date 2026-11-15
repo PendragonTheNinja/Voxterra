@@ -179,6 +179,21 @@ streams back up on the spurs). Rivers meet still water at its level
 within two blocks of its region. Cost: chunk generation +~5%, world
 creation +~1 s.
 
+**Canyons are washes' inner valleys on caprock; cliffs are bare rock
+(task 6, version 22).** Task 2c's canyons came from the erosion stage's
+incision on flash-flood ground, but that needs rivers of 0.1+ m³/s, and
+dry uplands drain inward: none crossed them. On caprock now every wash
+of 0.001+ m³/s gets an inner valley that cuts 90% of the way down to the
+floor it drains to (at most 200), its walls fading over 0.3 of its
+depth — near sheer; deepest where it leaves the plateau, shallowing
+headward. Inner valleys' lines wander ±20 blocks by a value noise tiled
+on the drainage grid (straight, they read as ruled cuts). A dry column
+standing 3+ blocks (×stride in the LOD) over a neighbour in its own
+32×32 grid is a cliff and wears bare rock (sandstone in hot desert;
+badlands keep their bands; dune sand stays sand): judged within the
+grid, not across chunk edges, so it costs nothing and the LOD, whose
+nodes sit on the same grid, agrees at stride 1.
+
 The climate map and the process weights read the base elevation (step 0),
 never steps 1–3: landforms are smaller than climate cells and would only
 add noise to rain, and reading them back would make weights depend on
