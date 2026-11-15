@@ -332,7 +332,7 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   canyons carried), cliffs of bare rock near and far, dry-land cliffs
   banded to the floor (23, after the owner's first look), mesas and
   buttes with Monument Valley's profile and benches with sloped risers
-  (24).** Left: the owner's
+  (24); cliff-aware LOD skirts closing the slits in distant mesa walls.** Left: the owner's
   `--bench` and walk of version 22, then the retrospective. Dune
   seas, mesas and canyons, glacial valleys and fjords, inselbergs, dissected
   humid hills, as height layers weighted by a stage-1 process map, applied
@@ -354,7 +354,7 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   rivers as ribbons, reservoirs with the water simulation.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 306, vox-mesh 72, vox-worldgen 129, vox-render 21, vox-app 18
+  vox-core 306, vox-mesh 73, vox-worldgen 129, vox-render 21, vox-app 19
   passing (288, 72 and 11 before the 2026-11 audit; worldgen was 81
   before the tectonic framework and 103 before M15's landforms), plus the ignored
   `every_biome_in_every_world` and `biome_survey`, run in release), then

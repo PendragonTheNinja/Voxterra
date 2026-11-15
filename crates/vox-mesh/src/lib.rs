@@ -3159,6 +3159,10 @@ pub const LOD_CELLS: usize = CHUNK_SIZE;
 ///
 /// `skirt_depth_blocks` extends the node's outer border walls downward to hide
 /// cracks against neighbouring nodes whose edge heights differ.
+/// How many cells around a border cell its skirt looks for lower ground of
+/// its own node to reach down to.
+const SKIRT_REACH: i32 = 2;
+
 /// Emit one LOD quad. Mirrors `emit_rect` but writes [`LodVertex`]: per-corner
 /// morph targets instead of block light, and no diagonal flip (the heightfield
 /// has uniform light per quad, so there is no gradient to make anisotropic).
@@ -3657,11 +3661,50 @@ pub fn mesh_lod_cells(
                 } else {
                     skirt_depth_blocks
                 };
+                // How low this node's own ground lies near a border cell:
+                // the neighbouring node's ground beside a cliff is as low (a
+                // coarser one, sampling the lowest of a wider span, lower
+                // still), and a skirt a fixed depth below the cliff's top
+                // left a slit of sky down distant mesa walls (the owner's
+                // first look at version 22). Not for ice, whose skirt is
+                // only the ice.
+                // The lowest ground near, and below it twice the steepest
+                // step between neighbouring cells near: the ground beyond the
+                // border, which a coarser neighbour samples, may fall that
+                // much further.
+                let near_low = |height: &dyn Fn(i32, i32) -> i32| {
+                    let (mut low, mut steep) = (i32::MAX, 0);
+                    for dz in -SKIRT_REACH..=SKIRT_REACH {
+                        for dx in -SKIRT_REACH..=SKIRT_REACH {
+                            let (x, z) = (cx + dx, cz + dz);
+                            if !((0..n).contains(&x) && (0..n).contains(&z)) {
+                                continue;
+                            }
+                            let here = height(x, z);
+                            low = low.min(here);
+                            if x + 1 < n {
+                                steep = steep.max((here - height(x + 1, z)).abs());
+                            }
+                            if z + 1 < n {
+                                steep = steep.max((here - height(x, z + 1)).abs());
+                            }
+                        }
+                    }
+                    low - 2 * steep - origin_y
+                };
+                let foot = |top: i32, height: &dyn Fn(i32, i32) -> i32| {
+                    // Only where skirts hang at all (0 is none, 1 is ice's).
+                    if skirt <= 1 {
+                        top
+                    } else {
+                        top.min(near_low(height))
+                    }
+                };
                 let neighbour = if inside {
                     at(nx, nz) - origin_y
                 } else {
                     // Border: drop a skirt instead of assuming a height.
-                    h - skirt
+                    foot(h, &at) - skirt
                 };
                 // Where this wall's bottom edge ends up at full morph. Inside
                 // the node that is the neighbour's coarse height; on the border
@@ -3673,7 +3716,8 @@ pub fn mesh_lod_cells(
                 let coarse_neighbour = if inside {
                     coarse_at(nx, nz) - origin_y
                 } else {
-                    coarse_h - skirt
+                    // Never above the skirt's own bottom: a morph only lowers.
+                    (foot(coarse_h, &coarse_at) - skirt).min(neighbour)
                 };
                 // Emit if the two cells differ at EITHER end of the morph.
                 //
@@ -4111,6 +4155,38 @@ mod heightfield_tests {
             mesh.vertices.len(),
             1 + 4 * LOD_CELLS + 4 * 4 * LOD_CELLS,
             "fan vertices are shared"
+        );
+    }
+
+    /// A skirt on a cliff reaches the cliff's foot: a border cell standing
+    /// over lower cells of its own node near the border hangs its skirt
+    /// below them, since the neighbouring node's ground there is as low.
+    /// (Skirts a fixed 3 × stride deep left slits of sky in distant mesa
+    /// walls where a neighbouring node, sampled at another stride, stood
+    /// lower: the owner's first look at version 22; ten times deeper took
+    /// the hole census at his view from 76 to 8.)
+    #[test]
+    fn skirts_reach_the_foot_of_a_cliff_at_the_border() {
+        let n = LOD_CELLS as i32;
+        // A cliff along the +x border: the two border columns stand at 200,
+        // the ground two cells in at 100 — which a coarser neighbouring node,
+        // sampling the lowest of a wider span, sees beyond the border too.
+        let heights: Vec<i32> = (0..n * n)
+            .map(|i| if i % n >= n - 2 { 200 } else { 100 })
+            .collect();
+        let stride = 4;
+        let mesh = mesh_lod_heightfield(&heights, stride, 0, |_, _| 0, 3 * stride);
+        let edge = (n * stride) as f32;
+        // The lowest point on the +x border: only the skirt reaches it.
+        let bottom = mesh
+            .vertices
+            .iter()
+            .filter(|v| v.position[0] == edge)
+            .map(|v| v.position[1])
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            bottom <= 101.0 - (3 * stride) as f32,
+            "the high cell's skirt stops at {bottom}, above the cliff's foot"
         );
     }
 

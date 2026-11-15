@@ -2585,3 +2585,91 @@ mod fly_speed {
         assert!((cam.position.x - 300.0).abs() < 1e-9);
     }
 }
+
+#[cfg(test)]
+mod lod_watertight {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Open edges inside an LOD node's ground: an edge of one triangle
+    /// only, away from the node's border, is a crack the sky shows through.
+    /// Returns (open edges, triangles).
+    fn open_edges(mesh: &vox_mesh::LodMeshData, extent: f32) -> (usize, usize) {
+        let key = |i: u32| {
+            let p = mesh.vertices[i as usize].position;
+            // Exact: two corners a hair apart are a crack too.
+            [
+                i64::from(p[0].to_bits()),
+                i64::from(p[1].to_bits()),
+                i64::from(p[2].to_bits()),
+            ]
+        };
+        let tris = &mesh.indices[..mesh.opaque_index_count as usize];
+        let mut edges: HashMap<([i64; 3], [i64; 3]), u32> = HashMap::new();
+        for t in tris.chunks(3) {
+            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                let (a, b) = (key(a), key(b));
+                if a == b {
+                    continue;
+                }
+                let e = if a < b { (a, b) } else { (b, a) };
+                *edges.entry(e).or_insert(0) += 1;
+            }
+        }
+        let inside = |p: &[i64; 3]| {
+            let (x, z) = (f32::from_bits(p[0] as u32), f32::from_bits(p[2] as u32));
+            x > 0.0 && x < extent && z > 0.0 && z < extent
+        };
+        let open = edges
+            .iter()
+            .filter(|(e, &n)| n == 1 && (inside(&e.0) || inside(&e.1)))
+            .count();
+        (open, tris.len() / 3)
+    }
+
+    /// The LOD's ground is watertight over steep terrain: no crack inside a
+    /// node. (The owner saw slits of sky in distant mesa walls, version 22;
+    /// the hole census at his view counted them in the LOD alone.)
+    #[test]
+    fn lod_ground_is_watertight_over_mesa_walls() {
+        let g = vox_worldgen::Generator::new(0x7e22ac0de, WorldShape::default());
+        let mut total = 0;
+        let mut worst = Vec::new();
+        for stride in [2i64, 4, 8, 16] {
+            let span = 32 * stride;
+            let (cx, cz) = (29_700i64, 16_500i64);
+            for dz in -1..=1i64 {
+                for dx in -1..=1i64 {
+                    let ox = (cx.div_euclid(span) + dx) * span;
+                    let oz = (cz.div_euclid(span) + dz) * span;
+                    let (heights, tops, mut water) =
+                        g.lod_surface(ox, oz, stride, vox_worldgen::LodSampling::Sparse);
+                    for (w, sea) in water.iter_mut().zip(vox_mesh::lod_sea(&heights)) {
+                        if *w == vox_mesh::LOD_DRY {
+                            *w = sea;
+                        }
+                    }
+                    let origin_y = (*heights.iter().min().unwrap() >> 5) << 5;
+                    let mesh = vox_mesh::mesh_lod_cells(
+                        vox_mesh::LodCells {
+                            heights: &heights,
+                            tops: &tops,
+                            water: &water,
+                        },
+                        stride as i32,
+                        origin_y,
+                        |_, _| 0,
+                        LOD_SKIRT_DEPTH_CELLS * stride as i32,
+                        true,
+                    );
+                    let (open, tris) = open_edges(&mesh, span as f32);
+                    total += open;
+                    if open > 0 {
+                        worst.push((stride, ox, oz, open, tris));
+                    }
+                }
+            }
+        }
+        assert_eq!(total, 0, "open edges inside LOD nodes: {worst:?}");
+    }
+}

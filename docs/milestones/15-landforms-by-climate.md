@@ -285,7 +285,16 @@ items, measured in the chunks over the survey's seeds:
   cliff 40%, steep slope 35%, talus 25%) and ragged outlines. Tests
   `mesa_walls_stand_on_slopes` (53 of 163 edges one sheer drop at
   version 23) and `bench_risers_stand_on_slopes` (41 sheer risers);
-  closed basins unchanged (17.6 / 22.8 / 19.6%). Seen and not yet fixed: inselbergs are smooth grey
+  closed basins unchanged (17.6 / 22.8 / 19.6%). **Slits of sky in distant
+  mesa walls (no terrain change):** the hole census at the owner's view D
+  counted 76 sky pixels, all in the LOD alone, and the LOD's ground is
+  watertight inside every node (`lod_ground_is_watertight_over_mesa_walls`)
+  — the slits were between nodes: border skirts a fixed 3 × stride deep
+  stopped above a neighbouring node's ground beside a cliff. A skirt now
+  reaches below the lowest of its node's own ground within two cells and
+  twice the steepest step there (`skirts_reach_the_foot_of_a_cliff_at_the_border`);
+  census 76 → 15 at D (7 the old horizon pinholes), 13 → 7 at H, 5 → 4
+  at C, for 0.4–2% more LOD triangles. Seen and not yet fixed: inselbergs are smooth grey
   blobs on the plain; thin gaps in the LOD's mesa walls; the LOD under
   sea ice; ice blocks all light. The world emptying while flying was
   speed: 400–700 blocks a second, 3–6× sprint-flight, outruns generation.
