@@ -212,9 +212,33 @@ items, measured in the chunks over the survey's seeds:
   valleys cut some rims); still far above other ground's ~1.2%. World
   creation +~1 s (network 6.9–7.0 s → 7.7–8.7 s, two seeds); chunk
   generation unchanged within noise. Drainage cache format 6.
-- **Still open in task 5: small streams that follow the ground** (the
-  owner's version 9 flight) — next. Canyons: still none (no river of
-  0.1+ m³/s crosses flash-flood ground in three seeds).
+- **Small streams that follow the ground: built (version 21).** Each
+  stream's path bends across its straight line to the low ground (stage
+  1: four points chosen together, up to 32 blocks across, a smooth curve
+  in stage 2); streams on slopes cut their own gullies (3–9 blocks,
+  fading over four depths); the grid-scale wander shrinks on steep
+  reaches. Channels on hillsides run on ground a median **3 blocks below
+  their straight lines** (`stream_survey`, three seeds, p25 1–2; version
+  20: 0) — test `small_streams_take_the_low_ground`. A first draft as a
+  polyline through seven points zigzagged (gallery, `…-zigzag-draft`).
+  What did not move: the share of hillside stream points with a slot's
+  wall (4+ blocks above the water two blocks off) stays ~4–7%, as at
+  version 20 — the banks' 45° cut already decides the ground nearest a
+  channel — and many small streams still run *across* hillsides, held
+  by their downhill bank, because the network's eight directions between
+  cells 128 blocks apart rarely match the fall line; bending within
+  ±32 blocks cannot turn a reach. That is the owner's to judge on
+  foot. Found on the way, each with the failing test first: a fill
+  raising ground below sea level out of the water was still treated as
+  under it, leaving a river beside it unbanked; rivers stood a block or
+  two above the sea or a lake at the edge of its region, where the shore
+  is left unbuilt (`water_is_never_held_by_air`,
+  `lake_shores_hold_their_water`). Gullies on flat ground had lowered
+  banks into wetland; they act on slopes only. Cost: chunk generation
+  +~5% (1.10 → 1.15 ms a chunk column), LOD nodes +5–7%, world creation
+  +~1 s. Drainage cache format 7.
+- **Task 5 is built.** Canyons: still none (no river of 0.1+ m³/s crosses
+  flash-flood ground in three seeds) — carried to task 6 or the retro.
 
 ## Why this milestone exists
 

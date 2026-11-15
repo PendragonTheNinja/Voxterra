@@ -357,7 +357,14 @@ pub enum DrainageSource {
 ///   its mouth; rivers of 1+ m³/s sit ~30 deep (~20 before). Drainage
 ///   cache format 6. Every pond held only where no bank within three
 ///   blocks is cut below it.
-pub const GENERATOR_VERSION: u32 = 20;
+///   21 — small streams that follow the ground (M15 task 5): each reach's
+///   path bends across its line to the low ground (four points, a smooth
+///   curve, its channel on ground ~3 blocks below the line's), streams on
+///   slopes cut their own gullies, the grid-scale wander shrinks on steep
+///   reaches; rivers meet still water at its level within two blocks of
+///   its region, and still water is judged on the ground after the fill.
+///   Drainage cache format 7.
+pub const GENERATOR_VERSION: u32 = 21;
 
 impl Generator {
     /// A generator for one world: its seed and its size. The size is part of
@@ -2880,7 +2887,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (20, 0x0134_5209_6a74_3165);
+        const PINNED: (u32, u64) = (21, 0x09c4_1007_cd4e_75da);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),
@@ -3263,6 +3270,140 @@ mod valley_tests {
                 })
                 .collect();
             println!("seed {seed:#x}: {}", line.join(" | "));
+        }
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+
+    /// Small streams (0.01–0.1 m³/s) on hillsides, at four points along
+    /// every `step`th drainage cell's reach, each the channel column
+    /// nearest its straight line: how much lower the natural ground under
+    /// the channel is than on the line ("natural": landformed and eroded,
+    /// before any river shapes it), and how high the ground 2 blocks
+    /// either side of the channel stands over its water (4+ is a slot's
+    /// wall).
+    fn small_streams(g: &Generator, step: usize) -> Vec<(i64, i64)> {
+        let d = g.drainage();
+        let (nx, nz) = d.cells();
+        let natural = |x: i64, z: i64| d.erode(x, z, g.landformed(x, z).1.height);
+        let wrap = |v: i64, n: usize| {
+            let k = v.rem_euclid(n as i64);
+            if k > n as i64 / 2 { k - n as i64 } else { k }
+        };
+        let mut out = Vec::new();
+        for j in (0..nz).step_by(step) {
+            for i in (0..nx).step_by(step) {
+                let (_, _, q, (ri, rj)) = d.cell(i, j);
+                if !(0.01..0.1).contains(&q)
+                    || d.is_sea(i, j)
+                    || d.is_lake(i, j)
+                    || d.is_sea(ri, rj)
+                    || d.is_lake(ri, rj)
+                {
+                    continue;
+                }
+                let a = d.node(i as i64, j as i64);
+                let b = d.node(
+                    i as i64 + wrap(ri as i64 - i as i64, nx),
+                    j as i64 + wrap(rj as i64 - j as i64, nz),
+                );
+                let (vx, vz) = (b.0 - a.0, b.1 - a.1);
+                let len = (vx * vx + vz * vz).sqrt();
+                let (ux, uz) = (vx / len, vz / len);
+                let at = |p: (f64, f64), o: f64| {
+                    ((p.0 - uz * o).round() as i64, (p.1 + ux * o).round() as i64)
+                };
+                for t in [0.2, 0.4, 0.6, 0.8] {
+                    let line = (a.0 + vx * t, a.1 + vz * t);
+                    let Some((x, z)) = (0..=40).find_map(|k: i64| {
+                        [k, -k]
+                            .into_iter()
+                            .map(|o| at(line, o as f64))
+                            .find(|&(x, z)| matches!(g.ground(x, z).1.body, Body::River(_)))
+                    }) else {
+                        continue;
+                    };
+                    let here = natural(x, z);
+                    // Hillsides only: some relief across the line.
+                    let side: Vec<i64> = [-24.0, -12.0, 12.0, 24.0]
+                        .iter()
+                        .map(|&o| {
+                            let (px, pz) = at((x as f64, z as f64), o);
+                            natural(px, pz)
+                        })
+                        .collect();
+                    if side.iter().max().unwrap() - side.iter().min().unwrap().min(&here) < 8 {
+                        continue;
+                    }
+                    let (s, w) = g.ground(x, z);
+                    let water = w.level.max(s.height);
+                    let wall = [-2.0, 2.0]
+                        .iter()
+                        .map(|&o| {
+                            let (px, pz) = at((x as f64, z as f64), o);
+                            g.ground(px, pz).0.height
+                        })
+                        .max()
+                        .unwrap()
+                        - water;
+                    let (lx, lz) = at(line, 0.0);
+                    out.push((natural(lx, lz) - here, wall));
+                }
+            }
+        }
+        out
+    }
+
+    /// M15 task 5 (the owner's first flight on version 9: "so many weird
+    /// funky things with rivers ... worse in mountains"): a small stream
+    /// takes the low ground beside its straight line — round spurs, down
+    /// gullies — not the line. Version 20's channels ran on ground as high
+    /// as the line's (median 0); their paths now bend to it.
+    #[test]
+    fn small_streams_take_the_low_ground() {
+        let g = Generator::new(0x7e22ac0de, WorldShape::DEFAULT);
+        let mut lower: Vec<i64> = small_streams(&g, 9).iter().map(|p| p.0).collect();
+        assert!(
+            lower.len() > 150,
+            "only {} hillside stream points",
+            lower.len()
+        );
+        lower.sort_unstable();
+        let p50 = lower[lower.len() / 2];
+        assert!(
+            p50 >= 2,
+            "small streams' channels on ground {p50} below their straight lines (median)"
+        );
+    }
+
+    /// `cargo test -p vox-worldgen --release stream_survey -- --ignored
+    /// --nocapture`; env `SURVEY_SEEDS` (default 3).
+    #[test]
+    #[ignore]
+    fn stream_survey() {
+        let seeds = std::env::var("SURVEY_SEEDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3u64);
+        for k in 0..seeds {
+            let seed = if k == 0 { 0x7e22ac0de } else { k };
+            let g = Generator::new(seed, WorldShape::DEFAULT);
+            let points = small_streams(&g, 7);
+            let mut lower: Vec<i64> = points.iter().map(|p| p.0).collect();
+            lower.sort_unstable();
+            let p = |f: f64| lower[((f * lower.len() as f64) as usize).min(lower.len() - 1)];
+            let walls = points.iter().filter(|p| p.1 >= 4).count() as f64 / points.len() as f64;
+            println!(
+                "seed {seed:#x}: {} hillside stream points; channel's ground below its line's: p25 {} p50 {} p75 {}; slot walls (4+ above the water 2 off) {:.1}%",
+                points.len(),
+                p(0.25),
+                p(0.5),
+                p(0.75),
+                100.0 * walls
+            );
         }
     }
 }

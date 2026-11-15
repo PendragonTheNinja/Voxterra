@@ -104,6 +104,18 @@ const SEAT_SPACING: f64 = 4.0;
 const SEAT_NEAR: f64 = 0.125;
 /// The points of a reach's long profile.
 pub(crate) const PROFILE_STEPS: usize = 8;
+/// A stream's path (M15 task 5): this many points along its reach, each
+/// moved across it by up to [`BEND_MOST`] blocks in steps of
+/// [`BEND_STEP`], to the low ground — round spurs, down gullies — at a
+/// cost of [`BEND_COST`] blocks of height per block it moves across from
+/// the point before (so it bends, never zigzags), its ends at the nodes.
+/// A straight line between nodes 128 blocks apart ran small streams over
+/// spurs and straight down hillsides in one-block slots (the owner's
+/// first flight on version 9).
+pub(crate) const BEND_POINTS: usize = 4;
+const BEND_MOST: i32 = 32;
+const BEND_STEP: i32 = 4;
+const BEND_COST: f64 = 0.2;
 
 /// The bit of a cell's cover marking a closed basin's sink.
 const SINK: u8 = 0x80;
@@ -144,6 +156,10 @@ pub struct DrainageMap {
     /// index, ascending, each its water at PROFILE_STEPS points along it,
     /// from its own level (255) to its receiver's (0).
     profile: Vec<(u32, [u8; PROFILE_STEPS])>,
+    /// Streams' paths (M15 task 5): by cell, ascending, each of
+    /// [`BEND_POINTS`] points' offset across its reach, blocks — only the
+    /// reaches that bend.
+    bends: Vec<(u32, [i8; BEND_POINTS])>,
     /// The elevation's erosion stage (task 2).
     erosion: Erosion,
     /// The water budget, kept for the conservation test.
@@ -435,18 +451,91 @@ impl DrainageMap {
             )
         };
         let water_level = |spill: &[i32], c: usize| if sea[c] { 0 } else { spill[c] };
+        // Each stream's path: its points moved across the reach to the low
+        // ground, chosen together (the cheapest path through each point's
+        // offsets, ground plus the cost of moving across), within an inner
+        // valley's floor where it has one (it would leave its own valley).
+        let bends: Vec<(u32, [i8; BEND_POINTS])> = (0..nx * nz)
+            .into_par_iter()
+            .filter_map(|c| {
+                if !stream(c) {
+                    return None;
+                }
+                let (a, b) = reach_line(c);
+                let (dx, dz) = (b.0 - a.0, b.1 - a.1);
+                let len = (dx * dx + dz * dz).sqrt();
+                let (ux, uz) = (dx / len, dz / len);
+                let most = erosion
+                    .valleys
+                    .half_at(c)
+                    .map_or(BEND_MOST, |h| (h as i32).min(BEND_MOST));
+                let most = most - most % BEND_STEP;
+                let offsets: Vec<i32> = (-most..=most).step_by(BEND_STEP as usize).collect();
+                let m = offsets.len();
+                // Gently: a point moves across no more than half the way
+                // between points (the path is measured across its line,
+                // which holds while it bends gently).
+                let reachable = 0.5 * len / (BEND_POINTS + 1) as f64;
+                let mut cost = vec![0.0f64; m];
+                let mut from = vec![[0usize; BEND_POINTS]; m];
+                for k in 0..BEND_POINTS {
+                    let t = (k + 1) as f64 / (BEND_POINTS + 1) as f64;
+                    let (px, pz) = (a.0 + dx * t, a.1 + dz * t);
+                    let mut next = vec![f64::INFINITY; m];
+                    let mut via = vec![0usize; m];
+                    for (o, &off) in offsets.iter().enumerate() {
+                        let g = f64::from(seat_ground(
+                            px - uz * f64::from(off),
+                            pz + ux * f64::from(off),
+                        ));
+                        for (p, &prev) in offsets.iter().enumerate() {
+                            let shift = f64::from((off - if k == 0 { 0 } else { prev }).abs());
+                            if shift > reachable || (k == 0 && p > 0) {
+                                continue;
+                            }
+                            let v = cost[p] + g + BEND_COST * shift;
+                            if v < next[o] {
+                                (next[o], via[o]) = (v, p);
+                            }
+                        }
+                    }
+                    let before = from.clone();
+                    for o in 0..m {
+                        from[o] = before[via[o]];
+                        from[o][k] = o;
+                    }
+                    cost = next;
+                }
+                // Back to the receiver's node.
+                let (best, _) = offsets
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &off)| f64::from(off.abs()) <= reachable)
+                    .map(|(o, &off)| (o, cost[o] + BEND_COST * f64::from(off.abs())))
+                    .min_by(|x, y| x.1.total_cmp(&y.1))?;
+                let path = from[best].map(|o| offsets[o] as i8);
+                (path != [0; BEND_POINTS]).then_some((c as u32, path))
+            })
+            .collect();
+        let bent = |c: usize| match bends.binary_search_by_key(&(c as u32), |b| b.0) {
+            Ok(k) => bends[k].1,
+            Err(_) => [0; BEND_POINTS],
+        };
         // The ground along a reach, every `spacing` blocks: at each step
         // the lowest of the line and points `belt` either side of it.
         let along = |c: usize, spacing: f64, belt: f64| -> Vec<i32> {
             let (a, b) = reach_line(c);
+            let bend = bent(c);
             let (dx, dz) = (b.0 - a.0, b.1 - a.1);
             let len = (dx * dx + dz * dz).sqrt();
             let (ux, uz) = (dx / len, dz / len);
             let n = (len / spacing).ceil().max(2.0) as usize;
             (0..n)
                 .map(|k| {
+                    // Along its path (stage 2's `Reach::locate`), across
+                    // its line.
                     let t = k as f64 / n as f64;
-                    let (x, z) = (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
+                    let (x, z) = rivers::along_path(a, b, bend, t);
                     let across = |f: f64| seat_ground(x - uz * belt * f, z + ux * belt * f);
                     if belt > 0.0 {
                         [-1.0, -0.5, 0.0, 0.5, 1.0]
@@ -561,6 +650,7 @@ impl DrainageMap {
                 .collect(),
             discharge,
             profile,
+            bends,
             erosion,
             #[cfg(test)]
             budget: (runoff, demand),

@@ -22,8 +22,9 @@ const MAGIC: &[u8; 4] = b"VXDR";
 /// Bump when the layout changes. A file of another version is rebuilt.
 /// 2 — the cover byte carries arid and ice-scoured bits (M14 criterion 10).
 /// 3 — waterfalls' lips. 4 — reaches' long profiles instead. 5 — glacial
-/// troughs (M15). 6 — rivers' inner valleys (M15 task 5).
-pub const FORMAT_VERSION: u32 = 6;
+/// troughs (M15). 6 — rivers' inner valleys (M15 task 5). 7 — streams'
+/// paths (M15 task 5).
+pub const FORMAT_VERSION: u32 = 7;
 
 /// What a cache must have been built for to be used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,6 +82,12 @@ impl DrainageMap {
         // rivers' inner valleys after them.
         put_lines(&mut out, &e.troughs);
         put_lines(&mut out, &e.valleys);
+        // Format 7: streams' paths, by cell.
+        put_u32(&mut out, self.bends.len() as u32);
+        for (c, bend) in &self.bends {
+            put_u32(&mut out, *c);
+            out.extend(bend.iter().map(|&o| o as u8));
+        }
         let sum = fnv1a(&out);
         out.extend_from_slice(&sum.to_le_bytes());
         out
@@ -134,6 +141,21 @@ impl DrainageMap {
         let delta = r.array(en, |b| f32::from_le_bytes(b.try_into().unwrap()), 4)?;
         let troughs = r.lines(GLACIAL, (nx, nz), (cell_x, cell_z))?;
         let valleys = r.lines(FLUVIAL, (nx, nz), (cell_x, cell_z))?;
+        let count = r.u32()? as usize;
+        let mut bends: Vec<(u32, [i8; super::BEND_POINTS])> = Vec::with_capacity(count.min(n));
+        for _ in 0..count {
+            let c = r.u32()?;
+            let raw = r.take(super::BEND_POINTS)?;
+            // Ascending and in the grid, or it is not this world's.
+            if c as usize >= n || bends.last().is_some_and(|&(p, _)| p >= c) {
+                return None;
+            }
+            let mut bend = [0i8; super::BEND_POINTS];
+            for (o, &b) in bend.iter_mut().zip(raw) {
+                *o = b as i8;
+            }
+            bends.push((c, bend));
+        }
         if !r.0.is_empty() || flow.iter().any(|&d| d > super::HERE) {
             return None;
         }
@@ -149,6 +171,7 @@ impl DrainageMap {
             flow,
             discharge,
             profile,
+            bends,
             erosion: Erosion {
                 nx: enx,
                 nz: enz,

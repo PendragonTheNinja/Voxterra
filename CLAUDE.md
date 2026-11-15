@@ -323,11 +323,12 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   note; ADR-0023, the parallel task 1, is superseded), then re-checked
   there: moraines, drumlins and cirques fixed as **version 19**
   (2026-11-14; closed basins now ~19–24%, canyons none — the spec's
-  *Re-checked* note). **Task 5 (2026-11-14): closed basins (19.3%) and
-  valleys for large rivers (~30 deep; inner valleys, `GENERATOR_VERSION`
-  20) are met**; small streams that follow the ground are next. Every
-  landform waits on the owner's flight of version 20, and his `--bench`.
-  Then task 6. Dune
+  *Re-checked* note). **Task 5 is built (2026-11-15): closed basins
+  (19.3%), valleys for large rivers (~30 deep; inner valleys, version
+  20) and small streams that follow the ground (bent paths and gullies,
+  `GENERATOR_VERSION` 21).** The owner will test the milestone as a
+  whole at its end (2026-11-15). **Next: task 6** — materials, the LOD,
+  the bench, the owner's walk, the retrospective. Dune
   seas, mesas and canyons, glacial valleys and fjords, inselbergs, dissected
   humid hills, as height layers weighted by a stage-1 process map, applied
   before the drainage network so water still fits the ground (M14's lesson).
@@ -348,7 +349,7 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   rivers as ribbons, reservoirs with the water simulation.
 - **Starting a new session:** clone fresh, confirm `git log` matches the
   commits the checklist names as done, run the headless tests (expect
-  vox-core 306, vox-mesh 72, vox-worldgen 122, vox-render 21, vox-app 18
+  vox-core 306, vox-mesh 72, vox-worldgen 123, vox-render 21, vox-app 18
   passing (288, 72 and 11 before the 2026-11 audit; worldgen was 81
   before the tectonic framework and 103 before M15's landforms), plus the ignored
   `every_biome_in_every_world` and `biome_survey`, run in release), then
@@ -393,8 +394,8 @@ The owner's ideas for all of them, and a proposed order, are recorded in
   the LOD's slopes as bright as full resolution's, water darkening with
   depth. Small streams that follow the ground went to M15 (task 5);
   coastal landforms are proposed for M15's catalogue. Version 10's polish
-  is carried into versions 18–20 by the M15 merge (2026-11-14). **Next: the
-  owner's `--bench` and a flight on version 20** (a fresh world again).
+  is carried into versions 18–21 by the M15 merge (2026-11-14). **Next: the
+  owner's `--bench` and a flight on version 21** (a fresh world again).
 - **Open decision records (2026-11-11):** ADR-0022 (relight and mesh off
   the frame — proposed; **its gate is met** by the owner's bench: the two
   passes hold the frame thread ~320 ms of every sprinting second and the

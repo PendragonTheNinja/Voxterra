@@ -160,6 +160,25 @@ network (the mesas' rule above): the network is routed after it, on the
 ground it leaves. Its cost: world creation +~1 s; chunk generation
 unchanged within noise.
 
+**Small streams follow the ground in stage 1 and cut gullies in stage 2
+(task 5, version 21).** A reach ran straight between nodes 128 blocks
+apart, so a small stream crossed spurs and ran down hillsides in a slot.
+Stage 1 now bends each stream's path: four points along its line, each
+moved up to 32 blocks across it to the low ground of the eroded ground,
+chosen together (the cheapest path, ground plus 0.2 blocks of height per
+block moved across, never more than half the way between points), within
+an inner valley's floor where it has one; stored in the cache (format 7)
+and read in stage 2 as a smooth curve across the straight line (Catmull–
+Rom; a polyline through the points kinked every few dozen blocks). The
+long profile and the seating are laid along the curve. In stage 2 every
+stream on a slope lowers the ground along it (3 blocks for the smallest,
+3 more a decade, at most 9, fading over four depths; never below a block
+over any water near), and the grid-scale wander shrinks to a quarter on
+steep reaches (the path already bends; the full wander put hillside
+streams back up on the spurs). Rivers meet still water at its level
+within two blocks of its region. Cost: chunk generation +~5%, world
+creation +~1 s.
+
 The climate map and the process weights read the base elevation (step 0),
 never steps 1–3: landforms are smaller than climate cells and would only
 add noise to rain, and reading them back would make weights depend on

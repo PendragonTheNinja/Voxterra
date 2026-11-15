@@ -450,6 +450,15 @@ impl Troughs {
         }
     }
 
+    /// The half-width of the floor of drainage cell `c`'s line, if it has
+    /// one, blocks.
+    pub(super) fn half_at(&self, c: usize) -> Option<f32> {
+        match self.index.get(c) {
+            Some(&k) if k != u32::MAX => Some(self.cells[k as usize].half),
+            _ => None,
+        }
+    }
+
     /// How far a river's inner valleys lower ground `h` at a point, blocks
     /// (never negative): along each line near, the ground within the
     /// floor's half-width goes down to the floor, and beyond it the cut
