@@ -294,9 +294,15 @@ items, measured in the chunks over the survey's seeds:
   reaches below the lowest of its node's own ground within two cells and
   twice the steepest step there (`skirts_reach_the_foot_of_a_cliff_at_the_border`);
   census 76 → 15 at D (7 the old horizon pinholes), 13 → 7 at H, 5 → 4
-  at C, for 0.4–2% more LOD triangles. Seen and not yet fixed: inselbergs are smooth grey
-  blobs on the plain; thin gaps in the LOD's mesa walls; the LOD under
-  sea ice; ice blocks all light. The world emptying while flying was
+  at C, for 0.4–2% more LOD triangles. **Inselbergs as massifs (version
+  25):** each dome now has 2–4 lesser lobes on its shoulders (Kata Tjuta,
+  the Sugarloaf) and grooves running straight down its flanks (a noise
+  of direction from its centre, so no trigonometry), its outline rougher.
+  Test `domes_are_massifs_not_blobs`: of 24 domes, 0 had two summits at
+  version 24 and 8 now; flank roughness 1.17 → 1.57. A rubble apron of
+  bare rock was tried and dropped: a grey stone disc round every dome.
+  Still bare grey rock; colour is the owner's to judge. Seen and not yet
+  fixed: the LOD under sea ice; ice blocks all light. The world emptying while flying was
   speed: 400–700 blocks a second, 3–6× sprint-flight, outruns generation.
 - Still to do in task 6: renders of every landform (the gallery has one
   per landform at versions 18–22), the owner's `--bench` and walk, the

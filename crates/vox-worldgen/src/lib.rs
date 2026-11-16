@@ -83,6 +83,8 @@ pub struct Generator {
     inselbergs: landform::Inselbergs,
     /// The noise that roughens inselbergs' outlines (~150 blocks).
     outline: elevation::LandformNoise,
+    /// Rain's grooves down an inselberg's flanks (M15 task 6).
+    grooves: elevation::LandformNoise,
     dissection: landform::Dissection,
     /// Recently generated chunk columns' ground, shared by every clone
     /// ([`GroundCache`]): a speed-up only, never a source of truth.
@@ -436,7 +438,10 @@ pub enum DrainageSource {
 ///   beds, slower to vary) and risers half as wide as high, a slope under
 ///   a cliff band (a whole step had been one sheer drop, and terraces left
 ///   standing cylinders).
-pub const GENERATOR_VERSION: u32 = 24;
+///   25 — inselbergs as massifs: a main dome with 2–4 lobes on its
+///   shoulders and grooves down its flanks, the outline rougher (smooth
+///   single domes had read as "big spheres of rock").
+pub const GENERATOR_VERSION: u32 = 25;
 
 impl Generator {
     /// A generator for one world: its seed and its size. The size is part of
@@ -455,6 +460,7 @@ impl Generator {
             deposits: landform::Deposits::new(seed, shape),
             inselbergs: landform::Inselbergs::new(seed, shape),
             outline: elevation::LandformNoise::new(shape, 150, 0xB0_0010),
+            grooves: elevation::LandformNoise::new(shape, 12, 0xB0_0011),
             dissection: landform::Dissection::new(shape),
             grounds: Arc::new(GroundCache::default()),
         }
@@ -719,15 +725,24 @@ impl Generator {
             return None;
         }
         let wobble = self.elevation.noise(wx, wz, &self.outline);
-        self.inselbergs.at(wx, wz, wobble, |sx, sz| {
-            let p = self.processes(sx, sz);
-            let h = self.elevation.height(sx, sz) as f32;
-            let upland = climate::smoothstep(TOR_UPLAND.0, TOR_UPLAND.1, h);
-            (
-                p.weathering,
-                p.weathering.max(TOR_UPLAND_WEIGHT * p.rain * upland),
-            )
-        })
+        self.inselbergs.at(
+            wx,
+            wz,
+            wobble,
+            |sx, sz| {
+                let p = self.processes(sx, sz);
+                let h = self.elevation.height(sx, sz) as f32;
+                let upland = climate::smoothstep(TOR_UPLAND.0, TOR_UPLAND.1, h);
+                (
+                    p.weathering,
+                    p.weathering.max(TOR_UPLAND_WEIGHT * p.rain * upland),
+                )
+            },
+            |x, z| {
+                self.elevation
+                    .noise(x.floor() as i64, z.floor() as i64, &self.grooves)
+            },
+        )
     }
 
     /// What the last ice age's ice left at a column (M15): an end moraine
@@ -3000,7 +3015,7 @@ mod tests {
     /// another with no code change, that is a real bug, not a stale pin.
     #[test]
     fn terrain_fingerprint_is_pinned() {
-        const PINNED: (u32, u64) = (24, 0xda1a_8a52_f6c0_1099);
+        const PINNED: (u32, u64) = (25, 0x4c61_735a_bf38_6208);
         let got = terrain_fingerprint();
         assert_eq!(
             (GENERATOR_VERSION, got),
@@ -3719,5 +3734,126 @@ mod cliff_tests {
             soil.len(),
             &soil[..soil.len().min(5)]
         );
+    }
+}
+
+#[cfg(test)]
+mod dome_tests {
+    use super::*;
+
+    /// Domes found on the default world's equatorial plains: for each,
+    /// its rock heights (landformed less base) every 4 blocks over its
+    /// footprint, as a grid, and its tallest.
+    fn domes(g: &Generator) -> Vec<(i64, i64, Vec<Vec<f32>>)> {
+        let mut found: Vec<(i64, i64)> = Vec::new();
+        for z in (-12_000..12_000i64).step_by(97) {
+            for x in (0..204_800i64).step_by(193) {
+                if g.landform(x, z) != Some("inselberg") {
+                    continue;
+                }
+                if found
+                    .iter()
+                    .any(|&(fx, fz)| (fx - x).abs() < 900 && (fz - z).abs() < 900)
+                {
+                    continue;
+                }
+                found.push((x, z));
+            }
+        }
+        found
+            .into_iter()
+            .take(24)
+            .map(|(x, z)| {
+                let grid: Vec<Vec<f32>> = (-100..=100)
+                    .map(|j| {
+                        (-100..=100)
+                            .map(|i| {
+                                let (px, pz) = (x + 4 * i, z + 4 * j);
+                                let (b, f, _) = g.landformed(px, pz);
+                                if f.rock {
+                                    (f.height - b.height) as f32
+                                } else {
+                                    0.0
+                                }
+                            })
+                            .collect()
+                    })
+                    .collect();
+                (x, z, grid)
+            })
+            .collect()
+    }
+
+    /// Inselbergs are rock massifs, not smooth blobs (the owner's first
+    /// look at version 22: "random bare big spheres-ish of rock"): many
+    /// have more than one summit — Kata Tjuta's lobes, the Sugarloaf's
+    /// shoulders — and their flanks are grooved where rain runs down them.
+    #[test]
+    fn domes_are_massifs_not_blobs() {
+        let g = Generator::new(0x7e22ac0de, WorldShape::DEFAULT);
+        let all = domes(&g);
+        assert!(all.len() >= 8, "only {} domes found", all.len());
+        let (mut lobed, mut rough_sum, mut flank_cols) = (0, 0.0f64, 0u32);
+        for (_, _, h) in &all {
+            let n = h.len();
+            let top = h.iter().flatten().fold(0.0f32, |a, &b| a.max(b));
+            // Summits: higher than everything within 24 blocks by 6+.
+            let mut summits = 0;
+            for j in 6..n - 6 {
+                for i in 6..n - 6 {
+                    let here = h[j][i];
+                    if here < 0.3 * top {
+                        continue;
+                    }
+                    let mut highest = true;
+                    let mut lowest_round = f32::INFINITY;
+                    for dj in -6i64..=6 {
+                        for di in -6i64..=6 {
+                            if di == 0 && dj == 0 {
+                                continue;
+                            }
+                            let o = h[(j as i64 + dj) as usize][(i as i64 + di) as usize];
+                            // Ties allowed (heights are whole blocks; a top
+                            // is a little plateau), one cell of it counted.
+                            let earlier = dj < 0 || (dj == 0 && di < 0);
+                            highest &= if earlier { o < here } else { o <= here };
+                            if di.abs() == 6 || dj.abs() == 6 {
+                                lowest_round = lowest_round.min(o);
+                            }
+                        }
+                    }
+                    if highest && here - lowest_round >= 6.0 {
+                        summits += 1;
+                    }
+                }
+            }
+            lobed += usize::from(summits >= 2);
+            // Flank roughness: the second difference across 4 blocks on
+            // the flanks (30–80% of the top).
+            for j in 1..n - 1 {
+                for i in 1..n - 1 {
+                    let here = h[j][i];
+                    if here < 0.3 * top || here > 0.8 * top {
+                        continue;
+                    }
+                    let d2 = (h[j][i - 1] + h[j][i + 1] - 2.0 * here).abs()
+                        + (h[j - 1][i] + h[j + 1][i] - 2.0 * here).abs();
+                    rough_sum += f64::from(d2);
+                    flank_cols += 1;
+                }
+            }
+        }
+        let rough = rough_sum / f64::from(flank_cols.max(1));
+        eprintln!(
+            "{} domes, {lobed} with 2+ summits; flank roughness {rough:.2}",
+            all.len()
+        );
+        assert!(
+            lobed * 3 >= all.len(),
+            "only {lobed} of {} domes with 2+ summits",
+            all.len()
+        );
+        // Version 24: 1.17, every flank a smooth curve.
+        assert!(rough >= 1.4, "flanks smooth: roughness {rough:.2}");
     }
 }

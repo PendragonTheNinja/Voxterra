@@ -54,7 +54,25 @@ const TOR: Kind = Kind {
 /// The short axis's length against the long's, and the outline's wobble
 /// (a share of the radius).
 const ASPECT: (f64, f64) = (0.55, 1.0);
-const OUTLINE: f64 = 0.25;
+const OUTLINE: f64 = 0.35;
+/// A dome is a massif (the owner's first look at version 22: "random bare
+/// big spheres-ish of rock"): its main dome and 2–4 lesser lobes leaning on
+/// it (Kata Tjuta's domes, the Sugarloaf's shoulders), each this far from
+/// the centre, this wide and this high (shares of the main dome's) — on
+/// its shoulder, standing as a summit of its own (nearer, the main dome
+/// buried it).
+const LOBES: (u32, u32) = (2, 4);
+const LOBE_OFFSET: (f64, f64) = (0.7, 1.1);
+const LOBE_RADIUS: (f64, f64) = (0.35, 0.6);
+const LOBE_HEIGHT: (f32, f32) = (0.4, 0.8);
+/// Rain's grooves down its flanks: up to this share of its height deep,
+/// deepest half-way down, as many around as the groove noise gives at this
+/// many blocks from the centre (a noise of direction alone: grooves run
+/// straight downhill).
+const FLUTE: f32 = 0.15;
+const FLUTE_REACH: f64 = 90.0;
+/// How far beyond its radius a dome's rock may reach, as a share of it.
+const DOME_REACH: f64 = 1.75;
 
 /// Which rock a column stands on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,6 +113,10 @@ struct Site {
     /// Its long axis (a unit vector) and how much shorter the short one is.
     axis: (f64, f64),
     aspect: f64,
+    /// A dome's lesser lobes: offset from its centre (x, z), radius,
+    /// height; the first `lobe_count` of them.
+    lobes: [(f64, f64, f64, f32); 4],
+    lobe_count: usize,
 }
 
 impl Inselbergs {
@@ -119,12 +141,15 @@ impl Inselbergs {
     /// z)` gives the dome and tor weights at a site's centre; it is asked
     /// only for sites whose rock could reach the column.
     /// `wobble` is a noise in `[-1, 1]` that roughens the outlines.
+    /// `groove(x, z)` is a noise in `[-1, 1]` at a point, which the flutes
+    /// sample along a circle about each dome's centre.
     pub fn at(
         &self,
         x: i64,
         z: i64,
         wobble: f32,
         mut weights: impl FnMut(i64, i64) -> (f32, f32),
+        groove: impl Fn(f64, f64) -> f32,
     ) -> Option<(f32, Rock)> {
         let mut best: Option<(f32, Rock)> = None;
         for (k, &(kind, rock)) in KINDS.iter().enumerate() {
@@ -132,11 +157,15 @@ impl Inselbergs {
                 let (dx, dz) = (x as f64 + 0.5 - site.x, z as f64 + 0.5 - site.z);
                 // Along and across its axis, the short way stretched; the
                 // outline roughened.
-                let along = dx * site.axis.0 + dz * site.axis.1;
-                let across = (-dx * site.axis.1 + dz * site.axis.0) / site.aspect;
-                let r = (along * along + across * across).sqrt()
-                    / (site.radius * (1.0 + OUTLINE * f64::from(wobble)));
-                if r >= 1.0 {
+                let scale = 1.0 + OUTLINE * f64::from(wobble);
+                let local = |(dx, dz): (f64, f64)| {
+                    let along = dx * site.axis.0 + dz * site.axis.1;
+                    let across = (-dx * site.axis.1 + dz * site.axis.0) / site.aspect;
+                    (along * along + across * across).sqrt()
+                };
+                let r = local((dx, dz)) / (site.radius * scale);
+                let reach = if rock == Rock::Dome { DOME_REACH } else { 1.0 };
+                if r >= reach {
                     return;
                 }
                 let (dome, tor) = weights(site.x.floor() as i64, site.z.floor() as i64);
@@ -144,12 +173,29 @@ impl Inselbergs {
                 if keep(self.seed, kind, &site) >= w * kind.density {
                     return;
                 }
-                let r = r as f32;
-                let mut h = if site.round {
-                    site.height * (1.0 - r * r)
-                } else {
-                    site.height * (1.0 - r * r * r).max(0.0).sqrt()
+                let profile = |r: f32, height: f32| {
+                    if r >= 1.0 {
+                        0.0
+                    } else if site.round {
+                        height * (1.0 - r * r)
+                    } else {
+                        height * (1.0 - r * r * r).max(0.0).sqrt()
+                    }
                 };
+                let mut h = profile(r as f32, site.height);
+                if rock == Rock::Dome {
+                    // Grooves down the main dome's flanks.
+                    let d = (dx * dx + dz * dz).sqrt().max(1e-6);
+                    let g = groove(site.x + dx / d * FLUTE_REACH, site.z + dz / d * FLUTE_REACH);
+                    let flank = (4.0 * r * (1.0 - r)).clamp(0.0, 1.0) as f32;
+                    let cut = 0.5 + 0.5 * g;
+                    h -= FLUTE * site.height * flank * cut * cut;
+                    // Its lobes.
+                    for lobe in &site.lobes[..site.lobe_count] {
+                        let rl = local((dx - lobe.0, dz - lobe.1)) / (lobe.2 * scale);
+                        h = h.max(profile(rl as f32, lobe.3));
+                    }
+                }
                 if kind.course > 0.0 {
                     h = (h / kind.course).ceil() * kind.course;
                 }
@@ -186,7 +232,7 @@ impl Inselbergs {
                 let margin = (radius / cw.min(ch)).min(0.45);
                 let sx = (i as f64 + margin + (1.0 - 2.0 * margin) * h(2)) * cw;
                 let sz = (j as f64 + margin + (1.0 - 2.0 * margin) * h(3)) * ch;
-                let reach = radius * (1.0 + OUTLINE) + 1.0;
+                let reach = radius * (1.0 + OUTLINE) * if k == 0 { DOME_REACH } else { 1.0 } + 1.0;
                 if (px - sx).abs() > reach || (pz - sz).abs() > reach {
                     continue;
                 }
@@ -203,6 +249,26 @@ impl Inselbergs {
                         (ax / len, az / len)
                     },
                     aspect: ASPECT.0 + (ASPECT.1 - ASPECT.0) * h(8),
+                    lobes: core::array::from_fn(|l| {
+                        let l = l as u64;
+                        let (ax, az) = (h(10 + 5 * l) - 0.5, h(11 + 5 * l) - 0.5);
+                        let len = (ax * ax + az * az).sqrt().max(1e-6);
+                        let off = radius
+                            * (LOBE_OFFSET.0 + (LOBE_OFFSET.1 - LOBE_OFFSET.0) * h(12 + 5 * l));
+                        (
+                            ax / len * off,
+                            az / len * off,
+                            radius
+                                * (LOBE_RADIUS.0 + (LOBE_RADIUS.1 - LOBE_RADIUS.0) * h(13 + 5 * l)),
+                            LOBE_HEIGHT.0 + (LOBE_HEIGHT.1 - LOBE_HEIGHT.0) * h(14 + 5 * l) as f32,
+                        )
+                    }),
+                    lobe_count: if k == 0 {
+                        (LOBES.0 + ((LOBES.1 - LOBES.0 + 1) as f64 * h(9)) as u32).min(LOBES.1)
+                            as usize
+                    } else {
+                        0
+                    },
                 });
             }
         }
@@ -233,30 +299,38 @@ mod tests {
         let (mut found, mut steep) = (0u32, 0u32);
         for i in 0..2_000i64 {
             let (x, z) = (i * 97, i * 61 + 13);
-            let got = l.at(x, z, 0.0, |_, _| (1.0, 0.0));
+            let got = l.at(x, z, 0.0, |_, _| (1.0, 0.0), |_, _| 0.0);
             assert_eq!(
                 got,
-                l.at(x + shape.size_x(), z - shape.size_z(), 0.0, |_, _| (
-                    1.0, 0.0
-                ))
+                l.at(
+                    x + shape.size_x(),
+                    z - shape.size_z(),
+                    0.0,
+                    |_, _| (1.0, 0.0),
+                    |_, _| 0.0
+                )
             );
             if let Some((h, Rock::Dome)) = got {
                 found += 1;
                 assert!((0.0..=150.0).contains(&h));
-                // Walk out along x to the foot: the steep kind ends in a
-                // drop of several blocks.
+                // Walk out along x to the foot: the steep kind drops several
+                // blocks at once there (above its apron of rubble).
                 let mut k = 1;
                 let mut last = h;
-                while let Some((h2, Rock::Dome)) = l.at(x + k, z, 0.0, |_, _| (1.0, 0.0)) {
+                let mut drop = 0.0f32;
+                while let Some((h2, Rock::Dome)) =
+                    l.at(x + k, z, 0.0, |_, _| (1.0, 0.0), |_, _| 0.0)
+                {
+                    drop = drop.max(last - h2);
                     last = h2;
                     k += 1;
                 }
-                steep += u32::from(last >= 5.0);
+                steep += u32::from(drop >= 5.0);
             }
         }
         assert!(found > 20, "{found}");
         assert!(steep > 0);
         // No weight, no rock.
-        assert_eq!(l.at(1_000, 1_000, 0.0, |_, _| (0.0, 0.0)), None);
+        assert_eq!(l.at(1_000, 1_000, 0.0, |_, _| (0.0, 0.0), |_, _| 0.0), None);
     }
 }
